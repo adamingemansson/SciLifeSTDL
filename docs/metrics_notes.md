@@ -1,5 +1,15 @@
 # Evaluation Metrics — Notes & Plan
 
+Last verified: 2026-07-13 — see docs/literature_review.md "Metrics /
+evaluation" section for full citations. One correction to the framing below:
+a Fréchet-distance metric for *non-spatial* single-cell generative models
+already exists (**scFID**, bioRxiv 2025.04.14.648850) — there is no
+published spatial-specific analog yet, but "no FID-style metric exists
+anywhere in transcriptomics" would be an overclaim. Position "ST-FID" as
+extending scFID's recipe to spatial data (patch/neighborhood embeddings that
+capture spatial arrangement, not just per-cell expression), and cite scFID
+explicitly wherever this metric is written up.
+
 ## 1. Standard / pointwise metrics (use as a baseline suite regardless of
    what else you do)
 
