@@ -1,0 +1,37 @@
+name: st3d
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - scikit-learn
+  - scikit-image
+  - matplotlib
+  - seaborn
+  - jupyterlab
+  - pytorch
+  - torchvision
+  - pytorch-cuda=12.1   # remove/adjust if no GPU or different CUDA version
+  - pytorch-lightning
+  - anndata
+  - scanpy
+  - squidpy
+  - h5py
+  - zarr
+  - pip:
+      - spatialdata
+      - spatialdata-io
+      - wandb
+      - hydra-core
+      - omegaconf
+      - einops
+      - diffusers
+      - torchmetrics
+      - POT            # optimal transport, useful for slice alignment (PASTE-style) and metrics
+      - anndata2ri; sys_platform != "win32"

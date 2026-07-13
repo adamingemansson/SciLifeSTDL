@@ -1,0 +1,41 @@
+# Base experiment config. Copy this per-experiment (e.g. configs/exp_vae_mosta.yaml)
+# and override only what changes. Loaded with hydra/omegaconf.
+
+experiment_name: baseline_interp
+
+data:
+  dataset: mosta_e9.5          # key into a dataset registry you'll add in src/data
+  paths: []                    # fill in with actual h5ad/Visium paths
+  z_positions: null            # list of real depths per slice, or null to use index
+  task: inter_slice             # inter_slice | intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: hold_out_slice      # hold_out_slice | mask_region_2d | random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [50, 150]
+
+model:
+  name: interp_baseline         # matches @register_model name in src/models/registry.py
+  params:
+    k: 5
+
+training:
+  batch_size: 256
+  lr: 1.0e-3
+  epochs: 100
+  seed: 0
+  device: cuda                  # cuda | cpu
+  log_every_n_steps: 50
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid]
+  embedding_for_fid: pca        # pca | scvi | custom_encoder
+  pca_n_components: 50
+
+logging:
+  backend: wandb                 # wandb | mlflow | none  -- confirm data policy first
+  project: st3d-lundeberg-lab

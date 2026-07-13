@@ -1,0 +1,29 @@
+# data (never commit raw or large processed data)
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# results / logs / checkpoints
+results/*
+logs/*
+!results/.gitkeep
+!logs/.gitkeep
+*.ckpt
+*.pt
+*.pth
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.env
+.venv/
+*.egg-info/
+
+# os
+.DS_Store
+
+# experiment trackers
+wandb/
+mlruns/
