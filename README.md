@@ -20,6 +20,7 @@ st3d-project/
 ├── requirements.txt           <- pip fallback / for pip-only installs
 ├── docs/
 │   ├── project_proposal.md    <- 1-pager: aim, scope, success criteria
+│   ├── project_outline.md     <- phased execution roadmap, start here
 │   ├── literature_review.md   <- running annotated bibliography
 │   ├── dataset_notes.md       <- candidate datasets, access, pros/cons
 │   ├── metrics_notes.md       <- evaluation metrics + FID-style metric plan
