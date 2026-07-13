@@ -1,15 +1,22 @@
 """
-Model registry: lets configs pick a generator backbone by name, so the
-rest of the pipeline (data, masking, training loop, evaluation) never needs
-to know or care which architecture is in use.
+Model registry: model-agnostic generative backbone interface.
+
+Every family (VAE, WAE-GAN, diffusion, ...) implements BaseGenerativeModel,
+a thin pytorch_lightning.LightningModule subclass. Lightning owns the
+boilerplate (checkpointing, device placement, single- vs. multi-optimizer
+training loops via automatic_optimization) so each family only has to
+implement its own training_step/configure_optimizers/sample() — necessary
+because GAN-style alternating updates and multi-step diffusion sampling
+don't fit a single shared loss()/forward() call the way a plain VAE does.
+See docs/architecture_plan.md for the full design rationale.
 
 Usage:
     from src.models.registry import build_model
 
-    model = build_model(cfg.model)   # cfg.model.name == "vae_baseline", "diffusion_v1", ...
+    model = build_model(cfg.model)   # cfg.model.name == "vae_baseline", "wae_gan", ...
 
 To add a new architecture:
-    1. Implement a class inheriting from BaseGenerator (below).
+    1. Implement a class inheriting from BaseGenerativeModel (below).
     2. Register it with @register_model("your_name").
     3. Reference "your_name" in a config file. Nothing else changes.
 """
@@ -19,8 +26,9 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import pytorch_lightning as pl
 
-_MODEL_REGISTRY: dict[str, type["BaseGenerator"]] = {}
+_MODEL_REGISTRY: dict[str, type["BaseGenerativeModel"]] = {}
 
 
 def register_model(name: str):
@@ -32,7 +40,7 @@ def register_model(name: str):
     return _wrap
 
 
-def build_model(model_cfg: dict) -> "BaseGenerator":
+def build_model(model_cfg: dict) -> "BaseGenerativeModel":
     name = model_cfg["name"]
     if name not in _MODEL_REGISTRY:
         raise KeyError(
@@ -41,7 +49,7 @@ def build_model(model_cfg: dict) -> "BaseGenerator":
     return _MODEL_REGISTRY[name](**model_cfg.get("params", {}))
 
 
-class BaseGenerator(nn.Module, abc.ABC):
+class BaseGenerativeModel(pl.LightningModule, abc.ABC):
     """
     Common interface every generative backbone must implement so the
     training loop, masking simulator, and evaluation code are architecture-
@@ -50,34 +58,40 @@ class BaseGenerator(nn.Module, abc.ABC):
     Conceptually mirrors the Mimyr-style decomposition (see
     docs/literature_review.md) but keeps it generic:
         context   -> spatial/expression info from observed (unmasked) tissue
-        query     -> where we want to generate (missing locations / slice)
-        output    -> reconstructed (location, cell_type, expression) at query
-
-    A simpler baseline (e.g. plain interpolation or a VAE) can ignore parts
-    of this interface it doesn't need (e.g. skip explicit cell-location
-    generation and just fill in expression on a fixed grid).
-    """
-
-    @abc.abstractmethod
-    def forward(self, context: dict[str, torch.Tensor], query: dict[str, Any]
-                ) -> dict[str, torch.Tensor]:
-        """
-        context: dict with keys such as
             'coords'     [N_obs, D]   spatial coords of observed points (D=2 or 3)
             'expression' [N_obs, G]   gene expression of observed points
             'cell_type'  [N_obs]      optional cell type labels/ids
-        query: dict describing what to generate, e.g.
-            'coords'     [N_query, D] target locations (may itself be predicted
-                                       by the model for location-generation tasks)
-        Returns a dict with (a subset of):
+        query     -> where we want to generate (missing locations / slice)
+            'coords'     [N_query, D] target locations
+        sample() return -> dict with (a subset of):
             'coords'      [N_gen, D]
             'cell_type'   [N_gen]
             'expression'  [N_gen, G]
-        """
+
+    sample() is the ONE entry point evaluation code and every other consumer
+    calls, regardless of what happens internally — a single forward pass for
+    VAE/WAE-GAN, an iterative denoising loop for diffusion. Never reach into
+    a family's internals from outside this class.
+    """
+
+    @abc.abstractmethod
+    def sample(self, context: dict[str, torch.Tensor], query: dict[str, Any]
+               ) -> dict[str, torch.Tensor]:
         raise NotImplementedError
 
-    def loss(self, batch: dict, output: dict) -> torch.Tensor:
-        """Override per-model; training loop calls this generically."""
+    @abc.abstractmethod
+    def training_step(self, batch: dict, batch_idx: int):
+        """Lightning entry point. Implement the family's own training logic
+        here (ELBO for VAE, alternating encoder/decoder vs. discriminator
+        updates for WAE-GAN, noise-prediction for diffusion, ...). Use
+        self.log(...)/self.log_dict(...) to report training metrics."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def configure_optimizers(self):
+        """Return one optimizer (VAE, diffusion) or a list of optimizers
+        (WAE-GAN: [opt_ae, opt_disc]). Pair a list with
+        self.automatic_optimization = False in __init__ — see WAEGAN."""
         raise NotImplementedError
 
 
@@ -87,12 +101,12 @@ class BaseGenerator(nn.Module, abc.ABC):
 # pipeline before any real model is trained.
 # ---------------------------------------------------------------------------
 @register_model("interp_baseline")
-class InterpolationBaseline(BaseGenerator):
+class InterpolationBaseline(BaseGenerativeModel):
     def __init__(self, k: int = 5):
         super().__init__()
         self.k = k
 
-    def forward(self, context, query):
+    def sample(self, context, query):
         coords_obs = context["coords"]          # [N_obs, D]
         expr_obs = context["expression"]         # [N_obs, G]
         coords_q = query["coords"]               # [N_query, D]
@@ -103,22 +117,26 @@ class InterpolationBaseline(BaseGenerator):
                                    largest=False, dim=1)
         weights = 1.0 / (knn_d + 1e-6)
         weights = weights / weights.sum(dim=1, keepdim=True)
-        expr_gen = torch.einsum(
-            "nk,nkg->ng", weights, expr_obs[knn_i]
-        )
+        expr_gen = torch.einsum("nk,nkg->ng", weights, expr_obs[knn_i])
         return {"coords": coords_q, "expression": expr_gen}
 
+    def training_step(self, batch, batch_idx):
+        return None  # no learned parameters — nothing to train
+
+    def configure_optimizers(self):
+        return None  # no parameters to optimize
+
 
 # ---------------------------------------------------------------------------
-# Stub for a real learned backbone. Fill in per architecture decision
-# (diffusion / VAE / flow / GNN) once the literature review + Aim 3 baselines
-# are chosen. Keeping this as an explicit stub so the registry pattern is
-# demonstrated end-to-end.
+# VAE baseline. Unconditioned placeholder — see docs/architecture_plan.md
+# "Known gaps" for the conditioning encoder this still needs.
 # ---------------------------------------------------------------------------
 @register_model("vae_baseline")
-class VAEBaseline(BaseGenerator):
-    def __init__(self, n_genes: int, latent_dim: int = 32, hidden_dim: int = 256):
+class VAEBaseline(BaseGenerativeModel):
+    def __init__(self, n_genes: int, latent_dim: int = 32, hidden_dim: int = 256,
+                 kl_weight: float = 1e-3, lr: float = 1e-3):
         super().__init__()
+        self.save_hyperparameters()
         self.encoder = nn.Sequential(
             nn.Linear(n_genes, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, 2 * latent_dim),
@@ -128,22 +146,126 @@ class VAEBaseline(BaseGenerator):
             nn.Linear(hidden_dim, n_genes),
         )
         self.latent_dim = latent_dim
+        self.kl_weight = kl_weight
+        self.lr = lr
 
-    def forward(self, context, query):
-        # TODO: condition on query['coords'] (e.g. via a small coordinate
-        # encoder concatenated to the latent) once the conditioning strategy
-        # is decided. Left unconditioned here as a structural placeholder.
-        h = self.encoder(context["expression"])
+    def _encode(self, expression):
+        h = self.encoder(expression)
         mu, logvar = h.chunk(2, dim=-1)
+        return mu, logvar
+
+    def sample(self, context, query):
+        # TODO: condition on query['coords']/context once the shared
+        # conditioning encoder exists (docs/architecture_plan.md). Left
+        # unconditioned here as a structural placeholder — draws z from the
+        # prior directly, same as the original stub.
+        n = query["coords"].shape[0]
+        z = torch.randn(n, self.latent_dim, device=self.device)
+        expr_gen = self.decoder(z)
+        return {"coords": query["coords"], "expression": expr_gen}
+
+    def training_step(self, batch, batch_idx):
+        expression = batch["context"]["expression"]
+        mu, logvar = self._encode(expression)
         std = torch.exp(0.5 * logvar)
         z = mu + std * torch.randn_like(std)
-        expr_gen = self.decoder(z)
-        return {"coords": query["coords"], "expression": expr_gen,
-                "_mu": mu, "_logvar": logvar}
+        recon = self.decoder(z)
+        recon_loss = nn.functional.mse_loss(recon, expression)
+        kld = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        loss = recon_loss + self.kl_weight * kld
+        self.log_dict({"train/recon": recon_loss, "train/kld": kld, "train/loss": loss})
+        return loss
 
-    def loss(self, batch, output):
-        recon = nn.functional.mse_loss(output["expression"], batch["target_expression"])
-        kld = -0.5 * torch.mean(
-            1 + output["_logvar"] - output["_mu"].pow(2) - output["_logvar"].exp()
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.lr)
+
+
+# ---------------------------------------------------------------------------
+# WAE-GAN: Wasserstein Auto-Encoder with an adversarial latent regularizer
+# (Tolstikhin et al. 2017 — docs/literature_review.md, docs/metrics_notes.md
+# SS4). Same reconstruction path as the VAE above, but replaces the KL term
+# with a discriminator that pushes the *encoder's* aggregated latent
+# distribution toward the prior, instead of judging generated expression
+# directly. Chosen over a vanilla conditional GAN because the adversarial
+# signal only touches the low-dimensional latent code, not the sparse/
+# zero-inflated expression output — a smaller, better-behaved sub-problem
+# and the lower-risk way to get a first GAN-family entry working.
+# ---------------------------------------------------------------------------
+@register_model("wae_gan")
+class WAEGAN(BaseGenerativeModel):
+    def __init__(self, n_genes: int, latent_dim: int = 32, hidden_dim: int = 256,
+                 disc_hidden_dim: int = 128, adv_weight: float = 1.0,
+                 lr: float = 1e-3, lr_disc: float = 1e-3):
+        super().__init__()
+        self.save_hyperparameters()
+        self.automatic_optimization = False  # we alternate encoder/decoder vs. discriminator ourselves
+
+        self.encoder = nn.Sequential(
+            nn.Linear(n_genes, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim),   # deterministic encoder, no logvar
         )
-        return recon + 1e-3 * kld
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, n_genes),
+        )
+        self.discriminator = nn.Sequential(
+            nn.Linear(latent_dim, disc_hidden_dim), nn.ReLU(),
+            nn.Linear(disc_hidden_dim, 1),   # logit: real-prior-sample vs. encoder output
+        )
+        self.latent_dim = latent_dim
+        self.adv_weight = adv_weight
+        self.lr = lr
+        self.lr_disc = lr_disc
+
+    def sample(self, context, query):
+        # Generation never touches the encoder or discriminator: decode
+        # z ~ prior, identical to the VAE path above. TODO: condition once
+        # the shared conditioning encoder exists (docs/architecture_plan.md).
+        n = query["coords"].shape[0]
+        z = torch.randn(n, self.latent_dim, device=self.device)
+        expr_gen = self.decoder(z)
+        return {"coords": query["coords"], "expression": expr_gen}
+
+    def training_step(self, batch, batch_idx):
+        expression = batch["context"]["expression"]
+        opt_ae, opt_disc = self.optimizers()
+        batch_size = expression.shape[0]
+
+        z_fake = self.encoder(expression)                                    # encoder's latent code
+        z_real = torch.randn(batch_size, self.latent_dim, device=self.device)  # prior sample
+
+        # --- 1. discriminator step: real prior sample vs. encoder output ---
+        logits_real = self.discriminator(z_real.detach())
+        logits_fake = self.discriminator(z_fake.detach())
+        disc_loss = nn.functional.binary_cross_entropy_with_logits(
+            logits_real, torch.ones_like(logits_real)
+        ) + nn.functional.binary_cross_entropy_with_logits(
+            logits_fake, torch.zeros_like(logits_fake)
+        )
+        opt_disc.zero_grad()
+        self.manual_backward(disc_loss)
+        opt_disc.step()
+
+        # --- 2. encoder/decoder step: reconstruction + fool the discriminator ---
+        recon = self.decoder(z_fake)
+        recon_loss = nn.functional.mse_loss(recon, expression)
+        logits_fake_for_ae = self.discriminator(z_fake)
+        adv_loss = nn.functional.binary_cross_entropy_with_logits(
+            logits_fake_for_ae, torch.ones_like(logits_fake_for_ae)  # fool disc: look like prior
+        )
+        ae_loss = recon_loss + self.adv_weight * adv_loss
+        opt_ae.zero_grad()
+        self.manual_backward(ae_loss)
+        opt_ae.step()
+
+        self.log_dict({
+            "train/recon": recon_loss, "train/adv": adv_loss,
+            "train/disc": disc_loss, "train/ae_loss": ae_loss,
+        })
+
+    def configure_optimizers(self):
+        opt_ae = torch.optim.Adam(
+            list(self.encoder.parameters()) + list(self.decoder.parameters()), lr=self.lr
+        )
+        opt_disc = torch.optim.Adam(self.discriminator.parameters(), lr=self.lr_disc)
+        return [opt_ae, opt_disc]

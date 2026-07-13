@@ -1,9 +1,16 @@
 """
 Minimal training/eval loop skeleton showing how the pieces connect:
-data -> masking -> model (from registry) -> loss -> metrics.
+data -> masking -> model (from registry) -> Lightning Trainer -> metrics.
 
-This is intentionally thin — flesh it out (proper DataLoader/batching,
-checkpointing, logging backend) once a real dataset + model are chosen.
+Wraps the single context/query split as a repeating dataset so
+pytorch_lightning.Trainer can drive it uniformly across model families —
+including WAE-GAN's manual multi-optimizer step, which needs an attached
+Trainer to work at all (self.optimizers() is only valid inside one).
+
+This is intentionally thin — replace _SingleBatchDataset with a real
+per-cell/mini-batch Dataset once a real pilot dataset is chosen (Phase 4,
+see docs/project_outline.md). The model interface does not need to change
+when that happens.
 Run with: python -m src.training.train --config configs/base_config.yaml
 """
 from __future__ import annotations
@@ -11,11 +18,33 @@ import argparse
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, Dataset
+import pytorch_lightning as pl
 from omegaconf import OmegaConf
 
 from src.data import loaders, masking
 from src.models.registry import build_model
 from src.evaluation import metrics as ev
+
+
+class _SingleBatchDataset(Dataset):
+    """Yields the same context/query batch `n_steps` times, so Trainer's
+    dataloader loop maps onto the old script's manual epoch loop. Placeholder
+    until real mini-batching exists (see module docstring)."""
+
+    def __init__(self, batch: dict, n_steps: int):
+        self.batch = batch
+        self.n_steps = n_steps
+
+    def __len__(self):
+        return self.n_steps
+
+    def __getitem__(self, idx):
+        return self.batch
+
+
+def _collate_identity(batch_list):
+    return batch_list[0]
 
 
 def main(cfg_path: str):
@@ -48,37 +77,37 @@ def main(cfg_path: str):
     # 3. Build model from registry -------------------------------------------
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     model = build_model(model_cfg)
-    device = cfg.training.device if torch.cuda.is_available() else "cpu"
-    model = model.to(device)
 
     # 4. Package tensors -------------------------------------------------------
     context = {
-        "coords": torch.tensor(coords3d[context_mask], dtype=torch.float32, device=device),
-        "expression": torch.tensor(expr[context_mask], dtype=torch.float32, device=device),
+        "coords": torch.tensor(coords3d[context_mask], dtype=torch.float32),
+        "expression": torch.tensor(expr[context_mask], dtype=torch.float32),
     }
-    query = {
-        "coords": torch.tensor(coords3d[query_mask], dtype=torch.float32, device=device),
-    }
+    query = {"coords": torch.tensor(coords3d[query_mask], dtype=torch.float32)}
     target_expression = expr[query_mask]
+    batch = {
+        "context": context,
+        "query": query,
+        "target_expression": torch.tensor(target_expression, dtype=torch.float32),
+    }
 
-    # 5. Forward + (if learned) train loop -------------------------------------
-    optimizer = None
+    # 5. Train (skipped entirely for parameter-free baselines like interp_baseline) --
     if list(model.parameters()):
-        optimizer = torch.optim.Adam(model.parameters(), lr=cfg.training.lr)
-
-    for epoch in range(cfg.training.epochs if optimizer else 1):
-        output = model(context, query)
-        if optimizer is not None:
-            batch = {"target_expression": torch.tensor(
-                target_expression, dtype=torch.float32, device=device)}
-            loss = model.loss(batch, output)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            if epoch % cfg.training.log_every_n_steps == 0:
-                print(f"epoch {epoch}: loss={loss.item():.4f}")
+        dataset = _SingleBatchDataset(batch, n_steps=cfg.training.epochs)
+        dataloader = DataLoader(dataset, batch_size=1, collate_fn=_collate_identity)
+        trainer = pl.Trainer(
+            max_epochs=1,  # one pass over `n_steps` repeats of the batch == old epoch count
+            accelerator="auto",
+            log_every_n_steps=cfg.training.log_every_n_steps,
+            enable_checkpointing=False,
+            logger=False,
+        )
+        trainer.fit(model, dataloader)
 
     # 6. Evaluate ---------------------------------------------------------------
+    model.eval()
+    with torch.no_grad():
+        output = model.sample(context, query)
     pred = output["expression"].detach().cpu().numpy()
     pcc = ev.pearson_per_gene(pred, target_expression)
     print(f"mean PCC: {np.nanmean(pcc):.4f}")

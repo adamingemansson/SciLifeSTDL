@@ -1,0 +1,46 @@
+# WAE-GAN experiment config. Copy of base_config.yaml with the model block
+# swapped — see docs/architecture_plan.md "WAE-GAN" for the design.
+
+experiment_name: wae_gan_baseline
+
+data:
+  dataset: mosta_e9.5
+  paths: []
+  z_positions: null
+  task: inter_slice              # inter_slice | intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: hold_out_slice
+  params:
+    n_patches: 3
+    radius_range: [50, 150]
+
+model:
+  name: wae_gan                  # matches @register_model("wae_gan") in src/models/registry.py
+  params:
+    n_genes: null                 # fill in with the dataset's actual gene count before running
+    latent_dim: 32
+    hidden_dim: 256
+    disc_hidden_dim: 128
+    adv_weight: 1.0
+    lr: 1.0e-3
+    lr_disc: 1.0e-3
+
+training:
+  batch_size: 256
+  epochs: 100
+  seed: 0
+  device: cuda                   # cuda | cpu
+  log_every_n_steps: 50
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab
