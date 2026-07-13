@@ -49,6 +49,42 @@ breaks for the other two. The architecture has to abstract over training
    output shape, so `src/evaluation/metrics.py` never needs to know which
    family produced it. No changes needed here for new model families.
 
+## Workflow schematic
+
+```mermaid
+flowchart TD
+    A["Real complete tissue\n(chosen dataset — e.g. whole mouse brain atlas,\nMOSTA, STARmap PLUS, HEST-1k)"] --> B["Masking / gap simulator\nhold_out_slice / mask_region_2d / random_dropout_patches\n(src/data/masking.py — built)"]
+    B --> C["Context\nobserved tissue"]
+    B --> D["Query + held-out ground truth\nreal answer, kept for scoring only"]
+
+    C --> E["Conditioning encoder\nspatial graph/neighborhood representation\n(NOT YET BUILT — next priority)"]
+    D -.->|coords only, no leakage| E
+
+    E --> F{"Swappable generator\n(location -> expression directly,\nno explicit cell-type step)"}
+    F --> G["VAE\nbuilt"]
+    F --> H["WAE-GAN\nbuilt"]
+    F --> I["Diffusion / Flow Matching\nnext to build"]
+
+    G --> J["Generated expression\n(+ optionally histology, stretch goal)"]
+    H --> J
+    I --> J
+
+    J --> K["Evaluation"]
+    K --> K1["Pointwise: PCC, RMSE, AUC"]
+    K --> K2["Downstream: ARI/NMI +\ncell-type plausibility check\n(independent classifier, post-hoc)"]
+    K --> K3["Spatial coherence: Moran's I"]
+    K --> K4["Distributional: FID/MMD\n(stretch goal)"]
+
+    D --> K
+    J --> L["Compare vs. Mimyr / isoST\n(reproduced on our own data,\nnot just cited numbers)"]
+    D --> L
+```
+
+Two things this diagram makes explicit: (1) the held-out ground truth
+(`D`) only ever touches evaluation (`K`) and the comparison step (`L`) —
+never the generator — so there's no leakage; (2) the conditioning encoder
+(`E`) is the one box in the whole pipeline that doesn't exist yet.
+
 ## Build vs. reuse
 
 Most infrastructure is either already built or nearly free via existing
@@ -93,6 +129,74 @@ Generation (`sample()`) never touches the encoder or discriminator — decode
 interchangeable at inference time from the pipeline's point of view, which
 is exactly the point of the shared interface.
 
+## Design decision: no explicit cell-type conditioning
+
+Where this architecture deliberately diverges from Mimyr (the closest prior
+art — see `docs/literature_review.md`): Mimyr generates location → cell
+type (discrete classifier) → expression (conditioned on that type). We
+generate **location → expression directly**, with no discrete cell-type
+commitment inside the generation path.
+
+Rationale:
+- **Bias/information bottleneck**: forcing continuous expression variation
+  through a fixed, externally-imposed cell-type taxonomy discards real
+  biological signal (transitional states, within-type variation, states not
+  in the reference taxonomy).
+- **Error propagation**: a misclassified cell type in Mimyr's pipeline
+  becomes a wrong conditioning signal for expression generation — a
+  compounding failure mode structurally built into a 3-stage chain.
+- **Generalizability**: Mimyr's cell-type stage requires a target dataset
+  with a taxonomy compatible with (or retrained against) its reference
+  annotations. Skipping it removes that dependency.
+
+**This is a trade-off, not a free win** — worth stating plainly, not
+overselling: explicit type conditioning is also a real efficiency scaffold,
+giving the expression generator a strong, low-dimensional signal about which
+region of expression-space to target. Removing it is a harder, less
+structured learning problem, likely to need more data/capacity to match
+Mimyr's sample efficiency. The bet being made here is that the bias/
+generalizability gain outweighs that cost — to be checked empirically, not
+assumed.
+
+**Mode-averaging risk — the reason the backbone choice matters here
+specifically**: without a discrete type variable, a location can be
+genuinely multimodal (e.g. a boundary between two cell types). A model
+trained with a plain reconstruction loss (MSE, vanilla VAE) tends to
+collapse multimodal targets to their average — a blurry profile matching
+neither real type. Diffusion and GAN-style models don't have this failure
+mode the same way, because they sample from the distribution rather than
+regress to a conditional mean. This is a concrete, checkable reason to
+compare backbones on this task specifically, independent of the general
+"try different things" motivation.
+
+**Validation plan**: train an independent cell-type classifier on held-out
+real data (never seen during generation training). Run it on generated
+expression profiles and compare predicted type against the true type at the
+real held-out location. This reuses the ARI/NMI downstream-task-preservation
+metric already planned in `docs/metrics_notes.md` §1 — it now doubles as the
+check on whether skipping explicit cell-typing was the right call, not just
+a generic quality metric.
+
+## Comparison target: Mimyr
+
+Mimyr is the primary benchmark, not just a literature reference — same
+core task (full expression reconstruction, both missing-region and
+missing-slice cases, real neighbor-conditioning with a prior-based
+fallback), close enough that a head-to-head comparison is meaningful.
+isoST is the secondary reference specifically for Track B framing
+(continuous SDE field vs. our discrete point-cloud generation). Code for
+both is public (`gkrieg/mimyr`, `deng-ai-lab/isoST`) — reproducing their
+numbers on our own pilot dataset, not just citing their reported results, is
+the honest way to compare.
+
+Worth being explicit about why this project is worth doing given Mimyr
+already exists and does the core task: the point isn't that the task is
+unsolved. It's building and understanding a working version ourselves,
+checking empirically whether removing the cell-type bottleneck actually
+helps (see "Design decision" above), and doing it on our own chosen data —
+legitimate internship-scale goals independent of whether the field's
+central problem is novel.
+
 ## Prioritization (unchanged from the original plan)
 
 1. **VAE** — done, proves the plumbing end-to-end.
@@ -121,3 +225,13 @@ is exactly the point of the shared interface.
   setup in a placeholder `_SingleBatchDataset`. Replace with a real
   per-cell/mini-batch `Dataset` once a pilot dataset is chosen — the
   model interface does not need to change when that happens.
+- The diffusion/Flow Matching backbone (prioritization item 3 above) is not
+  implemented yet — only `vae_baseline` and `wae_gan` exist in the registry.
+- **Histology image reconstruction is out of current scope, tracked as a
+  stretch goal.** Filling in broken tissue "in histology image" as well as
+  gene expression was raised as a possible extension — HEST-1k's paired
+  H&E data and the RNA-CDM/MORPHE precedents (`docs/literature_review.md`)
+  make this feasible, but adding a second output modality multiplies scope
+  (a second loss, a second embedding space, a second set of metrics) before
+  the primary GEX pipeline works end-to-end on even one backbone. Revisit
+  once VAE/WAE-GAN/diffusion are all working on expression alone.

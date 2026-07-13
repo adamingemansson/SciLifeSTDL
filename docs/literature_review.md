@@ -28,6 +28,40 @@ citing in any report; this is a scoping-level pass.
   location→identity→expression decomposition is a strong candidate skeleton
   for our "general architecture."
   https://www.biorxiv.org/content/10.1101/2025.11.24.690239
+  **[design critique, 2026-07-13]** The location model is "plane-conditioned"
+  and uses backward-guidance from neighboring slices *when available*
+  (falls back to a learned density prior + metadata otherwise) — so it's not
+  strictly a hard requirement to have real local context, which matters for
+  distinguishing genuine interpolation from prior-only generation when
+  reading their results. More importantly: the cell-type classifier stage is
+  a real generalizability bottleneck — it requires a target dataset with a
+  cell-type taxonomy compatible with (or retrained against) their reference
+  annotations, and any misclassification propagates as a wrong conditioning
+  signal into the expression transformer. This is our chosen point of
+  departure (see `docs/architecture_plan.md` "Design decision: no explicit
+  cell-type conditioning") — skip the discrete cell-type bottleneck and
+  generate location→expression directly, validated by checking whether an
+  independent classifier still recovers sensible types from the generated
+  expression post-hoc, rather than baking type into the generation path.
+
+- **MORPHE: Bridging Image Generation and Spatial Omics for Tissue
+  Synthesis** (bioRxiv, Mar 2026; Feng, Robers, Rasheed, Miao, Wen, Lee,
+  Sohigian, Brbić — Duke BME + EPFL). Converts discrete cell identity +
+  spatial-relationship graphs into a continuous "RGB-like" latent embedding,
+  letting it reuse large pretrained image-generation diffusion models, then
+  refines with a cascaded diffusion architecture to single-cell pixel
+  precision. Does outpainting (beyond imaged field of view), inpainting
+  (damaged/missing tissue — Track A), and cross-tissue imputation connecting
+  separated regions in both 2D and 3D (Track B-adjacent). Tested on CODEX
+  intestine (proteomics) and MERFISH mouse brain (transcriptomics), millions
+  of cells. **Important limitation:** generates cell type/identity +
+  spatial architecture only, **not full gene expression profiles** — the
+  expression vector is an input feature, not a generative output. Solves a
+  related but genuinely different problem than ours (architecture/cell-type
+  synthesis vs. expression synthesis) — not a direct competitor on the exact
+  task, but the RGB-embedding trick (piggyback spatial-omics generation on
+  pretrained image diffusion models) is a potentially reusable idea for our
+  diffusion backbone. Code: https://github.com/HickeyLab/MORPHE
   (code: search GitHub for `gkrieg/mimyr`)
 
 - **isoST: Three-dimensional spatial transcriptomics at isotropic resolution
