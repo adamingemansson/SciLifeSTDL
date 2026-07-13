@@ -62,6 +62,43 @@ citing in any report; this is a scoping-level pass.
   task, but the RGB-embedding trick (piggyback spatial-omics generation on
   pretrained image diffusion models) is a potentially reusable idea for our
   diffusion backbone. Code: https://github.com/HickeyLab/MORPHE
+
+- **HoloTea** ("3D-Guided Scalable Flow Matching for Generating Volumetric
+  Tissue Spatial Transcriptomics from Serial Histology," arXiv 2511.14613,
+  Nov 2025; Sanian, Hemmat, Vahidi, Maaskola, Lee, Makarchuk, Demirci,
+  Chipampe, Haniffa, Bayraktar, Paavolainen, Lotfollahi — Sanger Institute /
+  Lotfollahi lab; note Jonas Maaskola also co-authored the Bergenstråhle
+  super-resolution ST paper, a Lundeberg-lab-adjacent connection). Uses
+  **Flow Matching** — the same generative family chosen for our own
+  diffusion-backbone entry (`docs/architecture_plan.md`). **Important
+  caveat, changes how directly this applies**: HoloTea imputes expression
+  **from paired H&E histology**, not from surrounding real ST expression
+  context — every location needs a histology image as its primary
+  conditioning input. That's a different task shape than Track A/B as
+  currently scoped (no paired-histology requirement). The reusable part is
+  the *mechanism*, not the task: a lightweight ControlNet retrieves
+  morphologically-corresponding spots on neighboring slides in a shared
+  feature space and fuses that cross-section context in, so 3D consistency
+  comes from retrieval + conditioning rather than an explicit continuity
+  assumption (contrast with isoST's SDE-continuity approach). Worth
+  revisiting if the histology stretch goal (`docs/architecture_plan.md`
+  "Known gaps") gets activated, or as a conditioning-mechanism reference
+  even without histology.
+
+- **DRIFT** ("Diffusion-based Representation Integration for Foundation
+  Models Improves Spatial Transcriptomics Analysis," bioRxiv, Nov 2025;
+  code: https://github.com/rsinghlab/DRIFT). **Not a generator** — a
+  representation-learning technique, noted here because it's directly
+  relevant to our conditioning encoder, the one piece of the architecture
+  not yet built (`docs/architecture_plan.md` "Known gaps"). Builds a
+  spatial adjacency graph over cells/spots and applies a heat-kernel
+  diffusion process that propagates expression signal across local
+  neighborhoods while preserving tissue boundaries, producing a spatially-
+  coherent representation that can feed into any pretrained foundation
+  model without retraining it. Validated on cell-type annotation,
+  cross-section alignment, and clustering. A plausible concrete design for
+  the conditioning encoder's spatial-graph step — worth reading before
+  designing that layer from scratch.
   (code: search GitHub for `gkrieg/mimyr`)
 
 - **isoST: Three-dimensional spatial transcriptomics at isotropic resolution

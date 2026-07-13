@@ -26,7 +26,11 @@ breaks for the other two. The architecture has to abstract over training
    GNN/transformer over a k-NN spatial graph → a set of tokens. Built once,
    consumed identically by every model family. This is the actual reusable
    "general architecture" contribution — not yet implemented (see Status
-   below), current models are unconditioned placeholders.
+   below), current models are unconditioned placeholders. **DRIFT**
+   (`docs/literature_review.md`) is a plausible concrete design reference
+   for this layer — heat-kernel diffusion over a spatial adjacency graph to
+   produce a spatially-coherent representation, worth reading before
+   designing this from scratch.
 2. **Backbone registry** — small swappable network pieces (denoiser,
    encoder+decoder, generator+discriminator) that plug into layer 3.
 3. **Model family wrapper (`BaseGenerativeModel`)** — every family
