@@ -201,18 +201,29 @@ helps (see "Design decision" above), and doing it on our own chosen data —
 legitimate internship-scale goals independent of whether the field's
 central problem is novel.
 
-## Prioritization (unchanged from the original plan)
+## Prioritization — settled roster (2026-07-13)
 
-1. **VAE** — done, proves the plumbing end-to-end.
-2. **WAE-GAN** — done (this update). Chosen GAN entry point.
-3. **Diffusion / Flow Matching** — next priority. Every close prior-art
-   paper reviewed (Mimyr, isoST, stDiff, LGDiST) is diffusion-based, so
-   this is where real comparability against the literature lives. Flow
-   Matching (Lipman et al. 2022, `docs/literature_review.md`) is the
-   preferred entry over classic DDPM — simpler, more stable
-   simulation-free training, subsumes diffusion as a special case. `diffusers`
-   schedulers handle the noise/sampling math; we only write the denoiser
-   network.
+`vae_baseline` (done) stays in the registry as the floor/plumbing-proof
+baseline, not counted as one of the three comparison models below.
+
+1. **WAE-GAN** — done. GAN entry point (Tolstikhin et al. 2017).
+2. **Flow Matching, OT path (FM-OT)** — next to build. One shared
+   denoiser/velocity network; diffusion-path training is a cheap config-flag
+   ablation on the same network afterward, not a separate model or a
+   priority in its own right. EMDiffuse's actual contribution (missing-
+   slice conditioning/task design, `docs/literature_review.md`) informs how
+   this model is conditioned, not a separate registry entry. `diffusers`
+   schedulers/utilities handle sampling-loop math where applicable; we
+   write the velocity-field network and the conditional-flow-matching
+   training objective.
+3. **VQ-VAE + autoregressive transformer** — promoted from stretch to core.
+   Genuinely distinct paradigm (discrete latent, autoregressive sampling)
+   with real quantitative precedent (`docs/literature_review.md`'s Nature
+   Machine Intelligence brain-generation paper beat GAN baselines by up to
+   2 orders of magnitude on FID/MMD). Known costs, accepted: a new
+   tokenizer/codebook needs its own design, and autoregressive sampling is
+   slower than the alternatives — relevant since FID/MMD evaluation needs
+   many generated samples per comparison.
 4. **Normalizing flows** — deprioritized; invertibility constraints on the
    network are restrictive and there's no prior-art pull toward it here.
 
@@ -229,8 +240,9 @@ central problem is novel.
   setup in a placeholder `_SingleBatchDataset`. Replace with a real
   per-cell/mini-batch `Dataset` once a pilot dataset is chosen — the
   model interface does not need to change when that happens.
-- The diffusion/Flow Matching backbone (prioritization item 3 above) is not
-  implemented yet — only `vae_baseline` and `wae_gan` exist in the registry.
+- Neither FM-OT nor VQ-VAE + autoregressive (prioritization items 2 and 3
+  above) is implemented yet — only `vae_baseline` and `wae_gan` exist in the
+  registry.
 - **Histology image reconstruction is out of current scope, tracked as a
   stretch goal.** Filling in broken tissue "in histology image" as well as
   gene expression was raised as a possible extension — HEST-1k's paired
