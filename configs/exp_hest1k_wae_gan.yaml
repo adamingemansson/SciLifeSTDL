@@ -17,7 +17,10 @@ masking:
   strategy: random_dropout_patches      # Track A: intra-slice damage, not hold_out_slice
   params:
     n_patches: 3
-    radius_range: [50, 150]
+    radius_range: [250, 450]            # calibrated to INT1's real spot spacing (median
+                                          # nearest-neighbor = 219px, verified 2026-07-14) -
+                                          # targets ~5-15 spots masked per patch, not the
+                                          # generic [50,150] default which barely covers 1
 
 model:
   name: wae_gan
