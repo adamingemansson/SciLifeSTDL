@@ -56,3 +56,31 @@ def get_coords_3d(adata: ad.AnnData) -> np.ndarray:
     xy = adata.obsm["spatial"]
     z = adata.obs["z"].to_numpy()[:, None]
     return np.concatenate([xy, z], axis=1)
+
+
+def load_hest_sample(hest_data_dir: str | Path, sample_id: str) -> ad.AnnData:
+    """
+    Load one HEST-1k sample (docs/dataset_notes.md Track A primary pick) —
+    a single 2D section, not part of a serial z-series, so `z` is a constant
+    placeholder. Track A only; Track B needs load_multi_slice with real
+    z-spacing instead.
+
+    Expects hest_data_dir already populated via HEST-1k's own download_hest
+    (huggingface_hub-based, needs a free HF account + auth token — see
+    docs/dataset_notes.md). Searches for the sample's .h5ad file by pattern
+    rather than assuming an exact folder nesting depth, since that layout
+    wasn't independently confirmed byte-for-byte from documentation alone.
+    """
+    hest_data_dir = Path(hest_data_dir)
+    matches = list(hest_data_dir.rglob(f"*{sample_id}*.h5ad"))
+    if not matches:
+        raise FileNotFoundError(
+            f"No .h5ad file found for sample_id={sample_id!r} under {hest_data_dir}. "
+            "Download it first via HEST-1k's download_hest (docs/dataset_notes.md)."
+        )
+    adata = ad.read_h5ad(matches[0])
+    # HEST-1k already uses the standard scanpy spatial convention
+    # (adata.obsm['spatial']), so no coordinate remapping needed here.
+    adata.obs["slice_id"] = sample_id
+    adata.obs["z"] = 0.0
+    return adata

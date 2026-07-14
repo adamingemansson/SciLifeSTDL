@@ -73,6 +73,45 @@ Same dataset as Track B #2 above — whole-transcriptome, single-cell
 resolution, many distinct developmental tissue states. Large volume,
 reusable across both tracks without adding a new dependency.
 
+### How to actually download a HEST-1k sample (2026-07-14, verified)
+
+Full dataset is 825 GB — never download it all. Download one or a few
+specific samples by ID or metadata filter instead.
+
+```bash
+pip install huggingface-hub
+git clone https://github.com/mahmoodlab/HEST.git && cd HEST
+pip install -e .   # installs the `hest` package used below
+```
+
+```python
+from huggingface_hub import login
+login(token="YOUR_HF_TOKEN")   # free account at huggingface.co, generate a token
+
+from hest.download import download_hest   # exact import path per HEST-1k's own tutorial
+
+local_dir = "data/raw/hest1k"
+ids_to_query = ["INT1"]        # small sample used in HEST-1k's own tutorial notebook
+list_patterns = [f"*{id}[_.]**" for id in ids_to_query]
+download_hest(list_patterns, local_dir)
+```
+
+Or filter by metadata instead of a fixed ID:
+```python
+import pandas as pd
+meta_df = pd.read_csv("hf://datasets/MahmoodLab/hest/HEST_v1_3_0.csv")
+meta_df = meta_df[(meta_df["oncotree_code"] == "IDC") & (meta_df["organ"] == "Breast")]
+ids_to_query = meta_df["id"].values
+```
+
+After download, each sample's expression data lands as a standard scanpy
+`.h5ad` under a `st/` subfolder (exact nesting not independently confirmed
+byte-for-byte — `src/data/loaders.py`'s `load_hest_sample` searches for the
+file by pattern rather than assuming one). Coordinates are already in the
+standard `adata.obsm['spatial']` key, so no remapping is needed against the
+rest of this repo's pipeline. Full tutorial:
+https://github.com/mahmoodlab/HEST/blob/main/tutorials/1-Downloading-HEST-1k.ipynb
+
 ### 3. 10x Genomics Xenium public datasets
 E.g. Human Breast Cancer panel, Human Multi-Tissue and Cancer panel.
 https://www.10xgenomics.com/datasets

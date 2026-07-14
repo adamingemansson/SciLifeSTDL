@@ -167,7 +167,8 @@ flowchart TD
 | ODE sampler | FM-OT | Not built (check `diffusers` first) |
 | VQ layer (encoder/codebook/decoder) | VQ-VAE+AR | Not built (check libraries first) |
 | Autoregressive transformer | VQ-VAE+AR | Not built |
-| Real per-cell/mini-batch `Dataset` | All 3 (for real training) | Placeholder only (`_SingleBatchDataset`) |
+| Real per-cell/mini-batch `Dataset` | All 3 (for real training) | **Done** — `MaskedContextQueryDataset`, verified via `tests/test_masked_dataset.py` |
+| HEST-1k loader (`load_hest_sample`) | All 3 (for real training) | **Written** — not yet run against an actual downloaded sample |
 | Independent cell-type classifier | Evaluation (all 3) | Not built |
 | Real FID/MMD embedding function | Evaluation (all 3) | Placeholder (PCA) only |
 

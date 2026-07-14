@@ -1,0 +1,48 @@
+# WAE-GAN on one real HEST-1k sample (Track A pilot dataset, docs/dataset_notes.md).
+# Requires the sample already downloaded via HEST-1k's own download_hest
+# (huggingface_hub, needs a free HF account + auth token) — see the
+# download instructions in docs/dataset_notes.md before running this.
+
+experiment_name: wae_gan_hest1k_pilot
+
+data:
+  source: hest1k
+  hest_data_dir: data/raw/hest1k        # wherever download_hest wrote to locally
+  sample_id: INT1                       # small example sample used in HEST-1k's own tutorial
+  task: intra_slice                     # Track A only — HEST-1k samples are single 2D sections
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches      # Track A: intra-slice damage, not hold_out_slice
+  params:
+    n_patches: 3
+    radius_range: [50, 150]
+
+model:
+  name: wae_gan
+  params:
+    n_genes: null                 # fill in with this sample's actual gene count before running
+    coord_dim: 2                  # single 2D section, not a z-series
+    latent_dim: 32
+    hidden_dim: 256
+    cond_hidden_dim: 256
+    disc_hidden_dim: 128
+    adv_weight: 1.0
+    lr: 1.0e-3
+    lr_disc: 1.0e-3
+
+training:
+  epochs: 100                     # = number of distinct random masking draws trained on
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab
