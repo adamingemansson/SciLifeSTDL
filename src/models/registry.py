@@ -320,6 +320,28 @@ class WAEGAN(BaseGenerativeModel):
 # same network, swap the interpolation formula) is deferred, not
 # implemented here — flagged explicitly as a cheap follow-up, not scope
 # creep on this entry.
+#
+# LATENT-SPACE, not raw 16570-gene space: the first real-data runs (flat
+# PCC~0, RMSE stuck near noise-scale from 100 to 10000 training steps —
+# docs/model_schematics.md) pointed to the velocity network converging to a
+# degenerate near-zero solution rather than actually training — consistent
+# with flow matching/diffusion directly in a very high-dimensional raw
+# space being a much harder regression target than WAE-GAN's direct
+# reconstruction. Standard fix, grounded in peer-reviewed and
+# domain-specific precedent: run the ODE in a small learned latent space
+# instead of raw expression space (Rombach et al. 2022, CVPR — "Latent
+# Diffusion Models"; the same recipe applied specifically to single-cell
+# gene expression in CFGen, Palma et al. 2025, built on scVI, and scLDM,
+# Palla et al. 2025 — both arXiv preprints as of this writing, cited here
+# as corroborating domain precedent, not as the sole grounding, which is
+# Rombach et al. 2022). FM-OT now owns its own small encoder/decoder (own
+# weights, not shared with WAEGAN's — same per-model-weights reasoning as
+# elsewhere in this file), trained *jointly* with the flow-matching
+# objective in one training_step rather than as a literal separate
+# pretraining stage: the encoder/decoder gradient comes only from the
+# reconstruction loss (the flow-matching target latent code is detached),
+# which approximates a frozen pretrained autoencoder without needing a
+# second training script. Documented simplification, not scope creep.
 # ---------------------------------------------------------------------------
 class _SinusoidalTimeEmbedding(nn.Module):
     """Standard sinusoidal embedding for a continuous scalar t in [0,1]
@@ -342,36 +364,52 @@ class _SinusoidalTimeEmbedding(nn.Module):
 @register_model("fm_ot")
 class FlowMatchingOT(BaseGenerativeModel):
     def __init__(self, n_genes: int, coord_dim: int = 3, cond_hidden_dim: int = 256,
+                 latent_dim: int = 32, ae_hidden_dim: int = 256,
                  hidden_dim: int = 512, time_embed_dim: int = 64,
-                 n_ode_steps: int = 50, lr: float = 1e-3):
+                 n_ode_steps: int = 50, recon_weight: float = 1.0,
+                 fm_weight: float = 1.0, lr: float = 1e-3):
         super().__init__()
         self.save_hyperparameters()
         self.context_encoder = SpatialContextEncoder(
             n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim
         )
+        # own autoencoder, own weights — compresses expression to a small
+        # latent code the velocity net operates on instead of raw n_genes
+        self.encoder = nn.Sequential(
+            nn.Linear(n_genes, ae_hidden_dim), nn.ReLU(),
+            nn.Linear(ae_hidden_dim, latent_dim),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim + cond_hidden_dim, ae_hidden_dim), nn.ReLU(),
+            nn.Linear(ae_hidden_dim, n_genes),
+        )
         self.time_embed = _SinusoidalTimeEmbedding(time_embed_dim)
         self.velocity_net = nn.Sequential(
-            nn.Linear(n_genes + time_embed_dim + cond_hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(latent_dim + time_embed_dim + cond_hidden_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, n_genes),
+            nn.Linear(hidden_dim, latent_dim),
         )
         self.n_genes = n_genes
+        self.latent_dim = latent_dim
         self.n_ode_steps = n_ode_steps
+        self.recon_weight = recon_weight
+        self.fm_weight = fm_weight
         self.lr = lr
 
-    def _velocity(self, x_t, t, c):
+    def _velocity(self, z_t, t, c):
         t_embed = self.time_embed(t)
-        return self.velocity_net(torch.cat([x_t, t_embed, c], dim=-1))
+        return self.velocity_net(torch.cat([z_t, t_embed, c], dim=-1))
 
     def sample(self, context, query):
         n = query["coords"].shape[0]
         c = self.context_encoder(context["coords"], context["expression"], query["coords"])
-        x = torch.randn(n, self.n_genes, device=self.device)
+        z = torch.randn(n, self.latent_dim, device=self.device)
         dt = 1.0 / self.n_ode_steps
         for step in range(self.n_ode_steps):
             t = torch.full((n,), step * dt, device=self.device)
-            x = x + dt * self._velocity(x, t, c)  # manual Euler ODE integration
-        return {"coords": query["coords"], "expression": x}
+            z = z + dt * self._velocity(z, t, c)  # manual Euler ODE integration, in latent space
+        expr_gen = self.decoder(torch.cat([z, c], dim=-1))
+        return {"coords": query["coords"], "expression": expr_gen}
 
     def training_step(self, batch, batch_idx):
         context, query = batch["context"], batch["query"]
@@ -379,14 +417,23 @@ class FlowMatchingOT(BaseGenerativeModel):
         n = x_1.shape[0]
         c = self.context_encoder(context["coords"], context["expression"], query["coords"])
 
-        x_0 = torch.randn_like(x_1)
-        t = torch.rand(n, device=self.device)
-        x_t = (1 - t[:, None]) * x_0 + t[:, None] * x_1   # OT straight-line path
-        target_velocity = x_1 - x_0                        # constant along a straight line
+        z_1 = self.encoder(x_1)
+        recon = self.decoder(torch.cat([z_1, c], dim=-1))
+        recon_loss = nn.functional.mse_loss(recon, x_1)
 
-        pred_velocity = self._velocity(x_t, t, c)
-        loss = nn.functional.mse_loss(pred_velocity, target_velocity)
-        self.log_dict({"train/fm_loss": loss})
+        # flow-matching target sees a frozen (detached) latent code, so the
+        # encoder/decoder are trained only by recon_loss — approximates a
+        # pretrained-then-frozen autoencoder without a separate stage
+        z_1_target = z_1.detach()
+        z_0 = torch.randn_like(z_1_target)
+        t = torch.rand(n, device=self.device)
+        z_t = (1 - t[:, None]) * z_0 + t[:, None] * z_1_target   # OT straight-line path
+        target_velocity = z_1_target - z_0                        # constant along a straight line
+        pred_velocity = self._velocity(z_t, t, c)
+        fm_loss = nn.functional.mse_loss(pred_velocity, target_velocity)
+
+        loss = self.recon_weight * recon_loss + self.fm_weight * fm_loss
+        self.log_dict({"train/recon": recon_loss, "train/fm_loss": fm_loss, "train/loss": loss})
         return loss
 
     def configure_optimizers(self):

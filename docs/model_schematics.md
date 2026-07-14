@@ -76,40 +76,61 @@ learns to reconstruct it from `(z, c)`. Smoke-tested with synthetic data
 
 ---
 
-## 2. FM-OT (built, smoke-tested — not yet run on real data)
+## 2. FM-OT (latent-space, built, smoke-tested — not yet run on real data)
+
+**Revised 2026-07-14**: first real-data runs (raw 16570-gene space) were
+stuck at PCC~0 / RMSE~noise-scale from 100 to 10000 training steps —
+consistent with the velocity network converging to a degenerate near-zero
+solution rather than actually training, a known failure mode of running
+flow matching/diffusion directly in a high-dimensional raw space. Fixed by
+moving the ODE into FM-OT's own small learned latent space (own
+encoder/decoder, own weights, trained jointly via a reconstruction loss —
+see `src/models/registry.py` for the full rationale/citations: Rombach et
+al. 2022 CVPR "Latent Diffusion Models" for the general peer-reviewed
+grounding, CFGen/Palma et al. 2025 and scLDM/Palla et al. 2025 as
+corroborating single-cell-gene-expression-specific precedent, both arXiv).
 
 ```mermaid
 flowchart TD
     subgraph Training
-    X1["Real expression x_1\n(target)"] --> XT["x_t = (1-t)*x_0 + t*x_1\n(OT straight-line path)"]
-    X0["Noise x_0 ~ N(0,I)"] --> XT
-    T["t ~ Uniform(0,1)"] --> XT
-    T --> TE["Time embedding\n(sinusoidal)"]
-    XT --> V["Velocity network\nv_theta(x_t, t_embed, c)"]
+    X1["Real expression x_1"] --> ENC4["Encoder(x_1) -> z_1"]
+    ENC4 --> DEC4["Decoder(z_1, c) -> x_hat"]
+    DEC4 --> RLOSS4["recon loss (x_hat vs x_1)"]
+    ENC4 --> ZT["z_t = (1-t)*z_0 + t*z_1.detach()\n(OT straight-line path, in latent space)"]
+    Z0["Noise z_0 ~ N(0,I)"] --> ZT
+    T["t ~ Uniform(0,1)"] --> ZT
+    T --> TE["Time embedding (sinusoidal)"]
+    ZT --> V["Velocity network\nv_theta(z_t, t_embed, c)"]
     TE --> V
     C3["Conditioning c"] --> V
-    V --> LOSS["MSE(v_theta, x_1 - x_0)"]
+    C3 --> DEC4
+    V --> FMLOSS["MSE(v_theta, z_1.detach() - z_0)"]
     end
     subgraph Generation / sample&#40;&#41;
-    X0S["x_0 ~ N(0,I)\n(start point)"] --> ODE["ODE solve: dx/dt = v_theta(x_t, t, c)\nintegrate t=0 -> t=1"]
+    Z0S["z_0 ~ N(0,I)"] --> ODE["ODE solve: dz/dt = v_theta(z_t, t, c)\nintegrate t=0 -> t=1"]
     C4["Conditioning c"] --> ODE
-    ODE --> OUT2["x_1 = generated expression"]
+    ODE --> DEC5["Decoder(z_1, c)"]
+    C4 --> DEC5
+    DEC5 --> OUT2["generated expression"]
     end
 ```
 
-**Additional parts needed (none exist yet):**
+**Built:**
 - Time embedding module (sinusoidal, standard/reusable pattern).
-- Velocity network `v_θ(x_t, t, c)` — an MLP or small transformer, same
-  input/output shape as expression, conditioned on `t` and `c`.
-- Conditional flow matching training loop (the diagram above — no
-  scheduler library needed for this part, it's a direct regression).
-- ODE integrator for sampling — `diffusers` has
-  `FlowMatchEulerDiscreteScheduler` which is directly usable here (worth
-  checking it fits our non-image data shape); `torchdiffeq` is the fallback
-  if not.
+- Own encoder/decoder (linear/MLP, `n_genes ⇄ latent_dim`), trained via
+  reconstruction loss in the same `training_step` — encoder/decoder
+  gradients come only from `recon_loss` (flow-matching sees a detached
+  latent target), approximating a frozen pretrained autoencoder without a
+  separate training script.
+- Velocity network `v_θ(z_t, t, c)` over the latent space, not raw
+  expression.
+- Conditional flow matching training loop, OT straight-line path, in
+  latent space.
+- ODE integrator for sampling (manual Euler, in latent space) + decode
+  back to expression at the end.
 - The cheap diffusion-path ablation (`docs/architecture_plan.md`): same
-  velocity network, swap the `x_t` interpolation formula for a diffusion-style
-  schedule — a training-loop config flag, not new modules.
+  velocity network, swap the `z_t` interpolation formula for a diffusion-style
+  schedule — a training-loop config flag, not new modules. Still deferred.
 
 ---
 

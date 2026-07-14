@@ -44,15 +44,19 @@ def test_training_step_updates_weights():
     batch = _make_batch(n_context=60, n_query=15, n_genes=50, coord_dim=2)
     before = model.velocity_net[0].weight.clone()
 
+    before_enc = model.encoder[0].weight.clone()
+
     loss = model.training_step(batch, batch_idx=0)
     opt.zero_grad()
     loss.backward()
     opt.step()
 
     after = model.velocity_net[0].weight
+    after_enc = model.encoder[0].weight
     assert not torch.allclose(before, after), "velocity_net weights did not change — optimizer step had no effect"
+    assert not torch.allclose(before_enc, after_enc), "encoder weights did not change — optimizer step had no effect"
     assert torch.isfinite(after).all(), "velocity_net weights contain NaN/Inf after one training step"
-    print("[training_step] OK — velocity_net weights updated, no NaNs")
+    print("[training_step] OK — velocity_net + encoder weights updated, no NaNs")
 
 
 if __name__ == "__main__":
