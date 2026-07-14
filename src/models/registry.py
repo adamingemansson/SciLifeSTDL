@@ -29,6 +29,7 @@ import torch.nn as nn
 import pytorch_lightning as pl
 
 from src.models.conditioning import SpatialContextEncoder
+from src.models.vqvae import VectorQuantizer, morton_order
 
 _MODEL_REGISTRY: dict[str, type["BaseGenerativeModel"]] = {}
 
@@ -440,4 +441,148 @@ class FlowMatchingOT(BaseGenerativeModel):
         # AdamW (decoupled weight decay) over plain Adam: standard choice in
         # the flow-matching/diffusion literature (Lipman et al. 2022 and
         # essentially all follow-ups use AdamW, not Adam).
+        return torch.optim.AdamW(self.parameters(), lr=self.lr)
+
+
+# ---------------------------------------------------------------------------
+# VQ-VAE + autoregressive transformer (docs/architecture_plan.md
+# "Prioritization" #3). Own encoder/decoder/VectorQuantizer (own weights,
+# same per-model reasoning as WAE-GAN/FM-OT), reusing VectorQuantizer from
+# src/models/vqvae.py (the same EMA + dead-code-reset implementation
+# validated standalone in task #11, docs/model_schematics.md) rather than
+# nesting a full VQVAEStage1 LightningModule inside another one.
+#
+# Anchor precedent (docs/literature_review.md SS3.2b, re-verified via live
+# search 2026-07-14 after finding the citation had gone stale/dangling in
+# our own docs): Tudosiu et al., "Realistic morphology-preserving
+# generative modelling of the brain" (Nature Machine Intelligence, 2024) —
+# VQ-VAE + autoregressive transformer over discrete tokens, fixed raster
+# order, evaluated vs. GAN baselines on FID/MMD.
+#
+# Token order: their raster order (regular voxel grid) doesn't apply to
+# our irregular point cloud, so query locations are ordered along a
+# Morton/Z-order space-filling curve instead (morton_order(),
+# src/models/vqvae.py) — a deterministic, locality-preserving
+# generalization of "fixed raster order" to arbitrary point sets.
+#
+# One token per cell (docs/model_schematics.md "Resolved" token-granularity
+# note, task #11) — the transformer predicts one codebook index per query
+# location, conditioned on (a) the previously generated tokens via causal
+# self-attention (teacher forcing during training) and (b) that location's
+# own conditioning vector c, added into each position's input embedding
+# (prefix-style conditioning, not cross-attention — simpler, and c is
+# already a fixed-size per-location vector, not a variable-length sequence
+# that would need cross-attention).
+#
+# Sampling is a sequential loop with no KV-cache (recomputes the full
+# growing sequence's self-attention every step) — fine at the query-set
+# sizes this pipeline currently produces (~15-45 points per masking draw),
+# flagged explicitly as a follow-up optimization if larger query sets are
+# used later, not built here (docs/model_schematics.md "Known cost").
+# ---------------------------------------------------------------------------
+@register_model("vqvae_ar")
+class VQVAEAutoregressive(BaseGenerativeModel):
+    def __init__(self, n_genes: int, coord_dim: int = 3, cond_hidden_dim: int = 256,
+                 latent_dim: int = 32, ae_hidden_dim: int = 256,
+                 codebook_size: int = 64, commitment_weight: float = 0.25,
+                 transformer_dim: int = 128, n_transformer_layers: int = 4,
+                 n_heads: int = 4, max_seq_len: int = 2048,
+                 recon_weight: float = 1.0, ar_weight: float = 1.0,
+                 lr: float = 1e-3):
+        super().__init__()
+        self.save_hyperparameters()
+        self.context_encoder = SpatialContextEncoder(
+            n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim
+        )
+        self.encoder = nn.Sequential(
+            nn.Linear(n_genes, ae_hidden_dim), nn.ReLU(),
+            nn.Linear(ae_hidden_dim, latent_dim),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, ae_hidden_dim), nn.ReLU(),
+            nn.Linear(ae_hidden_dim, n_genes),
+        )
+        self.vq = VectorQuantizer(codebook_size, latent_dim, commitment_weight)
+
+        self.bos_token = codebook_size  # one extra embedding slot for BOS
+        self.token_embed = nn.Embedding(codebook_size + 1, transformer_dim)
+        self.pos_embed = nn.Embedding(max_seq_len, transformer_dim)
+        self.cond_proj = nn.Linear(cond_hidden_dim, transformer_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=transformer_dim, nhead=n_heads, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_transformer_layers)
+        self.output_head = nn.Linear(transformer_dim, codebook_size)
+
+        self.codebook_size = codebook_size
+        self.max_seq_len = max_seq_len
+        self.recon_weight = recon_weight
+        self.ar_weight = ar_weight
+        self.lr = lr
+
+    def _transformer_forward(self, input_tokens: torch.Tensor, c_ordered: torch.Tensor):
+        """input_tokens, c_ordered: [N]/[N, cond_hidden_dim]. Returns
+        per-position hidden states [N, transformer_dim]."""
+        n = input_tokens.shape[0]
+        assert n <= self.max_seq_len, (
+            f"sequence length {n} exceeds max_seq_len={self.max_seq_len}"
+        )
+        pos = torch.arange(n, device=input_tokens.device)
+        h_in = self.token_embed(input_tokens) + self.pos_embed(pos) + self.cond_proj(c_ordered)
+        mask = nn.Transformer.generate_square_subsequent_mask(n).to(input_tokens.device)
+        h_out = self.transformer(h_in.unsqueeze(0), mask=mask)
+        return h_out.squeeze(0)
+
+    def sample(self, context, query):
+        n = query["coords"].shape[0]
+        c = self.context_encoder(context["coords"], context["expression"], query["coords"])
+        order = morton_order(query["coords"]).to(self.device)
+        c_ordered = c[order]
+
+        tokens = torch.full((1,), self.bos_token, dtype=torch.long, device=self.device)
+        generated = []
+        for i in range(n):
+            h = self._transformer_forward(tokens, c_ordered[: tokens.shape[0]])
+            logits = self.output_head(h[-1])
+            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            generated.append(next_token)
+            tokens = torch.cat([tokens, next_token])
+        idx = torch.cat(generated)  # [n], in Morton order
+
+        z_q = self.vq.embed[idx]
+        expr_gen_ordered = self.decoder(z_q)
+
+        expr_gen = torch.empty_like(expr_gen_ordered)
+        expr_gen[order] = expr_gen_ordered
+        return {"coords": query["coords"], "expression": expr_gen}
+
+    def training_step(self, batch, batch_idx):
+        context, query = batch["context"], batch["query"]
+        x_1 = batch["target_expression"]  # real target expression
+        n = x_1.shape[0]
+        c = self.context_encoder(context["coords"], context["expression"], query["coords"])
+
+        order = morton_order(query["coords"]).to(self.device)
+        x_1, c = x_1[order], c[order]
+
+        z_e = self.encoder(x_1)
+        z_q, idx, vq_loss = self.vq(z_e)
+        recon = self.decoder(z_q)
+        recon_loss = nn.functional.mse_loss(recon, x_1)
+
+        idx_detached = idx.detach()
+        bos = torch.full((1,), self.bos_token, dtype=torch.long, device=self.device)
+        input_tokens = torch.cat([bos, idx_detached[:-1]])
+        h = self._transformer_forward(input_tokens, c)
+        logits = self.output_head(h)  # [N, codebook_size]
+        ar_loss = nn.functional.cross_entropy(logits, idx_detached)
+
+        loss = self.recon_weight * recon_loss + vq_loss + self.ar_weight * ar_loss
+        self.log_dict({
+            "train/recon": recon_loss, "train/vq": vq_loss,
+            "train/ar": ar_loss, "train/loss": loss,
+        })
+        return loss
+
+    def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)

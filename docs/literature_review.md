@@ -176,6 +176,36 @@ tunable constructor argument in our implementation, not a fixed constant.
   inter-slice task than originally assumed; useful mainly as an example of
   using an auxiliary 3D imaging modality to constrain reconstruction.
 
+## 3.2b Peer-reviewed grounding for VQ-VAE + autoregressive transformer
+
+Added 2026-07-14, fixing a dangling reference: `docs/architecture_plan.md`
+had been citing this precedent by name since the roster was settled, but
+the actual entry was never written here. Re-verified via live search
+before use (not just trusted from earlier chat), per the "research before
+implementing" rule.
+
+- **Realistic morphology-preserving generative modelling of the brain**
+  (*Nature Machine Intelligence*, 2024; Tudosiu et al.).
+  https://www.nature.com/articles/s42256-024-00864-0 — VQ-VAE compresses
+  3D brain MRI volumes into discrete latent codes; a transformer then
+  autoregressively predicts token sequences (**fixed raster order** over
+  the regular voxel grid), decoded back through the VQ-VAE. Evaluated
+  against GAN baselines on FID/MMD, reporting up to ~2 orders of magnitude
+  improvement. This is our anchor precedent for the VQ-VAE+AR family
+  (`docs/architecture_plan.md` "Prioritization" #3) — same discrete-latent
+  + autoregressive-transformer paradigm, same FID/MMD evaluation approach
+  we're already planning (`docs/metrics_notes.md`).
+
+  Their token order (raster, over a regular grid) doesn't transfer
+  directly to our data — a spatial point cloud, not a voxel grid. Our
+  stage 2 (`docs/model_schematics.md`) generalizes it via a Morton/Z-order
+  space-filling curve: a standard, well-established technique (Morton,
+  1966, IBM technical report) for linearizing irregular multi-dimensional
+  points into a deterministic, locality-preserving sequence — the natural
+  point-cloud analogue of a fixed raster order, not itself a
+  peer-reviewed-paper-specific claim, just standard practice for ordering
+  spatial data.
+
 ## 3D reconstruction / alignment across slices (not generative per se, but
 foundational — needed for building any 3D dataset from serial slices)
 

@@ -152,3 +152,32 @@ class VQVAEStage1(pl.LightningModule):
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
+
+
+def morton_order(coords: torch.Tensor, bits: int = 10) -> torch.Tensor:
+    """Deterministic space-filling-curve (Morton/Z-order) ordering over
+    arbitrary-dimensional coordinates. Generalizes the fixed raster
+    ordering used for autoregressive token sequences in this family's
+    anchor precedent (Tudosiu et al., "Realistic morphology-preserving
+    generative modelling of the brain", Nature Machine Intelligence 2024
+    — docs/literature_review.md SS3.2b, which orders tokens over a regular
+    voxel grid) to an irregular spatial point cloud, by quantizing
+    coordinates onto a grid and interleaving their bits (Morton, 1966).
+
+    Returns an index tensor `order` such that coords[order] is sorted
+    along the curve.
+    """
+    coords = coords.detach().cpu()
+    mins = coords.min(dim=0).values
+    maxs = coords.max(dim=0).values
+    ranges = (maxs - mins).clamp(min=1e-6)
+    levels = (1 << bits) - 1
+    quantized = ((coords - mins) / ranges * levels).long().clamp(0, levels)
+
+    n, d = quantized.shape
+    codes = torch.zeros(n, dtype=torch.long)
+    for dim in range(d):
+        for b in range(bits):
+            bit = (quantized[:, dim] >> b) & 1
+            codes = codes | (bit << (b * d + dim))
+    return torch.argsort(codes)

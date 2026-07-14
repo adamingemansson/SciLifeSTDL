@@ -166,6 +166,26 @@ flowchart TD
 
 **Stage 2 — autoregressive transformer (learn to generate token
 sequences), built on top of stage 1's frozen or co-trained codebook.**
+**Built** — `src/models/registry.py` (`VQVAEAutoregressive`,
+`@register_model("vqvae_ar")`), smoke-tested via `tests/test_vqvae_ar.py`,
+not yet run on real data. Unlike stage 1 (`VQVAEStage1`), this is a full
+`BaseGenerativeModel` — own encoder/decoder/`VectorQuantizer` (reusing the
+EMA + dead-code-reset implementation from `src/models/vqvae.py`, task
+#11), trained jointly with the transformer in one `training_step`, runs
+through `src/training/train.py` + `configs/exp_hest1k_vqvae_ar.yaml` like
+WAE-GAN/FM-OT. One token per cell (docs' earlier "Resolved" note).
+Anchor precedent re-verified via live search after finding the citation
+had gone stale in our own docs (`docs/literature_review.md` §3.2b):
+Tudosiu et al., *Nature Machine Intelligence* 2024 — VQ-VAE+AR over fixed
+raster-ordered tokens. Our point cloud isn't a regular grid, so query
+locations are ordered along a **Morton/Z-order space-filling curve**
+(`morton_order()`, `src/models/vqvae.py`) instead — output is aligned back
+to the original query order before being returned from `sample()`.
+Conditioning is prefix-style (added into each position's input embedding),
+not cross-attention, since `c` is a fixed-size per-location vector.
+Sampling has no KV-cache (recomputes the growing sequence each step) —
+fine at current query-set sizes (~15-45 points), flagged as a follow-up
+if larger sequences are needed later.
 
 ```mermaid
 flowchart TD
@@ -202,8 +222,8 @@ flowchart TD
 | Time embedding | FM-OT | **Done** — verified via `tests/test_fm_ot.py` |
 | Velocity network | FM-OT | **Done** — verified via `tests/test_fm_ot.py` |
 | ODE sampler | FM-OT | **Done** — manual Euler integrator, verified via `tests/test_fm_ot.py` |
-| VQ layer (encoder/codebook/decoder) | VQ-VAE+AR | **Built** — smoke-tested via `tests/test_vqvae_stage1.py`, not yet run on real data |
-| Autoregressive transformer | VQ-VAE+AR | Not built |
+| VQ layer (encoder/codebook/decoder) | VQ-VAE+AR | **Built** — smoke-tested via `tests/test_vqvae_stage1.py`, real-data run done (task #11) |
+| Autoregressive transformer | VQ-VAE+AR | **Built** — smoke-tested via `tests/test_vqvae_ar.py`, not yet run on real data |
 | Real per-cell/mini-batch `Dataset` | All 3 (for real training) | **Done** — `MaskedContextQueryDataset`, verified via `tests/test_masked_dataset.py` |
 | HEST-1k loader (`load_hest_sample`) | All 3 (for real training) | **Written** — not yet run against an actual downloaded sample |
 | Independent cell-type classifier | Evaluation (all 3) | Not built |
@@ -228,7 +248,8 @@ flowchart TD
    both stages' bugs simultaneously. **Written, smoke-tested** — real-data
    reconstruction quality (codebook usage, recon RMSE) still to be checked.
 6. **Add the autoregressive transformer** (stage 2) on top of a validated
-   VQ-VAE.
+   VQ-VAE. **Done, smoke-tested** (`tests/test_vqvae_ar.py`) — real-data
+   run on the pilot sample still to be done.
 7. **Build the independent cell-type classifier** — needed for the
    plausibility-check evaluation (`docs/architecture_plan.md` "Design
    decision").
