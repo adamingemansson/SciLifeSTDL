@@ -1,0 +1,28 @@
+# VQ-VAE stage 1 (reconstruction only) on one real HEST-1k sample.
+# Unconditioned — no masking/context-query split, see src/models/vqvae.py
+# docstring. Held-out 10% of spots used only for the reported recon RMSE/
+# codebook usage below, never seen during training.
+# Run via src/training/train_vqvae_stage1.py, not train.py — VQVAEStage1
+# doesn't implement BaseGenerativeModel's context/query interface.
+
+experiment_name: vqvae_stage1_hest1k_pilot
+
+data:
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  min_genes: 200
+  min_cells: 3
+
+model:
+  n_genes: 16570                # INT1 after QC, same as other exp_hest1k_*.yaml configs
+  latent_dim: 32
+  hidden_dim: 256
+  codebook_size: 512
+  commitment_weight: 0.25
+  lr: 1.0e-3
+
+training:
+  epochs: 100
+  batch_size: 64
+  seed: 0
+  log_every_n_steps: 10

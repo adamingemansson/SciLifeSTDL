@@ -139,7 +139,9 @@ flowchart TD
 **Stage 1 — VQ-VAE (learn a discrete representation).** Get this working
 and validated on its own before touching stage 2. **Built** —
 `src/models/vqvae.py` (`VectorQuantizer`, `VQVAEStage1`), smoke-tested via
-`tests/test_vqvae_stage1.py`, not yet run on real data. Deliberately
+`tests/test_vqvae_stage1.py`. Real-data training script/config also built
+(`src/training/train_vqvae_stage1.py`, `configs/exp_hest1k_vqvae_stage1.yaml`)
+— not yet run. Deliberately
 unconditioned (no spatial context) — see file docstring; conditioning is
 stage 2's job. Single token per cell (not per-gene-chunk or residual VQ) —
 the token-granularity question flagged below is resolved this way for now,
