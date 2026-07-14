@@ -205,10 +205,11 @@ central problem is novel.
 baseline, not counted as one of the three comparison models below.
 
 1. **WAE-GAN** — done. GAN entry point (Tolstikhin et al. 2017).
-2. **Flow Matching, OT path (FM-OT)** — next to build. One shared
-   denoiser/velocity network; diffusion-path training is a cheap config-flag
-   ablation on the same network afterward, not a separate model or a
-   priority in its own right. EMDiffuse's actual contribution (missing-
+2. **Flow Matching, OT path (FM-OT)** — **written**, in `src/models/registry.py`
+   (`FlowMatchingOT`) — not yet executed anywhere with torch installed.
+   One shared denoiser/velocity network; diffusion-path training is a cheap
+   config-flag ablation on the same network afterward, not a separate model
+   or a priority in its own right. EMDiffuse's actual contribution (missing-
    slice conditioning/task design, `docs/literature_review.md`) informs how
    this model is conditioned, not a separate registry entry. `diffusers`
    schedulers/utilities handle sampling-loop math where applicable; we
@@ -238,9 +239,9 @@ baseline, not counted as one of the three comparison models below.
   setup in a placeholder `_SingleBatchDataset`. Replace with a real
   per-cell/mini-batch `Dataset` once a pilot dataset is chosen — the
   model interface does not need to change when that happens.
-- Neither FM-OT nor VQ-VAE + autoregressive (prioritization items 2 and 3
-  above) is implemented yet — only `vae_baseline` and `wae_gan` exist in the
-  registry.
+- FM-OT (`fm_ot`) is now in the registry alongside `vae_baseline` and
+  `wae_gan`, written but not yet run/verified. VQ-VAE + autoregressive
+  (prioritization item 3 above) is still not implemented.
 - **Histology image reconstruction is out of current scope, tracked as a
   stretch goal.** Filling in broken tissue "in histology image" as well as
   gene expression was raised as a possible extension — HEST-1k's paired

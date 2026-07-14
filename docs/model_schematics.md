@@ -76,7 +76,7 @@ learns to reconstruct it from `(z, c)`. Smoke-tested with synthetic data
 
 ---
 
-## 2. FM-OT (to build)
+## 2. FM-OT (written, not yet executed — see status table below)
 
 ```mermaid
 flowchart TD
@@ -162,9 +162,9 @@ flowchart TD
 |---|---|---|
 | Conditioning encoder | All 3 | **Done** — verified via `tests/test_conditioning.py` |
 | Decoder conditioning injection | WAE-GAN | **Done** — verified via `tests/test_wae_gan.py` |
-| Time embedding | FM-OT | Not built |
-| Velocity network | FM-OT | Not built |
-| ODE sampler | FM-OT | Not built (check `diffusers` first) |
+| Time embedding | FM-OT | **Built** — `_SinusoidalTimeEmbedding`, not yet run with torch installed |
+| Velocity network | FM-OT | **Built** — `FlowMatchingOT.velocity_net`, not yet run with torch installed |
+| ODE sampler | FM-OT | **Built** — manual Euler integrator (checked `diffusers.FlowMatchEulerDiscreteScheduler`, works on non-image tensors but manual is simpler for this regression setup), not yet run |
 | VQ layer (encoder/codebook/decoder) | VQ-VAE+AR | Not built (check libraries first) |
 | Autoregressive transformer | VQ-VAE+AR | Not built |
 | Real per-cell/mini-batch `Dataset` | All 3 (for real training) | **Done** — `MaskedContextQueryDataset`, verified via `tests/test_masked_dataset.py` |
@@ -183,9 +183,10 @@ flowchart TD
    Needed before FM-OT or VQ-VAE+AR training makes sense — both need many
    varied examples, not one repeated batch.
 4. **Build FM-OT**: time embedding → velocity network → conditional flow
-   matching training loop → ODE sampler. Validate against the "generation
-   quality gradient" sanity check (`docs/metrics_notes.md`) before trusting
-   it.
+   matching training loop → ODE sampler. **Written** — `tests/test_fm_ot.py`
+   smoke test pending confirmation on real torch env; still needs the
+   "generation quality gradient" sanity check (`docs/metrics_notes.md`) on
+   real data before trusting it.
 5. **Build VQ-VAE stage 1** (reconstruction only) and validate reconstruction
    quality alone before adding the autoregressive transformer — don't debug
    both stages' bugs simultaneously.

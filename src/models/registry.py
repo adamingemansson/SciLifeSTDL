@@ -300,3 +300,94 @@ class WAEGAN(BaseGenerativeModel):
         )
         opt_disc = torch.optim.Adam(self.discriminator.parameters(), lr=self.lr_disc)
         return [opt_ae, opt_disc]
+
+
+# ---------------------------------------------------------------------------
+# FM-OT: Flow Matching with optimal-transport (straight-line) paths
+# (Lipman et al. 2022 — docs/literature_review.md). Trains a velocity
+# network to regress onto x_1-x_0 along linear interpolation paths between
+# noise and the real target expression, conditioned on local spatial
+# context via its own SpatialContextEncoder (same reasoning as WAE-GAN:
+# per-model instance, not shared trained weights).
+#
+# diffusers.FlowMatchEulerDiscreteScheduler confirmed to operate on generic
+# (non-image) tensors (docs/model_schematics.md), but sampling here uses a
+# plain manual Euler integrator instead — our training loop is a direct
+# regression, not needing the scheduler's broader image-pipeline feature
+# set (s_churn/s_tmin/s_tmax/per_token_timesteps etc.).
+#
+# The diffusion-path ablation (docs/architecture_plan.md "Prioritization" —
+# same network, swap the interpolation formula) is deferred, not
+# implemented here — flagged explicitly as a cheap follow-up, not scope
+# creep on this entry.
+# ---------------------------------------------------------------------------
+class _SinusoidalTimeEmbedding(nn.Module):
+    """Standard sinusoidal embedding for a continuous scalar t in [0,1]
+    (Vaswani et al. 2017 positional encoding, adapted from integer
+    positions to continuous time) — used across essentially all modern
+    diffusion/flow-matching implementations for exactly this purpose."""
+
+    def __init__(self, dim: int = 64):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        half = self.dim // 2
+        freqs = torch.exp(-torch.log(torch.tensor(10000.0, device=t.device))
+                           * torch.arange(half, device=t.device) / half)
+        args = t[:, None] * freqs[None, :]
+        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+
+
+@register_model("fm_ot")
+class FlowMatchingOT(BaseGenerativeModel):
+    def __init__(self, n_genes: int, coord_dim: int = 3, cond_hidden_dim: int = 256,
+                 hidden_dim: int = 512, time_embed_dim: int = 64,
+                 n_ode_steps: int = 50, lr: float = 1e-3):
+        super().__init__()
+        self.save_hyperparameters()
+        self.context_encoder = SpatialContextEncoder(
+            n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim
+        )
+        self.time_embed = _SinusoidalTimeEmbedding(time_embed_dim)
+        self.velocity_net = nn.Sequential(
+            nn.Linear(n_genes + time_embed_dim + cond_hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, n_genes),
+        )
+        self.n_genes = n_genes
+        self.n_ode_steps = n_ode_steps
+        self.lr = lr
+
+    def _velocity(self, x_t, t, c):
+        t_embed = self.time_embed(t)
+        return self.velocity_net(torch.cat([x_t, t_embed, c], dim=-1))
+
+    def sample(self, context, query):
+        n = query["coords"].shape[0]
+        c = self.context_encoder(context["coords"], context["expression"], query["coords"])
+        x = torch.randn(n, self.n_genes, device=self.device)
+        dt = 1.0 / self.n_ode_steps
+        for step in range(self.n_ode_steps):
+            t = torch.full((n,), step * dt, device=self.device)
+            x = x + dt * self._velocity(x, t, c)  # manual Euler ODE integration
+        return {"coords": query["coords"], "expression": x}
+
+    def training_step(self, batch, batch_idx):
+        context, query = batch["context"], batch["query"]
+        x_1 = batch["target_expression"]  # real target expression
+        n = x_1.shape[0]
+        c = self.context_encoder(context["coords"], context["expression"], query["coords"])
+
+        x_0 = torch.randn_like(x_1)
+        t = torch.rand(n, device=self.device)
+        x_t = (1 - t[:, None]) * x_0 + t[:, None] * x_1   # OT straight-line path
+        target_velocity = x_1 - x_0                        # constant along a straight line
+
+        pred_velocity = self._velocity(x_t, t, c)
+        loss = nn.functional.mse_loss(pred_velocity, target_velocity)
+        self.log_dict({"train/fm_loss": loss})
+        return loss
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.lr)
