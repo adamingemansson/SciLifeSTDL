@@ -26,7 +26,11 @@ model:
   name: wae_gan
   params:
     n_genes: 16570                # INT1 after QC (min_genes=200, min_cells=3), verified 2026-07-14
-    coord_dim: 2                  # single 2D section, not a z-series
+    coord_dim: 3                  # get_coords_3d() always returns (x,y,z), even for a
+                                    # single 2D section - z is a constant 0 here, but the
+                                    # shape is still 3 columns (bug found 2026-07-14 by
+                                    # actually running this: coord_dim=2 crashed with a
+                                    # shape mismatch against real 3-column coordinates)
     latent_dim: 32
     hidden_dim: 256
     cond_hidden_dim: 256
