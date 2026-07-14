@@ -390,4 +390,7 @@ class FlowMatchingOT(BaseGenerativeModel):
         return loss
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.lr)
+        # AdamW (decoupled weight decay) over plain Adam: standard choice in
+        # the flow-matching/diffusion literature (Lipman et al. 2022 and
+        # essentially all follow-ups use AdamW, not Adam).
+        return torch.optim.AdamW(self.parameters(), lr=self.lr)
