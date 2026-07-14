@@ -8,8 +8,21 @@ each model's internals.
 
 ## Shared component: conditioning encoder (blocks all three)
 
-Nothing below produces a meaningful result until this exists — every model
-in the registry today is an unconditioned placeholder.
+**Status: written, in `src/models/conditioning.py` (`SpatialContextEncoder`)
+— not yet executed anywhere with torch installed.** Smoke test at
+`tests/test_conditioning.py` (synthetic data, no real dataset needed) still
+needs to actually be run to confirm it works as reasoned through. Not yet
+wired into any generator (`wae_gan`, task #8).
+
+Implementation notes vs. the original schematic below: no `torch_geometric`
+dependency — k-NN + message passing is done directly in plain PyTorch
+(`cdist`/`topk`, same pattern as `InterpolationBaseline`), and continuous
+coordinates are encoded with Random Fourier Features (`docs/literature_review.md`
+— the same technique Mimyr's location model uses), not a generic
+"positional encoding." Deliberately ST-only (no H&E) — see "Known gaps"
+below — but designed so an image-encoder branch can be fused into
+`node_repr`/`query_feat` later without changing any downstream model, since
+they only ever consume this module's output `c`.
 
 ```mermaid
 flowchart TD
@@ -143,8 +156,8 @@ flowchart TD
 
 | Part | Needed by | Status |
 |---|---|---|
-| Conditioning encoder | All 3 | Not built — highest priority |
-| Decoder conditioning injection | WAE-GAN | Small change once encoder exists |
+| Conditioning encoder | All 3 | **Written** (`src/models/conditioning.py`), **not yet executed/verified** |
+| Decoder conditioning injection | WAE-GAN | Not built — next up, task #8 |
 | Time embedding | FM-OT | Not built |
 | Velocity network | FM-OT | Not built |
 | ODE sampler | FM-OT | Not built (check `diffusers` first) |
