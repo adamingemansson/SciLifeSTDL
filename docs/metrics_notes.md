@@ -61,11 +61,19 @@ port:
      model) on the reference dataset(s) — most controllable, but you own the
      burden of showing the embedding is meaningful (sanity check: does it
      separate known cell types / spatial domains?).
-2. **Unit of comparison**: decide if "samples" are individual cells,
-   fixed-size spatial patches (like image patches for FID), or whole
-   reconstructed regions/slices. Patches probably map best to the original
-   FID logic and let you compute a distribution over many patches even from
-   a single reconstructed slice.
+2. **Unit of comparison — resolved 2026-07-14, via `tests/test_fid_validation.py`**:
+   NOT individual points. A plain per-point embedding (`embed_pca`,
+   `src/evaluation/metrics.py`) is *provably* insensitive to
+   spatial-arrangement-only corruption — permuting an unordered embedding
+   set never changes its mean/covariance, so `st_fid`/`st_mmd` on it
+   cannot detect "right values, wrong locations" errors, confirmed
+   experimentally (shuffling real profiles across locations gave
+   `fid ≈ 0`). Fixed with `pool_knn_neighborhood()` (same file):
+   mean-pool each point's expression over its k nearest spatial neighbours
+   before embedding — a lightweight "patch" unit that does pick up the
+   same shuffling corruption (confirmed `fid > 0` in the same test). Use
+   `pool_knn_neighborhood` + PCA (or another embedding) as the default,
+   not raw per-point `embed_pca`.
 3. **Distance**: start with the standard Fréchet distance assuming Gaussian
    embeddings (fast, matches literature expectations). Consider also
    reporting **Maximum Mean Discrepancy (MMD)** as a comparison, since MMD
@@ -82,6 +90,12 @@ good/bad, and (c) is *sensitive to failure modes that pointwise metrics
 miss* (e.g. correct marginal gene distributions but wrong spatial
 arrangement) — this last point is the actual selling point of a new metric,
 so design at least one experiment specifically to demonstrate it.
+
+**Status (task #14, 2026-07-14)**: all three checks implemented as
+`tests/test_fid_validation.py`, synthetic spatially-clustered data (real
+HEST-1k data not needed for this validation). Not yet run — pending
+confirmation on a real torch/sklearn environment. Check (c) is what
+surfaced the "unit of comparison" finding above.
 
 ## 3. Suggested reporting table for any experiment
 For each model × dataset × task (inter-slice vs. intra-slice):

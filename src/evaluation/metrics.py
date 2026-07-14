@@ -89,5 +89,31 @@ def st_mmd(real_embeddings: np.ndarray, gen_embeddings: np.ndarray,
 def embed_pca(expression: np.ndarray, pca_model) -> np.ndarray:
     """Simplest baseline embedding function for st_fid/st_mmd: a PCA fit on
     real reference data. pca_model = a fitted sklearn PCA (fit on real data
-    only, then applied to both real held-out and generated samples)."""
+    only, then applied to both real held-out and generated samples).
+
+    Per-point unit of comparison — provably insensitive to
+    spatial-arrangement-only corruption (permuting an unordered embedding
+    set never changes its mean/covariance, so st_fid/st_mmd computed on
+    this embedding cannot detect "right values, wrong locations" errors).
+    Confirmed via tests/test_fid_validation.py (task #14, 2026-07-14).
+    Use pool_knn_neighborhood() below to embed patches instead, when that
+    failure mode matters."""
     return pca_model.transform(expression)
+
+
+def pool_knn_neighborhood(coords: np.ndarray, expression: np.ndarray, k: int = 8) -> np.ndarray:
+    """Mean-pool each point's expression over its k nearest spatial
+    neighbours (including itself) — a lightweight "patch"/neighborhood
+    unit of comparison for st_fid/st_mmd (docs/metrics_notes.md "Unit of
+    comparison"). Needed because a plain per-point embedding (embed_pca
+    above) is mathematically blind to spatial-arrangement-only corruption;
+    pooling over each point's local neighborhood makes the embedding
+    depend on which profiles are actually near each other, not just which
+    profiles exist somewhere in the sample — see
+    tests/test_fid_validation.py, which found and confirmed this gap
+    before this function was added."""
+    from sklearn.neighbors import NearestNeighbors
+    k = min(k, coords.shape[0])
+    nbrs = NearestNeighbors(n_neighbors=k).fit(coords)
+    _, idx = nbrs.kneighbors(coords)
+    return expression[idx].mean(axis=1)
