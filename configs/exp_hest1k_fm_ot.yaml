@@ -37,7 +37,7 @@ model:
     lr: 1.0e-3
 
 training:
-  epochs: 2000
+  epochs: 10000
   seed: 0
   log_every_n_steps: 10
   checkpoint_dir: results/checkpoints/${experiment_name}
