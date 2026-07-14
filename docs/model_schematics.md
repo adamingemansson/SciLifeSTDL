@@ -134,10 +134,17 @@ flowchart TD
 
 ---
 
-## 3. VQ-VAE + Autoregressive Transformer (to build, two stages)
+## 3. VQ-VAE + Autoregressive Transformer (stage 1 built, stage 2 to build)
 
 **Stage 1 — VQ-VAE (learn a discrete representation).** Get this working
-and validated on its own before touching stage 2.
+and validated on its own before touching stage 2. **Built** —
+`src/models/vqvae.py` (`VectorQuantizer`, `VQVAEStage1`), smoke-tested via
+`tests/test_vqvae_stage1.py`, not yet run on real data. Deliberately
+unconditioned (no spatial context) — see file docstring; conditioning is
+stage 2's job. Single token per cell (not per-gene-chunk or residual VQ) —
+the token-granularity question flagged below is resolved this way for now,
+grounded in single-cell VQ-VAE precedent (CASTLE, CellTok) using the same
+per-cell tokenization; revisit only if reconstruction quality is poor.
 
 ```mermaid
 flowchart TD
@@ -159,14 +166,13 @@ flowchart TD
     TOK --> DECODE["VQ-Decoder(full token sequence)\n-> generated expression"]
 ```
 
-**Additional parts needed (none exist yet):**
-- VQ layer: encoder + learnable codebook + straight-through-estimator
-  quantization + decoder. Worth checking a library implementation (e.g.
-  `vector-quantize-pytorch`) before writing this from scratch — it's a
-  well-solved, fiddly-to-get-right component.
-- **Open design decision, decide before building**: token granularity —
-  one token per cell's whole expression vector, or per gene-chunk? Affects
-  sequence length and what the transformer actually models.
+**Additional parts needed:**
+- ~~VQ layer: encoder + learnable codebook + straight-through-estimator
+  quantization + decoder.~~ **Built** — hand-rolled in plain PyTorch rather
+  than `vector-quantize-pytorch`, consistent with this codebase's existing
+  dependency-footprint choices (see `src/models/vqvae.py` docstring).
+- ~~**Open design decision**: token granularity~~ **Resolved**: one token
+  per cell's whole expression vector (see stage 1 note above).
 - Autoregressive transformer decoder (causal self-attention over the token
   sequence, cross-attention or prefix-conditioning on `c`).
 - A generation ordering scheme — arbitrary order, or informed like Mimyr's
@@ -186,7 +192,7 @@ flowchart TD
 | Time embedding | FM-OT | **Done** — verified via `tests/test_fm_ot.py` |
 | Velocity network | FM-OT | **Done** — verified via `tests/test_fm_ot.py` |
 | ODE sampler | FM-OT | **Done** — manual Euler integrator, verified via `tests/test_fm_ot.py` |
-| VQ layer (encoder/codebook/decoder) | VQ-VAE+AR | Not built (check libraries first) |
+| VQ layer (encoder/codebook/decoder) | VQ-VAE+AR | **Built** — smoke-tested via `tests/test_vqvae_stage1.py`, not yet run on real data |
 | Autoregressive transformer | VQ-VAE+AR | Not built |
 | Real per-cell/mini-batch `Dataset` | All 3 (for real training) | **Done** — `MaskedContextQueryDataset`, verified via `tests/test_masked_dataset.py` |
 | HEST-1k loader (`load_hest_sample`) | All 3 (for real training) | **Written** — not yet run against an actual downloaded sample |
@@ -209,7 +215,8 @@ flowchart TD
    sanity check (`docs/metrics_notes.md`) on real data before trusting it.
 5. **Build VQ-VAE stage 1** (reconstruction only) and validate reconstruction
    quality alone before adding the autoregressive transformer — don't debug
-   both stages' bugs simultaneously.
+   both stages' bugs simultaneously. **Written, smoke-tested** — real-data
+   reconstruction quality (codebook usage, recon RMSE) still to be checked.
 6. **Add the autoregressive transformer** (stage 2) on top of a validated
    VQ-VAE.
 7. **Build the independent cell-type classifier** — needed for the
