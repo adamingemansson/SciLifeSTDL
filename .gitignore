@@ -27,3 +27,8 @@ __pycache__/
 # experiment trackers
 wandb/
 mlruns/
+
+# external tool clones (not our code - installed via docs/dataset_notes.md,
+# not tracked here; was accidentally committed as a broken gitlink once,
+# see git history 2026-07-14)
+/HEST/
