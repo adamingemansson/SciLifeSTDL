@@ -187,6 +187,18 @@ Sampling has no KV-cache (recomputes the growing sequence each step) —
 fine at current query-set sizes (~15-45 points), flagged as a follow-up
 if larger sequences are needed later.
 
+**Real-data run, 2026-07-14**: first run (100 then 2000 epochs) produced
+`mean PCC: nan` — the model generated the *identical* expression profile
+for every query point in the eval draw (zero variance per gene, so
+Pearson correlation is undefined; RMSE alone looked fine and hid this).
+Cause: `sample()` was decoding via greedy argmax, a documented failure
+mode for autoregressive generation (Holtzman et al. 2019, ICLR,
+"Neural Text Degeneration" — greedy/deterministic decoding collapses into
+repeating one token). Fixed by switching to stochastic temperature
+sampling (`sample_temperature` param, default 1.0) — also brings this
+model in line with every other registry entry, which all sample
+stochastically rather than deterministically. Not yet re-run to confirm.
+
 ```mermaid
 flowchart TD
     C5["Conditioning c /\ncontext tokens"] --> TR["Autoregressive transformer"]

@@ -39,6 +39,11 @@ def test_sample():
     # output must be aligned back to the original query order, not left in
     # Morton order — coords passed through unchanged is the contract check
     assert torch.equal(out["coords"], batch["query"]["coords"])
+    # regression check for the real collapse seen on HEST-1k data
+    # (docs/model_schematics.md, 2026-07-14): greedy argmax generated the
+    # identical token for every query point regardless of conditioning
+    unique_rows = torch.unique(out["expression"], dim=0)
+    assert unique_rows.shape[0] > 1, "sample() collapsed to one repeated output for every query point"
     print(f"[sample] OK — output shape {tuple(out['expression'].shape)}, "
           f"aligned to original query order")
 

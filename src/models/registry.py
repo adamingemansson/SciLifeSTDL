@@ -479,6 +479,14 @@ class FlowMatchingOT(BaseGenerativeModel):
 # sizes this pipeline currently produces (~15-45 points per masking draw),
 # flagged explicitly as a follow-up optimization if larger query sets are
 # used later, not built here (docs/model_schematics.md "Known cost").
+#
+# Stochastic (temperature) sampling at generation time, not greedy argmax:
+# the first real-data run (2026-07-14) produced the identical token for
+# every query point regardless of conditioning — a documented failure mode
+# of greedy decoding in autoregressive generation (Holtzman et al. 2019,
+# ICLR, "The Curious Case of Neural Text Degeneration"), and inconsistent
+# with the rest of this registry, where every other family samples
+# stochastically rather than deterministically.
 # ---------------------------------------------------------------------------
 @register_model("vqvae_ar")
 class VQVAEAutoregressive(BaseGenerativeModel):
@@ -488,7 +496,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  transformer_dim: int = 128, n_transformer_layers: int = 4,
                  n_heads: int = 4, max_seq_len: int = 2048,
                  recon_weight: float = 1.0, ar_weight: float = 1.0,
-                 lr: float = 1e-3):
+                 sample_temperature: float = 1.0, lr: float = 1e-3):
         super().__init__()
         self.save_hyperparameters()
         self.context_encoder = SpatialContextEncoder(
@@ -518,6 +526,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
         self.max_seq_len = max_seq_len
         self.recon_weight = recon_weight
         self.ar_weight = ar_weight
+        self.sample_temperature = sample_temperature
         self.lr = lr
 
     def _transformer_forward(self, input_tokens: torch.Tensor, c_ordered: torch.Tensor):
@@ -544,7 +553,17 @@ class VQVAEAutoregressive(BaseGenerativeModel):
         for i in range(n):
             h = self._transformer_forward(tokens, c_ordered[: tokens.shape[0]])
             logits = self.output_head(h[-1])
-            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            # stochastic (temperature) sampling, not greedy argmax: greedy
+            # decoding in autoregressive generation is a documented cause of
+            # degenerate repetition collapse (Holtzman et al. 2019, ICLR,
+            # "The Curious Case of Neural Text Degeneration") - confirmed as
+            # the actual failure mode here 2026-07-14 (real-data run
+            # produced the exact same token/expression for every query
+            # point). Also more consistent with the rest of this registry,
+            # where every other family samples stochastically (z ~ prior),
+            # not deterministically.
+            probs = torch.softmax(logits / self.sample_temperature, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
             generated.append(next_token)
             tokens = torch.cat([tokens, next_token])
         idx = torch.cat(generated)  # [n], in Morton order

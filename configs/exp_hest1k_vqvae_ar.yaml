@@ -42,6 +42,9 @@ model:
     max_seq_len: 2048
     recon_weight: 1.0
     ar_weight: 1.0
+    sample_temperature: 1.0        # stochastic sampling at generation time -
+                                    # greedy argmax collapsed to one repeated
+                                    # token for every query point (2026-07-14)
     lr: 1.0e-3
 
 training:
