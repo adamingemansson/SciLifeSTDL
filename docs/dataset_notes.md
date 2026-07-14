@@ -91,16 +91,20 @@ login(token="YOUR_HF_TOKEN")   # free account at huggingface.co, generate a toke
 from hest.download import download_hest   # exact import path per HEST-1k's own tutorial
 
 local_dir = "data/raw/hest1k"
-ids_to_query = ["INT1"]        # small sample used in HEST-1k's own tutorial notebook
+ids_to_query = ["INT1"]        # small sample used in HEST-1k's own tutorial notebook -
+                                 # confirmed Visium (one of 24 ccRCC samples, INT1-INT24,
+                                 # fresh-frozen, all processed with Visium)
 list_patterns = [f"*{id}[_.]**" for id in ids_to_query]
 download_hest(list_patterns, local_dir)
 ```
 
-Or filter by metadata instead of a fixed ID:
+Or filter by metadata instead of a fixed ID — `technology` column selects the
+platform (`Visium`, `Xenium`, `Visium HD`, legacy `ST`):
 ```python
 import pandas as pd
 meta_df = pd.read_csv("hf://datasets/MahmoodLab/hest/HEST_v1_3_0.csv")
-meta_df = meta_df[(meta_df["oncotree_code"] == "IDC") & (meta_df["organ"] == "Breast")]
+meta_df = meta_df[(meta_df["oncotree_code"] == "IDC") & (meta_df["organ"] == "Breast")
+                   & (meta_df["technology"] == "Visium")]
 ids_to_query = meta_df["id"].values
 ```
 
