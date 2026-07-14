@@ -28,6 +28,8 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 
+from src.models.conditioning import SpatialContextEncoder
+
 _MODEL_REGISTRY: dict[str, type["BaseGenerativeModel"]] = {}
 
 
@@ -190,22 +192,33 @@ class VAEBaseline(BaseGenerativeModel):
 # signal only touches the low-dimensional latent code, not the sparse/
 # zero-inflated expression output — a smaller, better-behaved sub-problem
 # and the lower-risk way to get a first GAN-family entry working.
+#
+# Conditioning (docs/model_schematics.md SS1): owns its own
+# SpatialContextEncoder instance, trained jointly with this model's own
+# gradient signal rather than sharing weights with other registry entries —
+# same reasoning as encoder/decoder already being per-model. "One shared
+# architecture" means one reusable class, not one shared set of trained
+# weights across families.
 # ---------------------------------------------------------------------------
 @register_model("wae_gan")
 class WAEGAN(BaseGenerativeModel):
-    def __init__(self, n_genes: int, latent_dim: int = 32, hidden_dim: int = 256,
+    def __init__(self, n_genes: int, coord_dim: int = 3, latent_dim: int = 32,
+                 hidden_dim: int = 256, cond_hidden_dim: int = 256,
                  disc_hidden_dim: int = 128, adv_weight: float = 1.0,
                  lr: float = 1e-3, lr_disc: float = 1e-3):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False  # we alternate encoder/decoder vs. discriminator ourselves
 
+        self.context_encoder = SpatialContextEncoder(
+            n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim
+        )
         self.encoder = nn.Sequential(
             nn.Linear(n_genes, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, latent_dim),   # deterministic encoder, no logvar
         )
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(latent_dim + cond_hidden_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, n_genes),
         )
         self.discriminator = nn.Sequential(
@@ -218,20 +231,35 @@ class WAEGAN(BaseGenerativeModel):
         self.lr_disc = lr_disc
 
     def sample(self, context, query):
-        # Generation never touches the encoder or discriminator: decode
-        # z ~ prior, identical to the VAE path above. TODO: condition once
-        # the shared conditioning encoder exists (docs/architecture_plan.md).
+        # No real target expression at generation time, so z ~ prior (as
+        # before) — but the decoder is now also conditioned on c, which
+        # carries real local structure from context. z supplies the
+        # remaining stochasticity/diversity (docs/architecture_plan.md
+        # "mode-averaging risk" — a query location can be genuinely
+        # multimodal, e.g. a cell-type boundary; c alone doesn't resolve
+        # that, sampling z does).
         n = query["coords"].shape[0]
+        c = self.context_encoder(context["coords"], context["expression"], query["coords"])
         z = torch.randn(n, self.latent_dim, device=self.device)
-        expr_gen = self.decoder(z)
+        expr_gen = self.decoder(torch.cat([z, c], dim=-1))
         return {"coords": query["coords"], "expression": expr_gen}
 
     def training_step(self, batch, batch_idx):
-        expression = batch["context"]["expression"]
+        # Fixes a real gap in the previous placeholder: it trained as a
+        # plain autoencoder on context alone and never touched
+        # target_expression, i.e. never actually learned to predict the
+        # held-out query locations it's meant to reconstruct. Now: encode
+        # the REAL target expression (available during training, not at
+        # generation time) into z, and train the decoder to reconstruct it
+        # from (z, c) — teaches decoder+context_encoder to actually combine
+        # local context with a latent code into the right expression.
+        context, query = batch["context"], batch["query"]
+        target_expression = batch["target_expression"]
         opt_ae, opt_disc = self.optimizers()
-        batch_size = expression.shape[0]
+        batch_size = target_expression.shape[0]
 
-        z_fake = self.encoder(expression)                                    # encoder's latent code
+        c = self.context_encoder(context["coords"], context["expression"], query["coords"])
+        z_fake = self.encoder(target_expression)                              # encoder's latent code
         z_real = torch.randn(batch_size, self.latent_dim, device=self.device)  # prior sample
 
         # --- 1. discriminator step: real prior sample vs. encoder output ---
@@ -247,8 +275,8 @@ class WAEGAN(BaseGenerativeModel):
         opt_disc.step()
 
         # --- 2. encoder/decoder step: reconstruction + fool the discriminator ---
-        recon = self.decoder(z_fake)
-        recon_loss = nn.functional.mse_loss(recon, expression)
+        recon = self.decoder(torch.cat([z_fake, c], dim=-1))
+        recon_loss = nn.functional.mse_loss(recon, target_expression)
         logits_fake_for_ae = self.discriminator(z_fake)
         adv_loss = nn.functional.binary_cross_entropy_with_logits(
             logits_fake_for_ae, torch.ones_like(logits_fake_for_ae)  # fool disc: look like prior
@@ -265,7 +293,10 @@ class WAEGAN(BaseGenerativeModel):
 
     def configure_optimizers(self):
         opt_ae = torch.optim.Adam(
-            list(self.encoder.parameters()) + list(self.decoder.parameters()), lr=self.lr
+            list(self.context_encoder.parameters())
+            + list(self.encoder.parameters())
+            + list(self.decoder.parameters()),
+            lr=self.lr,
         )
         opt_disc = torch.optim.Adam(self.discriminator.parameters(), lr=self.lr_disc)
         return [opt_ae, opt_disc]

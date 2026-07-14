@@ -46,7 +46,7 @@ resolved since no real dataset is loaded.
 
 ---
 
-## 1. WAE-GAN (built — conditioning injection point is the gap)
+## 1. WAE-GAN (built, conditioning wired in — smoke-tested, not yet run on real data)
 
 ```mermaid
 flowchart TD
@@ -66,11 +66,13 @@ flowchart TD
     end
 ```
 
-**Additional part needed**: the decoder currently takes `z` alone
-(`src/models/registry.py` `WAEGAN.sample`/`training_step`) — needs `c`
-concatenated or added before the first decoder layer. Encoder/discriminator
-don't need to change; conditioning only has to reach the decoder, since
-that's the only path `sample()` uses.
+**Done**: `c` (from its own `SpatialContextEncoder` instance) is
+concatenated with `z` before the decoder. One thing this also fixed along
+the way: `training_step` previously trained as a plain autoencoder on
+context alone and never used `target_expression` — now `z` is encoded from
+the real held-out target (available during training only), and the decoder
+learns to reconstruct it from `(z, c)`. Smoke-tested with synthetic data
+(`tests/test_wae_gan.py`) — not yet run on real data (blocked on task #9).
 
 ---
 
@@ -158,8 +160,8 @@ flowchart TD
 
 | Part | Needed by | Status |
 |---|---|---|
-| Conditioning encoder | All 3 | **Written** (`src/models/conditioning.py`), **not yet executed/verified** |
-| Decoder conditioning injection | WAE-GAN | Not built — next up, task #8 |
+| Conditioning encoder | All 3 | **Done** — verified via `tests/test_conditioning.py` |
+| Decoder conditioning injection | WAE-GAN | **Done** — verified via `tests/test_wae_gan.py` |
 | Time embedding | FM-OT | Not built |
 | Velocity network | FM-OT | Not built |
 | ODE sampler | FM-OT | Not built (check `diffusers` first) |

@@ -21,8 +21,10 @@ model:
   name: wae_gan                  # matches @register_model("wae_gan") in src/models/registry.py
   params:
     n_genes: null                 # fill in with the dataset's actual gene count before running
+    coord_dim: 3                  # 2 for intra-slice (Track A), 3 for inter-slice (Track B)
     latent_dim: 32
     hidden_dim: 256
+    cond_hidden_dim: 256          # conditioning encoder's output dim, src/models/conditioning.py
     disc_hidden_dim: 128
     adv_weight: 1.0
     lr: 1.0e-3

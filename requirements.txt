@@ -1,4 +1,4 @@
-numpy
+numpy<2  # pinned: installed torch build is compiled against NumPy 1.x ABI
 scipy
 pandas
 scikit-learn
