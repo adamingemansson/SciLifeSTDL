@@ -18,11 +18,18 @@ is also used directly on single-cell data in CASTLE (scATAC-seq) and
 CellTok; multi-token/residual VQ (RVQ-Alpha) is a documented possible
 upgrade if single-token reconstruction proves too lossy, not built here.
 
-Codebook update: standard (non-EMA) straight-through VQ-VAE formulation
-from the original paper — codebook loss + commitment loss via the
-stop-gradient trick. EMA codebook updates (VQ-VAE-2, Razavi et al. 2019)
-are a documented possible upgrade if the plain version undertrains the
-codebook (watch train/codebook_usage below), not implemented here.
+Codebook update: EMA (van den Oord et al. 2017, Appendix A.1; made the
+default in Razavi et al. 2019, VQ-VAE-2) rather than the gradient-based
+codebook loss from the main text of the original paper. Switched
+2026-07-14 after the gradient-based version collapsed to 1/512 codes on
+real HEST-1k data (see docs/model_schematics.md) — a well-known failure
+mode of that formulation (rich-get-richer: only the current nearest code
+gets pushed toward the data, so early winners keep winning). EMA also
+comes with dead-code reset (reinitialize codes whose EMA usage falls near
+zero to a random real encoder output from the current batch) — standard
+engineering practice in most working VQ-VAE implementations (e.g. Jukebox,
+EnCodec), not itself a peer-reviewed claim, just how EMA-VQ is normally
+deployed.
 
 No external VQ library (e.g. vector-quantize-pytorch) — the layer itself
 is small and well-specified; consistent with this codebase's existing
@@ -45,27 +52,63 @@ import pytorch_lightning as pl
 
 class VectorQuantizer(nn.Module):
     """Nearest-neighbour codebook lookup with straight-through gradients
-    (van den Oord et al. 2017, module docstring above)."""
+    and an EMA-updated codebook (van den Oord et al. 2017 Appendix A.1;
+    Razavi et al. 2019 VQ-VAE-2 — module docstring above). The codebook is
+    a buffer, not a trainable nn.Embedding — it's updated directly from
+    encoder outputs each training step, not via backprop, so it never
+    appears in an optimizer's parameter list."""
 
-    def __init__(self, codebook_size: int, latent_dim: int, commitment_weight: float = 0.25):
+    def __init__(self, codebook_size: int, latent_dim: int, commitment_weight: float = 0.25,
+                 decay: float = 0.99, eps: float = 1e-5, dead_code_threshold: float = 1.0):
         super().__init__()
         self.codebook_size = codebook_size
-        self.codebook = nn.Embedding(codebook_size, latent_dim)
-        self.codebook.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
         self.commitment_weight = commitment_weight
+        self.decay = decay
+        self.eps = eps
+        self.dead_code_threshold = dead_code_threshold
+
+        embed = torch.randn(codebook_size, latent_dim)
+        self.register_buffer("embed", embed)
+        self.register_buffer("ema_cluster_size", torch.zeros(codebook_size))
+        self.register_buffer("ema_embed_sum", embed.clone())
 
     def forward(self, z_e: torch.Tensor):
         # z_e: [N, latent_dim]
-        dists = torch.cdist(z_e, self.codebook.weight)   # [N, codebook_size]
-        idx = torch.argmin(dists, dim=-1)                  # [N]
-        z_q = self.codebook(idx)                            # [N, latent_dim]
+        dists = torch.cdist(z_e, self.embed)   # [N, codebook_size]
+        idx = torch.argmin(dists, dim=-1)        # [N]
+        z_q = self.embed[idx]                     # [N, latent_dim]
 
-        codebook_loss = nn.functional.mse_loss(z_q, z_e.detach())
-        commitment_loss = nn.functional.mse_loss(z_e, z_q.detach())
-        vq_loss = codebook_loss + self.commitment_weight * commitment_loss
+        commitment_loss = self.commitment_weight * nn.functional.mse_loss(z_e, z_q.detach())
+
+        if self.training:
+            with torch.no_grad():
+                one_hot = nn.functional.one_hot(idx, self.codebook_size).type(z_e.dtype)  # [N, K]
+                cluster_size = one_hot.sum(dim=0)                                           # [K]
+                embed_sum = one_hot.t() @ z_e                                               # [K, D]
+
+                self.ema_cluster_size.mul_(self.decay).add_(cluster_size, alpha=1 - self.decay)
+                self.ema_embed_sum.mul_(self.decay).add_(embed_sum, alpha=1 - self.decay)
+
+                n = self.ema_cluster_size.sum()
+                smoothed_size = (
+                    (self.ema_cluster_size + self.eps) / (n + self.codebook_size * self.eps) * n
+                )
+                self.embed.copy_(self.ema_embed_sum / smoothed_size.unsqueeze(1))
+
+                # dead-code reset: codes the EMA has essentially stopped
+                # using get snapped to a random real encoder output from
+                # this batch, so they get a chance to re-enter rotation
+                dead = self.ema_cluster_size < self.dead_code_threshold
+                if dead.any():
+                    n_dead = int(dead.sum().item())
+                    random_idx = torch.randint(0, z_e.shape[0], (n_dead,), device=z_e.device)
+                    revived = z_e[random_idx]
+                    self.embed[dead] = revived
+                    self.ema_embed_sum[dead] = revived
+                    self.ema_cluster_size[dead] = 1.0
 
         z_q_st = z_e + (z_q - z_e).detach()  # straight-through estimator
-        return z_q_st, idx, vq_loss
+        return z_q_st, idx, commitment_loss
 
 
 class VQVAEStage1(pl.LightningModule):

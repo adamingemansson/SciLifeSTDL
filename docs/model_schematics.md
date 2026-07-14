@@ -140,8 +140,16 @@ flowchart TD
 and validated on its own before touching stage 2. **Built** —
 `src/models/vqvae.py` (`VectorQuantizer`, `VQVAEStage1`), smoke-tested via
 `tests/test_vqvae_stage1.py`. Real-data training script/config also built
-(`src/training/train_vqvae_stage1.py`, `configs/exp_hest1k_vqvae_stage1.yaml`)
-— not yet run. Deliberately
+(`src/training/train_vqvae_stage1.py`, `configs/exp_hest1k_vqvae_stage1.yaml`).
+
+**Real-data run, 2026-07-14 (100 epochs, batch 64, ~1600 steps)**: recon
+RMSE 0.3651 (comparable to WAE-GAN's), but codebook usage 1/512 —
+**codebook collapse**, the classic VQ-VAE failure mode (gradient-based
+codebook loss lets the first winning code keep winning; RMSE looks fine
+only because the decoder is outputting one fixed profile for every input).
+Fixed by switching `VectorQuantizer` to EMA codebook updates (van den Oord
+et al. 2017 Appendix A.1; default in Razavi et al. 2019 VQ-VAE-2) with
+dead-code reset. Not yet re-run to confirm the fix on real data. Deliberately
 unconditioned (no spatial context) — see file docstring; conditioning is
 stage 2's job. Single token per cell (not per-gene-chunk or residual VQ) —
 the token-granularity question flagged below is resolved this way for now,
