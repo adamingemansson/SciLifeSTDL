@@ -4,8 +4,10 @@ tiny synthetic data, no real dataset needed. Checks shapes, no crashes, no
 NaNs, and that it handles both Track A (2D) and Track B (3D) coordinate
 dimensionality with the same module.
 
-Run with: python tests/test_conditioning.py
-(needs the st3d conda env active — docs/environment_setup.md)
+Run with: python -m tests.test_conditioning
+(needs the st3d conda env active — docs/environment_setup.md; must be run
+as a module with -m from the repo root, not as a plain script, so `src` is
+importable — same convention as src/training/train.py)
 """
 import torch
 
