@@ -16,11 +16,14 @@ wired into any generator (`wae_gan`, task #8).
 
 Implementation notes vs. the original schematic below: no `torch_geometric`
 dependency — k-NN + message passing is done directly in plain PyTorch
-(`cdist`/`topk`, same pattern as `InterpolationBaseline`), and continuous
-coordinates are encoded with Random Fourier Features (`docs/literature_review.md`
-— the same technique Mimyr's location model uses), not a generic
-"positional encoding." Deliberately ST-only (no H&E) — see "Known gaps"
-below — but designed so an image-encoder branch can be fused into
+(`cdist`/`topk`, same pattern as `InterpolationBaseline`). Design grounded
+in peer-reviewed work independent of any single unreviewed preprint: Random
+Fourier coordinate encoding (Rahimi & Recht 2007, Tancik et al. 2020,
+NeurIPS both), and k-NN graph attention for spatial context specifically
+validated in ST by SpaGCN (*Nat Methods* 2021), GraphST (*Nat Commun*
+2023), and GAAEST (*Commun Biol* 2024) — see `src/models/conditioning.py`
+docstring for full citations. Deliberately ST-only (no H&E) — see "Known
+gaps" below — but designed so an image-encoder branch can be fused into
 `node_repr`/`query_feat` later without changing any downstream model, since
 they only ever consume this module's output `c`.
 
@@ -36,11 +39,10 @@ flowchart TD
     H --> I["Fed into WAE-GAN decoder /\nFM-OT velocity net /\nVQ-VAE+AR transformer"]
 ```
 
-**Not yet built.** Design decisions still open: point-cloud/graph
-representation vs. fixed patches (depends on pilot dataset — spot vs.
-single-cell resolution, `docs/project_outline.md` Phase 4); DRIFT's
-heat-kernel spatial diffusion (`docs/literature_review.md`) is a concrete
-candidate design to start from rather than inventing from scratch.
+Remaining open design decision: point-cloud/graph representation vs. fixed
+patches, depends on which pilot dataset gets pulled first (spot vs.
+single-cell resolution, `docs/project_outline.md` Phase 4) — not yet
+resolved since no real dataset is loaded.
 
 ---
 

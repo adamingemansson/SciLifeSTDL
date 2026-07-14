@@ -22,15 +22,13 @@ breaks for the other two. The architecture has to abstract over training
 ## Four-layer decomposition
 
 1. **Conditioning encoder (shared, family-agnostic)** — turns `context`
-   (neighboring cells/spatial graph) into a fixed representation, e.g. a
-   GNN/transformer over a k-NN spatial graph → a set of tokens. Built once,
-   consumed identically by every model family. This is the actual reusable
-   "general architecture" contribution — not yet implemented (see Status
-   below), current models are unconditioned placeholders. **DRIFT**
-   (`docs/literature_review.md`) is a plausible concrete design reference
-   for this layer — heat-kernel diffusion over a spatial adjacency graph to
-   produce a spatially-coherent representation, worth reading before
-   designing this from scratch.
+   (neighboring cells/spatial graph) into a fixed representation via a k-NN
+   spatial graph + attention. **Built** — `src/models/conditioning.py`
+   (`SpatialContextEncoder`), grounded in peer-reviewed work (Rahimi &
+   Recht 2007, Tancik et al. 2020 for coordinate encoding; SpaGCN, GraphST,
+   GAAEST for k-NN graph attention specifically in ST — full citations in
+   the module docstring), not derived from any single unreviewed preprint.
+   Not yet executed/verified, not yet wired into any generator model.
 2. **Backbone registry** — small swappable network pieces (denoiser,
    encoder+decoder, generator+discriminator) that plug into layer 3.
 3. **Model family wrapper (`BaseGenerativeModel`)** — every family

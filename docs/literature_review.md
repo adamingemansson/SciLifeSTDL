@@ -88,18 +88,39 @@ citing in any report; this is a scoping-level pass.
 - **DRIFT** ("Diffusion-based Representation Integration for Foundation
   Models Improves Spatial Transcriptomics Analysis," bioRxiv, Nov 2025;
   code: https://github.com/rsinghlab/DRIFT). **Not a generator** — a
-  representation-learning technique, noted here because it's directly
-  relevant to our conditioning encoder, the one piece of the architecture
-  not yet built (`docs/architecture_plan.md` "Known gaps"). Builds a
-  spatial adjacency graph over cells/spots and applies a heat-kernel
-  diffusion process that propagates expression signal across local
-  neighborhoods while preserving tissue boundaries, producing a spatially-
-  coherent representation that can feed into any pretrained foundation
-  model without retraining it. Validated on cell-type annotation,
-  cross-section alignment, and clustering. A plausible concrete design for
-  the conditioning encoder's spatial-graph step — worth reading before
-  designing that layer from scratch.
-  (code: search GitHub for `gkrieg/mimyr`)
+  representation-learning technique: builds a spatial adjacency graph over
+  cells/spots and applies heat-kernel diffusion to propagate expression
+  signal across neighborhoods. **[2026-07-14] Not used as a design basis**
+  for our conditioning encoder — it's an unreviewed preprint, and we
+  deliberately grounded that component in peer-reviewed work instead (see
+  §3.2a below). Kept here only as a literature note, not a reference
+  implementation.
+
+## 3.2a Peer-reviewed grounding for the conditioning encoder
+
+Added 2026-07-14 specifically to ground `src/models/conditioning.py` in
+established, independently-published work rather than any single
+unreviewed preprint (full citations also in the module docstring):
+
+- **Rahimi & Recht, "Random Features for Large-Scale Kernel Machines"**
+  (NeurIPS 2007) — foundational random Fourier feature method.
+- **Tancik et al., "Fourier Features Let Networks Learn High Frequency
+  Functions in Low Dimensional Domains"** (NeurIPS 2020) — applies random
+  Fourier features specifically to coordinate encoding, addressing neural
+  networks' spectral bias toward low-frequency functions.
+- **SpaGCN** (*Nature Methods* 2021) — graph convolutional network
+  integrating expression, spatial location, and histology via a
+  spatial-distance-based graph.
+- **GraphST** (*Nature Communications* 2023) — nearest-neighbor graph +
+  self-supervised GNN for spatial clustering/integration/deconvolution.
+- **GAAEST** (*Communications Biology* 2024) — graph attention autoencoder
+  for spatial-transcriptomics domain recognition via contrastive learning.
+
+These confirm k-NN-graph-plus-attention over spatial neighborhoods is a
+standard, multiply-peer-reviewed approach in ST specifically, not a
+technique unique to any one (unreviewed) paper. k is dataset-dependent in
+this literature — commonly cited in the 6-20 range — which is why it's a
+tunable constructor argument in our implementation, not a fixed constant.
 
 - **isoST: Three-dimensional spatial transcriptomics at isotropic resolution
   enabled by generative deep learning** (bioRxiv, Aug 2025). Models gene

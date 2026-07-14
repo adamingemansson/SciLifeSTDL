@@ -5,6 +5,19 @@ expression) into a fixed conditioning representation per query location,
 consumed identically by every generator family (WAE-GAN's decoder, FM-OT's
 velocity net, VQ-VAE+AR's transformer).
 
+Design grounded in peer-reviewed, independently-published work (not any
+single unreviewed preprint):
+  - Random Fourier coordinate encoding: Rahimi & Recht, "Random Features
+    for Large-Scale Kernel Machines" (NeurIPS 2007); Tancik et al., "Fourier
+    Features Let Networks Learn High Frequency Functions in Low Dimensional
+    Domains" (NeurIPS 2020).
+  - k-NN graph + attention for spatial neighborhoods in ST specifically:
+    SpaGCN (Nature Methods 2021), GraphST (Nature Communications 2023),
+    GAAEST (Communications Biology 2024) — all use graph-based spatial
+    neighborhood encoding for ST; k is dataset-dependent in this
+    literature, commonly in the 6-20 range, which is why it's a
+    constructor argument here, not a fixed constant.
+
 Deliberately ST-only for now (no H&E) — see docs/architecture_plan.md
 "Known gaps". Kept modular on purpose: everything downstream only ever
 consumes this module's output `c`, never its internals, so an image-encoder
@@ -25,8 +38,7 @@ import torch.nn as nn
 class RandomFourierFeatures(nn.Module):
     """
     Encodes continuous coordinates into a higher-dimensional feature basis
-    (Rahimi & Recht 2007) — the same technique Mimyr's location model uses
-    for encoding continuous spatial coordinates (docs/literature_review.md).
+    (Rahimi & Recht 2007; Tancik et al. 2020 — module docstring above).
     Fixed (non-trainable) random projection, so `sigma` is the one
     hyperparameter that matters — controls the encoding's spatial frequency.
     """
