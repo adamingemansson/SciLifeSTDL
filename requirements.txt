@@ -14,6 +14,8 @@ scanpy
 squidpy
 h5py
 zarr
+python-igraph   # sc.tl.leiden backend (src/evaluation/cell_type_classifier.py)
+leidenalg       # sc.tl.leiden backend
 spatialdata
 spatialdata-io
 wandb
