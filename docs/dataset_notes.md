@@ -80,23 +80,31 @@ specific samples by ID or metadata filter instead.
 
 ```bash
 pip install huggingface-hub
-git clone https://github.com/mahmoodlab/HEST.git && cd HEST
-pip install -e .   # installs the `hest` package used below
+huggingface-cli login   # free account at huggingface.co, generate a token first
 ```
 
 ```python
-from huggingface_hub import login
-login(token="YOUR_HF_TOKEN")   # free account at huggingface.co, generate a token
+from huggingface_hub import snapshot_download
 
-from hest.download import download_hest   # exact import path per HEST-1k's own tutorial
-
+# NOTE: earlier drafts of this doc said `from hest.download import download_hest` -
+# WRONG, confirmed by inspecting the actual hest package source: no such function
+# is exported. Use huggingface_hub's own snapshot_download directly instead - this
+# is what that (non-existent, or at least non-public) helper would have wrapped
+# anyway. Verified working 2026-07-14: produces data/raw/hest1k/st/INT1.h5ad.
 local_dir = "data/raw/hest1k"
-ids_to_query = ["INT1"]        # small sample used in HEST-1k's own tutorial notebook -
-                                 # confirmed Visium (one of 24 ccRCC samples, INT1-INT24,
-                                 # fresh-frozen, all processed with Visium)
-list_patterns = [f"*{id}[_.]**" for id in ids_to_query]
-download_hest(list_patterns, local_dir)
+snapshot_download(
+    repo_id="MahmoodLab/hest",
+    repo_type="dataset",
+    local_dir=local_dir,
+    allow_patterns=["*INT1[_.]**"],   # confirmed Visium (one of 24 ccRCC samples,
+                                        # INT1-INT24, fresh-frozen, all Visium)
+)
 ```
+
+Only install/clone the `mahmoodlab/HEST` repo (`pip install -e .`) if you
+need the `hest` package's other convenience helpers later (e.g.
+`iter_hest`) — not required for `load_hest_sample()` in
+`src/data/loaders.py`, which reads the `.h5ad` directly via `anndata`.
 
 Or filter by metadata instead of a fixed ID — `technology` column selects the
 platform (`Visium`, `Xenium`, `Visium HD`, legacy `ST`):
@@ -106,6 +114,7 @@ meta_df = pd.read_csv("hf://datasets/MahmoodLab/hest/HEST_v1_3_0.csv")
 meta_df = meta_df[(meta_df["oncotree_code"] == "IDC") & (meta_df["organ"] == "Breast")
                    & (meta_df["technology"] == "Visium")]
 ids_to_query = meta_df["id"].values
+allow_patterns = [f"*{id}[_.]**" for id in ids_to_query]
 ```
 
 After download, each sample's expression data lands as a standard scanpy
