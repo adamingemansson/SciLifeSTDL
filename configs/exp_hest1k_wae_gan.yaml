@@ -22,7 +22,7 @@ masking:
 model:
   name: wae_gan
   params:
-    n_genes: null                 # fill in with this sample's actual gene count before running
+    n_genes: 16570                # INT1 after QC (min_genes=200, min_cells=3), verified 2026-07-14
     coord_dim: 2                  # single 2D section, not a z-series
     latent_dim: 32
     hidden_dim: 256
