@@ -268,6 +268,14 @@ flowchart TD
 8. **Implement a real FID/MMD embedding** — replace the PCA placeholder,
    validate per the plan in `docs/metrics_notes.md` §2.
 9. **Run the full comparison**: VAE (floor) / WAE-GAN / FM-OT /
-   VQ-VAE+AR, on the pilot dataset, full metric suite.
+   VQ-VAE+AR, on the pilot dataset, full metric suite. **Built** —
+   `src/evaluation/run_comparison.py` + `configs/exp_hest1k_vae_baseline.yaml`
+   (the missing config), smoke-tested via `tests/test_run_comparison.py`
+   (synthetic data, tiny epoch counts). Trains all four on their own tuned
+   configs, then evaluates every model — plus the free `interp_baseline`
+   floor — on one shared held-out masking draw, reporting PCC/RMSE/AUC/
+   ST-FID/cell-type-plausibility in a single table. Not yet run for real
+   (a real run is a multi-thousand-epoch job per model, per the tuning
+   already done in tasks #10-#12).
 10. **Get Mimyr's/isoST's public code running** as external baselines on
     the same data for the head-to-head comparison.

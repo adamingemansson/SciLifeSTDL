@@ -1,0 +1,45 @@
+# Plain VAE (floor/plumbing-proof baseline, docs/architecture_plan.md) on
+# one real HEST-1k sample. Same pilot sample/masking setup as the other
+# exp_hest1k_*.yaml configs — only the model block differs. Unconditioned
+# (ignores context/query['coords'] beyond trivial use) on purpose — it's
+# the floor, not a comparison model in its own right.
+
+experiment_name: vae_baseline_hest1k_pilot
+
+data:
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: vae_baseline
+  params:
+    n_genes: 16570                # INT1 after QC, same as other exp_hest1k_*.yaml configs
+    latent_dim: 32
+    hidden_dim: 256
+    kl_weight: 1.0e-3
+    lr: 1.0e-3
+
+training:
+  epochs: 2000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

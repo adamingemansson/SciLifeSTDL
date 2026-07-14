@@ -25,6 +25,26 @@ from src.models.registry import build_model
 from src.evaluation import metrics as ev
 
 
+def make_context_query_split(coords3d: np.ndarray, slice_ids: np.ndarray, masking_cfg, seed: int):
+    """One random context/query mask draw. Factored out of
+    MaskedContextQueryDataset so anything that needs the raw boolean masks
+    directly (e.g. src/evaluation/run_comparison.py, task #15, which needs
+    to index the source AnnData the same way) doesn't have to duplicate
+    the strategy branching logic."""
+    strategy = masking_cfg.strategy
+    if strategy == "hold_out_slice":
+        rng = np.random.default_rng(seed)
+        held_out = rng.choice(np.unique(slice_ids))
+        context_mask, query_mask = masking.hold_out_slice(coords3d[:, 2], held_out, slice_ids)
+    elif strategy == "random_dropout_patches":
+        context_mask, query_mask = masking.random_dropout_patches(
+            coords3d[:, :2], slice_ids, seed=seed, **masking_cfg.params
+        )
+    else:
+        raise ValueError(f"Unknown masking strategy {strategy}")
+    return context_mask, query_mask
+
+
 class MaskedContextQueryDataset(Dataset):
     """Each item = one fresh random context/query split over the same
     underlying AnnData. batch_size stays 1 at the DataLoader level since
@@ -45,20 +65,9 @@ class MaskedContextQueryDataset(Dataset):
 
     def __getitem__(self, idx):
         seed = self.base_seed + idx
-        strategy = self.masking_cfg.strategy
-        if strategy == "hold_out_slice":
-            rng = np.random.default_rng(seed)
-            held_out = rng.choice(np.unique(self.slice_ids))
-            context_mask, query_mask = masking.hold_out_slice(
-                self.coords3d[:, 2], held_out, self.slice_ids
-            )
-        elif strategy == "random_dropout_patches":
-            context_mask, query_mask = masking.random_dropout_patches(
-                self.coords3d[:, :2], self.slice_ids, seed=seed, **self.masking_cfg.params
-            )
-        else:
-            raise ValueError(f"Unknown masking strategy {strategy}")
-
+        context_mask, query_mask = make_context_query_split(
+            self.coords3d, self.slice_ids, self.masking_cfg, seed
+        )
         context = {
             "coords": torch.tensor(self.coords3d[context_mask], dtype=torch.float32),
             "expression": torch.tensor(self.expr[context_mask], dtype=torch.float32),
@@ -72,14 +81,22 @@ def _collate_identity(batch_list):
     return batch_list[0]
 
 
-def _load_data(cfg) -> tuple:
+def load_adata(cfg):
+    """QC'd AnnData for this config's data section — factored out so
+    src/evaluation/run_comparison.py (task #15) can get the AnnData object
+    itself (needed for cell-type clustering), not just the derived arrays
+    _load_data returns."""
     if cfg.data.get("source") == "hest1k":
         adata = loaders.load_hest_sample(cfg.data.hest_data_dir, cfg.data.sample_id)
     else:
         adata = loaders.load_multi_slice(cfg.data.paths, cfg.data.z_positions)
-    adata = loaders.basic_qc_and_normalize(
+    return loaders.basic_qc_and_normalize(
         adata, min_genes=cfg.data.min_genes, min_cells=cfg.data.min_cells
     )
+
+
+def _load_data(cfg) -> tuple:
+    adata = load_adata(cfg)
     coords3d = loaders.get_coords_3d(adata)
     expr = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()
     slice_ids = adata.obs["slice_id"].to_numpy()
