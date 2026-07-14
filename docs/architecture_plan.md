@@ -205,8 +205,8 @@ central problem is novel.
 baseline, not counted as one of the three comparison models below.
 
 1. **WAE-GAN** — done. GAN entry point (Tolstikhin et al. 2017).
-2. **Flow Matching, OT path (FM-OT)** — **written**, in `src/models/registry.py`
-   (`FlowMatchingOT`) — not yet executed anywhere with torch installed.
+2. **Flow Matching, OT path (FM-OT)** — done, smoke-tested (`tests/test_fm_ot.py`),
+   in `src/models/registry.py` (`FlowMatchingOT`). Not yet run on real data.
    One shared denoiser/velocity network; diffusion-path training is a cheap
    config-flag ablation on the same network afterward, not a separate model
    or a priority in its own right. EMDiffuse's actual contribution (missing-
