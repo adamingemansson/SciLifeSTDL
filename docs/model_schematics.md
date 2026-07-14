@@ -238,7 +238,7 @@ flowchart TD
 | Autoregressive transformer | VQ-VAE+AR | **Built** — smoke-tested via `tests/test_vqvae_ar.py`, not yet run on real data |
 | Real per-cell/mini-batch `Dataset` | All 3 (for real training) | **Done** — `MaskedContextQueryDataset`, verified via `tests/test_masked_dataset.py` |
 | HEST-1k loader (`load_hest_sample`) | All 3 (for real training) | **Written** — not yet run against an actual downloaded sample |
-| Independent cell-type classifier | Evaluation (all 3) | Not built |
+| Independent cell-type classifier | Evaluation (all 3) | **Built** — `src/evaluation/cell_type_classifier.py`, smoke-tested via `tests/test_cell_type_classifier.py`. INT1 has no curated cell-type labels (confirmed 2026-07-14), so it uses Leiden-cluster pseudo-labels (docs/metrics_notes.md's existing ARI/NMI plan) — not yet run on real data or wired into a real generation comparison. |
 | Real FID/MMD embedding function | Evaluation (all 3) | Placeholder (PCA) only |
 
 ## Step-by-step build order
