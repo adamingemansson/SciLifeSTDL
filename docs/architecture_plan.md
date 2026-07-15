@@ -398,9 +398,15 @@ baseline, not counted as one of the three comparison models below.
   activation scale was optimized for its own training objective, not for
   whatever scale an untrained `nn.Linear` expects, so normalizing first
   removes that whole class of bug rather than hoping the projection
-  learns to compensate. Not yet re-verified end-to-end after this fix —
-  next real run should show STPath's numbers back in the same range as
-  every other encoder variant.
+  learns to compensate.
+
+  **Fix confirmed on real hardware (2026-07-15):** re-ran
+  `exp_hest1k_wae_gan_stpath.yaml` at 500 epochs (still short of the full
+  10000, but enough to tell): RMSE 0.3520 (vs. 3.7-3.8 pre-fix), AUC
+  0.8462, PCC 0.0065 — RMSE and AUC already **beat** `interp_baseline`'s
+  own row from the same run (RMSE 0.3839, AUC 0.7690), and PCC is
+  comparable. Back in the same range as every other encoder variant, as
+  expected once `self.proj` could actually learn.
 - **Full histology image generation/reconstruction stays a deferred
   stretch goal**, separate from the conditioning use above. Filling in
   broken tissue *in the H&E image itself*, not just using H&E to condition
