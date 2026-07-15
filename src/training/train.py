@@ -365,9 +365,12 @@ def main(cfg_path: str, overrides: list[str] | None = None):
             logger=False,
         )
         trainer.fit(model, dataloader)
-        saved_path = save_trained_model(
-            model, model_cfg, adata.var_names.tolist(), cfg.training.checkpoint_dir
-        )
+        # .get() with the same default every real config's own YAML comment
+        # documents, not a bare attribute access — configs that don't
+        # declare checkpoint_dir (e.g. tests/test_run_comparison.py's
+        # synthetic configs) must still work, not crash on a missing key
+        checkpoint_dir = cfg.training.get("checkpoint_dir", f"results/checkpoints/{cfg.experiment_name}")
+        saved_path = save_trained_model(model, model_cfg, adata.var_names.tolist(), checkpoint_dir)
         if saved_path is not None:
             print(f"Saved trained model (weights + config + gene names) to {saved_path.parent}")
 
