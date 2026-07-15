@@ -37,7 +37,7 @@ model:
   params:
     image_encoder_type: cnn      # task #17: our own from-scratch CNN H&E encoder
     image_feat_dim: 64
-    image_patch_size: 256
+    image_patch_size: 224            # real HEST-1k patches are 224x224, not 256 (verified 2026-07-15)
     n_genes: 16570                # INT1 after QC, same as other exp_hest1k_*.yaml configs
     coord_dim: 3
     cond_hidden_dim: 256

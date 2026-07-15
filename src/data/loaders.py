@@ -62,11 +62,14 @@ def load_hest_patches(hest_data_dir: str | Path, sample_id: str
                        ) -> tuple[np.ndarray, np.ndarray]:
     """
     H&E patches for one HEST-1k sample (task #17, docs/architecture_plan.md
-    "Known gaps" — the H&E branch). HEST-1k pre-extracts 256x256 patches per
-    spot into patches/{sample_id}.h5 (h5py keys: 'img' [N,256,256,3] uint8,
-    'coords' [N,2], 'barcodes' [N] — confirmed 2026-07-14 by inspecting
-    HESTData.dump_patches() in the actual mahmoodlab/HEST source, not just
-    the README/tutorial prose). No raw WSI/openslide handling needed.
+    "Known gaps" — the H&E branch). HEST-1k pre-extracts per-spot patches
+    into patches/{sample_id}.h5. Real h5py keys, confirmed 2026-07-15 by
+    inspecting an actual downloaded file (corrects the earlier
+    2026-07-14 note, which was based on HESTData.dump_patches() source
+    reading alone and got two details wrong): 'img' [N,224,224,3] uint8
+    (224x224, NOT 256x256), 'coords' [N,2], 'barcode' [N,1] object
+    (singular key name, NOT 'barcodes', and 2D not 1D). No raw
+    WSI/openslide handling needed.
 
     Same download command as load_hest_sample already pulls this file
     (docs/dataset_notes.md's `allow_patterns=["*INT1[_.]**"]` matches
@@ -74,7 +77,7 @@ def load_hest_patches(hest_data_dir: str | Path, sample_id: str
     raises FileNotFoundError, re-run that download command rather than
     assuming a separate one is needed.
 
-    Returns (patches [N,256,256,3] uint8, barcodes [N] str) in whatever
+    Returns (patches [N,224,224,3] uint8, barcodes [N] str) in whatever
     order the .h5 file stores them — NOT necessarily aligned to any
     AnnData's obs order. Use align_patches_to_adata() for that.
     """
@@ -89,7 +92,8 @@ def load_hest_patches(hest_data_dir: str | Path, sample_id: str
         )
     with h5py.File(matches[0], "r") as f:
         patches = f["img"][:]
-        barcodes = np.array([b.decode() if isinstance(b, bytes) else b for b in f["barcodes"][:]])
+        raw_barcodes = f["barcode"][:, 0]  # [N, 1] object array -> [N]
+        barcodes = np.array([b.decode() if isinstance(b, bytes) else b for b in raw_barcodes])
     return patches, barcodes
 
 

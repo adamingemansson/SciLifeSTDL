@@ -33,7 +33,7 @@ model:
   params:
     image_encoder_type: cnn      # task #17: our own from-scratch CNN H&E encoder
     image_feat_dim: 64
-    image_patch_size: 256
+    image_patch_size: 224            # real HEST-1k patches are 224x224, not 256 (verified 2026-07-15)
     n_genes: 16570                # INT1 after QC (min_genes=200, min_cells=3), verified 2026-07-14
     coord_dim: 3                  # get_coords_3d() always returns (x,y,z), even for a
                                     # single 2D section - z is a constant 0 here, but the
