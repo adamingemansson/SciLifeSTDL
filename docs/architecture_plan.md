@@ -455,6 +455,50 @@ baseline, not counted as one of the three comparison models below.
   candidates. Round-trip correctness (save → reload into a fresh model
   instance → identical output for identical input, gene_names preserved
   exactly) verified in `tests/test_model_save_load.py`.
+- **Multi-sample training scaffolding started (2026-07-15)** — the
+  actual remaining blocker for the "real" multi-sample/multi-day training
+  run discussed after task #19's single-sample comparison. NOT yet wired
+  into `train.py`'s/`run_comparison.py`'s CLI — this is the loader +
+  dataset half, proven correct in isolation
+  (`tests/test_multi_sample.py`); hooking it up to an actual config/CLI
+  path is separate follow-up work.
+  - `src/data/loaders.py` `load_multi_sample(hest_data_dir, sample_ids, ...)`
+    — reuses `load_hest_sample`/`basic_qc_and_normalize` per sample (no
+    new per-sample loading logic), then aligns every sample to the
+    INTERSECTION of their post-QC gene panels (a fixed sorted order),
+    returning a list of gene-aligned AnnData — deliberately NOT
+    `ad.concat()`'d into one pooled object the way `load_multi_slice`
+    does for Track B's slices. Track B's slices are legitimately one
+    spatial 3D volume (cross-slice attention in the context encoder is
+    the point); independent HEST-1k samples are not — different
+    patients'/sections' spots have no real spatial relationship, so
+    pooling coordinates would let a k-NN/attention context encoder draw
+    "neighbors" across physically unrelated tissue. Uses intersection,
+    not `load_multi_slice`'s outer join + zero-fill: our own models'
+    dense fixed-width decoder needs every sample to present identically
+    -shaped, identically-ordered expression vectors, and zero-filling an
+    unmeasured gene would conflate "not measured" with "measured as
+    zero" — especially risky given HEST-1k spans both Visium
+    (~20k-gene whole-transcriptome) and Xenium (~few-hundred-gene
+    targeted panel) platforms (`docs/dataset_notes.md`). Confirmed
+    INT1-INT24 are all-Visium, same ccRCC cohort — a well-grounded first
+    multi-sample pool with minimal expected gene loss, unlike an
+    arbitrary cross-platform pool.
+  - `src/training/train.py` `MultiSampleMaskedContextQueryDataset` — each
+    item picks ONE sample (reseeded per item) and draws its masking split
+    from just that sample via `_build_masked_item` (the exact same
+    per-sample logic `MaskedContextQueryDataset` already uses, factored
+    out rather than duplicated). Never pools samples into one coordinate
+    space, for the same reason `load_multi_sample` doesn't.
+  - `load_multi_sample_data(cfg)` — converts `load_multi_sample`'s output
+    into the tuples the dataset consumes, reading `cfg.data.sample_ids`
+    (plural) instead of the single-sample configs' `cfg.data.sample_id`.
+  - **Scoped out of this pass, real follow-up work**: H&E/Gigapath/STPath
+    support across multiple samples (per-sample Gigapath caching, image
+    alignment — real extra complexity, better designed once the
+    expression-only base case is validated); actually wiring this into a
+    runnable config/CLI path; deciding real epoch counts and which
+    sample_ids to pool for the eventual real run.
 - **Full histology image generation/reconstruction stays a deferred
   stretch goal**, separate from the conditioning use above. Filling in
   broken tissue *in the H&E image itself*, not just using H&E to condition

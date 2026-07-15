@@ -166,6 +166,27 @@ def _images_tensor(images: np.ndarray, mask: np.ndarray) -> torch.Tensor:
     return torch.tensor(selected, dtype=torch.float32)  # already-precomputed features [n, feat_dim]
 
 
+def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.ndarray,
+                        masking_cfg, images: np.ndarray | None, seed: int) -> dict:
+    """One {context, query, target_expression} training item for a SINGLE
+    sample's data. Factored out of MaskedContextQueryDataset.__getitem__
+    (2026-07-15) so MultiSampleMaskedContextQueryDataset below can reuse
+    the exact same masking-draw logic per-sample, rather than duplicating
+    it — the only new thing multi-sample training needs is WHICH sample
+    to draw from each item, not a different way of drawing from one."""
+    context_mask, query_mask = make_context_query_split(coords3d, slice_ids, masking_cfg, seed)
+    context = {
+        "coords": torch.tensor(coords3d[context_mask], dtype=torch.float32),
+        "expression": torch.tensor(expr[context_mask], dtype=torch.float32),
+    }
+    query = {"coords": torch.tensor(coords3d[query_mask], dtype=torch.float32)}
+    if images is not None:
+        context["images"] = _images_tensor(images, context_mask)
+        query["images"] = _images_tensor(images, query_mask)
+    target_expression = torch.tensor(expr[query_mask], dtype=torch.float32)
+    return {"context": context, "query": query, "target_expression": target_expression}
+
+
 class MaskedContextQueryDataset(Dataset):
     """Each item = one fresh random context/query split over the same
     underlying AnnData. batch_size stays 1 at the DataLoader level since
@@ -194,19 +215,58 @@ class MaskedContextQueryDataset(Dataset):
 
     def __getitem__(self, idx):
         seed = self.base_seed + idx
-        context_mask, query_mask = make_context_query_split(
-            self.coords3d, self.slice_ids, self.masking_cfg, seed
+        return _build_masked_item(
+            self.coords3d, self.expr, self.slice_ids, self.masking_cfg, self.images, seed
         )
-        context = {
-            "coords": torch.tensor(self.coords3d[context_mask], dtype=torch.float32),
-            "expression": torch.tensor(self.expr[context_mask], dtype=torch.float32),
-        }
-        query = {"coords": torch.tensor(self.coords3d[query_mask], dtype=torch.float32)}
-        if self.images is not None:
-            context["images"] = _images_tensor(self.images, context_mask)
-            query["images"] = _images_tensor(self.images, query_mask)
-        target_expression = torch.tensor(self.expr[query_mask], dtype=torch.float32)
-        return {"context": context, "query": query, "target_expression": target_expression}
+
+
+class MultiSampleMaskedContextQueryDataset(Dataset):
+    """Multi-sample generalization of MaskedContextQueryDataset (task
+    #19 follow-up scaffolding, 2026-07-15 — not yet wired into
+    train.py's/run_comparison.py's CLI, which still train on one sample;
+    this is the dataset half of extending to real multi-sample training).
+
+    Each item picks ONE sample (uniformly at random, reseeded per item)
+    and draws its masking split from JUST that sample via
+    _build_masked_item — the same logic MaskedContextQueryDataset uses,
+    not a reimplementation. Deliberately does NOT pool samples into one
+    shared coordinate space: independent HEST-1k samples (different
+    patients/sections) have no real spatial relationship to each other,
+    so letting a k-NN/attention context encoder draw "neighbors" across
+    samples would be meaningless — see load_multi_sample's docstring in
+    src/data/loaders.py for the full reasoning (this mirrors that
+    function's design: keep samples separate, never concatenate their
+    coordinate spaces).
+
+    samples: list of (coords3d, expr, slice_ids, images) tuples, one per
+    already-loaded/QC'd/gene-aligned sample (see
+    src/data/loaders.py load_multi_sample for the loading half — it
+    returns a list of gene-aligned AnnData; callers derive these tuples
+    from that list the same way _load_data already does for one sample).
+    images is None throughout in the current scaffolding — H&E/Gigapath/
+    STPath support across multiple samples is real follow-up work, not
+    built here yet, since it adds real extra complexity (per-sample
+    Gigapath caching, image alignment) better scoped once this base case
+    (expression-only, multi-sample) is validated."""
+
+    def __init__(self, samples: list[tuple], masking_cfg, n_items: int, base_seed: int = 0):
+        assert samples, "samples must be non-empty"
+        self.samples = samples
+        self.masking_cfg = masking_cfg
+        self.n_items = n_items
+        self.base_seed = base_seed
+
+    def __len__(self):
+        return self.n_items
+
+    def __getitem__(self, idx):
+        seed = self.base_seed + idx
+        # separate RNG draw for "which sample" vs. the masking split
+        # itself (seed + 1, passed to _build_masked_item) so the two
+        # choices aren't spuriously correlated through a shared seed
+        sample_idx = int(np.random.default_rng(seed).integers(len(self.samples)))
+        coords3d, expr, slice_ids, images = self.samples[sample_idx]
+        return _build_masked_item(coords3d, expr, slice_ids, self.masking_cfg, images, seed + 1)
 
 
 def _collate_identity(batch_list):
@@ -322,6 +382,35 @@ def _load_data(cfg) -> tuple:
     expr = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()
     slice_ids = adata.obs["slice_id"].to_numpy()
     return adata, coords3d, expr, slice_ids, images
+
+
+def load_multi_sample_data(cfg) -> list[tuple]:
+    """Multi-sample counterpart to _load_data (scaffolding, 2026-07-15;
+    not yet called from main() — this loads the data,
+    MultiSampleMaskedContextQueryDataset above is the dataset that
+    consumes it, wiring both into an actual training run/config is
+    later, real work). Reads cfg.data.sample_ids (a list), not the
+    single-sample configs' cfg.data.sample_id.
+
+    Deliberately expression-only for now (images always None per
+    sample) — see MultiSampleMaskedContextQueryDataset's docstring for
+    why H&E support is scoped separately. Uses
+    loaders.load_multi_sample for the actual loading/QC/shared-gene-panel
+    alignment (not reimplemented here) — this function's only job is
+    converting that list of AnnData into the (coords3d, expr, slice_ids,
+    images) tuples MultiSampleMaskedContextQueryDataset expects, the same
+    conversion _load_data already does for the single-sample case."""
+    adatas = loaders.load_multi_sample(
+        cfg.data.hest_data_dir, list(cfg.data.sample_ids),
+        min_genes=cfg.data.min_genes, min_cells=cfg.data.min_cells,
+    )
+    samples = []
+    for adata in adatas:
+        coords3d = loaders.get_coords_3d(adata)
+        expr = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()
+        slice_ids = adata.obs["slice_id"].to_numpy()
+        samples.append((coords3d, expr, slice_ids, None))
+    return samples
 
 
 def inject_stpath_gene_names(model_cfg: dict, adata) -> None:

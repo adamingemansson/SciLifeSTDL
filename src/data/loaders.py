@@ -152,3 +152,61 @@ def load_hest_sample(hest_data_dir: str | Path, sample_id: str) -> ad.AnnData:
     adata.obs["slice_id"] = sample_id
     adata.obs["z"] = 0.0
     return adata
+
+
+def load_multi_sample(hest_data_dir: str | Path, sample_ids: list[str],
+                       min_genes: int = 200, min_cells: int = 3) -> list[ad.AnnData]:
+    """Multiple INDEPENDENT HEST-1k samples (different patients/sections,
+    not a serial z-series of the same tissue block — for that, use
+    load_multi_slice instead) for multi-sample training (scaffolding,
+    2026-07-15, ahead of the eventual "real" multi-sample training run
+    discussed after task #19). Reuses load_hest_sample +
+    basic_qc_and_normalize per sample (no new per-sample loading logic)
+    rather than reinventing what already works for the single-sample
+    case.
+
+    Returns a LIST of AnnData, one per sample — deliberately NOT
+    ad.concat()'d into one pooled object the way load_multi_slice does
+    for Track B's slices. Track B's slices are legitimately part of one
+    spatial 3D volume (cross-slice attention in the context encoder is
+    the whole point); independent HEST-1k samples are not — spot (100,
+    200) in one patient's section has no real spatial relationship to
+    spot (100, 200) in another's, so a k-NN/attention context encoder
+    must never be allowed to mix them. Keeping samples separate here
+    means callers (see MultiSampleMaskedContextQueryDataset in
+    src/training/train.py) draw each masking split from exactly ONE
+    sample's own coordinate system, never blending across samples.
+
+    All samples ARE aligned to a SHARED gene panel (the intersection of
+    every sample's post-QC var_names, in a fixed sorted order) — the
+    generative models here use a dense fixed-width decoder (n_genes is
+    baked into the architecture at construction time), so every sample
+    fed through the same model instance must present identically-shaped,
+    identically-ordered expression vectors. This is why, unlike
+    load_multi_slice's join="outer" (safe there since serial sections of
+    one tissue block typically share the same sequencing run/gene
+    panel), an outer join with zero-filling would be scientifically
+    misleading here: it would conflate "this gene wasn't measured in
+    this sample" with "this gene measured as zero expression," and could
+    easily happen across genuinely different gene panels (HEST-1k spans
+    Visium ~20k-gene whole-transcriptome AND Xenium ~few-hundred-gene
+    targeted panels, docs/dataset_notes.md — confirm sample_ids share a
+    platform before pooling; INT1-INT24 are documented as all-Visium,
+    same ccRCC cohort, a well-grounded first choice)."""
+    adatas = [
+        basic_qc_and_normalize(load_hest_sample(hest_data_dir, sid),
+                                min_genes=min_genes, min_cells=min_cells)
+        for sid in sample_ids
+    ]
+    shared_genes = sorted(set.intersection(*(set(a.var_names) for a in adatas)))
+    if not shared_genes:
+        raise ValueError(
+            f"No genes shared across all samples {sample_ids!r} after per-sample QC — "
+            "likely mixing different gene panels/platforms (see this function's "
+            "docstring); check the `technology` column in HEST-1k's metadata CSV."
+        )
+    for sid, a in zip(sample_ids, adatas):
+        n_before = a.n_vars
+        print(f"load_multi_sample: {sid} keeps {len(shared_genes)}/{n_before} genes "
+              f"({len(shared_genes) / n_before:.0%}) after intersecting with the shared panel")
+    return [a[:, shared_genes].copy() for a in adatas]
