@@ -35,7 +35,13 @@ def cluster_pseudo_labels(adata: ad.AnnData, resolution: float = 1.0,
     adata = adata.copy()
     sc.pp.pca(adata, n_comps=min(50, adata.n_vars - 1))
     sc.pp.neighbors(adata, n_neighbors=n_neighbors, random_state=seed)
-    sc.tl.leiden(adata, resolution=resolution, random_state=seed)
+    # flavor="igraph" (+ n_iterations=2, directed=False) pins to scanpy's
+    # own documented future default rather than the current
+    # leidenalg-backed one, silencing its FutureWarning (2026-07-15, real
+    # warning seen on a run) — same clustering algorithm, different
+    # backend implementation.
+    sc.tl.leiden(adata, resolution=resolution, random_state=seed,
+                 flavor="igraph", n_iterations=2, directed=False)
     return adata.obs["leiden"].to_numpy().astype(str)
 
 

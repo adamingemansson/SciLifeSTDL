@@ -333,35 +333,48 @@ baseline, not counted as one of the three comparison models below.
   `interp_baseline` (zero-param, auto-added by `run_comparison.py`) as
   floor references = 18 total table rows.
 
-  `run_comparison.py`'s existing constraint (module docstring) — one
-  invocation can't mix `use_images: true` and `use_images: false` configs,
-  since the shared held-out eval draw takes its image data from only the
-  first config in the list — means this needs **two separate invocations**:
-  expression-only (`vae_baseline`, `wae_gan`, `fm_ot`, `fm_edm`,
-  `vqvae_ar` + auto `interp_baseline`) and H&E-enabled (all 4 models x
-  {he_cnn, he_gigapath, stpath} + auto `interp_baseline`, with an
-  `_he_cnn` config listed **first** so the shared eval images stay in raw
-  patch format — the only format `ImagePatchEncoder`/CNN can consume,
-  while Gigapath/STPath can consume either raw patches or precomputed
-  features).
+  `run_comparison.py`'s remaining constraint (module docstring) — one
+  invocation can't mix `use_images: true` and `use_images: false` configs
+  — means this needs **two separate invocations**: expression-only
+  (`vae_baseline`, `wae_gan`, `fm_ot`, `fm_edm`, `vqvae_ar` + auto
+  `interp_baseline`) and H&E-enabled (all 4 models x {he_cnn,
+  he_gigapath, stpath} + auto `interp_baseline`). WITHIN the H&E-enabled
+  invocation, mixing CNN/Gigapath/STPath configs together in any order IS
+  supported (see the two fixes below) — no need to sequence configs
+  specially.
 
-  **Real RAM crash fixed (2026-07-15):** `run_comparison.py` used to
-  accumulate every trained model in memory and only evaluate them all at
-  the end — with several Gigapath/STPath-backed configs in one invocation
-  (each carrying a ~4.4GB frozen encoder in fp32), that meant multiple
-  full copies resident simultaneously, which crashed a real machine.
-  Fixed by evaluating and freeing (`gc.collect()` +
-  `torch.cuda`/`torch.mps.empty_cache()`) each model immediately after
-  training it (`_free()`/`_evaluate()`/`_build_shared_eval()`), rather
-  than accumulate-then-evaluate. Separately, `GigapathPatchEncoder`
-  (`conditioning.py`) and `STPathContextEncoder`
-  (`stpath_encoder.py`) both used to unconditionally load their own
-  ~4.4GB Gigapath tile encoder at construction time even though real
-  training always passes precomputed features (2D) and never raw patches
-  (4D) — meaning that copy was pure dead weight in every real run. Both
-  now lazy-load it on first actual raw-patch use (never, in practice),
-  cutting steady-state memory per model roughly in half for
-  Gigapath/STPath configs.
+  **Two real bugs found and fixed on the user's Mac (2026-07-15), running
+  the actual 12-config H&E smoke test:**
+  1. `run_comparison.py` used to accumulate every trained model in memory
+     and only evaluate them all at the end — with several
+     Gigapath/STPath-backed configs in one invocation (each carrying a
+     ~4.4GB frozen encoder in fp32), that meant multiple full copies
+     resident simultaneously, which crashed the machine. Fixed by
+     evaluating and freeing (`gc.collect()` +
+     `torch.cuda`/`torch.mps.empty_cache()`) each model immediately after
+     training it (`_free()`/`_evaluate()`), rather than
+     accumulate-then-evaluate. Separately, `GigapathPatchEncoder`
+     (`conditioning.py`) and `STPathContextEncoder` (`stpath_encoder.py`)
+     both used to unconditionally load their own ~4.4GB Gigapath tile
+     encoder at construction time even though real training always
+     passes precomputed features (2D) and never raw patches (4D) —
+     meaning that copy was pure dead weight in every real run. Both now
+     lazy-load it on first actual raw-patch use (never, in practice).
+  2. A second, more serious bug survived fix #1 and still crashed with
+     ~25GB RAM used: `_build_shared_eval` only ever had ONE image format
+     — whichever the *first* config in the list happened to produce (raw
+     patches, if that first config was `he_cnn`). Later `he_gigapath`/
+     `stpath` configs in the same run got fed those raw patches at eval
+     time, which forced their encoders into an *unbatched* full-ViT
+     forward pass over the whole ~700-900 point eval set at once
+     (`_gigapath_preprocess_and_encode` has no batching — unlike
+     `precompute_gigapath_features`, which processes 16 at a time).
+     Fixed: `_build_shared_eval` now computes BOTH raw patches and
+     precomputed Gigapath features once up front (reusing the on-disk
+     cache via the new `get_gigapath_features()` in `train.py`, factored
+     out of `_load_images` for this reuse), and `_evaluate` picks
+     whichever format each model's own config actually expects
+     (`_images_for_model`).
 - **Full histology image generation/reconstruction stays a deferred
   stretch goal**, separate from the conditioning use above. Filling in
   broken tissue *in the H&E image itself*, not just using H&E to condition

@@ -144,6 +144,37 @@ def _gigapath_cache_path(cfg) -> Path:
     return Path(cfg.data.hest_data_dir) / "gigapath_cache" / f"{cfg.data.sample_id}.npz"
 
 
+def get_gigapath_features(cfg, patches: np.ndarray, barcodes: np.ndarray) -> np.ndarray:
+    """Load cached Gigapath features for these patches (see
+    _gigapath_cache_path) if available, else compute + cache them.
+    Factored out of _load_images (2026-07-15) so
+    src/evaluation/run_comparison.py's shared eval-image construction can
+    reuse the exact same cache, instead of only ever having whichever
+    image format the FIRST config in a comparison run happened to
+    produce — see run_comparison.py's _build_shared_eval for why that
+    was a real bug (raw patches fed into a Gigapath/STPath model at eval
+    time forced an unbatched full-ViT forward pass over the whole eval
+    set at once, a real ~25GB RAM crash)."""
+    cache_path = _gigapath_cache_path(cfg)
+    if cache_path.exists():
+        cached = np.load(cache_path)
+        if np.array_equal(cached["barcodes"], barcodes):
+            print(f"get_gigapath_features: loaded cached features for "
+                  f"{cached['features'].shape[0]} spots from {cache_path} "
+                  f"(delete this file to force a recompute).")
+            return cached["features"]
+        print(f"get_gigapath_features: cache at {cache_path} covers a different "
+              f"barcode set than the current patches file — recomputing.")
+    from src.models.conditioning import precompute_gigapath_features, _default_device
+    print(f"Precomputing Gigapath features for {patches.shape[0]} spots on "
+          f"{_default_device()} (one-time cost, cached to {cache_path} "
+          f"so future runs skip this step)...")
+    features = precompute_gigapath_features(patches)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(cache_path, features=features, barcodes=barcodes)
+    return features
+
+
 def _load_images(cfg, adata):
     """Optional H&E patches (task #17) — only loaded when
     cfg.data.use_images is set, since every existing pilot config stays
@@ -186,26 +217,7 @@ def _load_images(cfg, adata):
         or model_params.get("context_encoder_type") == "stpath"
     )
     if uses_frozen_gigapath:
-        cache_path = _gigapath_cache_path(cfg)
-        features = None
-        if cache_path.exists():
-            cached = np.load(cache_path)
-            if np.array_equal(cached["barcodes"], barcodes):
-                features = cached["features"]
-                print(f"_load_images: loaded cached Gigapath features for "
-                      f"{features.shape[0]} spots from {cache_path} "
-                      f"(delete this file to force a recompute).")
-            else:
-                print(f"_load_images: cache at {cache_path} covers a different "
-                      f"barcode set than the current patches file — recomputing.")
-        if features is None:
-            from src.models.conditioning import precompute_gigapath_features, _default_device
-            print(f"Precomputing Gigapath features for {patches.shape[0]} spots on "
-                  f"{_default_device()} (one-time cost, cached to {cache_path} "
-                  f"so future runs skip this step)...")
-            features = precompute_gigapath_features(patches)
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            np.savez(cache_path, features=features, barcodes=barcodes)
+        features = get_gigapath_features(cfg, patches, barcodes)
         adata, images = loaders.align_patches_to_adata(adata, features, barcodes)
     else:
         adata, images = loaders.align_patches_to_adata(adata, patches, barcodes)

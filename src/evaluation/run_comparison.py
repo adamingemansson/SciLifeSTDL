@@ -23,15 +23,21 @@ Run with:
         configs/exp_hest1k_fm_ot.yaml \\
         configs/exp_hest1k_vqvae_ar.yaml
 
-H&E (task #17/#20): configs may set data.use_images: true to also load
+H&E (task #17/#18/#20): configs may set data.use_images: true to also load
 HEST-1k's H&E patches (needs model.params.image_encoder_type set to "cnn"
-or "gigapath" too, or the images are loaded but unused). All configs
-passed to one invocation should agree on data.use_images (and point at
-the same underlying sample) — this script loads images once, from the
-first config, and reuses them for the shared held-out eval draw; it does
-NOT support mixing image-enabled and expression-only configs within a
-single comparison run. Run expression-only and H&E sweeps as separate
-invocations instead.
+or "gigapath", or context_encoder_type set to "stpath" — or the images
+are loaded but unused). All configs passed to one invocation should agree
+on data.use_images (and point at the same underlying sample); it does NOT
+support mixing image-enabled and expression-only configs within a single
+comparison run — run expression-only and H&E sweeps as separate
+invocations. WITHIN one H&E-enabled invocation, mixing CNN/Gigapath/STPath
+configs together IS supported (that's the point of task #19's matrix):
+_build_shared_eval computes both raw patches and precomputed Gigapath
+features once, and each model gets whichever format it actually expects
+(see _images_for_model) — an earlier version only had whichever format
+the first config's own training happened to produce, which crashed on
+real hardware when a Gigapath/STPath model got raw patches instead
+(2026-07-15, see _images_for_model's docstring).
 """
 from __future__ import annotations
 import argparse
@@ -56,6 +62,7 @@ from src.models.registry import build_model
 from src.training.train import (
     load_adata, make_context_query_split, MaskedContextQueryDataset,
     _collate_identity, _load_images, _images_tensor, inject_stpath_gene_names,
+    get_gigapath_features,
 )
 from src.evaluation import metrics as ev
 from src.evaluation.cell_type_classifier import cluster_pseudo_labels, CellTypePlausibilityClassifier
@@ -121,9 +128,43 @@ def _free(model) -> None:
         torch.mps.empty_cache()
 
 
-def _evaluate(model, shared_eval: dict) -> tuple:
+def _images_for_model(model_params: dict, shared_eval: dict):
+    """Pick the image FORMAT this particular model actually expects.
+    Real bug found 2026-07-15: a single comparison run can mix CNN,
+    Gigapath, and STPath configs (that's the whole point of task #19's
+    matrix) — CNN wants raw patches, Gigapath/STPath want precomputed
+    features. Blindly reusing whatever format the FIRST config's own
+    training happened to produce meant a Gigapath/STPath model sometimes
+    got raw patches at eval time, which forced its encoder into an
+    unbatched full-ViT forward pass over the whole ~700-900 point eval
+    set at once (no batching, unlike precompute_gigapath_features) — a
+    real ~25GB RAM crash. See _build_shared_eval, which now computes
+    BOTH formats once up front so this never happens."""
+    if shared_eval.get("raw_images") is None and shared_eval.get("gigapath_images") is None:
+        return None
+    image_encoder_type = model_params.get("image_encoder_type", "none")
+    context_encoder_type = model_params.get("context_encoder_type", "builtin")
+    if image_encoder_type == "none" and context_encoder_type != "stpath":
+        return None  # this model doesn't use images at all (e.g. interp_baseline)
+    needs_gigapath = image_encoder_type == "gigapath" or context_encoder_type == "stpath"
+    return shared_eval["gigapath_images"] if needs_gigapath else shared_eval["raw_images"]
+
+
+def _evaluate(model, model_params: dict, shared_eval: dict) -> tuple:
+    context_mask, query_mask = shared_eval["context_mask"], shared_eval["query_mask"]
+    coords3d, expr = shared_eval["coords3d"], shared_eval["expr"]
+    context = {
+        "coords": torch.tensor(coords3d[context_mask], dtype=torch.float32),
+        "expression": torch.tensor(expr[context_mask], dtype=torch.float32),
+    }
+    query = {"coords": torch.tensor(coords3d[query_mask], dtype=torch.float32)}
+    images = _images_for_model(model_params, shared_eval)
+    if images is not None:
+        context["images"] = _images_tensor(images, context_mask)
+        query["images"] = _images_tensor(images, query_mask)
+
     with torch.no_grad():
-        out = model.sample(shared_eval["context"], shared_eval["query"])
+        out = model.sample(context, query)
     pred = out["expression"].detach().cpu().numpy()
     target_expression = shared_eval["target_expression"]
 
@@ -131,9 +172,7 @@ def _evaluate(model, shared_eval: dict) -> tuple:
     rmse = ev.rmse(pred, target_expression)
     auc = ev.nonzero_auc(pred, target_expression)
 
-    gen_patches = ev.pool_knn_neighborhood(
-        shared_eval["coords3d"][shared_eval["query_mask"]], pred, k=shared_eval["query_k"]
-    )
+    gen_patches = ev.pool_knn_neighborhood(coords3d[query_mask], pred, k=shared_eval["query_k"])
     fid = ev.st_fid(shared_eval["real_embed"], shared_eval["pca"].transform(gen_patches))
 
     plausibility = shared_eval["clf"].plausibility_accuracy(pred, shared_eval["true_query_labels"])
@@ -146,17 +185,29 @@ def _build_shared_eval(cfg, adata, coords3d, expr, slice_ids, images,
     why mixed image-enabled/expression-only runs aren't supported. Every
     later config's own (coords3d, expr, slice_ids) must match this one for
     the shared held-out draw to mean the same thing across models (true
-    whenever every config in one invocation points at the same sample)."""
+    whenever every config in one invocation points at the same sample).
+
+    Computes BOTH raw patches and precomputed Gigapath features when
+    images are enabled at all — not just whichever format the first
+    config's own training happened to use — since later configs in the
+    same run may need the other format (see _images_for_model)."""
     context_mask, query_mask = make_context_query_split(coords3d, slice_ids, cfg.masking, EVAL_SEED)
-    context = {
-        "coords": torch.tensor(coords3d[context_mask], dtype=torch.float32),
-        "expression": torch.tensor(expr[context_mask], dtype=torch.float32),
-    }
-    query = {"coords": torch.tensor(coords3d[query_mask], dtype=torch.float32)}
-    if images is not None:
-        context["images"] = _images_tensor(images, context_mask)
-        query["images"] = _images_tensor(images, query_mask)
     target_expression = expr[query_mask]
+
+    raw_images, gigapath_images = None, None
+    if images is not None:
+        if images.ndim == 4:
+            raw_images = images
+        else:
+            gigapath_images = images
+        if raw_images is None or gigapath_images is None:
+            from src.data import loaders as _loaders
+            patches, barcodes = _loaders.load_hest_patches(cfg.data.hest_data_dir, cfg.data.sample_id)
+            if raw_images is None:
+                _, raw_images = _loaders.align_patches_to_adata(adata, patches, barcodes)
+            if gigapath_images is None:
+                features = get_gigapath_features(cfg, patches, barcodes)
+                _, gigapath_images = _loaders.align_patches_to_adata(adata, features, barcodes)
 
     # cell-type plausibility (task #13): Leiden pseudo-labels over the
     # whole real sample, classifier trained only on this draw's context
@@ -174,10 +225,11 @@ def _build_shared_eval(cfg, adata, coords3d, expr, slice_ids, images,
     real_embed = pca.transform(real_patches)
 
     return {
-        "context": context, "query": query, "target_expression": target_expression,
+        "context_mask": context_mask, "query_mask": query_mask,
+        "coords3d": coords3d, "expr": expr, "target_expression": target_expression,
+        "raw_images": raw_images, "gigapath_images": gigapath_images,
         "clf": clf, "true_query_labels": true_query_labels,
         "pca": pca, "real_embed": real_embed, "query_k": query_k,
-        "coords3d": coords3d, "query_mask": query_mask,
     }
 
 
@@ -189,19 +241,20 @@ def main(model_config_paths: list[str], k_neighborhood: int = 8, pca_components:
 
     for path in model_config_paths:
         model, cfg, adata, coords3d, expr, slice_ids, images = _train_model(path, overrides)
+        model_params = cfg.model.get("params", {})
 
         if shared_eval is None:
             shared_eval = _build_shared_eval(
                 cfg, adata, coords3d, expr, slice_ids, images, k_neighborhood, pca_components
             )
             interp_model = build_model({"name": "interp_baseline", "params": {}})
-            interp_row = ("interp_baseline", *_evaluate(interp_model, shared_eval))
+            interp_row = ("interp_baseline", *_evaluate(interp_model, {}, shared_eval))
             _free(interp_model)
 
         # keyed by experiment_name, not cfg.model.name: multiple configs can
         # share a registered model name (e.g. fm_ot's OT and EDM path_type
         # variants both register as "fm_ot") and must stay distinct rows
-        rows.append((cfg.experiment_name, *_evaluate(model, shared_eval)))
+        rows.append((cfg.experiment_name, *_evaluate(model, model_params, shared_eval)))
         _free(model)  # evaluate-then-free, not accumulate-then-evaluate — see _free's comment
         print(f"trained + evaluated: {cfg.experiment_name}")
 
