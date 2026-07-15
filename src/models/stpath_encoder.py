@@ -59,6 +59,25 @@ pass, same as every other component built this way in this project.
 """
 from __future__ import annotations
 
+import os
+
+# STPath's own SpatialTransformer (stpath/model/nn_utils/fa.py create_frame,
+# its "frame averaging" geometry step) calls torch.linalg.eigh, which isn't
+# implemented on MPS (Apple Silicon) as of this writing - confirmed
+# 2026-07-15 via a real crash (NotImplementedError: aten::_linalg_eigh...).
+# This is inside the external stpath package's own code, not ours, so we
+# can't fix it the way we fixed our own bicubic-interpolate MPS gap
+# (moving that one op to CPU manually) without patching code outside this
+# repo. PYTORCH_ENABLE_MPS_FALLBACK is PyTorch's own documented workaround
+# for exactly this situation - it falls back to CPU only for the specific
+# unimplemented op, not the whole model. Set here (setdefault, so an
+# explicit user setting always wins) rather than requiring the user to
+# remember to export it before every run. Must be set before the failing
+# op actually runs, not necessarily before `import torch` - PyTorch's MPS
+# fallback dispatch reads this env var lazily, at the time each op is
+# attempted, not once at process startup.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 import torch
 import torch.nn as nn
 
