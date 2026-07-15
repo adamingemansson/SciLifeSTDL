@@ -5,12 +5,13 @@ same pilot sample with each model's own tuned config
 (configs/exp_hest1k_*.yaml), evaluating each one (plus the zero-parameter
 interp_baseline, added for free) on the SAME held-out masking draw (a seed
 disjoint from every model's own training seeds), so the comparison is
-fair — then FREES it before training the next one (2026-07-15: an earlier
-version accumulated every trained model in memory and only evaluated them
-all at the end, which crashed on a real machine once several
-Gigapath/STPath-backed configs — each carrying a ~4.4GB frozen encoder —
-were resident simultaneously; see _free()/_evaluate() below). Reports the
-full metric suite in one table:
+fair — then FREES it (`del model` in main() itself, not inside a helper —
+see _release_torch_memory's docstring for a real Python-scoping bug found
+here) before training the next one (2026-07-15: an earlier version
+accumulated every trained model in memory and only evaluated them all at
+the end, which crashed on a real machine once several Gigapath/STPath-
+backed configs — each carrying a ~4.4GB frozen encoder — were resident
+simultaneously). Reports the full metric suite in one table:
 pointwise (PCC, RMSE, nonzero AUC), spatial-arrangement-aware
 distributional (ST-FID via pool_knn_neighborhood + PCA, task #14), and
 cell-type plausibility (task #13, Leiden pseudo-labels since INT1 has no
@@ -62,7 +63,7 @@ from src.models.registry import build_model
 from src.training.train import (
     load_adata, make_context_query_split, MaskedContextQueryDataset,
     _collate_identity, _load_images, _images_tensor, inject_stpath_gene_names,
-    get_gigapath_features, save_trainable_state_dict,
+    get_gigapath_features, save_trained_model,
 )
 from src.evaluation import metrics as ev
 from src.evaluation.cell_type_classifier import cluster_pseudo_labels, CellTypePlausibilityClassifier
@@ -105,25 +106,31 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None):
             enable_checkpointing=False, logger=False,
         )
         trainer.fit(model, dataloader)
-        saved_path = save_trainable_state_dict(model, cfg.training.checkpoint_dir)
+        saved_path = save_trained_model(
+            model, model_cfg, adata.var_names.tolist(), cfg.training.checkpoint_dir
+        )
         if saved_path is not None:
-            print(f"Saved trainable weights to {saved_path}")
+            print(f"Saved trained model (weights + config + gene names) to {saved_path.parent}")
 
     model.eval()
     return model, cfg, adata, coords3d, expr, slice_ids, images
 
 
-def _free(model) -> None:
-    """Release a trained model's memory before moving to the next config.
-    Added 2026-07-15 after a real RAM crash: this function used to just
-    accumulate every trained model in a dict and evaluate them all at the
-    very end, so N image-heavy configs (each carrying a ~4.4GB frozen
-    Gigapath copy) stayed resident simultaneously — see the module
-    docstring's H&E section and stpath_encoder.py's tile_encoder comment
-    for the other half of this fix. `del` + `gc.collect()` alone doesn't
-    reliably free GPU/MPS-resident tensors, hence the explicit cache
-    clears below."""
-    del model
+def _release_torch_memory() -> None:
+    """gc.collect() + device cache clear. Real bug found 2026-07-15 in an
+    earlier version of this fix: it was a function `_free(model)` that
+    called `del model` on its OWN parameter — that only removes the
+    binding inside THAT function's stack frame, not the caller's. Python
+    has no block scoping, so main()'s own `model` variable (assigned once
+    per loop iteration) stayed alive for the rest of the function
+    regardless of calling that helper — meaning gc.collect()/empty_cache()
+    ran while the object was still referenced and could free nothing,
+    every single call. The actual `del model` MUST happen in the caller's
+    own scope (see main() below) — a callee can never delete a variable
+    it doesn't own. Real symptom that exposed this: the user watched RAM
+    climb to 10GB across just 4 small expression-only models (tens of MB
+    each), which this bug alone doesn't fully explain either — worth
+    re-checking after this fix whether growth continues or plateaus."""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -252,13 +259,15 @@ def main(model_config_paths: list[str], k_neighborhood: int = 8, pca_components:
             )
             interp_model = build_model({"name": "interp_baseline", "params": {}})
             interp_row = ("interp_baseline", *_evaluate(interp_model, {}, shared_eval))
-            _free(interp_model)
+            del interp_model  # must del the CALLER's own reference — see _release_torch_memory
+            _release_torch_memory()
 
         # keyed by experiment_name, not cfg.model.name: multiple configs can
         # share a registered model name (e.g. fm_ot's OT and EDM path_type
         # variants both register as "fm_ot") and must stay distinct rows
         rows.append((cfg.experiment_name, *_evaluate(model, model_params, shared_eval)))
-        _free(model)  # evaluate-then-free, not accumulate-then-evaluate — see _free's comment
+        del model  # evaluate-then-free, not accumulate-then-evaluate — see _release_torch_memory
+        _release_torch_memory()
         print(f"trained + evaluated: {cfg.experiment_name}")
 
     rows.append(interp_row)

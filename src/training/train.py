@@ -13,6 +13,7 @@ Run with: python -m src.training.train --config configs/base_config.yaml
 """
 from __future__ import annotations
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -59,6 +60,71 @@ def save_trainable_state_dict(model, checkpoint_dir: str, filename: str = "train
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(state, path)
     return path
+
+
+def save_trained_model(model, model_cfg: dict, gene_names: list, checkpoint_dir: str) -> Path | None:
+    """save_trainable_state_dict's weights alone aren't enough to actually
+    reuse a trained model later — reconstructing it needs (1) the exact
+    architecture (model_cfg, so build_model() rebuilds something
+    load_state_dict-compatible) and (2) which gene each of the n_genes
+    fixed output positions corresponds to.
+
+    (2) matters because these models (WAE-GAN/FM-OT/VQ-VAE+AR) use a
+    dense fixed-width decoder — position i always means "the i-th gene in
+    whatever adata.var_names order was used at construction time," with
+    no notion of gene IDENTITY built into the architecture (unlike
+    STPath, which tokenizes genes by a fixed vocabulary and is naturally
+    panel-agnostic — see stpath_encoder.py). A DIFFERENT HEST-1k sample
+    will not have an identical gene panel after its own independent QC,
+    so testing a saved model against new data needs to align genes by
+    NAME, not position — impossible without recording gene_names here.
+    Discussed 2026-07-15 when planning cross-sample testing; this is the
+    save half, load_trained_model below is the load half."""
+    weights_path = save_trainable_state_dict(model, checkpoint_dir)
+    if weights_path is None:
+        return None
+    out_dir = weights_path.parent
+    with open(out_dir / "model_cfg.json", "w") as f:
+        json.dump(model_cfg, f)
+    with open(out_dir / "gene_names.json", "w") as f:
+        json.dump(list(gene_names), f)
+    return weights_path
+
+
+def load_trained_model(checkpoint_dir: str):
+    """Reconstruct a model saved by save_trained_model: rebuild an
+    architecturally-identical, freshly-initialized model from the saved
+    model_cfg (so frozen backbones like Gigapath/STPath get re-loaded
+    from their own real pretrained weights, exactly as they were during
+    training — see conditioning.py/stpath_encoder.py __init__, neither of
+    which was ever saved here in the first place), then load the saved
+    trainable-only weights on top. strict=False since frozen/buffer
+    entries in the fresh model's state_dict were never in the saved file
+    by design — but every TRAINABLE parameter the fresh architecture
+    expects must be present, checked explicitly rather than silently
+    trusting load_state_dict's missing-keys list (which conflates
+    "expected to be missing" with "genuinely lost").
+
+    Returns (model, gene_names) — gene_names is the exact ordered list
+    output position i corresponds to; callers must align any new sample's
+    genes to this list BY NAME before calling model.sample()."""
+    from src.models.registry import build_model
+    in_dir = Path(checkpoint_dir)
+    with open(in_dir / "model_cfg.json") as f:
+        model_cfg = json.load(f)
+    with open(in_dir / "gene_names.json") as f:
+        gene_names = json.load(f)
+    model = build_model(model_cfg)
+    state = torch.load(in_dir / "trainable_weights.pt", map_location="cpu")
+    trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
+    missing_trainable = trainable_names - set(state.keys())
+    assert not missing_trainable, (
+        f"saved weights at {in_dir} are missing trainable parameters this "
+        f"model architecture expects: {missing_trainable} (model_cfg mismatch?)"
+    )
+    model.load_state_dict(state, strict=False)
+    model.eval()
+    return model, gene_names
 
 
 def make_context_query_split(coords3d: np.ndarray, slice_ids: np.ndarray, masking_cfg, seed: int):
@@ -299,9 +365,11 @@ def main(cfg_path: str, overrides: list[str] | None = None):
             logger=False,
         )
         trainer.fit(model, dataloader)
-        saved_path = save_trainable_state_dict(model, cfg.training.checkpoint_dir)
+        saved_path = save_trained_model(
+            model, model_cfg, adata.var_names.tolist(), cfg.training.checkpoint_dir
+        )
         if saved_path is not None:
-            print(f"Saved trainable weights to {saved_path}")
+            print(f"Saved trained model (weights + config + gene names) to {saved_path.parent}")
 
     # Evaluate on a held-out masking draw not seen during training -----------
     eval_item = MaskedContextQueryDataset(

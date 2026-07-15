@@ -407,6 +407,54 @@ baseline, not counted as one of the three comparison models below.
   own row from the same run (RMSE 0.3839, AUC 0.7690), and PCC is
   comparable. Back in the same range as every other encoder variant, as
   expected once `self.proj` could actually learn.
+
+  **Real memory-freeing bug found and fixed (2026-07-15), user question
+  "why does RAM still grow across models even with the earlier fix":**
+  `_free(model)` — a helper that took `model` as a parameter and called
+  `del model` inside its own body — could never actually work. `del`
+  only removes a name binding in the frame it executes in; a callee has
+  no way to delete a variable in the caller's scope. `main()`'s own
+  `model` variable (assigned once per loop iteration, and Python has no
+  block scoping) stayed alive for the rest of the function regardless of
+  calling that helper, so `gc.collect()`/`empty_cache()` ran while the
+  object was still referenced and freed nothing — every single call. Real
+  symptom: RAM climbing to 10GB across just 4 small expression-only
+  models (tens of MB each), which the earlier "accumulate all models in
+  memory" bug doesn't apply to at that scale (no Gigapath/STPath
+  backbones involved) — this was the actual live cause. Fixed by moving
+  the `del model`/`del interp_model` into `main()`'s own scope, with
+  `_release_torch_memory()` (renamed from `_free()`) only doing the
+  gc/cache-clear part.
+- **Weight persistence added (2026-07-15), user question "weights are
+  saved now right?":** neither `train.py` nor `run_comparison.py` saved
+  anything before this — `run_comparison.py`'s memory fix above
+  specifically deletes each model right after evaluating it, so a
+  completed run's weights were gone the moment the table printed.
+  `save_trained_model()`/`load_trained_model()` (`train.py`) save/restore
+  three things per trained model into `training.checkpoint_dir`: (1)
+  `trainable_weights.pt` — TRAINABLE parameters only, not frozen
+  Gigapath/STPath backbones (those are identical to their public
+  pretrained weights and get reloaded fresh from HuggingFace/the local
+  weight file every time `build_model()` runs — saving them again would
+  be ~4.7GB of pure redundancy per STPath config vs. a few tens of MB for
+  the trainable parameters actually saved); (2) `model_cfg.json` — the
+  exact architecture params, so `build_model()` can reconstruct a
+  load-compatible model later; (3) `gene_names.json` — which gene each of
+  the `n_genes` fixed output positions corresponds to. (3) exists because
+  our own models (WAE-GAN/FM-OT/VQ-VAE+AR) use a dense fixed-width
+  decoder where position *i* means "the i-th gene in whatever
+  `adata.var_names` order was used at construction time" — no gene
+  IDENTITY is built into the architecture (unlike STPath, which
+  tokenizes genes by a fixed vocabulary and is naturally panel-agnostic).
+  A different HEST-1k sample will not have an identical gene panel after
+  its own independent QC, so reusing a saved model against new data will
+  need to align genes by NAME, not position — the actual "download a new
+  sample and test" script is future work, deliberately scoped separately
+  since its gene-intersection/zero-fill design is a real decision better
+  made once a winning model is known, not while still comparing 16
+  candidates. Round-trip correctness (save → reload into a fresh model
+  instance → identical output for identical input, gene_names preserved
+  exactly) verified in `tests/test_model_save_load.py`.
 - **Full histology image generation/reconstruction stays a deferred
   stretch goal**, separate from the conditioning use above. Filling in
   broken tissue *in the H&E image itself*, not just using H&E to condition
