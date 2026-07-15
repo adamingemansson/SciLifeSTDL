@@ -296,8 +296,13 @@ baseline, not counted as one of the three comparison models below.
   `var_names` at load time (`inject_stpath_gene_names()` in
   `src/training/train.py`), not hardcoded per-config. Three new configs
   (`configs/exp_hest1k_{wae_gan,fm_ot,vqvae_ar}_stpath.yaml`) — the two
-  `stpath_*_path` fields need editing per-machine (where STPath was
-  cloned, where its weight was downloaded). Smoke-tested
+  `stpath_*_path` fields resolve from `STPATH_GENE_VOC_PATH`/
+  `STPATH_MODEL_WEIGHT_PATH` env vars via OmegaConf's built-in
+  `${oc.env:...}` resolver (2026-07-15, switched from hardcoded
+  per-machine absolute paths once real multi-machine use started — Mac,
+  then an A100 server — so switching machines means setting two env
+  vars, not hand-editing all 4 `*_stpath.yaml` configs every time).
+  Smoke-tested
   (`tests/test_stpath_encoder.py`) skip-safely, and **confirmed running
   end-to-end on real hardware** (2026-07-15, user's Mac, MPS backend):
   `exp_hest1k_wae_gan_stpath.yaml` trained 50/50 masking draws in ~7s

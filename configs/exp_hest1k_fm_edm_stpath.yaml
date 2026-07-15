@@ -12,10 +12,13 @@
 # simplifications (Euler not Heun sampler, sigma_data/P_mean/P_std are
 # EDM's own image-domain defaults, not retuned for our latent scale).
 #
-# EDIT the two stpath_*_path fields below before running — see
-# src/models/stpath_encoder.py for what they need to point at (already
-# filled in for the OT-path sibling configs' real values on this machine
-# — copy from exp_hest1k_fm_ot_stpath.yaml if those still apply).
+# stpath_gene_voc_path/stpath_model_weight_path below resolve from the
+# STPATH_GENE_VOC_PATH/STPATH_MODEL_WEIGHT_PATH env vars (2026-07-15, so
+# switching machines - Mac, an A100 server, etc. - needs setting two env
+# vars, not hand-editing every *_stpath.yaml config). Set them to:
+#   STPATH_GENE_VOC_PATH=<cloned STPath repo>/utils_data/symbol2ensembl.json
+#   STPATH_MODEL_WEIGHT_PATH=<downloaded weight>/stfm.pth
+# See src/models/stpath_encoder.py for the full clone/install/download steps.
 
 experiment_name: fm_edm_hest1k_pilot_stpath
 
@@ -42,8 +45,8 @@ model:
                                     # src/models/stpath_encoder.py for setup
                                     # (clone STPath, pip install -e ., download
                                     # weights, locate symbol2ensembl.json)
-    stpath_gene_voc_path: /Users/adamingemansson/SciLifeSTDL/STPath/utils_data/symbol2ensembl.json
-    stpath_model_weight_path: /Users/adamingemansson/SciLifeSTDL/STPath_weights/stfm.pth
+    stpath_gene_voc_path: ${oc.env:STPATH_GENE_VOC_PATH}
+    stpath_model_weight_path: ${oc.env:STPATH_MODEL_WEIGHT_PATH}
     stpath_organ_type: Kidney      # INT1 is ccRCC (renal cell carcinoma)
     stpath_tech_type: Visium
     # stpath_gene_names auto-derived from the loaded AnnData at load time
