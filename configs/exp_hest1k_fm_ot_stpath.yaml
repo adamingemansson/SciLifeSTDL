@@ -34,8 +34,8 @@ model:
                                     # src/models/stpath_encoder.py for setup
                                     # (clone STPath, pip install -e ., download
                                     # weights, locate symbol2ensembl.json)
-    stpath_gene_voc_path: /path/to/STPath/utils_data/symbol2ensembl.json  # EDIT ME
-    stpath_model_weight_path: /path/to/stpath_weights.pkl                 # EDIT ME
+    stpath_gene_voc_path: /Users/adamingemansson/SciLifeSTDL/STPath/utils_data/symbol2ensembl.json
+    stpath_model_weight_path: /Users/adamingemansson/SciLifeSTDL/STPath_weights/stfm.pth
     stpath_organ_type: Kidney      # INT1 is ccRCC (renal cell carcinoma)
     stpath_tech_type: Visium
     # stpath_gene_names auto-derived from the loaded AnnData at load time
