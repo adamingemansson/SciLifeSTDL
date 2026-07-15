@@ -26,7 +26,7 @@ def test_dataset_produces_images():
     rng = np.random.default_rng(0)
     n, n_genes, patch_size = 60, 20, 16
     coords3d = rng.uniform(0, 100, size=(n, 3))
-    expr = rng.rand(n, n_genes).astype(np.float32)
+    expr = rng.random((n, n_genes)).astype(np.float32)
     slice_ids = np.zeros(n, dtype=int)
     images = rng.integers(0, 255, size=(n, patch_size, patch_size, 3), dtype=np.uint8)
 
