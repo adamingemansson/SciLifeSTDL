@@ -98,21 +98,32 @@ def load_hest_patches(hest_data_dir: str | Path, sample_id: str
 
 
 def align_patches_to_adata(adata: ad.AnnData, patches: np.ndarray, barcodes: np.ndarray
-                            ) -> np.ndarray:
-    """Reindex patches (arbitrary order from the .h5 file) to match
-    adata.obs_names order, via barcode matching. Raises if any spot in
-    adata has no matching patch — fail loudly rather than silently
-    returning misaligned images."""
+                            ) -> tuple[ad.AnnData, np.ndarray]:
+    """Subset adata to only the spots with a matching H&E patch, and
+    return (filtered_adata, aligned_patches) in that same (filtered)
+    order. HEST-1k's own patch extraction naturally drops some spots
+    (tissue-mask/WSI-border edge cases) — confirmed 2026-07-15 on real
+    INT1 data: 49/1080 spots had no matching patch, a normal ~4.5% gap in
+    HEST-1k's own pipeline, not a data-mismatch bug (an earlier version of
+    this function raised on ANY gap, which was too strict for real data).
+    Only raises if NONE of the spots match at all — that would indicate a
+    genuine version/sample mismatch, not normal partial coverage."""
     barcode_to_idx = {b: i for i, b in enumerate(barcodes)}
-    missing = [name for name in adata.obs_names if name not in barcode_to_idx]
-    if missing:
+    has_patch = np.array([name in barcode_to_idx for name in adata.obs_names])
+    if not has_patch.any():
         raise ValueError(
-            f"{len(missing)} of {adata.n_obs} adata spots have no matching H&E "
-            f"patch (e.g. {missing[:3]}) — patches and expression data may be "
-            "from different downloads/versions of this sample."
+            "None of the adata spots matched any H&E patch barcode — patches "
+            "and expression data are likely from different downloads/versions "
+            "of this sample."
         )
-    order = [barcode_to_idx[name] for name in adata.obs_names]
-    return patches[order]
+    n_dropped = int((~has_patch).sum())
+    if n_dropped:
+        print(f"align_patches_to_adata: dropping {n_dropped}/{adata.n_obs} spots "
+              f"with no matching H&E patch (HEST-1k's own patch extraction misses "
+              f"some spots at tissue/WSI edges — this is normal)")
+    filtered_adata = adata[has_patch].copy()
+    order = [barcode_to_idx[name] for name in filtered_adata.obs_names]
+    return filtered_adata, patches[order]
 
 
 def load_hest_sample(hest_data_dir: str | Path, sample_id: str) -> ad.AnnData:

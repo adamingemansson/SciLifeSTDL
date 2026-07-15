@@ -53,10 +53,13 @@ def _train_model(cfg_path: str):
     torch.manual_seed(cfg.training.seed)
     adata = load_adata(cfg)
     from src.data import loaders
+    # adata may come back as a SUBSET (align_patches_to_adata drops spots
+    # with no matching H&E patch, a normal gap, not an error) - always use
+    # the returned adata downstream, not the pre-image-loading one
+    adata, images = _load_images(cfg, adata)  # images is None unless cfg.data.use_images is set
     coords3d = loaders.get_coords_3d(adata)
     expr = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()
     slice_ids = adata.obs["slice_id"].to_numpy()
-    images = _load_images(cfg, adata)  # None unless cfg.data.use_images is set (task #17)
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     inject_stpath_gene_names(model_cfg, adata)

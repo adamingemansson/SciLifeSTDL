@@ -113,22 +113,26 @@ def load_adata(cfg):
 
 
 def _load_images(cfg, adata):
-    """Optional H&E patches aligned to adata.obs order (task #17) — only
-    loaded when cfg.data.use_images is set, since every existing pilot
-    config stays expression-only by default. Returns [N, 256, 256, 3]
-    uint8 or None."""
+    """Optional H&E patches (task #17) — only loaded when
+    cfg.data.use_images is set, since every existing pilot config stays
+    expression-only by default. Returns (adata, images): adata may come
+    back as a SUBSET of the input — align_patches_to_adata() drops spots
+    with no matching patch (a normal partial gap in HEST-1k's own patch
+    extraction, not an error) — so callers must use the returned adata,
+    not their original one, for everything downstream. images is
+    [N, 224, 224, 3] uint8 (N = the possibly-reduced spot count) or None."""
     if not cfg.data.get("use_images", False):
-        return None
+        return adata, None
     patches, barcodes = loaders.load_hest_patches(cfg.data.hest_data_dir, cfg.data.sample_id)
     return loaders.align_patches_to_adata(adata, patches, barcodes)
 
 
 def _load_data(cfg) -> tuple:
     adata = load_adata(cfg)
+    adata, images = _load_images(cfg, adata)
     coords3d = loaders.get_coords_3d(adata)
     expr = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()
     slice_ids = adata.obs["slice_id"].to_numpy()
-    images = _load_images(cfg, adata)
     return adata, coords3d, expr, slice_ids, images
 
 

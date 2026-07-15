@@ -1,10 +1,11 @@
 """
 Smoke test for HEST-1k H&E patch loading (src/data/loaders.py, task #17).
-Builds a tiny synthetic patches/*.h5 file matching the real format
-(h5py keys 'img'/'coords'/'barcodes', confirmed against HESTData's actual
-dump_patches() source — see load_hest_patches() docstring) plus a matching
-synthetic AnnData, in a shuffled order, to check alignment actually
-reorders correctly rather than assuming barcode order already matches.
+Builds a tiny synthetic patches/*.h5 file matching the REAL format
+(h5py keys 'img'/'coords'/'barcode' — 'barcode' singular, [N,1] shaped —
+confirmed 2026-07-15 against an actual downloaded file, correcting an
+earlier version of this test based on source-reading alone) plus a
+matching synthetic AnnData, in a shuffled order, to check alignment
+actually reorders correctly rather than assuming barcode order matches.
 
 Run with: python -m tests.test_hest_patches
 """
@@ -33,7 +34,7 @@ def test_load_and_align():
         with h5py.File(patches_dir / "TEST_INT1.h5", "w") as f:
             f.create_dataset("img", data=img)
             f.create_dataset("coords", data=coords)
-            f.create_dataset("barcodes", data=[b.encode() for b in barcodes])
+            f.create_dataset("barcode", data=[[b.encode()] for b in barcodes])  # [N, 1], real shape
 
         loaded_patches, loaded_barcodes = load_hest_patches(tmp_dir, "INT1")
         assert loaded_patches.shape == (n, 8, 8, 3)
@@ -46,24 +47,38 @@ def test_load_and_align():
         adata = ad.AnnData(X=np.zeros((n, 5)))
         adata.obs_names = shuffled
 
-        aligned = align_patches_to_adata(adata, loaded_patches, loaded_barcodes)
-        assert aligned.shape == (n, 8, 8, 3)
+        aligned_adata, aligned_patches = align_patches_to_adata(adata, loaded_patches, loaded_barcodes)
+        assert aligned_patches.shape == (n, 8, 8, 3)
+        assert aligned_adata.n_obs == n
         barcode_to_idx = {b: i for i, b in enumerate(loaded_barcodes)}
-        for i, name in enumerate(adata.obs_names):
+        for i, name in enumerate(aligned_adata.obs_names):
             expected = loaded_patches[barcode_to_idx[name]]
-            assert np.array_equal(aligned[i], expected), f"misaligned patch at row {i} ({name})"
+            assert np.array_equal(aligned_patches[i], expected), f"misaligned patch at row {i} ({name})"
         print("[align_patches_to_adata] OK — patches correctly reordered to match adata.obs_names")
 
-        # missing-barcode case must raise loudly, not silently misalign
-        adata_missing = ad.AnnData(X=np.zeros((1, 5)))
-        adata_missing.obs_names = ["not_a_real_spot"]
+        # partial gap (real-world case, e.g. INT1: 49/1080 spots missing a
+        # patch) must SUBSET, not raise — HEST-1k's own patch extraction
+        # naturally drops some spots, that's not an error
+        adata_partial = ad.AnnData(X=np.zeros((n + 3, 5)))
+        adata_partial.obs_names = list(shuffled) + ["no_patch_1", "no_patch_2", "no_patch_3"]
+        filtered_adata, filtered_patches = align_patches_to_adata(adata_partial, loaded_patches, loaded_barcodes)
+        assert filtered_adata.n_obs == n, f"expected {n} spots to survive, got {filtered_adata.n_obs}"
+        assert filtered_patches.shape == (n, 8, 8, 3)
+        assert "no_patch_1" not in filtered_adata.obs_names
+        print(f"[align_patches_to_adata] OK — partial gap subsets correctly "
+              f"({filtered_adata.n_obs}/{adata_partial.n_obs} spots kept)")
+
+        # zero-overlap case must still raise loudly — that indicates a real
+        # data-mismatch bug, not normal partial coverage
+        adata_none = ad.AnnData(X=np.zeros((1, 5)))
+        adata_none.obs_names = ["not_a_real_spot"]
         try:
-            align_patches_to_adata(adata_missing, loaded_patches, loaded_barcodes)
+            align_patches_to_adata(adata_none, loaded_patches, loaded_barcodes)
             raised = False
         except ValueError:
             raised = True
-        assert raised, "missing barcode should raise, not silently return misaligned data"
-        print("[align_patches_to_adata] OK — raises on missing barcode")
+        assert raised, "zero barcode overlap should raise, not silently return empty data"
+        print("[align_patches_to_adata] OK — raises when there is zero overlap")
 
 
 if __name__ == "__main__":
