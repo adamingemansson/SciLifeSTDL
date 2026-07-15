@@ -1,0 +1,75 @@
+# H&E variant of configs/exp_hest1k_vqvae_ar.yaml (GigaPath pretrained encoder). Same pilot
+# sample/masking/model hyperparameters, only data.use_images and
+# model.params.image_encoder_type differ. See src/models/conditioning.py
+# for what each image_encoder_type actually does.
+
+# VQ-VAE + autoregressive transformer on one real HEST-1k sample (Track A
+# pilot dataset, docs/dataset_notes.md). Same pilot sample/masking setup as
+# configs/exp_hest1k_wae_gan.yaml — only the model block differs. Unlike
+# VQ-VAE stage 1 (configs/exp_hest1k_vqvae_stage1.yaml), this is the full
+# location->expression pipeline entry — run via src/training/train.py, not
+# train_vqvae_stage1.py.
+#
+# codebook_size much smaller than stage 1's default (64 vs 512) — the
+# stage 1 real-data run (docs/model_schematics.md) only ever used ~20-25
+# codes on this same ~1000-spot sample even after fixing codebook
+# collapse, so 512 was oversized for this pilot's scale.
+
+experiment_name: vqvae_ar_hest1k_pilot_he_gigapath
+
+data:
+  use_images: true               # task #17/#20: load HEST-1k H&E patches
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: vqvae_ar
+  params:
+    image_encoder_type: gigapath  # task #20: Prov-GigaPath pretrained tile encoder -
+                                    # needs `pip install timm` + granted HF access to
+                                    # prov-gigapath/prov-gigapath (see conditioning.py
+                                    # GigapathPatchEncoder docstring)
+    image_feat_dim: 64
+    image_patch_size: 256
+    n_genes: 16570                # INT1 after QC, same as other exp_hest1k_*.yaml configs
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    codebook_size: 64
+    commitment_weight: 0.25
+    transformer_dim: 128
+    n_transformer_layers: 4
+    n_heads: 4
+    max_seq_len: 2048
+    recon_weight: 1.0
+    ar_weight: 1.0
+    sample_temperature: 1.0        # stochastic sampling at generation time -
+                                    # greedy argmax collapsed to one repeated
+                                    # token for every query point (2026-07-14)
+    lr: 1.0e-3
+
+training:
+  epochs: 10000                   # matched to FM-OT for a fair comparison (task #15)
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

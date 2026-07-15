@@ -17,6 +17,16 @@ Run with:
         configs/exp_hest1k_wae_gan.yaml \\
         configs/exp_hest1k_fm_ot.yaml \\
         configs/exp_hest1k_vqvae_ar.yaml
+
+H&E (task #17/#20): configs may set data.use_images: true to also load
+HEST-1k's H&E patches (needs model.params.image_encoder_type set to "cnn"
+or "gigapath" too, or the images are loaded but unused). All configs
+passed to one invocation should agree on data.use_images (and point at
+the same underlying sample) — this script loads images once, from the
+first config, and reuses them for the shared held-out eval draw; it does
+NOT support mixing image-enabled and expression-only configs within a
+single comparison run. Run expression-only and H&E sweeps as separate
+invocations instead.
 """
 from __future__ import annotations
 import argparse
@@ -28,7 +38,10 @@ import pytorch_lightning as pl
 from omegaconf import OmegaConf
 
 from src.models.registry import build_model
-from src.training.train import load_adata, make_context_query_split, MaskedContextQueryDataset, _collate_identity
+from src.training.train import (
+    load_adata, make_context_query_split, MaskedContextQueryDataset,
+    _collate_identity, _load_images, _images_tensor,
+)
 from src.evaluation import metrics as ev
 from src.evaluation.cell_type_classifier import cluster_pseudo_labels, CellTypePlausibilityClassifier
 
@@ -43,6 +56,7 @@ def _train_model(cfg_path: str):
     coords3d = loaders.get_coords_3d(adata)
     expr = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()
     slice_ids = adata.obs["slice_id"].to_numpy()
+    images = _load_images(cfg, adata)  # None unless cfg.data.use_images is set (task #17)
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     model = build_model(model_cfg)
@@ -50,7 +64,7 @@ def _train_model(cfg_path: str):
     if list(model.parameters()):
         dataset = MaskedContextQueryDataset(
             coords3d, expr, slice_ids, cfg.masking,
-            n_items=cfg.training.epochs, base_seed=cfg.training.seed,
+            n_items=cfg.training.epochs, base_seed=cfg.training.seed, images=images,
         )
         dataloader = DataLoader(dataset, batch_size=1, collate_fn=_collate_identity)
         trainer = pl.Trainer(
@@ -61,23 +75,25 @@ def _train_model(cfg_path: str):
         trainer.fit(model, dataloader)
 
     model.eval()
-    return model, cfg, adata, coords3d, expr, slice_ids
+    return model, cfg, adata, coords3d, expr, slice_ids, images
 
 
 def main(model_config_paths: list[str], k_neighborhood: int = 8, pca_components: int = 10):
     trained = {}
     shared = None
     for path in model_config_paths:
-        model, cfg, adata, coords3d, expr, slice_ids = _train_model(path)
+        model, cfg, adata, coords3d, expr, slice_ids, images = _train_model(path)
         # keyed by experiment_name, not cfg.model.name: multiple configs can
         # share a registered model name (e.g. fm_ot's OT and EDM path_type
         # variants both register as "fm_ot") and must stay distinct rows
         trained[cfg.experiment_name] = model
         if shared is None:
-            shared = (adata, coords3d, expr, slice_ids, cfg.masking)
+            # images taken from the FIRST config only — see module docstring
+            # on why mixed image-enabled/expression-only runs aren't supported
+            shared = (adata, coords3d, expr, slice_ids, cfg.masking, images)
         print(f"trained: {cfg.experiment_name}")
 
-    adata, coords3d, expr, slice_ids, masking_cfg = shared
+    adata, coords3d, expr, slice_ids, masking_cfg, images = shared
     trained["interp_baseline"] = build_model({"name": "interp_baseline", "params": {}})
 
     # one shared held-out draw, used identically for every model
@@ -87,6 +103,9 @@ def main(model_config_paths: list[str], k_neighborhood: int = 8, pca_components:
         "expression": torch.tensor(expr[context_mask], dtype=torch.float32),
     }
     query = {"coords": torch.tensor(coords3d[query_mask], dtype=torch.float32)}
+    if images is not None:
+        context["images"] = _images_tensor(images, context_mask)
+        query["images"] = _images_tensor(images, query_mask)
     target_expression = expr[query_mask]
 
     # cell-type plausibility (task #13): Leiden pseudo-labels over the

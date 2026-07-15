@@ -1,0 +1,61 @@
+# H&E variant of configs/exp_hest1k_fm_ot.yaml (our own CNN encoder). Same pilot
+# sample/masking/model hyperparameters, only data.use_images and
+# model.params.image_encoder_type differ. See src/models/conditioning.py
+# for what each image_encoder_type actually does.
+
+# FM-OT on one real HEST-1k sample (Track A pilot dataset, docs/dataset_notes.md).
+# Same pilot sample/masking setup as configs/exp_hest1k_wae_gan.yaml — only
+# the model block differs. See that file's comments for the dataset caveats.
+
+experiment_name: fm_ot_hest1k_pilot_he_cnn
+
+data:
+  use_images: true               # task #17/#20: load HEST-1k H&E patches
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    image_encoder_type: cnn      # task #17: our own from-scratch CNN H&E encoder
+    image_feat_dim: 64
+    image_patch_size: 256
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_wae_gan.yaml
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32                 # flow matching runs in this latent space, not raw
+                                    # 16570-gene space - see registry.py FM-OT comment
+                                    # (2026-07-14: raw-space runs were stuck at PCC~0,
+                                    # RMSE~noise-scale from 100 to 10000 epochs)
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50                # Euler steps at sample time; not used during training
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 10000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

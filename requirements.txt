@@ -25,3 +25,8 @@ einops
 diffusers
 torchmetrics
 POT
+# timm  # optional, only for image_encoder_type="gigapath" (GigapathPatchEncoder,
+#       # src/models/conditioning.py) - needs pip install timm + a HuggingFace
+#       # account with access GRANTED to the gated prov-gigapath/prov-gigapath
+#       # repo. Not installed by default since it's an opt-in, license-gated
+#       # dependency, not something usable out of the box.

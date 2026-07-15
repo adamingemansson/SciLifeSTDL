@@ -45,6 +45,16 @@ def make_context_query_split(coords3d: np.ndarray, slice_ids: np.ndarray, maskin
     return context_mask, query_mask
 
 
+def _images_tensor(images: np.ndarray, mask: np.ndarray) -> torch.Tensor:
+    """uint8 [n, H, W, 3] -> float [n, 3, H, W] in [0, 1], matching
+    ImagePatchEncoder/GigapathPatchEncoder's input convention. Standalone
+    (not a Dataset method) so src/evaluation/run_comparison.py's shared
+    held-out eval draw can build the same tensors without going through
+    MaskedContextQueryDataset."""
+    patches = images[mask]
+    return torch.tensor(patches, dtype=torch.float32).permute(0, 3, 1, 2) / 255.0
+
+
 class MaskedContextQueryDataset(Dataset):
     """Each item = one fresh random context/query split over the same
     underlying AnnData. batch_size stays 1 at the DataLoader level since
@@ -52,13 +62,17 @@ class MaskedContextQueryDataset(Dataset):
     point clouds isn't handled here yet."""
 
     def __init__(self, coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.ndarray,
-                 masking_cfg, n_items: int, base_seed: int = 0):
+                 masking_cfg, n_items: int, base_seed: int = 0,
+                 images: np.ndarray | None = None):
         self.coords3d = coords3d
         self.expr = expr
         self.slice_ids = slice_ids
         self.masking_cfg = masking_cfg
         self.n_items = n_items
         self.base_seed = base_seed
+        # optional H&E patches (task #17), [N, H, W, 3] uint8, already
+        # aligned to coords3d/expr's row order by the caller
+        self.images = images
 
     def __len__(self):
         return self.n_items
@@ -73,6 +87,9 @@ class MaskedContextQueryDataset(Dataset):
             "expression": torch.tensor(self.expr[context_mask], dtype=torch.float32),
         }
         query = {"coords": torch.tensor(self.coords3d[query_mask], dtype=torch.float32)}
+        if self.images is not None:
+            context["images"] = _images_tensor(self.images, context_mask)
+            query["images"] = _images_tensor(self.images, query_mask)
         target_expression = torch.tensor(self.expr[query_mask], dtype=torch.float32)
         return {"context": context, "query": query, "target_expression": target_expression}
 
@@ -95,19 +112,31 @@ def load_adata(cfg):
     )
 
 
+def _load_images(cfg, adata):
+    """Optional H&E patches aligned to adata.obs order (task #17) — only
+    loaded when cfg.data.use_images is set, since every existing pilot
+    config stays expression-only by default. Returns [N, 256, 256, 3]
+    uint8 or None."""
+    if not cfg.data.get("use_images", False):
+        return None
+    patches, barcodes = loaders.load_hest_patches(cfg.data.hest_data_dir, cfg.data.sample_id)
+    return loaders.align_patches_to_adata(adata, patches, barcodes)
+
+
 def _load_data(cfg) -> tuple:
     adata = load_adata(cfg)
     coords3d = loaders.get_coords_3d(adata)
     expr = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()
     slice_ids = adata.obs["slice_id"].to_numpy()
-    return coords3d, expr, slice_ids
+    images = _load_images(cfg, adata)
+    return coords3d, expr, slice_ids, images
 
 
 def main(cfg_path: str):
     cfg = OmegaConf.load(cfg_path)
     torch.manual_seed(cfg.training.seed)
 
-    coords3d, expr, slice_ids = _load_data(cfg)
+    coords3d, expr, slice_ids, images = _load_data(cfg)
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     model = build_model(model_cfg)
@@ -116,7 +145,7 @@ def main(cfg_path: str):
     if list(model.parameters()):
         dataset = MaskedContextQueryDataset(
             coords3d, expr, slice_ids, cfg.masking,
-            n_items=cfg.training.epochs, base_seed=cfg.training.seed,
+            n_items=cfg.training.epochs, base_seed=cfg.training.seed, images=images,
         )
         dataloader = DataLoader(dataset, batch_size=1, collate_fn=_collate_identity)
         trainer = pl.Trainer(
@@ -131,7 +160,7 @@ def main(cfg_path: str):
     # Evaluate on a held-out masking draw not seen during training -----------
     eval_item = MaskedContextQueryDataset(
         coords3d, expr, slice_ids, cfg.masking,
-        n_items=1, base_seed=cfg.training.seed + cfg.training.epochs + 1,
+        n_items=1, base_seed=cfg.training.seed + cfg.training.epochs + 1, images=images,
     )[0]
     context, query = eval_item["context"], eval_item["query"]
     target_expression = eval_item["target_expression"].numpy()

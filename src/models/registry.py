@@ -75,7 +75,20 @@ class BaseGenerativeModel(pl.LightningModule, abc.ABC):
     calls, regardless of what happens internally — a single forward pass for
     VAE/WAE-GAN, an iterative denoising loop for diffusion. Never reach into
     a family's internals from outside this class.
+
+    context/query also accept an optional 'images' key (task #17, H&E
+    branch) — [N, 3, H, W] float in [0,1], only meaningful if the model's
+    context_encoder was built with image_encoder_type != "none"
+    (src/models/conditioning.py). Use _encode_context() below rather than
+    calling self.context_encoder(...) directly, so this stays a one-line
+    addition instead of touching every family's sample()/training_step().
     """
+
+    def _encode_context(self, context: dict, query: dict) -> torch.Tensor:
+        return self.context_encoder(
+            context["coords"], context["expression"], query["coords"],
+            context_images=context.get("images"), query_images=query.get("images"),
+        )
 
     @abc.abstractmethod
     def sample(self, context: dict[str, torch.Tensor], query: dict[str, Any]
@@ -206,13 +219,17 @@ class WAEGAN(BaseGenerativeModel):
     def __init__(self, n_genes: int, coord_dim: int = 3, latent_dim: int = 32,
                  hidden_dim: int = 256, cond_hidden_dim: int = 256,
                  disc_hidden_dim: int = 128, adv_weight: float = 1.0,
-                 lr: float = 1e-3, lr_disc: float = 1e-3):
+                 lr: float = 1e-3, lr_disc: float = 1e-3,
+                 image_encoder_type: str = "none", image_feat_dim: int = 64,
+                 image_patch_size: int = 256):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False  # we alternate encoder/decoder vs. discriminator ourselves
 
         self.context_encoder = SpatialContextEncoder(
-            n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim
+            n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim,
+            image_encoder_type=image_encoder_type, image_feat_dim=image_feat_dim,
+            image_patch_size=image_patch_size,
         )
         self.encoder = nn.Sequential(
             nn.Linear(n_genes, hidden_dim), nn.ReLU(),
@@ -240,7 +257,7 @@ class WAEGAN(BaseGenerativeModel):
         # multimodal, e.g. a cell-type boundary; c alone doesn't resolve
         # that, sampling z does).
         n = query["coords"].shape[0]
-        c = self.context_encoder(context["coords"], context["expression"], query["coords"])
+        c = self._encode_context(context, query)
         z = torch.randn(n, self.latent_dim, device=self.device)
         expr_gen = self.decoder(torch.cat([z, c], dim=-1))
         return {"coords": query["coords"], "expression": expr_gen}
@@ -259,7 +276,7 @@ class WAEGAN(BaseGenerativeModel):
         opt_ae, opt_disc = self.optimizers()
         batch_size = target_expression.shape[0]
 
-        c = self.context_encoder(context["coords"], context["expression"], query["coords"])
+        c = self._encode_context(context, query)
         z_fake = self.encoder(target_expression)                              # encoder's latent code
         z_real = torch.randn(batch_size, self.latent_dim, device=self.device)  # prior sample
 
@@ -387,12 +404,16 @@ class FlowMatchingOT(BaseGenerativeModel):
                  fm_weight: float = 1.0, lr: float = 1e-3,
                  path_type: str = "ot", sigma_min: float = 0.002,
                  sigma_max: float = 80.0, sigma_data: float = 0.5, rho: float = 7.0,
-                 edm_p_mean: float = -1.2, edm_p_std: float = 1.2):
+                 edm_p_mean: float = -1.2, edm_p_std: float = 1.2,
+                 image_encoder_type: str = "none", image_feat_dim: int = 64,
+                 image_patch_size: int = 256):
         super().__init__()
         self.save_hyperparameters()
         assert path_type in ("ot", "edm"), f"unknown path_type {path_type!r}"
         self.context_encoder = SpatialContextEncoder(
-            n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim
+            n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim,
+            image_encoder_type=image_encoder_type, image_feat_dim=image_feat_dim,
+            image_patch_size=image_patch_size,
         )
         # own autoencoder, own weights — compresses expression to a small
         # latent code the velocity net operates on instead of raw n_genes
@@ -444,7 +465,7 @@ class FlowMatchingOT(BaseGenerativeModel):
 
     def sample(self, context, query):
         n = query["coords"].shape[0]
-        c = self.context_encoder(context["coords"], context["expression"], query["coords"])
+        c = self._encode_context(context, query)
 
         if self.path_type == "ot":
             z = torch.randn(n, self.latent_dim, device=self.device)
@@ -473,7 +494,7 @@ class FlowMatchingOT(BaseGenerativeModel):
         context, query = batch["context"], batch["query"]
         x_1 = batch["target_expression"]  # real target expression
         n = x_1.shape[0]
-        c = self.context_encoder(context["coords"], context["expression"], query["coords"])
+        c = self._encode_context(context, query)
 
         z_1 = self.encoder(x_1)
         recon = self.decoder(torch.cat([z_1, c], dim=-1))
@@ -564,11 +585,15 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  transformer_dim: int = 128, n_transformer_layers: int = 4,
                  n_heads: int = 4, max_seq_len: int = 2048,
                  recon_weight: float = 1.0, ar_weight: float = 1.0,
-                 sample_temperature: float = 1.0, lr: float = 1e-3):
+                 sample_temperature: float = 1.0, lr: float = 1e-3,
+                 image_encoder_type: str = "none", image_feat_dim: int = 64,
+                 image_patch_size: int = 256):
         super().__init__()
         self.save_hyperparameters()
         self.context_encoder = SpatialContextEncoder(
-            n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim
+            n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim,
+            image_encoder_type=image_encoder_type, image_feat_dim=image_feat_dim,
+            image_patch_size=image_patch_size,
         )
         self.encoder = nn.Sequential(
             nn.Linear(n_genes, ae_hidden_dim), nn.ReLU(),
@@ -612,7 +637,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
 
     def sample(self, context, query):
         n = query["coords"].shape[0]
-        c = self.context_encoder(context["coords"], context["expression"], query["coords"])
+        c = self._encode_context(context, query)
         order = morton_order(query["coords"]).to(self.device)
         c_ordered = c[order]
 
@@ -647,7 +672,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
         context, query = batch["context"], batch["query"]
         x_1 = batch["target_expression"]  # real target expression
         n = x_1.shape[0]
-        c = self.context_encoder(context["coords"], context["expression"], query["coords"])
+        c = self._encode_context(context, query)
 
         order = morton_order(query["coords"]).to(self.device)
         x_1, c = x_1[order], c[order]

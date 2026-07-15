@@ -1,0 +1,68 @@
+# H&E variant of configs/exp_hest1k_wae_gan.yaml (GigaPath pretrained encoder). Same pilot
+# sample/masking/model hyperparameters, only data.use_images and
+# model.params.image_encoder_type differ. See src/models/conditioning.py
+# for what each image_encoder_type actually does.
+
+# WAE-GAN on one real HEST-1k sample (Track A pilot dataset, docs/dataset_notes.md).
+# Requires the sample already downloaded via HEST-1k's own download_hest
+# (huggingface_hub, needs a free HF account + auth token) — see the
+# download instructions in docs/dataset_notes.md before running this.
+
+experiment_name: wae_gan_hest1k_pilot_he_gigapath
+
+data:
+  use_images: true               # task #17/#20: load HEST-1k H&E patches
+  source: hest1k
+  hest_data_dir: data/raw/hest1k        # wherever download_hest wrote to locally
+  sample_id: INT1                       # small example sample used in HEST-1k's own tutorial
+  task: intra_slice                     # Track A only — HEST-1k samples are single 2D sections
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches      # Track A: intra-slice damage, not hold_out_slice
+  params:
+    n_patches: 3
+    radius_range: [250, 450]            # calibrated to INT1's real spot spacing (median
+                                          # nearest-neighbor = 219px, verified 2026-07-14) -
+                                          # targets ~5-15 spots masked per patch, not the
+                                          # generic [50,150] default which barely covers 1
+
+model:
+  name: wae_gan
+  params:
+    image_encoder_type: gigapath  # task #20: Prov-GigaPath pretrained tile encoder -
+                                    # needs `pip install timm` + granted HF access to
+                                    # prov-gigapath/prov-gigapath (see conditioning.py
+                                    # GigapathPatchEncoder docstring)
+    image_feat_dim: 64
+    image_patch_size: 256
+    n_genes: 16570                # INT1 after QC (min_genes=200, min_cells=3), verified 2026-07-14
+    coord_dim: 3                  # get_coords_3d() always returns (x,y,z), even for a
+                                    # single 2D section - z is a constant 0 here, but the
+                                    # shape is still 3 columns (bug found 2026-07-14 by
+                                    # actually running this: coord_dim=2 crashed with a
+                                    # shape mismatch against real 3-column coordinates)
+    latent_dim: 32
+    hidden_dim: 256
+    cond_hidden_dim: 256
+    disc_hidden_dim: 128
+    adv_weight: 1.0
+    lr: 1.0e-3
+    lr_disc: 1.0e-3
+
+training:
+  epochs: 10000                   # matched to FM-OT/VQ-VAE+AR for a fair comparison (task #15);
+                                    # = number of distinct random masking draws trained on
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

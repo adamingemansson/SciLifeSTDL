@@ -37,3 +37,7 @@ dependencies:
       - torchmetrics
       - POT            # optimal transport, useful for slice alignment (PASTE-style) and metrics
       - anndata2ri; sys_platform != "win32"
+      # - timm  # optional, only for image_encoder_type="gigapath" - needs a HuggingFace
+      #         # account with access GRANTED to the gated prov-gigapath/prov-gigapath
+      #         # repo; uncomment + pip install once you have that access (see
+      #         # conditioning.py GigapathPatchEncoder)

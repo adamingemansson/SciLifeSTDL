@@ -113,6 +113,65 @@ class ImagePatchEncoder(nn.Module):
         return self.proj(h)
 
 
+class GigapathPatchEncoder(nn.Module):
+    """
+    Wraps Prov-GigaPath's tile encoder (Xu et al. 2024, Nature, "A
+    whole-slide foundation model for digital pathology from real-world
+    data") as an alternative to ImagePatchEncoder above — task #20, "does
+    a strong PRETRAINED image encoder help", kept separate from STPath
+    (task #18, which uses Gigapath internally but adds its own multi-modal
+    fusion): this class is Gigapath ALONE, feeding straight into this same
+    module's own k-NN/attention fusion instead of STPath's.
+
+    Frozen (eval mode, no gradient) — the RAE idea (Zheng et al. 2025)
+    applied here: reuse a strong pretrained representation as-is, only the
+    small projection head on top is trained.
+
+    Requires, neither a default dependency of this repo:
+      1. `pip install timm` (>=1.0.3 per the model's own README) — not in
+         environment.yml/requirements.txt, since it's only needed if this
+         class is actually instantiated.
+      2. A HuggingFace account with access GRANTED to the gated
+         prov-gigapath/prov-gigapath repo (research-use-only license —
+         request at huggingface.co/prov-gigapath/prov-gigapath) and
+         `huggingface-cli login` run once, or `HF_TOKEN` set in the
+         environment. Not something this code can obtain on your behalf.
+
+    Preprocessing (resize 256 -> center-crop 224 -> ImageNet normalize) is
+    Prov-GigaPath's own documented pipeline (its GitHub README), applied
+    here to patches already in [0, 1] float (same convention as
+    ImagePatchEncoder). Output feature dim is read from a real forward
+    pass at construction time rather than hardcoded, since the tile
+    encoder's exact embedding size isn't stated in its own README.
+    """
+
+    def __init__(self, feat_dim: int = 64):
+        super().__init__()
+        import timm
+        self.tile_encoder = timm.create_model(
+            "hf_hub:prov-gigapath/prov-gigapath", pretrained=True
+        )
+        self.tile_encoder.eval()
+        for p in self.tile_encoder.parameters():
+            p.requires_grad_(False)
+
+        self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+        with torch.no_grad():
+            gigapath_dim = self.tile_encoder(torch.zeros(1, 3, 224, 224)).shape[-1]
+        self.proj = nn.Linear(gigapath_dim, feat_dim)
+
+    def forward(self, patches: torch.Tensor) -> torch.Tensor:
+        x = nn.functional.interpolate(patches, size=256, mode="bicubic", align_corners=False)
+        top = (256 - 224) // 2
+        x = x[:, :, top:top + 224, top:top + 224]
+        x = (x - self.imagenet_mean) / self.imagenet_std
+        with torch.no_grad():
+            feat = self.tile_encoder(x)
+        return self.proj(feat)
+
+
 class SpatialContextEncoder(nn.Module):
     """
     context (coords [N_obs, D], expression [N_obs, G]) + query coords
@@ -121,30 +180,42 @@ class SpatialContextEncoder(nn.Module):
     D is 2 for intra-slice (Track A) or 3 for inter-slice (Track B) — same
     module handles both, since it only ever sees generic coordinates.
 
-    use_images=False (default) is the ORIGINAL gene-expression-only path,
-    completely unchanged — task #17 explicitly keeps this variant working
-    as an ablation baseline, not a replacement. When True, context_images/
-    query_images become required forward() args and get fused into
-    node_repr/query_feat via concatenation, exactly as this module's
-    original docstring promised ("designed so an image-encoder branch can
-    be fused in later... without changing any generator model").
+    image_encoder_type="none" (default) is the ORIGINAL gene-expression-only
+    path, completely unchanged — task #17 explicitly keeps this variant
+    working as an ablation baseline, not a replacement.
+    image_encoder_type="cnn" uses ImagePatchEncoder (task #17, our own
+    from-scratch encoder); "gigapath" uses GigapathPatchEncoder (task #20,
+    a pretrained encoder) — same fusion code either way, so switching
+    between them (or off) for a benchmark is a one-argument change, not a
+    rewrite. Whenever images are enabled, context_images/query_images
+    become required forward() args and get fused into node_repr/query_feat
+    via concatenation, exactly as this module's original docstring
+    promised ("designed so an image-encoder branch can be fused in
+    later... without changing any generator model").
     """
 
     def __init__(self, n_genes: int, coord_dim: int = 3, hidden_dim: int = 256,
                  n_message_layers: int = 2, k_neighbors: int = 10,
                  rff_features: int = 64, rff_sigma: float = 1.0,
-                 use_images: bool = False, image_feat_dim: int = 64,
+                 image_encoder_type: str = "none", image_feat_dim: int = 64,
                  image_patch_size: int = 256):
         super().__init__()
+        assert image_encoder_type in ("none", "cnn", "gigapath"), (
+            f"unknown image_encoder_type {image_encoder_type!r}"
+        )
         self.k_neighbors = k_neighbors
-        self.use_images = use_images
+        self.use_images = image_encoder_type != "none"
         self.coord_encoder = RandomFourierFeatures(coord_dim, rff_features, rff_sigma)
         coord_feat_dim = 2 * rff_features  # sin + cos
 
         node_in_dim = n_genes + coord_feat_dim
         query_in_dim = coord_feat_dim
-        if use_images:
+        if image_encoder_type == "cnn":
             self.image_encoder = ImagePatchEncoder(image_patch_size, image_feat_dim)
+            node_in_dim += image_feat_dim
+            query_in_dim += image_feat_dim
+        elif image_encoder_type == "gigapath":
+            self.image_encoder = GigapathPatchEncoder(image_feat_dim)
             node_in_dim += image_feat_dim
             query_in_dim += image_feat_dim
 

@@ -259,12 +259,24 @@ baseline, not counted as one of the three comparison models below.
   CNN — deliberately NOT a pretrained pathology foundation model, so it
   stays a clean "does adding any image info help" ablation, distinct from
   task #18 (STPath, a *pretrained* H&E+expression encoder, tests "does a
-  *much stronger* encoder help more"). Both smoke-tested
-  (`tests/test_hest_patches.py`, `tests/test_conditioning.py`'s new image
-  branch case). Still needed: wiring `context_images`/`query_images`
-  through WAE-GAN/FM-OT/VQ-VAE+AR's `sample()`/`training_step()` and
-  `MaskedContextQueryDataset`, and an `exp_hest1k_*_he.yaml` config set —
-  not done yet.
+  *much stronger* encoder help more"). `image_encoder_type` on
+  `SpatialContextEncoder` now takes `"none"` (default, unchanged
+  expression-only path) / `"cnn"` (task #17) / `"gigapath"` (task #20,
+  `GigapathPatchEncoder` — wraps Prov-GigaPath's real, license-gated
+  pretrained tile encoder, requires `pip install timm` + granted HF
+  access, neither a default dependency) — switching between them for a
+  benchmark is a one-argument change. **Wiring done** (2026-07-14):
+  `BaseGenerativeModel._encode_context()` threads `context["images"]`/
+  `query["images"]` through WAE-GAN/FM-OT/VQ-VAE+AR's `sample()`/
+  `training_step()` uniformly; `MaskedContextQueryDataset` loads and masks
+  images the same way as coords/expression when a config sets
+  `data.use_images: true`. VAE baseline is unconditioned by design
+  (no `context_encoder` at all) and stays out of scope for this branch.
+  Six new configs (`configs/exp_hest1k_{wae_gan,fm_ot,vqvae_ar}_he_{cnn,gigapath}.yaml`).
+  Smoke-tested (`tests/test_hest_patches.py`, `tests/test_conditioning.py`,
+  `tests/test_he_wiring.py`) — not yet run on real data (needs the H&E
+  patches actually downloaded, and for the gigapath variant, granted HF
+  access).
 - **Full histology image generation/reconstruction stays a deferred
   stretch goal**, separate from the conditioning use above. Filling in
   broken tissue *in the H&E image itself*, not just using H&E to condition
