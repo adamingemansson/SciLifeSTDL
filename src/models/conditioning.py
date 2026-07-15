@@ -84,6 +84,35 @@ class _KNNMessageLayer(nn.Module):
         return node_repr
 
 
+class ImagePatchEncoder(nn.Module):
+    """
+    H&E patch [B, 3, patch_size, patch_size] -> feature vector [B, feat_dim].
+    Task #17 — the "own, from-scratch" H&E branch, deliberately a small
+    plain CNN (own weights, jointly trained with the rest of the pipeline,
+    same per-model-weights reasoning used throughout this codebase), NOT a
+    pretrained pathology foundation model — that's task #18 (STPath), kept
+    as a separate arm precisely so the two-way ablation (does adding image
+    info help at all vs. does a *strong pretrained* image encoder help
+    more) stays clean. See src/data/loaders.py load_hest_patches() for
+    where the raw 256x256 uint8 patches come from.
+    """
+
+    def __init__(self, patch_size: int = 256, feat_dim: int = 64):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=5, stride=2, padding=2), nn.ReLU(),   # ->128
+            nn.Conv2d(16, 32, kernel_size=5, stride=2, padding=2), nn.ReLU(),  # ->64
+            nn.Conv2d(32, 64, kernel_size=5, stride=2, padding=2), nn.ReLU(),  # ->32
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.proj = nn.Linear(64, feat_dim)
+
+    def forward(self, patches: torch.Tensor) -> torch.Tensor:
+        # patches: [B, 3, H, W], expected already float in [0, 1]
+        h = self.conv(patches).flatten(1)
+        return self.proj(h)
+
+
 class SpatialContextEncoder(nn.Module):
     """
     context (coords [N_obs, D], expression [N_obs, G]) + query coords
@@ -91,28 +120,53 @@ class SpatialContextEncoder(nn.Module):
 
     D is 2 for intra-slice (Track A) or 3 for inter-slice (Track B) — same
     module handles both, since it only ever sees generic coordinates.
+
+    use_images=False (default) is the ORIGINAL gene-expression-only path,
+    completely unchanged — task #17 explicitly keeps this variant working
+    as an ablation baseline, not a replacement. When True, context_images/
+    query_images become required forward() args and get fused into
+    node_repr/query_feat via concatenation, exactly as this module's
+    original docstring promised ("designed so an image-encoder branch can
+    be fused in later... without changing any generator model").
     """
 
     def __init__(self, n_genes: int, coord_dim: int = 3, hidden_dim: int = 256,
                  n_message_layers: int = 2, k_neighbors: int = 10,
-                 rff_features: int = 64, rff_sigma: float = 1.0):
+                 rff_features: int = 64, rff_sigma: float = 1.0,
+                 use_images: bool = False, image_feat_dim: int = 64,
+                 image_patch_size: int = 256):
         super().__init__()
         self.k_neighbors = k_neighbors
+        self.use_images = use_images
         self.coord_encoder = RandomFourierFeatures(coord_dim, rff_features, rff_sigma)
         coord_feat_dim = 2 * rff_features  # sin + cos
 
-        self.node_proj = nn.Linear(n_genes + coord_feat_dim, hidden_dim)
+        node_in_dim = n_genes + coord_feat_dim
+        query_in_dim = coord_feat_dim
+        if use_images:
+            self.image_encoder = ImagePatchEncoder(image_patch_size, image_feat_dim)
+            node_in_dim += image_feat_dim
+            query_in_dim += image_feat_dim
+
+        self.node_proj = nn.Linear(node_in_dim, hidden_dim)
         self.message_layers = nn.ModuleList(
             _KNNMessageLayer(hidden_dim) for _ in range(n_message_layers)
         )
-        self.query_proj = nn.Linear(coord_feat_dim, hidden_dim)
+        self.query_proj = nn.Linear(query_in_dim, hidden_dim)
         self.query_attn = nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True)
 
     def forward(self, context_coords: torch.Tensor, context_expression: torch.Tensor,
-                query_coords: torch.Tensor) -> torch.Tensor:
-        # 1. embed each context node from its own expression + coordinate
+                query_coords: torch.Tensor, context_images: torch.Tensor | None = None,
+                query_images: torch.Tensor | None = None) -> torch.Tensor:
+        if self.use_images and (context_images is None or query_images is None):
+            raise ValueError("use_images=True requires context_images and query_images")
+
+        # 1. embed each context node from its own expression + coordinate (+ image)
         context_coord_feat = self.coord_encoder(context_coords)
-        node_repr = self.node_proj(torch.cat([context_expression, context_coord_feat], dim=-1))
+        node_feats = [context_expression, context_coord_feat]
+        if self.use_images:
+            node_feats.append(self.image_encoder(context_images))
+        node_repr = self.node_proj(torch.cat(node_feats, dim=-1))
 
         # 2. message-pass over the context's own k-NN graph
         context_knn = _knn_indices(context_coords, context_coords, self.k_neighbors)
@@ -121,7 +175,10 @@ class SpatialContextEncoder(nn.Module):
 
         # 3. for each query location, attend over its k nearest context nodes
         query_knn = _knn_indices(query_coords, context_coords, self.k_neighbors)
-        query_feat = self.query_proj(self.coord_encoder(query_coords))
+        query_feats = [self.coord_encoder(query_coords)]
+        if self.use_images:
+            query_feats.append(self.image_encoder(query_images))
+        query_feat = self.query_proj(torch.cat(query_feats, dim=-1))
         neighbor_repr = node_repr[query_knn]                     # [N_query, k, hidden_dim]
         c, _ = self.query_attn(query_feat.unsqueeze(1), neighbor_repr, neighbor_repr)
         return c.squeeze(1)                                        # [N_query, hidden_dim]

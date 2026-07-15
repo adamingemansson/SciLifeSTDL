@@ -242,11 +242,30 @@ baseline, not counted as one of the three comparison models below.
 - FM-OT (`fm_ot`) is now in the registry alongside `vae_baseline` and
   `wae_gan`, written but not yet run/verified. VQ-VAE + autoregressive
   (prioritization item 3 above) is still not implemented.
-- **Histology image reconstruction is out of current scope, tracked as a
-  stretch goal.** Filling in broken tissue "in histology image" as well as
-  gene expression was raised as a possible extension — HEST-1k's paired
-  H&E data and the RNA-CDM/MORPHE precedents (`docs/literature_review.md`)
-  make this feasible, but adding a second output modality multiplies scope
-  (a second loss, a second embedding space, a second set of metrics) before
-  the primary GEX pipeline works end-to-end on even one backbone. Revisit
-  once VAE/WAE-GAN/diffusion are all working on expression alone.
+- **H&E as an additional CONDITIONING input (task #17, started 2026-07-14)
+  — not histology generation/reconstruction, which stays a deferred
+  stretch goal (see below).** All four comparison models now have real
+  results (task #15), so this is the next real extension: an optional
+  image branch on `SpatialContextEncoder`, off by default
+  (`use_images=False` keeps the original expression-only path byte-for-byte
+  unchanged, deliberately kept as an ablation, not replaced).
+  `src/data/loaders.py` `load_hest_patches()`/`align_patches_to_adata()`
+  load HEST-1k's pre-extracted 256x256 per-spot H&E patches (verified
+  against the actual `HESTData.dump_patches()` source, not just docs) and
+  align them to an AnnData's obs order by barcode.
+  `src/models/conditioning.py` `ImagePatchEncoder` is a small from-scratch
+  CNN — deliberately NOT a pretrained pathology foundation model, so it
+  stays a clean "does adding any image info help" ablation, distinct from
+  task #18 (STPath, a *pretrained* H&E+expression encoder, tests "does a
+  *much stronger* encoder help more"). Both smoke-tested
+  (`tests/test_hest_patches.py`, `tests/test_conditioning.py`'s new image
+  branch case). Still needed: wiring `context_images`/`query_images`
+  through WAE-GAN/FM-OT/VQ-VAE+AR's `sample()`/`training_step()` and
+  `MaskedContextQueryDataset`, and an `exp_hest1k_*_he.yaml` config set —
+  not done yet.
+- **Full histology image generation/reconstruction stays a deferred
+  stretch goal**, separate from the conditioning use above. Filling in
+  broken tissue *in the H&E image itself*, not just using H&E to condition
+  expression generation, would add a second output modality (a second
+  loss, a second embedding space, a second set of metrics) — out of scope
+  until the primary GEX pipeline is further along.

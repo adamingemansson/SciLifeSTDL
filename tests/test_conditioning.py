@@ -31,6 +31,41 @@ def _run_case(coord_dim: int, n_context: int, n_query: int, n_genes: int, label:
           f"mean={c.mean().item():.4f}, std={c.std().item():.4f}")
 
 
+def _run_image_branch_case():
+    """Task #17: use_images=True fuses an H&E patch branch; use_images=False
+    (default, everywhere else in this file) must stay completely unchanged
+    — that's the whole point of keeping an expression-only variant."""
+    torch.manual_seed(0)
+    n_context, n_query, n_genes, patch_size = 40, 10, 30, 32
+    encoder = SpatialContextEncoder(n_genes=n_genes, coord_dim=3, hidden_dim=64,
+                                     k_neighbors=5, rff_features=16,
+                                     use_images=True, image_feat_dim=16,
+                                     image_patch_size=patch_size)
+
+    context_coords = torch.randn(n_context, 3)
+    context_expression = torch.rand(n_context, n_genes)
+    context_images = torch.rand(n_context, 3, patch_size, patch_size)
+    query_coords = torch.randn(n_query, 3)
+    query_images = torch.rand(n_query, 3, patch_size, patch_size)
+
+    c = encoder(context_coords, context_expression, query_coords,
+                context_images=context_images, query_images=query_images)
+    assert c.shape == (n_query, 64)
+    assert torch.isfinite(c).all()
+
+    # required-args check: use_images=True without images must raise, not
+    # silently ignore the image branch
+    try:
+        encoder(context_coords, context_expression, query_coords)
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised, "use_images=True should require context_images/query_images"
+
+    print(f"[image branch] OK — output shape {tuple(c.shape)}, "
+          f"correctly raises when images are missing")
+
+
 def _run_edge_cases():
     # fewer context points than k_neighbors — _knn_indices should clip k, not crash
     encoder = SpatialContextEncoder(n_genes=10, coord_dim=2, hidden_dim=32, k_neighbors=20)
@@ -52,5 +87,6 @@ def _run_edge_cases():
 if __name__ == "__main__":
     _run_case(coord_dim=2, n_context=200, n_query=30, n_genes=50, label="Track A (2D, intra-slice)")
     _run_case(coord_dim=3, n_context=500, n_query=80, n_genes=2000, label="Track B (3D, inter-slice)")
+    _run_image_branch_case()
     _run_edge_cases()
     print("\nAll conditioning encoder smoke tests passed.")

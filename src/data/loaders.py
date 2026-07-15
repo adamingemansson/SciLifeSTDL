@@ -58,6 +58,59 @@ def get_coords_3d(adata: ad.AnnData) -> np.ndarray:
     return np.concatenate([xy, z], axis=1)
 
 
+def load_hest_patches(hest_data_dir: str | Path, sample_id: str
+                       ) -> tuple[np.ndarray, np.ndarray]:
+    """
+    H&E patches for one HEST-1k sample (task #17, docs/architecture_plan.md
+    "Known gaps" — the H&E branch). HEST-1k pre-extracts 256x256 patches per
+    spot into patches/{sample_id}.h5 (h5py keys: 'img' [N,256,256,3] uint8,
+    'coords' [N,2], 'barcodes' [N] — confirmed 2026-07-14 by inspecting
+    HESTData.dump_patches() in the actual mahmoodlab/HEST source, not just
+    the README/tutorial prose). No raw WSI/openslide handling needed.
+
+    Same download command as load_hest_sample already pulls this file
+    (docs/dataset_notes.md's `allow_patterns=["*INT1[_.]**"]` matches
+    "patches/INT1.h5" the same way it matches "st/INT1.h5ad") — if this
+    raises FileNotFoundError, re-run that download command rather than
+    assuming a separate one is needed.
+
+    Returns (patches [N,256,256,3] uint8, barcodes [N] str) in whatever
+    order the .h5 file stores them — NOT necessarily aligned to any
+    AnnData's obs order. Use align_patches_to_adata() for that.
+    """
+    import h5py
+    hest_data_dir = Path(hest_data_dir)
+    matches = [m for m in hest_data_dir.rglob(f"*{sample_id}*.h5") if "patches" in m.parts]
+    if not matches:
+        raise FileNotFoundError(
+            f"No patches/{sample_id}.h5 file found under {hest_data_dir}. "
+            "Re-run the HEST-1k download command in docs/dataset_notes.md — "
+            "the same allow_patterns already covers this file."
+        )
+    with h5py.File(matches[0], "r") as f:
+        patches = f["img"][:]
+        barcodes = np.array([b.decode() if isinstance(b, bytes) else b for b in f["barcodes"][:]])
+    return patches, barcodes
+
+
+def align_patches_to_adata(adata: ad.AnnData, patches: np.ndarray, barcodes: np.ndarray
+                            ) -> np.ndarray:
+    """Reindex patches (arbitrary order from the .h5 file) to match
+    adata.obs_names order, via barcode matching. Raises if any spot in
+    adata has no matching patch — fail loudly rather than silently
+    returning misaligned images."""
+    barcode_to_idx = {b: i for i, b in enumerate(barcodes)}
+    missing = [name for name in adata.obs_names if name not in barcode_to_idx]
+    if missing:
+        raise ValueError(
+            f"{len(missing)} of {adata.n_obs} adata spots have no matching H&E "
+            f"patch (e.g. {missing[:3]}) — patches and expression data may be "
+            "from different downloads/versions of this sample."
+        )
+    order = [barcode_to_idx[name] for name in adata.obs_names]
+    return patches[order]
+
+
 def load_hest_sample(hest_data_dir: str | Path, sample_id: str) -> ad.AnnData:
     """
     Load one HEST-1k sample (docs/dataset_notes.md Track A primary pick) —
