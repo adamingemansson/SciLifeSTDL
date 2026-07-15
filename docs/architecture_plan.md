@@ -504,6 +504,24 @@ baseline, not counted as one of the three comparison models below.
     expression-only base case is validated); actually wiring this into a
     runnable config/CLI path; deciding real epoch counts and which
     sample_ids to pool for the eventual real run.
+- **`num_workers`/`pin_memory` added to the DataLoader (2026-07-15)** —
+  real observation on the A100 server: GPU utilization sat at ~22% during
+  training, meaning the GPU was idle most of the time waiting on the
+  CPU-side `__getitem__` work (masking draw, image tensor conversion) —
+  classic CPU-bound-data-loading, unlike the Mac's MPS backend, where the
+  model's own forward/backward pass is plausibly the actual bottleneck
+  instead (num_workers wasn't expected to help there and wasn't
+  recommended). `make_dataloader(dataset, cfg)` (`train.py`, shared by
+  both entry points) reads `cfg.training.num_workers` (defaults to `0` —
+  identical to every previous run's implicit behavior, so existing
+  configs/the Mac workflow are unaffected unless a config opts in) and
+  sets `pin_memory=torch.cuda.is_available()` (auto no-op off CUDA).
+  Real tradeoff to know about before cranking this up: each worker
+  process gets its OWN COPY of the Dataset's image array, multiplying
+  RAM by `num_workers` — a serious risk on a RAM-constrained machine (the
+  real Mac crashes earlier this project), much less so on a server with
+  far more system RAM. Use `--override training.num_workers=N` for a
+  quick try without editing configs.
 - **Full histology image generation/reconstruction stays a deferred
   stretch goal**, separate from the conditioning use above. Filling in
   broken tissue *in the H&E image itself*, not just using H&E to condition
