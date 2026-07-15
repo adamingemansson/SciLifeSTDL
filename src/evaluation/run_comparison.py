@@ -30,6 +30,15 @@ invocations instead.
 """
 from __future__ import annotations
 import argparse
+import os
+
+# Same fix as src/training/train.py (2026-07-15): must be set before any
+# MPS op is dispatched in the process, not just before torch.linalg.eigh
+# (STPath's own SpatialTransformer, see src/models/stpath_encoder.py)
+# actually runs. Importing src.training.train below sets this too, but
+# that's an incidental side effect of import order — set it explicitly
+# here so this script doesn't depend on that staying true.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import numpy as np
 import torch

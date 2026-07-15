@@ -13,6 +13,17 @@ Run with: python -m src.training.train --config configs/base_config.yaml
 """
 from __future__ import annotations
 import argparse
+import os
+from pathlib import Path
+
+# Must be set before `import torch` / any MPS usage, not just before the
+# specific op that needs it — PyTorch reads this once when the MPS
+# fallback mechanism initializes, not per-op. Confirmed 2026-07-15: setting
+# it later in src/models/stpath_encoder.py (imported lazily, well after
+# this process had already touched MPS via the Gigapath precompute step)
+# was too late and the crash still happened. STPath's own SpatialTransformer
+# uses torch.linalg.eigh (fa.py create_frame), not implemented on MPS.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import numpy as np
 import torch
@@ -125,6 +136,14 @@ def load_adata(cfg):
     )
 
 
+def _gigapath_cache_path(cfg) -> Path:
+    """Where precomputed Gigapath features for this sample get cached
+    across runs (see _load_images) — next to the HEST-1k data itself so
+    it's obvious it belongs to that sample, not somewhere in /tmp that
+    would silently vanish between sessions."""
+    return Path(cfg.data.hest_data_dir) / "gigapath_cache" / f"{cfg.data.sample_id}.npz"
+
+
 def _load_images(cfg, adata):
     """Optional H&E patches (task #17) — only loaded when
     cfg.data.use_images is set, since every existing pilot config stays
@@ -136,16 +155,30 @@ def _load_images(cfg, adata):
 
     For image_encoder_type "gigapath" or context_encoder_type "stpath",
     images comes back as PRECOMPUTED Gigapath features [N, gigapath_dim]
-    float32, not raw patches — computed once here via
-    precompute_gigapath_features() rather than recomputed from raw pixels
-    on every training step (task #18/#20's real bug, 2026-07-15: the
-    naive per-step version made a real STPath training run essentially
-    hang). For "cnn" (or no image use), images stays raw uint8 patches
+    float32, not raw patches — computed once via precompute_gigapath_features()
+    rather than recomputed from raw pixels on every training step (task
+    #18/#20's real bug, 2026-07-15: the naive per-step version made a real
+    STPath training run essentially hang).
+
+    That in-memory cache only helped WITHIN one run though — every fresh
+    `python -m src.training.train` invocation still re-ran the ~1.1B-param
+    frozen ViT over every patch from scratch (2026-07-15, user question:
+    "why is gigapath recomputing every run? cant it be saved?"). Since
+    Gigapath is frozen, its output for a given raw patch is fixed forever,
+    so it's cached to disk at _gigapath_cache_path(cfg) (features computed
+    for the FULL raw barcode set from the .h5 file, before any adata
+    filtering — align_patches_to_adata reorders/subsets an array purely by
+    barcode lookup, so it works identically whether that array is raw
+    patches or a cached feature matrix, meaning this cache stays valid
+    even if QC settings change which spots survive downstream). Delete the
+    cache file to force a recompute (e.g. after changing which patches
+    file is on disk).
+
+    For "cnn" (or no image use), images stays raw uint8 patches
     [N, 224, 224, 3] — the CNN is trainable so its output can't be cached."""
     if not cfg.data.get("use_images", False):
         return adata, None
     patches, barcodes = loaders.load_hest_patches(cfg.data.hest_data_dir, cfg.data.sample_id)
-    adata, patches = loaders.align_patches_to_adata(adata, patches, barcodes)
 
     model_params = cfg.model.get("params", {})
     uses_frozen_gigapath = (
@@ -153,12 +186,29 @@ def _load_images(cfg, adata):
         or model_params.get("context_encoder_type") == "stpath"
     )
     if uses_frozen_gigapath:
-        from src.models.conditioning import precompute_gigapath_features, _default_device
-        print(f"Precomputing Gigapath features for {patches.shape[0]} spots on "
-              f"{_default_device()} (one-time cost, not repeated per training step)...")
-        images = precompute_gigapath_features(patches)
+        cache_path = _gigapath_cache_path(cfg)
+        features = None
+        if cache_path.exists():
+            cached = np.load(cache_path)
+            if np.array_equal(cached["barcodes"], barcodes):
+                features = cached["features"]
+                print(f"_load_images: loaded cached Gigapath features for "
+                      f"{features.shape[0]} spots from {cache_path} "
+                      f"(delete this file to force a recompute).")
+            else:
+                print(f"_load_images: cache at {cache_path} covers a different "
+                      f"barcode set than the current patches file — recomputing.")
+        if features is None:
+            from src.models.conditioning import precompute_gigapath_features, _default_device
+            print(f"Precomputing Gigapath features for {patches.shape[0]} spots on "
+                  f"{_default_device()} (one-time cost, cached to {cache_path} "
+                  f"so future runs skip this step)...")
+            features = precompute_gigapath_features(patches)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(cache_path, features=features, barcodes=barcodes)
+        adata, images = loaders.align_patches_to_adata(adata, features, barcodes)
     else:
-        images = patches
+        adata, images = loaders.align_patches_to_adata(adata, patches, barcodes)
     return adata, images
 
 
