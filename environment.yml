@@ -36,7 +36,11 @@ dependencies:
       - diffusers
       - torchmetrics
       - POT            # optimal transport, useful for slice alignment (PASTE-style) and metrics
-      - anndata2ri; sys_platform != "win32"
+      # anndata2ri removed 2026-07-15: not referenced anywhere in src/tests/docs (grepped to
+      # confirm) - it was speculative R-interop that was never actually used, and its rpy2
+      # dependency requires R installed system-wide to build from source. Blocked env creation
+      # on a fresh server that doesn't have R. Re-add (with R available) only if something
+      # actually needs it later.
       # - timm  # optional, only for image_encoder_type="gigapath" - needs a HuggingFace
       #         # account with access GRANTED to the gated prov-gigapath/prov-gigapath
       #         # repo; uncomment + pip install once you have that access (see
