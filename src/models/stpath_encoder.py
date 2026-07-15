@@ -129,8 +129,14 @@ class STPathContextEncoder(nn.Module):
 
     def _gigapath_features(self, patches: torch.Tensor) -> torch.Tensor:
         # patches: [B, 3, H, W] float in [0,1] — same convention as
-        # ImagePatchEncoder/GigapathPatchEncoder
-        x = nn.functional.interpolate(patches, size=256, mode="bicubic", align_corners=False)
+        # ImagePatchEncoder/GigapathPatchEncoder. bicubic interpolate isn't
+        # implemented on MPS (Apple Silicon) as of this writing - do this
+        # one op on CPU rather than switch modes, to stay faithful to
+        # Gigapath's own documented bicubic preprocessing.
+        device = patches.device
+        x = nn.functional.interpolate(
+            patches.cpu(), size=256, mode="bicubic", align_corners=False
+        ).to(device)
         top = (256 - 224) // 2
         x = x[:, :, top:top + 224, top:top + 224]
         x = (x - self.imagenet_mean) / self.imagenet_std

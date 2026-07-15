@@ -172,7 +172,14 @@ class GigapathPatchEncoder(nn.Module):
         self.proj = nn.Linear(gigapath_dim, feat_dim)
 
     def forward(self, patches: torch.Tensor) -> torch.Tensor:
-        x = nn.functional.interpolate(patches, size=256, mode="bicubic", align_corners=False)
+        # bicubic interpolate isn't implemented on MPS (Apple Silicon) as
+        # of this writing - do this one op on CPU rather than switch to a
+        # mode MPS does support, to stay faithful to Gigapath's own
+        # documented preprocessing (bicubic resize, its GitHub README)
+        device = patches.device
+        x = nn.functional.interpolate(
+            patches.cpu(), size=256, mode="bicubic", align_corners=False
+        ).to(device)
         top = (256 - 224) // 2
         x = x[:, :, top:top + 224, top:top + 224]
         x = (x - self.imagenet_mean) / self.imagenet_std
