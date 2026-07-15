@@ -277,6 +277,32 @@ baseline, not counted as one of the three comparison models below.
   `tests/test_he_wiring.py`) — not yet run on real data (needs the H&E
   patches actually downloaded, and for the gigapath variant, granted HF
   access).
+- **Task #18: STPath as a pretrained H&E+expression encoder — written**
+  (2026-07-15), `src/models/stpath_encoder.py` `STPathContextEncoder`.
+  Unlike Mimyr (task #16), STPath's actual code (cloned and inspected
+  directly, not trusted from the README) IS a genuinely reusable inference
+  API (`STPathInference`, `stpath/app/pipeline/inference.py`) — its
+  documented "in-context learning" mode (real expression for context
+  spots, mask tokens for the rest) maps almost exactly onto our own
+  context/query setup. `STPathContextEncoder` calls
+  `model.prediction_head(..., return_all=True)` to get the pre-head
+  hidden state (not STPath's own final gene predictions) as our
+  conditioning `c` — the RAE idea again, reusing STPath's large-scale
+  pretrained representation instead of training a small encoder from
+  scratch. Replaces `SpatialContextEncoder` ENTIRELY for this arm (not a
+  fused branch), via a new `context_encoder_type: "builtin"|"stpath"`
+  switch (`_build_context_encoder()`, shared by all three models).
+  `stpath_gene_names` is auto-derived from the loaded AnnData's
+  `var_names` at load time (`inject_stpath_gene_names()` in
+  `src/training/train.py`), not hardcoded per-config. Three new configs
+  (`configs/exp_hest1k_{wae_gan,fm_ot,vqvae_ar}_stpath.yaml`) — the two
+  `stpath_*_path` fields need editing per-machine (where STPath was
+  cloned, where its weight was downloaded). Smoke-tested
+  (`tests/test_stpath_encoder.py`) skip-safely — **could not be run
+  end-to-end** in the environment this was written in (no way to install
+  the external `stpath` package/weights there); genuinely the most
+  complex, least independently-verified integration in this codebase so
+  far, flagged explicitly rather than presented as more solid than it is.
 - **Full histology image generation/reconstruction stays a deferred
   stretch goal**, separate from the conditioning use above. Filling in
   broken tissue *in the H&E image itself*, not just using H&E to condition

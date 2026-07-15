@@ -40,7 +40,7 @@ from omegaconf import OmegaConf
 from src.models.registry import build_model
 from src.training.train import (
     load_adata, make_context_query_split, MaskedContextQueryDataset,
-    _collate_identity, _load_images, _images_tensor,
+    _collate_identity, _load_images, _images_tensor, inject_stpath_gene_names,
 )
 from src.evaluation import metrics as ev
 from src.evaluation.cell_type_classifier import cluster_pseudo_labels, CellTypePlausibilityClassifier
@@ -59,6 +59,7 @@ def _train_model(cfg_path: str):
     images = _load_images(cfg, adata)  # None unless cfg.data.use_images is set (task #17)
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
+    inject_stpath_gene_names(model_cfg, adata)
     model = build_model(model_cfg)
 
     if list(model.parameters()):

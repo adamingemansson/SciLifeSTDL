@@ -34,6 +34,42 @@ from src.models.vqvae import VectorQuantizer, morton_order
 _MODEL_REGISTRY: dict[str, type["BaseGenerativeModel"]] = {}
 
 
+def _build_context_encoder(
+    n_genes: int, coord_dim: int, cond_hidden_dim: int,
+    context_encoder_type: str = "builtin",
+    image_encoder_type: str = "none", image_feat_dim: int = 64, image_patch_size: int = 256,
+    stpath_gene_names: list[str] | None = None, stpath_gene_voc_path: str | None = None,
+    stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
+    stpath_tech_type: str = "Visium",
+):
+    """Shared by WAE-GAN/FM-OT/VQ-VAE+AR so each model's __init__ doesn't
+    repeat the context_encoder_type branching. "builtin" (default) is our
+    own SpatialContextEncoder (task #17/#20's image_encoder_type switch
+    still applies here). "stpath" (task #18) replaces it entirely with
+    STPathContextEncoder — see src/models/stpath_encoder.py for the full
+    setup requirements and grounding; imported lazily since the `stpath`
+    package is an opt-in external dependency, not installed by default."""
+    if context_encoder_type == "builtin":
+        return SpatialContextEncoder(
+            n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim,
+            image_encoder_type=image_encoder_type, image_feat_dim=image_feat_dim,
+            image_patch_size=image_patch_size,
+        )
+    elif context_encoder_type == "stpath":
+        from src.models.stpath_encoder import STPathContextEncoder
+        assert stpath_gene_names and stpath_gene_voc_path and stpath_model_weight_path, (
+            "context_encoder_type='stpath' requires stpath_gene_names, "
+            "stpath_gene_voc_path, and stpath_model_weight_path"
+        )
+        return STPathContextEncoder(
+            gene_names=stpath_gene_names, gene_voc_path=stpath_gene_voc_path,
+            model_weight_path=stpath_model_weight_path, organ_type=stpath_organ_type,
+            tech_type=stpath_tech_type, hidden_dim=cond_hidden_dim,
+        )
+    else:
+        raise ValueError(f"unknown context_encoder_type {context_encoder_type!r}")
+
+
 def register_model(name: str):
     def _wrap(cls):
         if name in _MODEL_REGISTRY:
@@ -221,15 +257,22 @@ class WAEGAN(BaseGenerativeModel):
                  disc_hidden_dim: int = 128, adv_weight: float = 1.0,
                  lr: float = 1e-3, lr_disc: float = 1e-3,
                  image_encoder_type: str = "none", image_feat_dim: int = 64,
-                 image_patch_size: int = 256):
+                 image_patch_size: int = 256, context_encoder_type: str = "builtin",
+                 stpath_gene_names: list[str] | None = None, stpath_gene_voc_path: str | None = None,
+                 stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
+                 stpath_tech_type: str = "Visium"):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False  # we alternate encoder/decoder vs. discriminator ourselves
 
-        self.context_encoder = SpatialContextEncoder(
-            n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim,
+        self.context_encoder = _build_context_encoder(
+            n_genes=n_genes, coord_dim=coord_dim, cond_hidden_dim=cond_hidden_dim,
+            context_encoder_type=context_encoder_type,
             image_encoder_type=image_encoder_type, image_feat_dim=image_feat_dim,
             image_patch_size=image_patch_size,
+            stpath_gene_names=stpath_gene_names, stpath_gene_voc_path=stpath_gene_voc_path,
+            stpath_model_weight_path=stpath_model_weight_path, stpath_organ_type=stpath_organ_type,
+            stpath_tech_type=stpath_tech_type,
         )
         self.encoder = nn.Sequential(
             nn.Linear(n_genes, hidden_dim), nn.ReLU(),
@@ -406,14 +449,21 @@ class FlowMatchingOT(BaseGenerativeModel):
                  sigma_max: float = 80.0, sigma_data: float = 0.5, rho: float = 7.0,
                  edm_p_mean: float = -1.2, edm_p_std: float = 1.2,
                  image_encoder_type: str = "none", image_feat_dim: int = 64,
-                 image_patch_size: int = 256):
+                 image_patch_size: int = 256, context_encoder_type: str = "builtin",
+                 stpath_gene_names: list[str] | None = None, stpath_gene_voc_path: str | None = None,
+                 stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
+                 stpath_tech_type: str = "Visium"):
         super().__init__()
         self.save_hyperparameters()
         assert path_type in ("ot", "edm"), f"unknown path_type {path_type!r}"
-        self.context_encoder = SpatialContextEncoder(
-            n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim,
+        self.context_encoder = _build_context_encoder(
+            n_genes=n_genes, coord_dim=coord_dim, cond_hidden_dim=cond_hidden_dim,
+            context_encoder_type=context_encoder_type,
             image_encoder_type=image_encoder_type, image_feat_dim=image_feat_dim,
             image_patch_size=image_patch_size,
+            stpath_gene_names=stpath_gene_names, stpath_gene_voc_path=stpath_gene_voc_path,
+            stpath_model_weight_path=stpath_model_weight_path, stpath_organ_type=stpath_organ_type,
+            stpath_tech_type=stpath_tech_type,
         )
         # own autoencoder, own weights — compresses expression to a small
         # latent code the velocity net operates on instead of raw n_genes
@@ -587,13 +637,20 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  recon_weight: float = 1.0, ar_weight: float = 1.0,
                  sample_temperature: float = 1.0, lr: float = 1e-3,
                  image_encoder_type: str = "none", image_feat_dim: int = 64,
-                 image_patch_size: int = 256):
+                 image_patch_size: int = 256, context_encoder_type: str = "builtin",
+                 stpath_gene_names: list[str] | None = None, stpath_gene_voc_path: str | None = None,
+                 stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
+                 stpath_tech_type: str = "Visium"):
         super().__init__()
         self.save_hyperparameters()
-        self.context_encoder = SpatialContextEncoder(
-            n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim,
+        self.context_encoder = _build_context_encoder(
+            n_genes=n_genes, coord_dim=coord_dim, cond_hidden_dim=cond_hidden_dim,
+            context_encoder_type=context_encoder_type,
             image_encoder_type=image_encoder_type, image_feat_dim=image_feat_dim,
             image_patch_size=image_patch_size,
+            stpath_gene_names=stpath_gene_names, stpath_gene_voc_path=stpath_gene_voc_path,
+            stpath_model_weight_path=stpath_model_weight_path, stpath_organ_type=stpath_organ_type,
+            stpath_tech_type=stpath_tech_type,
         )
         self.encoder = nn.Sequential(
             nn.Linear(n_genes, ae_hidden_dim), nn.ReLU(),

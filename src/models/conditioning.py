@@ -113,6 +113,32 @@ class ImagePatchEncoder(nn.Module):
         return self.proj(h)
 
 
+def _load_gigapath_tile_encoder():
+    """Shared loader for Prov-GigaPath's tile encoder — used by both
+    GigapathPatchEncoder below (task #20) and
+    src/models/stpath_encoder.py's STPathContextEncoder (task #18, which
+    needs the same raw 1536-dim features, without a trainable projection
+    on top). Frozen (eval mode, no gradient) — the RAE idea (Zheng et al.
+    2025) applied here: reuse a strong pretrained representation as-is.
+
+    Requires, neither a default dependency of this repo:
+      1. `pip install timm` (>=1.0.3 per the model's own README) — not in
+         environment.yml/requirements.txt, since it's only needed if
+         Gigapath is actually used.
+      2. A HuggingFace account with access GRANTED to the gated
+         prov-gigapath/prov-gigapath repo (research-use-only license —
+         request at huggingface.co/prov-gigapath/prov-gigapath) and
+         `huggingface-cli login` run once, or `HF_TOKEN` set in the
+         environment. Not something this code can obtain on your behalf.
+    """
+    import timm
+    tile_encoder = timm.create_model("hf_hub:prov-gigapath/prov-gigapath", pretrained=True)
+    tile_encoder.eval()
+    for p in tile_encoder.parameters():
+        p.requires_grad_(False)
+    return tile_encoder
+
+
 class GigapathPatchEncoder(nn.Module):
     """
     Wraps Prov-GigaPath's tile encoder (Xu et al. 2024, Nature, "A
@@ -123,19 +149,9 @@ class GigapathPatchEncoder(nn.Module):
     fusion): this class is Gigapath ALONE, feeding straight into this same
     module's own k-NN/attention fusion instead of STPath's.
 
-    Frozen (eval mode, no gradient) — the RAE idea (Zheng et al. 2025)
-    applied here: reuse a strong pretrained representation as-is, only the
-    small projection head on top is trained.
-
-    Requires, neither a default dependency of this repo:
-      1. `pip install timm` (>=1.0.3 per the model's own README) — not in
-         environment.yml/requirements.txt, since it's only needed if this
-         class is actually instantiated.
-      2. A HuggingFace account with access GRANTED to the gated
-         prov-gigapath/prov-gigapath repo (research-use-only license —
-         request at huggingface.co/prov-gigapath/prov-gigapath) and
-         `huggingface-cli login` run once, or `HF_TOKEN` set in the
-         environment. Not something this code can obtain on your behalf.
+    Only the small trainable projection head is unique to this class — the
+    frozen tile encoder loading + setup requirements are documented once,
+    in _load_gigapath_tile_encoder() above.
 
     Preprocessing (resize 256 -> center-crop 224 -> ImageNet normalize) is
     Prov-GigaPath's own documented pipeline (its GitHub README), applied
@@ -147,14 +163,7 @@ class GigapathPatchEncoder(nn.Module):
 
     def __init__(self, feat_dim: int = 64):
         super().__init__()
-        import timm
-        self.tile_encoder = timm.create_model(
-            "hf_hub:prov-gigapath/prov-gigapath", pretrained=True
-        )
-        self.tile_encoder.eval()
-        for p in self.tile_encoder.parameters():
-            p.requires_grad_(False)
-
+        self.tile_encoder = _load_gigapath_tile_encoder()
         self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 

@@ -129,16 +129,27 @@ def _load_data(cfg) -> tuple:
     expr = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()
     slice_ids = adata.obs["slice_id"].to_numpy()
     images = _load_images(cfg, adata)
-    return coords3d, expr, slice_ids, images
+    return adata, coords3d, expr, slice_ids, images
+
+
+def inject_stpath_gene_names(model_cfg: dict, adata) -> None:
+    """If a config sets context_encoder_type: "stpath" (task #18),
+    auto-derive stpath_gene_names from the loaded AnnData's var_names
+    rather than requiring ~16570 gene symbols hardcoded into a YAML file.
+    Mutates model_cfg["params"] in place; no-op for every other config."""
+    params = model_cfg.get("params", {})
+    if params.get("context_encoder_type") == "stpath" and "stpath_gene_names" not in params:
+        params["stpath_gene_names"] = adata.var_names.tolist()
 
 
 def main(cfg_path: str):
     cfg = OmegaConf.load(cfg_path)
     torch.manual_seed(cfg.training.seed)
 
-    coords3d, expr, slice_ids, images = _load_data(cfg)
+    adata, coords3d, expr, slice_ids, images = _load_data(cfg)
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
+    inject_stpath_gene_names(model_cfg, adata)
     model = build_model(model_cfg)
 
     # Train (skipped entirely for parameter-free baselines like interp_baseline) --
