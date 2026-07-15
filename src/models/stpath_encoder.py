@@ -140,14 +140,18 @@ class STPathContextEncoder(nn.Module):
         # 1536-dim features STPath's image tokenizer expects — shares the
         # same loader as GigapathPatchEncoder (task #20), no separate
         # trainable projection here since STPath wants the raw feature.
-        # Only actually used for raw-patch input (see _gigapath_features
-        # below) — the real training pipeline passes precomputed features
+        # LAZY (not loaded here): only actually used for raw-patch input
+        # (see _ensure_tile_encoder/_gigapath_features below) — the real
+        # training pipeline always passes precomputed features
         # (src/models/conditioning.py precompute_gigapath_features) and
-        # never touches this.
-        self.tile_encoder = _load_gigapath_tile_encoder()
-        self.tile_encoder.eval()
-        for p in self.tile_encoder.parameters():
-            p.requires_grad_(False)
+        # never touches this. Loading it unconditionally here meant every
+        # STPathContextEncoder instance carried an extra ~4.4GB (fp32,
+        # ~1.1B params) of dead weight even though it was never called in
+        # practice — confirmed 2026-07-15 as a real contributor to a RAM
+        # crash when several STPath-based configs were resident in memory
+        # at once (src/evaluation/run_comparison.py, see its own fix for
+        # the bigger cause: not releasing models between configs).
+        self.tile_encoder = None
 
         self.proj = nn.Linear(self.d_model, hidden_dim)
 
@@ -157,6 +161,20 @@ class STPathContextEncoder(nn.Module):
         self._valid_gene_pos = valid_gene_pos
         self.register_buffer("_context_gene_ids", torch.tensor(context_gene_ids, dtype=torch.long))
 
+    def _ensure_tile_encoder(self, device: torch.device) -> nn.Module:
+        """Loads the ~4.4GB Gigapath tile encoder on first actual use,
+        not at construction time (see the comment on self.tile_encoder in
+        __init__). Takes device explicitly rather than relying on
+        Lightning's automatic .to(device) — this submodule may not exist
+        yet at the point Lightning moved the rest of the model, since it's
+        created lazily, possibly mid-training."""
+        if self.tile_encoder is None:
+            self.tile_encoder = _load_gigapath_tile_encoder().to(device)
+            self.tile_encoder.eval()
+            for p in self.tile_encoder.parameters():
+                p.requires_grad_(False)
+        return self.tile_encoder
+
     def _gigapath_features(self, patches_or_features: torch.Tensor) -> torch.Tensor:
         # accepts EITHER raw patches [B, 3, H, W] float in [0,1] (encodes
         # from scratch — slow, uncached path) OR already-precomputed
@@ -164,7 +182,8 @@ class STPathContextEncoder(nn.Module):
         # pipeline uses, see precompute_gigapath_features) - same
         # dispatch-on-rank pattern as GigapathPatchEncoder.forward
         if patches_or_features.dim() == 4:
-            return _gigapath_preprocess_and_encode(self.tile_encoder, patches_or_features)
+            tile_encoder = self._ensure_tile_encoder(patches_or_features.device)
+            return _gigapath_preprocess_and_encode(tile_encoder, patches_or_features)
         return patches_or_features
 
     @torch.no_grad()

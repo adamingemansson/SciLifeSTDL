@@ -344,6 +344,24 @@ baseline, not counted as one of the three comparison models below.
   patch format — the only format `ImagePatchEncoder`/CNN can consume,
   while Gigapath/STPath can consume either raw patches or precomputed
   features).
+
+  **Real RAM crash fixed (2026-07-15):** `run_comparison.py` used to
+  accumulate every trained model in memory and only evaluate them all at
+  the end — with several Gigapath/STPath-backed configs in one invocation
+  (each carrying a ~4.4GB frozen encoder in fp32), that meant multiple
+  full copies resident simultaneously, which crashed a real machine.
+  Fixed by evaluating and freeing (`gc.collect()` +
+  `torch.cuda`/`torch.mps.empty_cache()`) each model immediately after
+  training it (`_free()`/`_evaluate()`/`_build_shared_eval()`), rather
+  than accumulate-then-evaluate. Separately, `GigapathPatchEncoder`
+  (`conditioning.py`) and `STPathContextEncoder`
+  (`stpath_encoder.py`) both used to unconditionally load their own
+  ~4.4GB Gigapath tile encoder at construction time even though real
+  training always passes precomputed features (2D) and never raw patches
+  (4D) — meaning that copy was pure dead weight in every real run. Both
+  now lazy-load it on first actual raw-patch use (never, in practice),
+  cutting steady-state memory per model roughly in half for
+  Gigapath/STPath configs.
 - **Full histology image generation/reconstruction stays a deferred
   stretch goal**, separate from the conditioning use above. Filling in
   broken tissue *in the H&E image itself*, not just using H&E to condition

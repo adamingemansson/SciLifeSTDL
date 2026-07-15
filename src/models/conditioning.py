@@ -246,14 +246,32 @@ class GigapathPatchEncoder(nn.Module):
 
     def __init__(self, feat_dim: int = 64):
         super().__init__()
-        self.tile_encoder = _load_gigapath_tile_encoder()
+        tile_encoder = _load_gigapath_tile_encoder()
         with torch.no_grad():
-            gigapath_dim = self.tile_encoder(torch.zeros(1, 3, 224, 224)).shape[-1]
+            gigapath_dim = tile_encoder(torch.zeros(1, 3, 224, 224)).shape[-1]
         self.proj = nn.Linear(gigapath_dim, feat_dim)
+        # Don't keep the ~4.4GB tile encoder resident after this dim
+        # probe: real training always passes precomputed features (2D,
+        # see precompute_gigapath_features), never raw patches (4D), so
+        # forward() below never actually calls it in practice. Reloaded
+        # lazily only if raw patches genuinely do show up (smoke tests /
+        # one-off calls) — same pattern as
+        # stpath_encoder.py's STPathContextEncoder._ensure_tile_encoder,
+        # both added 2026-07-15 after a real RAM crash running several
+        # Gigapath/STPath-backed configs back to back
+        # (src/evaluation/run_comparison.py _free()).
+        del tile_encoder
+        self.tile_encoder = None
+
+    def _ensure_tile_encoder(self, device: torch.device) -> nn.Module:
+        if self.tile_encoder is None:
+            self.tile_encoder = _load_gigapath_tile_encoder().to(device)
+        return self.tile_encoder
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 4:  # raw patches - encode from scratch (uncached path)
-            x = _gigapath_preprocess_and_encode(self.tile_encoder, x)
+            tile_encoder = self._ensure_tile_encoder(x.device)
+            x = _gigapath_preprocess_and_encode(tile_encoder, x)
         return self.proj(x)
 
 
