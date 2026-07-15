@@ -51,11 +51,14 @@ SETUP (neither is a default dependency/step of this repo):
   4. Gigapath itself (task #20's GigapathPatchEncoder setup — STPath's
      image tokens are Gigapath tile-encoder features, feature_dim=1536).
 
-UNTESTED beyond structural smoke-testing (tests/test_stpath_encoder.py,
-skips cleanly without the above) — this integration has more moving parts
-than anything else in this codebase and could not be run end-to-end in
-the sandbox this was written in. Treat the first real run as a debugging
-pass, same as every other component built this way in this project.
+Structural smoke-testing: tests/test_stpath_encoder.py, skips cleanly
+without the above. CONFIRMED running end-to-end on real hardware
+(2026-07-15, user's Mac, MPS backend, exp_hest1k_wae_gan_stpath.yaml,
+50/50 masking draws in ~7s) after fixing two real bugs found along the
+way: HEST-1k's real patch .h5 format (src/data/loaders.py) and
+PYTORCH_ENABLE_MPS_FALLBACK timing (must be set before ANY MPS op runs
+in the process — see src/training/train.py's top-of-file comment, not
+the os.environ.setdefault below, which alone was NOT sufficient).
 """
 from __future__ import annotations
 
@@ -70,12 +73,18 @@ import os
 # (moving that one op to CPU manually) without patching code outside this
 # repo. PYTORCH_ENABLE_MPS_FALLBACK is PyTorch's own documented workaround
 # for exactly this situation - it falls back to CPU only for the specific
-# unimplemented op, not the whole model. Set here (setdefault, so an
-# explicit user setting always wins) rather than requiring the user to
-# remember to export it before every run. Must be set before the failing
-# op actually runs, not necessarily before `import torch` - PyTorch's MPS
-# fallback dispatch reads this env var lazily, at the time each op is
-# attempted, not once at process startup.
+# unimplemented op, not the whole model. Set here too (setdefault, so an
+# explicit user setting always wins) as a belt-and-suspenders default for
+# anyone importing this module directly — but this alone is NOT
+# sufficient. Confirmed empirically 2026-07-15: PyTorch checks this env
+# var once, early (not lazily per-op as an earlier version of this
+# comment assumed) — setting it here, after src/training/train.py's
+# _load_images had already dispatched MPS ops via the Gigapath precompute
+# step earlier in the same process, produced the identical
+# torch.linalg.eigh crash. The real fix is setting it before `import
+# torch` at the top of the process's actual entry point
+# (src/training/train.py / src/evaluation/run_comparison.py) — see the
+# comment there.
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import torch

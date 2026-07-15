@@ -298,11 +298,25 @@ baseline, not counted as one of the three comparison models below.
   (`configs/exp_hest1k_{wae_gan,fm_ot,vqvae_ar}_stpath.yaml`) — the two
   `stpath_*_path` fields need editing per-machine (where STPath was
   cloned, where its weight was downloaded). Smoke-tested
-  (`tests/test_stpath_encoder.py`) skip-safely — **could not be run
-  end-to-end** in the environment this was written in (no way to install
-  the external `stpath` package/weights there); genuinely the most
-  complex, least independently-verified integration in this codebase so
-  far, flagged explicitly rather than presented as more solid than it is.
+  (`tests/test_stpath_encoder.py`) skip-safely, and **confirmed running
+  end-to-end on real hardware** (2026-07-15, user's Mac, MPS backend):
+  `exp_hest1k_wae_gan_stpath.yaml` trained 50/50 masking draws in ~7s
+  (mean PCC 0.0015, RMSE 0.5485 — a single uncontrolled run, not yet
+  comparable to other arms until run through task #19's shared held-out
+  draw). Two real bugs fixed to get there, both now general fixes for
+  every config, not just STPath: (1) HEST-1k's real patch `.h5` format
+  differs from what source-reading alone suggested (`load_hest_patches`/
+  `align_patches_to_adata`, `src/data/loaders.py`); (2)
+  `PYTORCH_ENABLE_MPS_FALLBACK=1` must be set before ANY MPS op runs in
+  the process (top of `src/training/train.py` and
+  `src/evaluation/run_comparison.py`, before `import torch`), not merely
+  before STPath's own `torch.linalg.eigh` call — setting it later (inside
+  `stpath_encoder.py`, imported lazily during `build_model()`) was
+  confirmed too late on real hardware. Frozen Gigapath features (needed
+  both directly and as STPath's image tokens) are now cached to disk per
+  sample (`<hest_data_dir>/gigapath_cache/<sample_id>.npz`) so repeat runs
+  skip the ~1.1B-param forward pass entirely instead of just avoiding
+  per-step recomputation within one run.
 - **Full histology image generation/reconstruction stays a deferred
   stretch goal**, separate from the conditioning use above. Filling in
   broken tissue *in the H&E image itself*, not just using H&E to condition
