@@ -249,6 +249,16 @@ class GigapathPatchEncoder(nn.Module):
         tile_encoder = _load_gigapath_tile_encoder()
         with torch.no_grad():
             gigapath_dim = tile_encoder(torch.zeros(1, 3, 224, 224)).shape[-1]
+        # Gigapath's own activation scale was optimized for its own
+        # training objective, not for whatever an untrained nn.Linear
+        # here expects — normalize before projecting rather than relying
+        # on `proj` to learn a rescaling from scratch on top of learning
+        # everything else. Same reasoning as
+        # stpath_encoder.py's STPathContextEncoder.embedding_norm
+        # (2026-07-15), added here too for consistency since both classes
+        # are the same "frozen big model -> small trainable head" (RAE)
+        # pattern.
+        self.embedding_norm = nn.LayerNorm(gigapath_dim)
         self.proj = nn.Linear(gigapath_dim, feat_dim)
         # Don't keep the ~4.4GB tile encoder resident after this dim
         # probe: real training always passes precomputed features (2D,
@@ -272,7 +282,7 @@ class GigapathPatchEncoder(nn.Module):
         if x.dim() == 4:  # raw patches - encode from scratch (uncached path)
             tile_encoder = self._ensure_tile_encoder(x.device)
             x = _gigapath_preprocess_and_encode(tile_encoder, x)
-        return self.proj(x)
+        return self.proj(self.embedding_norm(x))
 
 
 class SpatialContextEncoder(nn.Module):

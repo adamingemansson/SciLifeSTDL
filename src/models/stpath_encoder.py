@@ -153,6 +153,20 @@ class STPathContextEncoder(nn.Module):
         # the bigger cause: not releasing models between configs).
         self.tile_encoder = None
 
+        # STPath's pre-head hidden state was trained for STPath's own
+        # objective, not ours — its activation scale is whatever that
+        # training left it at, not necessarily anything close to what an
+        # untrained nn.Linear expects. Normalize before projecting rather
+        # than relying on `proj` to learn a rescaling from scratch on top
+        # of everything else — standard practice for "frozen big model ->
+        # small trainable head" (the RAE pattern this class already is).
+        # Added 2026-07-15 after a real smoke-test run showed RMSE ~3.7
+        # for STPath-conditioned WAE-GAN/FM-OT/FM-EDM vs ~0.55-0.6 for
+        # every other encoder variant — plausibly this exact scale
+        # mismatch, though that run used a stale epochs=50 config (see
+        # exp_hest1k_wae_gan_stpath.yaml's fix) so it wasn't conclusive on
+        # its own; adding this regardless since it's safe either way.
+        self.embedding_norm = nn.LayerNorm(self.d_model)
         self.proj = nn.Linear(self.d_model, hidden_dim)
 
         context_gene_ids, valid_gene_pos = self.tokenizer.ge_tokenizer.symbol2id(
@@ -186,13 +200,22 @@ class STPathContextEncoder(nn.Module):
             return _gigapath_preprocess_and_encode(tile_encoder, patches_or_features)
         return patches_or_features
 
-    @torch.no_grad()
     def forward(self, context_coords: torch.Tensor, context_expression: torch.Tensor,
                 query_coords: torch.Tensor, context_images: torch.Tensor,
                 query_images: torch.Tensor) -> torch.Tensor:
         """context_images/query_images: raw H&E patches [N, 3, H, W] float
         in [0,1] — required (STPath has no meaningful expression-only
-        mode). Returns c [N_query, hidden_dim]."""
+        mode). Returns c [N_query, hidden_dim].
+
+        Real bug found 2026-07-15: this method used to be decorated with
+        @torch.no_grad(), disabling gradient tracking for the ENTIRE
+        forward pass — including self.proj/self.embedding_norm, the only
+        trainable parameters in this class. They never received a
+        gradient, training or eval, and stayed at random initialization
+        regardless of epoch count. Only STPath's own frozen backbone call
+        (self.model.prediction_head below) should skip autograd — moved
+        to its own `with torch.no_grad():` block, with proj/embedding_norm
+        left outside it so they actually train."""
         n_context = context_coords.shape[0]
         n_query = query_coords.shape[0]
         device = context_coords.device
@@ -220,13 +243,15 @@ class STPathContextEncoder(nn.Module):
         tech = self.tokenizer.tech_tokenizer.encode(self.tech_type, align_first=True)
         tech_ids = torch.full((n_total,), tech, dtype=torch.long, device=device)
 
-        _, x = self.model.prediction_head(
-            img_tokens=img_feats,
-            coords=coords,
-            ge_tokens=ge_tokens,
-            batch_idx=torch.zeros(n_total, dtype=torch.long, device=device),
-            tech_tokens=tech_ids,
-            organ_tokens=organ_ids,
-            return_all=True,
-        )
-        return self.proj(x[n_context:])  # query positions only
+        with torch.no_grad():  # STPath itself is frozen (see __init__) - skip building its autograd graph
+            _, x = self.model.prediction_head(
+                img_tokens=img_feats,
+                coords=coords,
+                ge_tokens=ge_tokens,
+                batch_idx=torch.zeros(n_total, dtype=torch.long, device=device),
+                tech_tokens=tech_ids,
+                organ_tokens=organ_ids,
+                return_all=True,
+            )
+        x = self.embedding_norm(x[n_context:])  # query positions only; trainable
+        return self.proj(x)  # trainable

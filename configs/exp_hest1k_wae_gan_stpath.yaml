@@ -59,7 +59,7 @@ model:
     lr_disc: 1.0e-3
 
 training:
-  epochs: 50                   # matched to FM-OT/VQ-VAE+AR for a fair comparison (task #15);
+  epochs: 10000                   # matched to FM-OT/VQ-VAE+AR for a fair comparison (task #15);
                                     # = number of distinct random masking draws trained on
   seed: 0
   log_every_n_steps: 10

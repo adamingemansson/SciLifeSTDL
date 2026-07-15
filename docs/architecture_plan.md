@@ -375,6 +375,32 @@ baseline, not counted as one of the three comparison models below.
      out of `_load_images` for this reuse), and `_evaluate` picks
      whichever format each model's own config actually expects
      (`_images_for_model`).
+
+  **Real correctness bug found from the first full smoke-test table
+  (2026-07-15):** STPath-conditioned WAE-GAN/FM-OT/FM-EDM showed RMSE
+  ~3.7-3.8 vs ~0.55-0.6 for every other row (VQ-VAE+AR/STPath was
+  unaffected, RMSE ~0.59). Root cause: `STPathContextEncoder.forward()`
+  was decorated with `@torch.no_grad()` for its ENTIRE body — including
+  `self.proj`, the only trainable parameter in that class. It never
+  received a gradient, training or eval, and stayed at random
+  initialization regardless of epoch count (independently, that specific
+  smoke-test run also used a stale `epochs: 50` in
+  `exp_hest1k_wae_gan_stpath.yaml` rather than the matrix's `10000` — now
+  fixed, along with confirming every other comparison-matrix config
+  already matches). Fixed: only the actual frozen-backbone call
+  (`self.model.prediction_head`) is now wrapped in its own
+  `with torch.no_grad():`; `self.proj` sits outside it and trains
+  normally. While fixing this, also added `self.embedding_norm =
+  nn.LayerNorm(...)` before the projection in both
+  `STPathContextEncoder` and `GigapathPatchEncoder` (`conditioning.py`)
+  — standard practice for "frozen big model -> small trainable head"
+  (the RAE pattern both classes already are): the frozen backbone's
+  activation scale was optimized for its own training objective, not for
+  whatever scale an untrained `nn.Linear` expects, so normalizing first
+  removes that whole class of bug rather than hoping the projection
+  learns to compensate. Not yet re-verified end-to-end after this fix —
+  next real run should show STPath's numbers back in the same range as
+  every other encoder variant.
 - **Full histology image generation/reconstruction stays a deferred
   stretch goal**, separate from the conditioning use above. Filling in
   broken tissue *in the H&E image itself*, not just using H&E to condition
