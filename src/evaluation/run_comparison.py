@@ -57,8 +57,14 @@ from src.evaluation.cell_type_classifier import cluster_pseudo_labels, CellTypeP
 EVAL_SEED = 999_999  # disjoint from every per-model config's own training seed range
 
 
-def _train_model(cfg_path: str):
+def _train_model(cfg_path: str, overrides: list[str] | None = None):
     cfg = OmegaConf.load(cfg_path)
+    if overrides:
+        # dotlist overrides applied to EVERY config in this comparison run,
+        # e.g. ["training.epochs=2"] for a quick smoke test (2026-07-15,
+        # checking all 18 task #19 configs run end-to-end before committing
+        # to full-length training on each)
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
     torch.manual_seed(cfg.training.seed)
     adata = load_adata(cfg)
     from src.data import loaders
@@ -91,11 +97,12 @@ def _train_model(cfg_path: str):
     return model, cfg, adata, coords3d, expr, slice_ids, images
 
 
-def main(model_config_paths: list[str], k_neighborhood: int = 8, pca_components: int = 10):
+def main(model_config_paths: list[str], k_neighborhood: int = 8, pca_components: int = 10,
+         overrides: list[str] | None = None):
     trained = {}
     shared = None
     for path in model_config_paths:
-        model, cfg, adata, coords3d, expr, slice_ids, images = _train_model(path)
+        model, cfg, adata, coords3d, expr, slice_ids, images = _train_model(path, overrides)
         # keyed by experiment_name, not cfg.model.name: multiple configs can
         # share a registered model name (e.g. fm_ot's OT and EDM path_type
         # variants both register as "fm_ot") and must stay distinct rows
@@ -164,5 +171,8 @@ if __name__ == "__main__":
     parser.add_argument("configs", nargs="+", type=str,
                          help="paths to trainable models' configs (VAE/WAE-GAN/FM-OT/VQ-VAE+AR); "
                               "interp_baseline is added automatically")
+    parser.add_argument("--override", nargs="*", default=[],
+                         help="dotlist overrides applied to EVERY config, "
+                              "e.g. --override training.epochs=2 for a quick smoke test")
     args = parser.parse_args()
-    main(args.configs)
+    main(args.configs, overrides=args.override)

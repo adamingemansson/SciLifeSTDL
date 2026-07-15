@@ -1,0 +1,73 @@
+# EDM path_type + H&E variant of configs/exp_hest1k_fm_ot.yaml (GigaPath
+# pretrained encoder). Combines two ablations that were previously
+# separate: exp_hest1k_fm_edm.yaml (diffusion path, expression-only) and
+# exp_hest1k_fm_ot_he_gigapath.yaml (OT path, Gigapath H&E branch) — added
+# 2026-07-15 so EDM is tested identically to WAE-GAN/FM-OT-ot/VQ-VAE+AR
+# across all four encoder choices, not left as a single expression-only
+# row. See src/models/registry.py FlowMatchingOT for the EDM
+# implementation (Karras et al. 2022) and its explicitly-flagged
+# simplifications (Euler not Heun sampler, sigma_data/P_mean/P_std are
+# EDM's own image-domain defaults, not retuned for our latent scale).
+
+experiment_name: fm_edm_hest1k_pilot_he_gigapath
+
+data:
+  use_images: true               # task #17/#20: load HEST-1k H&E patches
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    image_encoder_type: gigapath  # task #20: Prov-GigaPath pretrained tile encoder -
+                                    # needs `pip install timm` + granted HF access to
+                                    # prov-gigapath/prov-gigapath (see conditioning.py
+                                    # GigapathPatchEncoder docstring)
+    image_feat_dim: 64
+    image_patch_size: 224            # real HEST-1k patches are 224x224, not 256 (verified 2026-07-15)
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_wae_gan.yaml
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32                 # flow matching runs in this latent space, not raw
+                                    # 16570-gene space - see registry.py FM-OT comment
+                                    # (2026-07-14: raw-space runs were stuck at PCC~0,
+                                    # RMSE~noise-scale from 100 to 10000 epochs)
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50                # EDM sampling steps at sample time; not used during training
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+    path_type: edm                 # the only real difference from exp_hest1k_fm_ot_he_gigapath.yaml
+    sigma_min: 0.002               # EDM defaults (Karras et al. 2022) - not retuned for our data
+    sigma_max: 80.0
+    sigma_data: 0.5
+    rho: 7.0
+    edm_p_mean: -1.2
+    edm_p_std: 1.2
+
+training:
+  epochs: 10000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

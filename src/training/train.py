@@ -231,8 +231,14 @@ def inject_stpath_gene_names(model_cfg: dict, adata) -> None:
         params["stpath_gene_names"] = adata.var_names.tolist()
 
 
-def main(cfg_path: str):
+def main(cfg_path: str, overrides: list[str] | None = None):
     cfg = OmegaConf.load(cfg_path)
+    if overrides:
+        # dotlist overrides, e.g. ["training.epochs=2"] — smoke-testing a
+        # config without editing the file itself (2026-07-15, checking all
+        # 18 task #19 configs actually run before committing to full-length
+        # training on each)
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
     torch.manual_seed(cfg.training.seed)
 
     adata, coords3d, expr, slice_ids, images = _load_data(cfg)
@@ -277,5 +283,7 @@ def main(cfg_path: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/base_config.yaml")
+    parser.add_argument("--override", nargs="*", default=[],
+                         help="dotlist config overrides, e.g. --override training.epochs=2")
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, args.override)
