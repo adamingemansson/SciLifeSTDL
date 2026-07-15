@@ -164,7 +164,20 @@ def _gigapath_preprocess_and_encode(tile_encoder, patches: torch.Tensor) -> torc
         return tile_encoder(x)
 
 
-def precompute_gigapath_features(images, batch_size: int = 16):
+def _default_device() -> str:
+    """cuda > mps > cpu. Only used by precompute_gigapath_features below —
+    every nn.Module in this codebase instead relies on Lightning's Trainer
+    moving the whole model to the right device automatically, so encoder
+    classes deliberately don't do their own device auto-detection (that
+    would risk a mismatch if Lightning later picks a different device)."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def precompute_gigapath_features(images, batch_size: int = 16, device: str | None = None):
     """Run Gigapath's frozen tile encoder ONCE over a whole dataset's spot
     patches and cache the result, instead of recomputing it from raw
     pixels on every training step.
@@ -180,19 +193,29 @@ def precompute_gigapath_features(images, batch_size: int = 16):
     [N, gigapath_dim] array per draw like any other per-spot feature,
     exactly like it already does for coords/expression.
 
+    This function runs standalone, before any Lightning Trainer exists
+    (called from _load_data, not from inside a model), so — unlike every
+    nn.Module in this codebase — it has to pick its own device rather than
+    rely on Lightning's automatic placement. Defaults to the best
+    available (cuda > mps > cpu): confirmed 2026-07-15 that the original
+    CPU-only version was the actual bottleneck on Apple Silicon (a
+    ~1.1B-parameter ViT running on CPU for ~1000 images).
+
     images: [N, H, W, 3] uint8. Returns [N, gigapath_dim] float32 numpy
     array (gigapath_dim is read from a real forward pass, not hardcoded —
     same reasoning as GigapathPatchEncoder below)."""
     import numpy as np
-    tile_encoder = _load_gigapath_tile_encoder()
+    if device is None:
+        device = _default_device()
+    tile_encoder = _load_gigapath_tile_encoder().to(device)
     n = images.shape[0]
     all_feats = []
     with torch.no_grad():
         for start in range(0, n, batch_size):
             chunk = images[start:start + batch_size]
-            patches_t = torch.tensor(chunk, dtype=torch.float32).permute(0, 3, 1, 2) / 255.0
+            patches_t = torch.tensor(chunk, dtype=torch.float32).permute(0, 3, 1, 2).to(device) / 255.0
             feats = _gigapath_preprocess_and_encode(tile_encoder, patches_t)
-            all_feats.append(feats.numpy())
+            all_feats.append(feats.cpu().numpy())
     return np.concatenate(all_feats, axis=0)
 
 

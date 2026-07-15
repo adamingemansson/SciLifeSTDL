@@ -153,9 +153,9 @@ def _load_images(cfg, adata):
         or model_params.get("context_encoder_type") == "stpath"
     )
     if uses_frozen_gigapath:
-        from src.models.conditioning import precompute_gigapath_features
-        print(f"Precomputing Gigapath features for {patches.shape[0]} spots "
-              f"(one-time cost, not repeated per training step)...")
+        from src.models.conditioning import precompute_gigapath_features, _default_device
+        print(f"Precomputing Gigapath features for {patches.shape[0]} spots on "
+              f"{_default_device()} (one-time cost, not repeated per training step)...")
         images = precompute_gigapath_features(patches)
     else:
         images = patches
