@@ -62,7 +62,7 @@ from src.models.registry import build_model
 from src.training.train import (
     load_adata, make_context_query_split, MaskedContextQueryDataset,
     _collate_identity, _load_images, _images_tensor, inject_stpath_gene_names,
-    get_gigapath_features,
+    get_gigapath_features, save_trainable_state_dict,
 )
 from src.evaluation import metrics as ev
 from src.evaluation.cell_type_classifier import cluster_pseudo_labels, CellTypePlausibilityClassifier
@@ -105,6 +105,9 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None):
             enable_checkpointing=False, logger=False,
         )
         trainer.fit(model, dataloader)
+        saved_path = save_trainable_state_dict(model, cfg.training.checkpoint_dir)
+        if saved_path is not None:
+            print(f"Saved trainable weights to {saved_path}")
 
     model.eval()
     return model, cfg, adata, coords3d, expr, slice_ids, images

@@ -36,6 +36,31 @@ from src.models.registry import build_model
 from src.evaluation import metrics as ev
 
 
+def save_trainable_state_dict(model, checkpoint_dir: str, filename: str = "trainable_weights.pt") -> Path | None:
+    """Save only trainable parameters, not frozen backbones (Gigapath/
+    STPath). Those are identical to the public pretrained weights and get
+    reloaded fresh from HuggingFace/the local weight file every time a
+    model is rebuilt (see conditioning.py/stpath_encoder.py __init__) —
+    saving them again here would be pure redundancy: a STPath-conditioned
+    model's full state_dict() is ~4.7GB (1.2B frozen params) vs a few
+    tens of MB for just the trainable ones. No-op (returns None) for
+    parameter-free models like interp_baseline.
+
+    Added 2026-07-15 after a real question: training runs weren't saving
+    ANYTHING before this, meaning a completed 10000-step run's weights
+    were gone the moment run_comparison.py's _free() deleted the model
+    object — any later use (e.g. testing on a newly downloaded sample)
+    would have required retraining from scratch."""
+    trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
+    if not trainable_names:
+        return None
+    state = {k: v for k, v in model.state_dict().items() if k in trainable_names}
+    path = Path(checkpoint_dir) / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(state, path)
+    return path
+
+
 def make_context_query_split(coords3d: np.ndarray, slice_ids: np.ndarray, masking_cfg, seed: int):
     """One random context/query mask draw. Factored out of
     MaskedContextQueryDataset so anything that needs the raw boolean masks
@@ -274,6 +299,9 @@ def main(cfg_path: str, overrides: list[str] | None = None):
             logger=False,
         )
         trainer.fit(model, dataloader)
+        saved_path = save_trainable_state_dict(model, cfg.training.checkpoint_dir)
+        if saved_path is not None:
+            print(f"Saved trainable weights to {saved_path}")
 
     # Evaluate on a held-out masking draw not seen during training -----------
     eval_item = MaskedContextQueryDataset(
