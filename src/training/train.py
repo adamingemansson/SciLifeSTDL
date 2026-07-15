@@ -46,13 +46,22 @@ def make_context_query_split(coords3d: np.ndarray, slice_ids: np.ndarray, maskin
 
 
 def _images_tensor(images: np.ndarray, mask: np.ndarray) -> torch.Tensor:
-    """uint8 [n, H, W, 3] -> float [n, 3, H, W] in [0, 1], matching
-    ImagePatchEncoder/GigapathPatchEncoder's input convention. Standalone
-    (not a Dataset method) so src/evaluation/run_comparison.py's shared
-    held-out eval draw can build the same tensors without going through
-    MaskedContextQueryDataset."""
-    patches = images[mask]
-    return torch.tensor(patches, dtype=torch.float32).permute(0, 3, 1, 2) / 255.0
+    """Slice + tensor-ify per-spot image data for one masking draw.
+    Standalone (not a Dataset method) so src/evaluation/run_comparison.py's
+    shared held-out eval draw can build the same tensors without going
+    through MaskedContextQueryDataset.
+
+    `images` is either raw uint8 patches [N, H, W, 3] (image_encoder_type
+    "cnn" — the CNN is trainable, so caching its output would be wrong)
+    or precomputed Gigapath features [N, gigapath_dim] float32
+    (image_encoder_type "gigapath"/"stpath" — see
+    src/models/conditioning.py precompute_gigapath_features, computed
+    once by _load_images below rather than per training step). Dispatches
+    on ndim so callers don't need to know which case they're in."""
+    selected = images[mask]
+    if selected.ndim == 4:  # raw uint8 patches [n, H, W, 3]
+        return torch.tensor(selected, dtype=torch.float32).permute(0, 3, 1, 2) / 255.0
+    return torch.tensor(selected, dtype=torch.float32)  # already-precomputed features [n, feat_dim]
 
 
 class MaskedContextQueryDataset(Dataset):
@@ -70,8 +79,12 @@ class MaskedContextQueryDataset(Dataset):
         self.masking_cfg = masking_cfg
         self.n_items = n_items
         self.base_seed = base_seed
-        # optional H&E patches (task #17), [N, H, W, 3] uint8, already
-        # aligned to coords3d/expr's row order by the caller
+        # optional per-spot image data (task #17/#18/#20), already aligned
+        # to coords3d/expr's row order by the caller — either raw H&E
+        # patches [N, H, W, 3] uint8 (image_encoder_type "cnn") or
+        # precomputed Gigapath features [N, gigapath_dim] float32
+        # ("gigapath"/"stpath" — see _load_images in this file). See
+        # _images_tensor above for how the two cases are distinguished.
         self.images = images
 
     def __len__(self):
@@ -119,12 +132,34 @@ def _load_images(cfg, adata):
     back as a SUBSET of the input — align_patches_to_adata() drops spots
     with no matching patch (a normal partial gap in HEST-1k's own patch
     extraction, not an error) — so callers must use the returned adata,
-    not their original one, for everything downstream. images is
-    [N, 224, 224, 3] uint8 (N = the possibly-reduced spot count) or None."""
+    not their original one, for everything downstream.
+
+    For image_encoder_type "gigapath" or context_encoder_type "stpath",
+    images comes back as PRECOMPUTED Gigapath features [N, gigapath_dim]
+    float32, not raw patches — computed once here via
+    precompute_gigapath_features() rather than recomputed from raw pixels
+    on every training step (task #18/#20's real bug, 2026-07-15: the
+    naive per-step version made a real STPath training run essentially
+    hang). For "cnn" (or no image use), images stays raw uint8 patches
+    [N, 224, 224, 3] — the CNN is trainable so its output can't be cached."""
     if not cfg.data.get("use_images", False):
         return adata, None
     patches, barcodes = loaders.load_hest_patches(cfg.data.hest_data_dir, cfg.data.sample_id)
-    return loaders.align_patches_to_adata(adata, patches, barcodes)
+    adata, patches = loaders.align_patches_to_adata(adata, patches, barcodes)
+
+    model_params = cfg.model.get("params", {})
+    uses_frozen_gigapath = (
+        model_params.get("image_encoder_type") == "gigapath"
+        or model_params.get("context_encoder_type") == "stpath"
+    )
+    if uses_frozen_gigapath:
+        from src.models.conditioning import precompute_gigapath_features
+        print(f"Precomputing Gigapath features for {patches.shape[0]} spots "
+              f"(one-time cost, not repeated per training step)...")
+        images = precompute_gigapath_features(patches)
+    else:
+        images = patches
+    return adata, images
 
 
 def _load_data(cfg) -> tuple:

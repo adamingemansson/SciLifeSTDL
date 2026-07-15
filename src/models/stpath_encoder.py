@@ -62,7 +62,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from src.models.conditioning import _load_gigapath_tile_encoder
+from src.models.conditioning import _load_gigapath_tile_encoder, _gigapath_preprocess_and_encode
 
 
 class STPathContextEncoder(nn.Module):
@@ -112,12 +112,14 @@ class STPathContextEncoder(nn.Module):
         # 1536-dim features STPath's image tokenizer expects — shares the
         # same loader as GigapathPatchEncoder (task #20), no separate
         # trainable projection here since STPath wants the raw feature.
+        # Only actually used for raw-patch input (see _gigapath_features
+        # below) — the real training pipeline passes precomputed features
+        # (src/models/conditioning.py precompute_gigapath_features) and
+        # never touches this.
         self.tile_encoder = _load_gigapath_tile_encoder()
         self.tile_encoder.eval()
         for p in self.tile_encoder.parameters():
             p.requires_grad_(False)
-        self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
         self.proj = nn.Linear(self.d_model, hidden_dim)
 
@@ -127,21 +129,15 @@ class STPathContextEncoder(nn.Module):
         self._valid_gene_pos = valid_gene_pos
         self.register_buffer("_context_gene_ids", torch.tensor(context_gene_ids, dtype=torch.long))
 
-    def _gigapath_features(self, patches: torch.Tensor) -> torch.Tensor:
-        # patches: [B, 3, H, W] float in [0,1] — same convention as
-        # ImagePatchEncoder/GigapathPatchEncoder. bicubic interpolate isn't
-        # implemented on MPS (Apple Silicon) as of this writing - do this
-        # one op on CPU rather than switch modes, to stay faithful to
-        # Gigapath's own documented bicubic preprocessing.
-        device = patches.device
-        x = nn.functional.interpolate(
-            patches.cpu(), size=256, mode="bicubic", align_corners=False
-        ).to(device)
-        top = (256 - 224) // 2
-        x = x[:, :, top:top + 224, top:top + 224]
-        x = (x - self.imagenet_mean) / self.imagenet_std
-        with torch.no_grad():
-            return self.tile_encoder(x)
+    def _gigapath_features(self, patches_or_features: torch.Tensor) -> torch.Tensor:
+        # accepts EITHER raw patches [B, 3, H, W] float in [0,1] (encodes
+        # from scratch — slow, uncached path) OR already-precomputed
+        # Gigapath features [B, 1536] (the fast path the real training
+        # pipeline uses, see precompute_gigapath_features) - same
+        # dispatch-on-rank pattern as GigapathPatchEncoder.forward
+        if patches_or_features.dim() == 4:
+            return _gigapath_preprocess_and_encode(self.tile_encoder, patches_or_features)
+        return patches_or_features
 
     @torch.no_grad()
     def forward(self, context_coords: torch.Tensor, context_expression: torch.Tensor,

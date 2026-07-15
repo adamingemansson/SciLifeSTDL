@@ -139,6 +139,63 @@ def _load_gigapath_tile_encoder():
     return tile_encoder
 
 
+_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+_IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
+
+def _gigapath_preprocess_and_encode(tile_encoder, patches: torch.Tensor) -> torch.Tensor:
+    """Prov-GigaPath's own documented preprocessing (resize 256 -> center
+    crop 224 -> ImageNet normalize, its GitHub README) + a forward pass
+    through the frozen tile encoder. patches: [B, 3, H, W] float in
+    [0, 1]. Shared by GigapathPatchEncoder, STPathContextEncoder, and
+    precompute_gigapath_features below so the preprocessing logic exists
+    in exactly one place."""
+    device = patches.device
+    # bicubic interpolate isn't implemented on MPS (Apple Silicon) as of
+    # this writing - do this one op on CPU rather than switch to a mode
+    # MPS does support, to stay faithful to the documented preprocessing
+    x = nn.functional.interpolate(
+        patches.cpu(), size=256, mode="bicubic", align_corners=False
+    ).to(device)
+    top = (256 - 224) // 2
+    x = x[:, :, top:top + 224, top:top + 224]
+    x = (x - _IMAGENET_MEAN.to(device)) / _IMAGENET_STD.to(device)
+    with torch.no_grad():
+        return tile_encoder(x)
+
+
+def precompute_gigapath_features(images, batch_size: int = 16):
+    """Run Gigapath's frozen tile encoder ONCE over a whole dataset's spot
+    patches and cache the result, instead of recomputing it from raw
+    pixels on every training step.
+
+    Real bug found 2026-07-15: the original design ran GigapathPatchEncoder
+    (and STPathContextEncoder, which uses Gigapath internally) on raw
+    patches inside forward(), meaning every single training step re-ran a
+    giant ViT over ~1000 context images from scratch — a real training run
+    on real INT1 data with STPath conditioning was still stuck after the
+    first step. Gigapath's output for a given image never changes (it's
+    frozen, eval mode, no gradient), so this is pure waste — precompute
+    once here, then MaskedContextQueryDataset just slices/masks the cached
+    [N, gigapath_dim] array per draw like any other per-spot feature,
+    exactly like it already does for coords/expression.
+
+    images: [N, H, W, 3] uint8. Returns [N, gigapath_dim] float32 numpy
+    array (gigapath_dim is read from a real forward pass, not hardcoded —
+    same reasoning as GigapathPatchEncoder below)."""
+    import numpy as np
+    tile_encoder = _load_gigapath_tile_encoder()
+    n = images.shape[0]
+    all_feats = []
+    with torch.no_grad():
+        for start in range(0, n, batch_size):
+            chunk = images[start:start + batch_size]
+            patches_t = torch.tensor(chunk, dtype=torch.float32).permute(0, 3, 1, 2) / 255.0
+            feats = _gigapath_preprocess_and_encode(tile_encoder, patches_t)
+            all_feats.append(feats.numpy())
+    return np.concatenate(all_feats, axis=0)
+
+
 class GigapathPatchEncoder(nn.Module):
     """
     Wraps Prov-GigaPath's tile encoder (Xu et al. 2024, Nature, "A
@@ -150,42 +207,31 @@ class GigapathPatchEncoder(nn.Module):
     module's own k-NN/attention fusion instead of STPath's.
 
     Only the small trainable projection head is unique to this class — the
-    frozen tile encoder loading + setup requirements are documented once,
-    in _load_gigapath_tile_encoder() above.
+    frozen tile encoder loading + preprocessing are shared (see
+    _load_gigapath_tile_encoder / _gigapath_preprocess_and_encode above).
 
-    Preprocessing (resize 256 -> center-crop 224 -> ImageNet normalize) is
-    Prov-GigaPath's own documented pipeline (its GitHub README), applied
-    here to patches already in [0, 1] float (same convention as
-    ImagePatchEncoder). Output feature dim is read from a real forward
-    pass at construction time rather than hardcoded, since the tile
-    encoder's exact embedding size isn't stated in its own README.
+    forward() accepts EITHER raw patches [B, 3, H, W] float in [0, 1]
+    (encodes them from scratch — the uncached, slow path, useful for
+    smoke tests / one-off calls) OR already-precomputed Gigapath features
+    [B, gigapath_dim] (the fast, cached path real training should use —
+    see precompute_gigapath_features above) — dispatches on tensor rank
+    so callers don't need two different method names. Output feature dim
+    is read from a real forward pass at construction time rather than
+    hardcoded, since the tile encoder's exact embedding size isn't stated
+    in its own README.
     """
 
     def __init__(self, feat_dim: int = 64):
         super().__init__()
         self.tile_encoder = _load_gigapath_tile_encoder()
-        self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-
         with torch.no_grad():
             gigapath_dim = self.tile_encoder(torch.zeros(1, 3, 224, 224)).shape[-1]
         self.proj = nn.Linear(gigapath_dim, feat_dim)
 
-    def forward(self, patches: torch.Tensor) -> torch.Tensor:
-        # bicubic interpolate isn't implemented on MPS (Apple Silicon) as
-        # of this writing - do this one op on CPU rather than switch to a
-        # mode MPS does support, to stay faithful to Gigapath's own
-        # documented preprocessing (bicubic resize, its GitHub README)
-        device = patches.device
-        x = nn.functional.interpolate(
-            patches.cpu(), size=256, mode="bicubic", align_corners=False
-        ).to(device)
-        top = (256 - 224) // 2
-        x = x[:, :, top:top + 224, top:top + 224]
-        x = (x - self.imagenet_mean) / self.imagenet_std
-        with torch.no_grad():
-            feat = self.tile_encoder(x)
-        return self.proj(feat)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 4:  # raw patches - encode from scratch (uncached path)
+            x = _gigapath_preprocess_and_encode(self.tile_encoder, x)
+        return self.proj(x)
 
 
 class SpatialContextEncoder(nn.Module):

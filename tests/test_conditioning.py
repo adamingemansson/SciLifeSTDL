@@ -105,6 +105,21 @@ def _run_gigapath_case():
     assert torch.isfinite(c).all()
     print(f"[image branch: gigapath] OK — output shape {tuple(c.shape)}")
 
+    # precomputed-features (cached) path — task #18/#20's real fix,
+    # 2026-07-15: real training must use precomputed features, not raw
+    # patches recomputed every step. Must give the SAME result as the raw
+    # path above, since both go through _gigapath_preprocess_and_encode.
+    from src.models.conditioning import precompute_gigapath_features
+    context_np = (context_images.permute(0, 2, 3, 1) * 255).byte().numpy()
+    query_np = (query_images.permute(0, 2, 3, 1) * 255).byte().numpy()
+    context_feats = torch.from_numpy(precompute_gigapath_features(context_np))
+    query_feats = torch.from_numpy(precompute_gigapath_features(query_np))
+    c_cached = encoder(context_coords, context_expression, query_coords,
+                        context_images=context_feats, query_images=query_feats)
+    assert c_cached.shape == (n_query, 64)
+    assert torch.isfinite(c_cached).all()
+    print(f"[image branch: gigapath, cached] OK — output shape {tuple(c_cached.shape)}")
+
 
 def _run_edge_cases():
     # fewer context points than k_neighbors — _knn_indices should clip k, not crash
