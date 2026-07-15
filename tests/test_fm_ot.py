@@ -59,7 +59,47 @@ def test_training_step_updates_weights():
     print("[training_step] OK — velocity_net + encoder weights updated, no NaNs")
 
 
+def test_sample_edm():
+    torch.manual_seed(0)
+    model = FlowMatchingOT(n_genes=50, coord_dim=3, cond_hidden_dim=32,
+                            hidden_dim=64, time_embed_dim=16, n_ode_steps=5,
+                            path_type="edm")
+    batch = _make_batch(n_context=100, n_query=20, n_genes=50, coord_dim=3)
+
+    out = model.sample(batch["context"], batch["query"])
+    assert out["expression"].shape == (20, 50), out["expression"].shape
+    assert torch.isfinite(out["expression"]).all()
+    print(f"[sample_edm] OK — output shape {tuple(out['expression'].shape)}")
+
+
+def test_training_step_updates_weights_edm():
+    torch.manual_seed(0)
+    model = FlowMatchingOT(n_genes=50, coord_dim=2, cond_hidden_dim=32,
+                            hidden_dim=64, time_embed_dim=16, n_ode_steps=5,
+                            path_type="edm")
+    opt = model.configure_optimizers()
+    model.log_dict = lambda *args, **kwargs: None
+
+    batch = _make_batch(n_context=60, n_query=15, n_genes=50, coord_dim=2)
+    before = model.velocity_net[0].weight.clone()
+    before_enc = model.encoder[0].weight.clone()
+
+    loss = model.training_step(batch, batch_idx=0)
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+
+    after = model.velocity_net[0].weight
+    after_enc = model.encoder[0].weight
+    assert not torch.allclose(before, after), "velocity_net weights did not change — optimizer step had no effect"
+    assert not torch.allclose(before_enc, after_enc), "encoder weights did not change — optimizer step had no effect"
+    assert torch.isfinite(after).all(), "velocity_net weights contain NaN/Inf after one training step"
+    print("[training_step_edm] OK — velocity_net + encoder weights updated, no NaNs")
+
+
 if __name__ == "__main__":
     test_sample()
     test_training_step_updates_weights()
+    test_sample_edm()
+    test_training_step_updates_weights_edm()
     print("\nAll FM-OT smoke tests passed.")

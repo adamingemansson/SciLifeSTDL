@@ -317,10 +317,26 @@ class WAEGAN(BaseGenerativeModel):
 # regression, not needing the scheduler's broader image-pipeline feature
 # set (s_churn/s_tmin/s_tmax/per_token_timesteps etc.).
 #
-# The diffusion-path ablation (docs/architecture_plan.md "Prioritization" —
-# same network, swap the interpolation formula) is deferred, not
-# implemented here — flagged explicitly as a cheap follow-up, not scope
-# creep on this entry.
+# Diffusion-path ablation (`path_type="edm"`, added 2026-07-14): same
+# network (context_encoder/encoder/decoder/time_embed/velocity_net) —
+# swaps the OT straight-line interpolation for EDM's noise/denoising
+# formulation (Karras et al. 2022, NeurIPS, "Elucidating the Design Space
+# of Diffusion-Based Generative Models") rather than plain DDPM (Ho et al.
+# 2020) — EDM is the more carefully-justified, widely-adopted modern
+# diffusion formulation, and its "elucidated design" preconditioning
+# (c_skip/c_out/c_in/c_noise) is the actual core contribution, not an
+# optional add-on, so it's implemented here rather than skipped.
+# Simplifications flagged explicitly, not hidden: (1) sampling uses plain
+# Euler steps on the probability-flow ODE, not EDM's recommended 2nd-order
+# Heun sampler — consistent with this file's existing choice to keep
+# sampling loops simple (see the OT path's own manual-Euler-over-
+# diffusers-scheduler note above); (2) sigma_data/P_mean/P_std defaults
+# are EDM's own published values, tuned for their image-pixel domain, not
+# retuned for our latent-code scale — a reasonable starting point, not a
+# validated-for-this-domain claim; (3) _SinusoidalTimeEmbedding (built for
+# t in [0,1]) is reused for EDM's real-valued c_noise conditioning signal
+# rather than building a second embedding module — works numerically, not
+# specifically tuned for that input range.
 #
 # LATENT-SPACE, not raw 16570-gene space: the first real-data runs (flat
 # PCC~0, RMSE stuck near noise-scale from 100 to 10000 training steps —
@@ -368,9 +384,13 @@ class FlowMatchingOT(BaseGenerativeModel):
                  latent_dim: int = 32, ae_hidden_dim: int = 256,
                  hidden_dim: int = 512, time_embed_dim: int = 64,
                  n_ode_steps: int = 50, recon_weight: float = 1.0,
-                 fm_weight: float = 1.0, lr: float = 1e-3):
+                 fm_weight: float = 1.0, lr: float = 1e-3,
+                 path_type: str = "ot", sigma_min: float = 0.002,
+                 sigma_max: float = 80.0, sigma_data: float = 0.5, rho: float = 7.0,
+                 edm_p_mean: float = -1.2, edm_p_std: float = 1.2):
         super().__init__()
         self.save_hyperparameters()
+        assert path_type in ("ot", "edm"), f"unknown path_type {path_type!r}"
         self.context_encoder = SpatialContextEncoder(
             n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim
         )
@@ -396,19 +416,56 @@ class FlowMatchingOT(BaseGenerativeModel):
         self.recon_weight = recon_weight
         self.fm_weight = fm_weight
         self.lr = lr
+        self.path_type = path_type
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.sigma_data = sigma_data
+        self.rho = rho
+        self.edm_p_mean = edm_p_mean
+        self.edm_p_std = edm_p_std
 
     def _velocity(self, z_t, t, c):
         t_embed = self.time_embed(t)
         return self.velocity_net(torch.cat([z_t, t_embed, c], dim=-1))
 
+    def _edm_denoise(self, z_sigma, sigma, c):
+        """EDM's preconditioned denoiser D_theta (Karras et al. 2022 eq. 7):
+        wraps the same velocity_net used by the OT path with c_skip/c_out/
+        c_in scaling so the network only has to learn a well-conditioned
+        residual at every noise level, not the raw denoising map."""
+        sigma = sigma.view(-1, 1)
+        c_skip = self.sigma_data**2 / (sigma**2 + self.sigma_data**2)
+        c_out = sigma * self.sigma_data / torch.sqrt(sigma**2 + self.sigma_data**2)
+        c_in = 1.0 / torch.sqrt(sigma**2 + self.sigma_data**2)
+        c_noise = 0.25 * torch.log(sigma.squeeze(-1))
+        t_embed = self.time_embed(c_noise)
+        f = self.velocity_net(torch.cat([c_in * z_sigma, t_embed, c], dim=-1))
+        return c_skip * z_sigma + c_out * f
+
     def sample(self, context, query):
         n = query["coords"].shape[0]
         c = self.context_encoder(context["coords"], context["expression"], query["coords"])
-        z = torch.randn(n, self.latent_dim, device=self.device)
-        dt = 1.0 / self.n_ode_steps
-        for step in range(self.n_ode_steps):
-            t = torch.full((n,), step * dt, device=self.device)
-            z = z + dt * self._velocity(z, t, c)  # manual Euler ODE integration, in latent space
+
+        if self.path_type == "ot":
+            z = torch.randn(n, self.latent_dim, device=self.device)
+            dt = 1.0 / self.n_ode_steps
+            for step in range(self.n_ode_steps):
+                t = torch.full((n,), step * dt, device=self.device)
+                z = z + dt * self._velocity(z, t, c)  # manual Euler ODE integration, in latent space
+        else:  # edm
+            steps = self.n_ode_steps
+            i = torch.arange(steps, device=self.device, dtype=torch.float32)
+            sigmas = (self.sigma_max ** (1 / self.rho) + i / (steps - 1) *
+                      (self.sigma_min ** (1 / self.rho) - self.sigma_max ** (1 / self.rho))
+                      ) ** self.rho
+            sigmas = torch.cat([sigmas, torch.zeros(1, device=self.device)])  # sigma_N = 0
+            z = torch.randn(n, self.latent_dim, device=self.device) * self.sigma_max
+            for step in range(steps):
+                sigma_cur = sigmas[step]
+                d = self._edm_denoise(z, sigma_cur.expand(n), c)
+                d_over_sigma = (z - d) / sigma_cur          # probability-flow ODE: dz/dsigma
+                z = z + (sigmas[step + 1] - sigma_cur) * d_over_sigma  # Euler step
+
         expr_gen = self.decoder(torch.cat([z, c], dim=-1))
         return {"coords": query["coords"], "expression": expr_gen}
 
@@ -422,16 +479,27 @@ class FlowMatchingOT(BaseGenerativeModel):
         recon = self.decoder(torch.cat([z_1, c], dim=-1))
         recon_loss = nn.functional.mse_loss(recon, x_1)
 
-        # flow-matching target sees a frozen (detached) latent code, so the
-        # encoder/decoder are trained only by recon_loss — approximates a
-        # pretrained-then-frozen autoencoder without a separate stage
+        # flow-matching/diffusion target sees a frozen (detached) latent
+        # code, so the encoder/decoder are trained only by recon_loss —
+        # approximates a pretrained-then-frozen autoencoder without a
+        # separate stage
         z_1_target = z_1.detach()
-        z_0 = torch.randn_like(z_1_target)
-        t = torch.rand(n, device=self.device)
-        z_t = (1 - t[:, None]) * z_0 + t[:, None] * z_1_target   # OT straight-line path
-        target_velocity = z_1_target - z_0                        # constant along a straight line
-        pred_velocity = self._velocity(z_t, t, c)
-        fm_loss = nn.functional.mse_loss(pred_velocity, target_velocity)
+
+        if self.path_type == "ot":
+            z_0 = torch.randn_like(z_1_target)
+            t = torch.rand(n, device=self.device)
+            z_t = (1 - t[:, None]) * z_0 + t[:, None] * z_1_target   # OT straight-line path
+            target_velocity = z_1_target - z_0                        # constant along a straight line
+            pred_velocity = self._velocity(z_t, t, c)
+            fm_loss = nn.functional.mse_loss(pred_velocity, target_velocity)
+        else:  # edm
+            log_sigma = self.edm_p_mean + self.edm_p_std * torch.randn(n, device=self.device)
+            sigma = torch.exp(log_sigma)
+            noise = torch.randn_like(z_1_target)
+            z_sigma = z_1_target + sigma[:, None] * noise
+            d_pred = self._edm_denoise(z_sigma, sigma, c)
+            weight = (sigma**2 + self.sigma_data**2) / (sigma * self.sigma_data) ** 2
+            fm_loss = (weight[:, None] * (d_pred - z_1_target) ** 2).mean()
 
         loss = self.recon_weight * recon_loss + self.fm_weight * fm_loss
         self.log_dict({"train/recon": recon_loss, "train/fm_loss": fm_loss, "train/loss": loss})

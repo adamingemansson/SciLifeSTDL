@@ -206,10 +206,12 @@ baseline, not counted as one of the three comparison models below.
 
 1. **WAE-GAN** — done. GAN entry point (Tolstikhin et al. 2017).
 2. **Flow Matching, OT path (FM-OT)** — done, smoke-tested (`tests/test_fm_ot.py`),
-   in `src/models/registry.py` (`FlowMatchingOT`). Not yet run on real data.
-   One shared denoiser/velocity network; diffusion-path training is a cheap
-   config-flag ablation on the same network afterward, not a separate model
-   or a priority in its own right. EMDiffuse's actual contribution (missing-
+   in `src/models/registry.py` (`FlowMatchingOT`), real-data results in
+   (task #15). One shared denoiser/velocity network; diffusion-path
+   training (`path_type="edm"`, EDM — Karras et al. 2022, NeurIPS — added
+   2026-07-14) is a cheap config-flag ablation on the same network, now
+   built and smoke-tested (`configs/exp_hest1k_fm_edm.yaml`), not yet run
+   on real data. EMDiffuse's actual contribution (missing-
    slice conditioning/task design, `docs/literature_review.md`) informs how
    this model is conditioned, not a separate registry entry. `diffusers`
    schedulers/utilities handle sampling-loop math where applicable; we

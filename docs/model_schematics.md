@@ -129,8 +129,11 @@ flowchart TD
 - ODE integrator for sampling (manual Euler, in latent space) + decode
   back to expression at the end.
 - The cheap diffusion-path ablation (`docs/architecture_plan.md`): same
-  velocity network, swap the `z_t` interpolation formula for a diffusion-style
-  schedule — a training-loop config flag, not new modules. Still deferred.
+  velocity network, swap the `z_t` interpolation formula for a
+  diffusion-style schedule — a training-loop config flag, not new modules.
+  **Built** (2026-07-14): `path_type="edm"` on `FlowMatchingOT`, EDM
+  (Karras et al. 2022, NeurIPS), smoke-tested via `tests/test_fm_ot.py`,
+  config at `configs/exp_hest1k_fm_edm.yaml`. Not yet run on real data.
 
 ---
 

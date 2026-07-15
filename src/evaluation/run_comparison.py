@@ -69,10 +69,13 @@ def main(model_config_paths: list[str], k_neighborhood: int = 8, pca_components:
     shared = None
     for path in model_config_paths:
         model, cfg, adata, coords3d, expr, slice_ids = _train_model(path)
-        trained[cfg.model.name] = model
+        # keyed by experiment_name, not cfg.model.name: multiple configs can
+        # share a registered model name (e.g. fm_ot's OT and EDM path_type
+        # variants both register as "fm_ot") and must stay distinct rows
+        trained[cfg.experiment_name] = model
         if shared is None:
             shared = (adata, coords3d, expr, slice_ids, cfg.masking)
-        print(f"trained: {cfg.model.name}")
+        print(f"trained: {cfg.experiment_name}")
 
     adata, coords3d, expr, slice_ids, masking_cfg = shared
     trained["interp_baseline"] = build_model({"name": "interp_baseline", "params": {}})
