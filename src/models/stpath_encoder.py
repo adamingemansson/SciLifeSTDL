@@ -90,14 +90,80 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 import torch
 import torch.nn as nn
 
-from src.models.conditioning import _load_gigapath_tile_encoder, _gigapath_preprocess_and_encode
+from src.models.conditioning import (
+    _load_gigapath_tile_encoder, _gigapath_preprocess_and_encode,
+    MLPGeneEncoder, NovaeGeneEncoder,
+)
+
+
+class _ResidualEncodeInputs(nn.Module):
+    """Wraps STPath's real `EncodeInputs` (stpath/model/model.py — verified
+    2026-07-16 via its real source: `forward(img_tokens, ge_tokens,
+    tech_tokens, organ_tokens)` returns `img_embed + ge_embed + tech_embed +
+    organ_embed`, all frozen pretrained sub-embeddings) to additionally add
+    a NEW, trainable gene-expression signal as a residual, BEFORE the
+    spatial Transformer sees it — the actual "Route 1" test from this
+    project's GEX-encoder-bottleneck investigation: does a better gene
+    encoder help STPath's real (pretrained) fusion, not just our own weak
+    one (which task #19-followup's Novae/MLP-in-our-own-encoder test
+    already showed near-zero PCC for, regardless of gene encoder quality —
+    that result couldn't distinguish "gene encoder doesn't matter" from
+    "our fusion is too weak to use ANY gene encoder well").
+
+    Residual, not replacement: STPath's own gene_embed(ge_tokens) still
+    contributes as before (its pretrained weights, and the token pipeline
+    that already handles context/masked-query positions correctly) — this
+    just ADDS residual_proj(extra_embed) on top.
+
+    residual_proj is a Linear(d_model, d_model) with weight AND bias
+    zero-initialized — not a single scalar alpha (an earlier version of
+    this class used one; a single global scalar can only uniformly scale
+    the whole embedding, it can't let training weight different
+    dimensions of the new signal differently). Zero-init means
+    residual_proj(x) == 0 for ANY x at initialization, so training still
+    begins IDENTICAL to the unmodified pretrained model (the same safe-
+    initialization property the scalar had — see class docstring
+    reasoning in stpath_encoder.py's STPathContextEncoder for why an
+    outright replacement, with no safe starting point at all, risks
+    unstable training on our small pilot dataset) — just with a strictly
+    more expressive combiner once training actually moves it away from
+    zero. Standard pattern in adapter/residual-injection literature
+    (e.g. ControlNet's "zero convolution", NLP adapter layers).
+
+    extra_embed must be set via set_extra_embed() before each forward()
+    call (a side-channel, not a forward() parameter) because STPath's own
+    `STFM.inference`/`prediction_head` calls this module internally with a
+    fixed signature we don't control — see STPathContextEncoder.forward()
+    for where it's actually set."""
+
+    def __init__(self, original: nn.Module, d_model: int):
+        super().__init__()
+        self.original = original
+        self.residual_proj = nn.Linear(d_model, d_model)
+        nn.init.zeros_(self.residual_proj.weight)
+        nn.init.zeros_(self.residual_proj.bias)
+        self._extra_embed: torch.Tensor | None = None
+
+    def set_extra_embed(self, extra_embed: torch.Tensor) -> None:
+        self._extra_embed = extra_embed
+
+    def forward(self, img_tokens, ge_tokens, tech_tokens, organ_tokens):
+        base = self.original(img_tokens, ge_tokens, tech_tokens, organ_tokens)
+        assert self._extra_embed is not None, (
+            "_ResidualEncodeInputs.forward called without set_extra_embed() first"
+        )
+        return base + self.residual_proj(self._extra_embed)
 
 
 class STPathContextEncoder(nn.Module):
     def __init__(self, gene_names: list[str], gene_voc_path: str, model_weight_path: str,
                  organ_type: str = "Kidney", tech_type: str = "Visium",
-                 hidden_dim: int = 256, device: str = "cpu"):
+                 hidden_dim: int = 256, device: str = "cpu",
+                 new_gene_encoder_type: str = "none", novae_dim: int | None = None):
         super().__init__()
+        assert new_gene_encoder_type in ("none", "mlp", "novae"), (
+            f"unknown new_gene_encoder_type {new_gene_encoder_type!r}"
+        )
         from stpath.model.model import STFM
         from stpath.model.nn_utils.config import ModelConfig
         from stpath.tokenization import (
@@ -135,6 +201,31 @@ class STPathContextEncoder(nn.Module):
         self.model.eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
+
+        # Route B (2026-07-16, GEX-encoder-bottleneck investigation): test
+        # whether a better gene encoder helps STPath's REAL pretrained
+        # fusion, not just our own weak one (see task #19-followup's
+        # SpatialContextEncoder gene_encoder_type — that test couldn't
+        # distinguish "gene encoder doesn't matter" from "our fusion is
+        # too weak to use any gene encoder well"). Wraps
+        # self.model.input_encoder (verified 2026-07-16 via STPath's real
+        # source, stpath/model/model.py: EncodeInputs.forward returns
+        # img_embed + ge_embed + tech_embed + organ_embed) to additionally
+        # add alpha * new_gene_encoder(our_own_raw_expression) as a
+        # residual, alpha starting at 0 for safe initialization (see
+        # _ResidualEncodeInputs docstring for the full reasoning) — STPath's
+        # own gene_embed(ge_tokens) path is untouched, this only adds to it.
+        self.new_gene_encoder = None
+        if new_gene_encoder_type == "mlp":
+            self.new_gene_encoder = MLPGeneEncoder(len(gene_names), self.d_model)
+        elif new_gene_encoder_type == "novae":
+            assert novae_dim is not None, (
+                "new_gene_encoder_type='novae' requires novae_dim (see "
+                "precompute_novae_features()'s real output shape)"
+            )
+            self.new_gene_encoder = NovaeGeneEncoder(novae_dim, self.d_model)
+        if self.new_gene_encoder is not None:
+            self.model.input_encoder = _ResidualEncodeInputs(self.model.input_encoder, self.d_model)
 
         # Gigapath tile encoder (frozen) turns our raw H&E patches into the
         # 1536-dim features STPath's image tokenizer expects — shares the
@@ -202,10 +293,15 @@ class STPathContextEncoder(nn.Module):
 
     def forward(self, context_coords: torch.Tensor, context_expression: torch.Tensor,
                 query_coords: torch.Tensor, context_images: torch.Tensor,
-                query_images: torch.Tensor) -> torch.Tensor:
+                query_images: torch.Tensor,
+                context_novae_features: torch.Tensor | None = None) -> torch.Tensor:
         """context_images/query_images: raw H&E patches [N, 3, H, W] float
         in [0,1] — required (STPath has no meaningful expression-only
-        mode). Returns c [N_query, hidden_dim].
+        mode). context_novae_features: [N_context, novae_dim] precomputed
+        Novae features, only used/required when new_gene_encoder_type=
+        "novae" (see __init__) — a SEPARATE channel from context_expression
+        (which STPath's own gene_embed pathway always needs raw, whatever
+        new_gene_encoder_type is set to). Returns c [N_query, hidden_dim].
 
         Real bug found 2026-07-15: this method used to be decorated with
         @torch.no_grad(), disabling gradient tracking for the ENTIRE
@@ -215,7 +311,21 @@ class STPathContextEncoder(nn.Module):
         regardless of epoch count. Only STPath's own frozen backbone call
         (self.model.prediction_head below) should skip autograd — moved
         to its own `with torch.no_grad():` block, with proj/embedding_norm
-        left outside it so they actually train."""
+        left outside it so they actually train.
+
+        Real gradient-flow subtlety found 2026-07-16 while adding
+        new_gene_encoder (Route B residual): that SAME no_grad block would
+        silently kill gradient to new_gene_encoder/residual_proj too, even
+        though they're set up as trainable — the residual gets injected
+        INSIDE self.model.input_encoder, which prediction_head calls INSIDE
+        the no_grad block, so any op executed there (including the
+        residual addition) produces outputs with requires_grad=False
+        regardless of its inputs. Every one of STPath's own parameters
+        already has requires_grad_(False) set (see __init__), so removing
+        no_grad here doesn't make anything unintentionally trainable — it
+        only lets gradient flow THROUGH the frozen layers (using their
+        fixed weights) to reach new_gene_encoder/residual_proj on the
+        other side, which is exactly what training the residual requires."""
         n_context = context_coords.shape[0]
         n_query = query_coords.shape[0]
         device = context_coords.device
@@ -243,7 +353,29 @@ class STPathContextEncoder(nn.Module):
         tech = self.tokenizer.tech_tokenizer.encode(self.tech_type, align_first=True)
         tech_ids = torch.full((n_total,), tech, dtype=torch.long, device=device)
 
-        with torch.no_grad():  # STPath itself is frozen (see __init__) - skip building its autograd graph
+        if self.new_gene_encoder is not None:
+            # query positions get zero extra signal, same treatment STPath's
+            # own ge_tokens already give query positions (mask token, no
+            # real expression) — only context rows carry real information.
+            extra_embed = torch.zeros(n_total, self.d_model, device=device)
+            if isinstance(self.new_gene_encoder, MLPGeneEncoder):
+                # log1p for numerical stability (matches STPath's own
+                # convention for its ge_tokens above) — MUST use the FULL,
+                # unfiltered context_expression (all our genes), not
+                # STPath's `expr` above (that one's already restricted to
+                # _valid_gene_pos, a different width than what
+                # MLPGeneEncoder was constructed for: len(gene_names)).
+                mlp_input = torch.log1p(context_expression)
+                extra_embed[:n_context] = self.new_gene_encoder(mlp_input)
+            else:  # NovaeGeneEncoder
+                assert context_novae_features is not None, (
+                    "new_gene_encoder_type='novae' requires context_novae_features"
+                )
+                extra_embed[:n_context] = self.new_gene_encoder(context_novae_features)
+            self.model.input_encoder.set_extra_embed(extra_embed)
+            # NO torch.no_grad() here — see forward()'s own docstring for
+            # why: gradient must flow through the frozen layers to reach
+            # new_gene_encoder/residual_proj on the other side of them.
             _, x = self.model.prediction_head(
                 img_tokens=img_feats,
                 coords=coords,
@@ -253,5 +385,16 @@ class STPathContextEncoder(nn.Module):
                 organ_tokens=organ_ids,
                 return_all=True,
             )
+        else:
+            with torch.no_grad():  # STPath itself is frozen (see __init__) - skip building its autograd graph
+                _, x = self.model.prediction_head(
+                    img_tokens=img_feats,
+                    coords=coords,
+                    ge_tokens=ge_tokens,
+                    batch_idx=torch.zeros(n_total, dtype=torch.long, device=device),
+                    tech_tokens=tech_ids,
+                    organ_tokens=organ_ids,
+                    return_all=True,
+                )
         x = self.embedding_norm(x[n_context:])  # query positions only; trainable
         return self.proj(x)  # trainable

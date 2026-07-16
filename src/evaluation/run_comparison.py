@@ -122,13 +122,19 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
     expr = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()
     slice_ids = adata.obs["slice_id"].to_numpy()
 
-    # gene_encoder_type="novae" (2026-07-16): same reasoning as
+    # gene_encoder_type="novae" (2026-07-15) / stpath_new_gene_encoder_type=
+    # "novae" (2026-07-16, Route B): same reasoning as
     # src/training/train.py's main() — precompute once, row-aligned to
     # THIS config's (possibly image-QC-filtered) adata, before building
-    # the model, so novae_dim can be injected into model_cfg.
+    # the model, so the right *_novae_dim can be injected into model_cfg.
+    train_model_params = cfg.model.get("params", {})
     context_gene_features = None
-    if cfg.model.get("params", {}).get("gene_encoder_type") == "novae":
+    context_novae_features = None
+    if train_model_params.get("gene_encoder_type") == "novae":
         context_gene_features = get_novae_features(cfg, adata)
+    elif (train_model_params.get("context_encoder_type") == "stpath"
+          and train_model_params.get("stpath_new_gene_encoder_type") == "novae"):
+        context_novae_features = get_novae_features(cfg, adata)
 
     # .get() with the same default every real config's own YAML comment
     # documents, not a bare attribute access — configs that don't declare
@@ -155,6 +161,8 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
     inject_stpath_gene_names(model_cfg, adata)
     if context_gene_features is not None:
         inject_novae_dim(model_cfg, context_gene_features.shape[1])
+    if context_novae_features is not None:
+        inject_stpath_novae_dim(model_cfg, context_novae_features.shape[1])
     model = build_model(model_cfg)
     # UNRESOLVED copy, saved (not model_cfg above) so a STPath config's
     # ${oc.env:STPATH_GENE_VOC_PATH}/${oc.env:STPATH_MODEL_WEIGHT_PATH}
@@ -166,12 +174,15 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
     inject_stpath_gene_names(unresolved_model_cfg, adata)
     if context_gene_features is not None:
         inject_novae_dim(unresolved_model_cfg, context_gene_features.shape[1])
+    if context_novae_features is not None:
+        inject_stpath_novae_dim(unresolved_model_cfg, context_novae_features.shape[1])
 
     if list(model.parameters()):
         dataset = MaskedContextQueryDataset(
             coords3d, expr, slice_ids, cfg.masking,
             n_items=cfg.training.epochs, base_seed=cfg.training.seed, images=images,
             context_gene_features=context_gene_features,
+            context_novae_features=context_novae_features,
         )
         dataloader = make_dataloader(dataset, cfg)
         trainer = pl.Trainer(
@@ -246,6 +257,22 @@ def _gene_features_for_model(model_params: dict, shared_eval: dict):
     return None
 
 
+def _stpath_novae_features_for_model(model_params: dict, shared_eval: dict):
+    """STPathContextEncoder's Route-B residual counterpart to
+    _gene_features_for_model above (2026-07-16) — genuinely different
+    from it, not reusable: this is an ADDITIVE channel (context["novae_
+    features"]), never a replacement for context["expression"] (STPath's
+    own gene_embed pathway always needs real raw expression regardless of
+    stpath_new_gene_encoder_type — see _build_masked_item's
+    context_novae_features docstring in train.py for the full reasoning).
+    Returns None unless this model is context_encoder_type="stpath" with
+    stpath_new_gene_encoder_type="novae"."""
+    if (model_params.get("context_encoder_type") == "stpath"
+            and model_params.get("stpath_new_gene_encoder_type") == "novae"):
+        return shared_eval["novae_features"]
+    return None
+
+
 def _evaluate(model, model_params: dict, shared_eval: dict) -> tuple:
     context_mask, query_mask = shared_eval["context_mask"], shared_eval["query_mask"]
     coords3d, expr = shared_eval["coords3d"], shared_eval["expr"]
@@ -255,6 +282,11 @@ def _evaluate(model, model_params: dict, shared_eval: dict) -> tuple:
         "coords": torch.tensor(coords3d[context_mask], dtype=torch.float32),
         "expression": torch.tensor(context_expr_source[context_mask], dtype=torch.float32),
     }
+    stpath_novae_features = _stpath_novae_features_for_model(model_params, shared_eval)
+    if stpath_novae_features is not None:
+        context["novae_features"] = torch.tensor(
+            stpath_novae_features[context_mask], dtype=torch.float32
+        )
     query = {"coords": torch.tensor(coords3d[query_mask], dtype=torch.float32)}
     images = _images_for_model(model_params, shared_eval)
     if images is not None:
@@ -314,6 +346,11 @@ def _evaluate_shuffled_images(model, model_params: dict, shared_eval: dict, seed
         "expression": torch.tensor(context_expr_source[context_mask], dtype=torch.float32),
         "images": _images_tensor(images, context_mask),
     }
+    stpath_novae_features = _stpath_novae_features_for_model(model_params, shared_eval)
+    if stpath_novae_features is not None:
+        context["novae_features"] = torch.tensor(
+            stpath_novae_features[context_mask], dtype=torch.float32
+        )
     query_images = _images_tensor(images, query_mask)
     perm = np.random.default_rng(seed).permutation(query_images.shape[0])
     query = {
@@ -358,15 +395,19 @@ def _cnn_image_patch_size(model_config_paths: list[str], overrides: list[str] | 
 
 def _any_config_uses_novae(model_config_paths: list[str], overrides: list[str] | None) -> bool:
     """Scan every config in this invocation for gene_encoder_type: "novae"
-    — same "scan all configs before building shared_eval" pattern as
-    _cnn_image_patch_size, for the same reason: shared_eval is built once
-    from the FIRST config, but a later config in the same run may be the
-    one that actually needs Novae features."""
+    (builtin encoder) OR stpath_new_gene_encoder_type: "novae" (STPath
+    Route-B residual, 2026-07-16) — same "scan all configs before building
+    shared_eval" pattern as _cnn_image_patch_size, for the same reason:
+    shared_eval is built once from the FIRST config, but a later config in
+    the same run may be the one that actually needs Novae features."""
     for path in model_config_paths:
         cfg = OmegaConf.load(path)
         if overrides:
             cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
-        if cfg.model.get("params", {}).get("gene_encoder_type") == "novae":
+        params = cfg.model.get("params", {})
+        if (params.get("gene_encoder_type") == "novae"
+                or (params.get("context_encoder_type") == "stpath"
+                    and params.get("stpath_new_gene_encoder_type") == "novae")):
             return True
     return False
 

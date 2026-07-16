@@ -541,11 +541,21 @@ class SpatialContextEncoder(nn.Module):
 
     def forward(self, context_coords: torch.Tensor, context_expression: torch.Tensor,
                 query_coords: torch.Tensor, context_images: torch.Tensor | None = None,
-                query_images: torch.Tensor | None = None) -> torch.Tensor:
+                query_images: torch.Tensor | None = None,
+                context_novae_features: torch.Tensor | None = None) -> torch.Tensor:
         # NOTE: gene_encoder_type applies to context_expression only, same
         # as "raw"/"mlp" always did — query locations never carry an
         # expression feature at all (predicting it is the task), so there
         # is no query-side counterpart to add here for "novae" either.
+        # context_novae_features is accepted-and-ignored here — it exists
+        # so BaseGenerativeModel._encode_context (registry.py) can call
+        # every context encoder type with the same call signature; this
+        # class's own gene_encoder_type="novae" path (added 2026-07-16)
+        # already gets Novae features THROUGH context_expression itself
+        # (context_gene_features replaces it upstream in train.py), unlike
+        # STPathContextEncoder's Route-B residual, which needs both raw
+        # expression AND Novae features simultaneously and so needs this
+        # as a genuinely separate channel.
         if self.use_images and (context_images is None or query_images is None):
             raise ValueError("use_images=True requires context_images and query_images")
 

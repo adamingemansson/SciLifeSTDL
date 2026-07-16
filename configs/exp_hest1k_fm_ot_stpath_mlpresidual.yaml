@@ -1,0 +1,76 @@
+# Route B (2026-07-16): STPath's REAL pretrained fusion + a NEW trainable
+# gene-expression signal injected as a residual, verified via STPath's
+# actual source (stpath/model/model.py EncodeInputs) — see
+# src/models/stpath_encoder.py _ResidualEncodeInputs for the full
+# mechanism/reasoning. STPath's transformer stays frozen at its pretrained
+# weights throughout; only the new MLP gene encoder + a zero-initialized
+# residual_proj (+ this class's existing proj/embedding_norm) train.
+#
+# Direct comparison target: configs/exp_hest1k_fm_ot_stpath.yaml (same
+# everything else — same epochs, same masking, same n_genes) — that
+# config's real result (PCC 0.4352, RMSE 0.3050, ST-FID 1.95) is the
+# baseline this is testing whether we can beat. Answers the actual open
+# question from the 2026-07-16 GEX-encoder-bottleneck investigation: does
+# a better gene encoder help STPath's REAL (pretrained) fusion — task
+# #19-followup's Novae/MLP-in-OUR-OWN-weak-encoder test could only show
+# it doesn't rescue a bad fusion, not whether it matters to a good one.
+#
+# MLP chosen over Novae for this first run (both implemented,
+# stpath_new_gene_encoder_type: novae is the other option) — MLP has no
+# external dependency/network download, lower risk for an unattended
+# overnight run. Try the Novae variant as a follow-up once this result is in.
+
+experiment_name: fm_ot_hest1k_pilot_stpath_mlpresidual
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: stpath
+    stpath_gene_voc_path: ${oc.env:STPATH_GENE_VOC_PATH}
+    stpath_model_weight_path: ${oc.env:STPATH_MODEL_WEIGHT_PATH}
+    stpath_organ_type: Kidney      # INT1 is ccRCC (renal cell carcinoma)
+    stpath_tech_type: Visium
+    stpath_new_gene_encoder_type: mlp   # 2026-07-16: Route B residual (see header)
+    # stpath_gene_names auto-derived from the loaded AnnData at load time
+    # (train.py/run_comparison.py inject_stpath_gene_names) - do not set here
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_fm_ot_stpath.yaml
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 10000                  # same as exp_hest1k_fm_ot_stpath.yaml - fair comparison
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

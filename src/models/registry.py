@@ -42,6 +42,7 @@ def _build_context_encoder(
     stpath_gene_names: list[str] | None = None, stpath_gene_voc_path: str | None = None,
     stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
     stpath_tech_type: str = "Visium",
+    stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None,
 ):
     """Shared by WAE-GAN/FM-OT/VQ-VAE+AR so each model's __init__ doesn't
     repeat the context_encoder_type branching. "builtin" (default) is our
@@ -50,7 +51,16 @@ def _build_context_encoder(
     apply here). "stpath" (task #18) replaces it entirely with
     STPathContextEncoder — see src/models/stpath_encoder.py for the full
     setup requirements and grounding; imported lazily since the `stpath`
-    package is an opt-in external dependency, not installed by default."""
+    package is an opt-in external dependency, not installed by default.
+
+    stpath_new_gene_encoder_type/stpath_novae_dim (2026-07-16, "Route B"
+    GEX-encoder-bottleneck follow-up) are DELIBERATELY separate params
+    from gene_encoder_type/novae_dim above, not reused — those swap the
+    gene branch of our OWN builtin encoder; these add a residual gene
+    signal ON TOP of STPath's real pretrained fusion (see
+    STPathContextEncoder's new_gene_encoder_type) — different mechanism,
+    different meaning, kept as distinctly-named params so a config can't
+    accidentally conflate the two."""
     if context_encoder_type == "builtin":
         return SpatialContextEncoder(
             n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim,
@@ -69,6 +79,7 @@ def _build_context_encoder(
             gene_names=stpath_gene_names, gene_voc_path=stpath_gene_voc_path,
             model_weight_path=stpath_model_weight_path, organ_type=stpath_organ_type,
             tech_type=stpath_tech_type, hidden_dim=cond_hidden_dim,
+            new_gene_encoder_type=stpath_new_gene_encoder_type, novae_dim=stpath_novae_dim,
         )
     else:
         raise ValueError(f"unknown context_encoder_type {context_encoder_type!r}")
@@ -128,6 +139,7 @@ class BaseGenerativeModel(pl.LightningModule, abc.ABC):
         return self.context_encoder(
             context["coords"], context["expression"], query["coords"],
             context_images=context.get("images"), query_images=query.get("images"),
+            context_novae_features=context.get("novae_features"),
         )
 
     @abc.abstractmethod
@@ -266,7 +278,8 @@ class WAEGAN(BaseGenerativeModel):
                  novae_dim: int | None = None,
                  stpath_gene_names: list[str] | None = None, stpath_gene_voc_path: str | None = None,
                  stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
-                 stpath_tech_type: str = "Visium"):
+                 stpath_tech_type: str = "Visium",
+                 stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False  # we alternate encoder/decoder vs. discriminator ourselves
@@ -280,6 +293,7 @@ class WAEGAN(BaseGenerativeModel):
             stpath_gene_names=stpath_gene_names, stpath_gene_voc_path=stpath_gene_voc_path,
             stpath_model_weight_path=stpath_model_weight_path, stpath_organ_type=stpath_organ_type,
             stpath_tech_type=stpath_tech_type,
+            stpath_new_gene_encoder_type=stpath_new_gene_encoder_type, stpath_novae_dim=stpath_novae_dim,
         )
         self.encoder = nn.Sequential(
             nn.Linear(n_genes, hidden_dim), nn.ReLU(),
@@ -461,7 +475,8 @@ class FlowMatchingOT(BaseGenerativeModel):
                  novae_dim: int | None = None,
                  stpath_gene_names: list[str] | None = None, stpath_gene_voc_path: str | None = None,
                  stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
-                 stpath_tech_type: str = "Visium"):
+                 stpath_tech_type: str = "Visium",
+                 stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None):
         super().__init__()
         self.save_hyperparameters()
         assert path_type in ("ot", "edm"), f"unknown path_type {path_type!r}"
@@ -474,6 +489,7 @@ class FlowMatchingOT(BaseGenerativeModel):
             stpath_gene_names=stpath_gene_names, stpath_gene_voc_path=stpath_gene_voc_path,
             stpath_model_weight_path=stpath_model_weight_path, stpath_organ_type=stpath_organ_type,
             stpath_tech_type=stpath_tech_type,
+            stpath_new_gene_encoder_type=stpath_new_gene_encoder_type, stpath_novae_dim=stpath_novae_dim,
         )
         # own autoencoder, own weights — compresses expression to a small
         # latent code the velocity net operates on instead of raw n_genes
@@ -652,7 +668,8 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  novae_dim: int | None = None,
                  stpath_gene_names: list[str] | None = None, stpath_gene_voc_path: str | None = None,
                  stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
-                 stpath_tech_type: str = "Visium"):
+                 stpath_tech_type: str = "Visium",
+                 stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None):
         super().__init__()
         self.save_hyperparameters()
         self.context_encoder = _build_context_encoder(
@@ -664,6 +681,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
             stpath_gene_names=stpath_gene_names, stpath_gene_voc_path=stpath_gene_voc_path,
             stpath_model_weight_path=stpath_model_weight_path, stpath_organ_type=stpath_organ_type,
             stpath_tech_type=stpath_tech_type,
+            stpath_new_gene_encoder_type=stpath_new_gene_encoder_type, stpath_novae_dim=stpath_novae_dim,
         )
         self.encoder = nn.Sequential(
             nn.Linear(n_genes, ae_hidden_dim), nn.ReLU(),
