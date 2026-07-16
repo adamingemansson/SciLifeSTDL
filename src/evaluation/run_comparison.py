@@ -146,6 +146,14 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     inject_stpath_gene_names(model_cfg, adata)
     model = build_model(model_cfg)
+    # UNRESOLVED copy, saved (not model_cfg above) so a STPath config's
+    # ${oc.env:STPATH_GENE_VOC_PATH}/${oc.env:STPATH_MODEL_WEIGHT_PATH}
+    # interpolations stay literal in the checkpoint rather than getting
+    # baked in as THIS machine's resolved path — see
+    # train.py load_trained_model's docstring for the real cross-machine
+    # bug this fixes (2026-07-15).
+    unresolved_model_cfg = OmegaConf.to_container(cfg.model, resolve=False)
+    inject_stpath_gene_names(unresolved_model_cfg, adata)
 
     if list(model.parameters()):
         dataset = MaskedContextQueryDataset(
@@ -159,7 +167,7 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
             enable_checkpointing=False, logger=False,
         )
         trainer.fit(model, dataloader)
-        saved_path = save_trained_model(model, model_cfg, adata.var_names.tolist(), checkpoint_dir)
+        saved_path = save_trained_model(model, unresolved_model_cfg, adata.var_names.tolist(), checkpoint_dir)
         if saved_path is not None:
             print(f"Saved trained model (weights + config + gene names) to {saved_path.parent}")
 

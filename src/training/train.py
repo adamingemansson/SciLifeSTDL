@@ -107,11 +107,28 @@ def load_trained_model(checkpoint_dir: str):
 
     Returns (model, gene_names) — gene_names is the exact ordered list
     output position i corresponds to; callers must align any new sample's
-    genes to this list BY NAME before calling model.sample()."""
+    genes to this list BY NAME before calling model.sample().
+
+    Real cross-machine bug found 2026-07-15 (user question: can I scp
+    checkpoints from the A100 server to my Mac and just run
+    --skip-training there): the caller-supplied model_cfg going INTO
+    save_trained_model must be the UNRESOLVED config (OmegaConf
+    to_container(..., resolve=False)), not the resolved one used to
+    actually build the live model. STPath configs' stpath_gene_voc_path/
+    stpath_model_weight_path are ${oc.env:...} interpolations
+    (2026-07-15's earlier portability fix) — resolving them before saving
+    would bake in whichever machine happened to run training (e.g. the
+    A100's /nfs/scratch1/... path), making the checkpoint unusable on any
+    other machine even though the actual weights transfer fine. Re-
+    resolving here, at LOAD time, means the SAME checkpoint correctly
+    picks up THIS machine's own STPATH_GENE_VOC_PATH/
+    STPATH_MODEL_WEIGHT_PATH env vars — set them before calling this on a
+    new machine, same as running a real training config there."""
     from src.models.registry import build_model
     in_dir = Path(checkpoint_dir)
     with open(in_dir / "model_cfg.json") as f:
-        model_cfg = json.load(f)
+        raw_model_cfg = json.load(f)
+    model_cfg = OmegaConf.to_container(OmegaConf.create(raw_model_cfg), resolve=True)
     with open(in_dir / "gene_names.json") as f:
         gene_names = json.load(f)
     model = build_model(model_cfg)
@@ -518,6 +535,13 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     inject_stpath_gene_names(model_cfg, adata)
     model = build_model(model_cfg)
+    # UNRESOLVED copy, saved (not model_cfg above) so a STPath config's
+    # ${oc.env:STPATH_GENE_VOC_PATH}/${oc.env:STPATH_MODEL_WEIGHT_PATH}
+    # interpolations stay literal in the checkpoint rather than getting
+    # baked in as THIS machine's resolved path — see load_trained_model's
+    # docstring for the real cross-machine bug this fixes (2026-07-15).
+    unresolved_model_cfg = OmegaConf.to_container(cfg.model, resolve=False)
+    inject_stpath_gene_names(unresolved_model_cfg, adata)
 
     # Train (skipped entirely for parameter-free baselines like interp_baseline) --
     if list(model.parameters()):
@@ -539,7 +563,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
         # declare checkpoint_dir (e.g. tests/test_run_comparison.py's
         # synthetic configs) must still work, not crash on a missing key
         checkpoint_dir = cfg.training.get("checkpoint_dir", f"results/checkpoints/{cfg.experiment_name}")
-        saved_path = save_trained_model(model, model_cfg, adata.var_names.tolist(), checkpoint_dir)
+        saved_path = save_trained_model(model, unresolved_model_cfg, adata.var_names.tolist(), checkpoint_dir)
         if saved_path is not None:
             print(f"Saved trained model (weights + config + gene names) to {saved_path.parent}")
 

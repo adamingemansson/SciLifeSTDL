@@ -589,6 +589,34 @@ baseline, not counted as one of the three comparison models below.
   (`test_downsample_patches`): correct output shape, dtype preserved,
   corner pixels genuinely preserved (not silently dropped by an
   off-by-one), no-op when already at the target size.
+- **ST-MMD metric + `--skip-training` mode (2026-07-15)** —
+  `run_comparison.py` now also reports `ev.st_mmd` (already implemented,
+  never wired into the table before) next to ST-FID, using the same
+  pooled PCA embeddings for free. `--skip-training` loads a config's
+  already-saved weights via `load_trained_model()` instead of retraining
+  — lets a new/expanded metric set be checked against completed
+  multi-thousand-epoch runs in minutes.
+- **Real cross-machine checkpoint bug found and fixed (2026-07-15)** —
+  user question: can I `scp` checkpoints from the A100 server to my Mac
+  and just run `--skip-training` there? `save_trained_model` was being
+  passed the RESOLVED `model_cfg` (the same one used to actually build
+  the live model) — for STPath configs, that means
+  `${oc.env:STPATH_GENE_VOC_PATH}`/`${oc.env:STPATH_MODEL_WEIGHT_PATH}`
+  interpolations get baked into `model_cfg.json` as whichever machine's
+  literal resolved path happened to run training (e.g. the A100's
+  `/nfs/scratch1/...`), making that checkpoint unusable on any other
+  machine even though the actual weight tensors transfer fine. Fixed:
+  both `train.py`'s `main()` and `run_comparison.py`'s `_train_model` now
+  build a SEPARATE unresolved copy (`OmegaConf.to_container(cfg.model,
+  resolve=False)`) to pass to `save_trained_model`, and
+  `load_trained_model` re-wraps the loaded dict via `OmegaConf.create()`
+  and resolves it fresh at LOAD time — so the same checkpoint correctly
+  picks up whichever machine's own env vars are set when loaded, same as
+  running a real training config there. **Only fixes NEW saves** — the
+  4 STPath checkpoints already completed on the A100 before this fix
+  still have the resolved A100 path baked into their `model_cfg.json`;
+  those need a one-time manual fix (`sed` the two path fields) before
+  `--skip-training` will work for them on a different machine.
 - **Full histology image generation/reconstruction stays a deferred
   stretch goal**, separate from the conditioning use above. Filling in
   broken tissue *in the H&E image itself*, not just using H&E to condition
