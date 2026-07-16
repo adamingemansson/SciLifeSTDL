@@ -63,7 +63,7 @@ from src.training.train import (
     load_adata, make_context_query_split, MaskedContextQueryDataset,
     _load_images, _images_tensor, inject_stpath_gene_names,
     get_gigapath_features, save_trained_model, make_dataloader,
-    _downsample_patches, get_novae_features, inject_novae_dim,
+    _downsample_patches, get_novae_features, inject_novae_dim, inject_stpath_novae_dim,
 )
 from src.evaluation import metrics as ev
 from src.evaluation.cell_type_classifier import cluster_pseudo_labels, CellTypePlausibilityClassifier
