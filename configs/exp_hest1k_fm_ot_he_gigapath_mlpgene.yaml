@@ -1,0 +1,62 @@
+# GEX-encoder ablation of configs/exp_hest1k_fm_ot_he_gigapath.yaml —
+# companion to exp_hest1k_fm_ot_he_gigapath_novae.yaml, same investigation,
+# but with our OWN nonlinear encoder (MLPGeneEncoder, no external
+# dependency/pretraining) instead of frozen pretrained Novae — the
+# "build our own" arm of the 2026-07-16 GEX-encoder comparison, run
+# alongside the "reuse an existing pretrained encoder" arm so both get
+# benchmarked against each other and against the raw-expression baseline
+# (exp_hest1k_fm_ot_he_gigapath.yaml) under identical everything else.
+
+experiment_name: fm_ot_hest1k_pilot_he_gigapath_mlpgene
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    image_encoder_type: gigapath
+    image_feat_dim: 64
+    image_patch_size: 224
+    gene_encoder_type: mlp         # 2026-07-16: own nonlinear MLPGeneEncoder
+    gene_feat_dim: 256             # MLPGeneEncoder's output dim (Linear(G,2048)->
+                                     # LayerNorm+GELU->Linear(2048,512)->LayerNorm+GELU->
+                                     # Linear(512,256)) — see conditioning.py
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_fm_ot.yaml
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 10000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

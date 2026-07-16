@@ -38,14 +38,16 @@ def _build_context_encoder(
     n_genes: int, coord_dim: int, cond_hidden_dim: int,
     context_encoder_type: str = "builtin",
     image_encoder_type: str = "none", image_feat_dim: int = 64, image_patch_size: int = 256,
+    gene_encoder_type: str = "raw", gene_feat_dim: int = 256, novae_dim: int | None = None,
     stpath_gene_names: list[str] | None = None, stpath_gene_voc_path: str | None = None,
     stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
     stpath_tech_type: str = "Visium",
 ):
     """Shared by WAE-GAN/FM-OT/VQ-VAE+AR so each model's __init__ doesn't
     repeat the context_encoder_type branching. "builtin" (default) is our
-    own SpatialContextEncoder (task #17/#20's image_encoder_type switch
-    still applies here). "stpath" (task #18) replaces it entirely with
+    own SpatialContextEncoder (task #17/#20's image_encoder_type switch,
+    and the 2026-07-16 gene_encoder_type switch — "mlp"/"novae" — still
+    apply here). "stpath" (task #18) replaces it entirely with
     STPathContextEncoder — see src/models/stpath_encoder.py for the full
     setup requirements and grounding; imported lazily since the `stpath`
     package is an opt-in external dependency, not installed by default."""
@@ -54,6 +56,8 @@ def _build_context_encoder(
             n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim,
             image_encoder_type=image_encoder_type, image_feat_dim=image_feat_dim,
             image_patch_size=image_patch_size,
+            gene_encoder_type=gene_encoder_type, gene_feat_dim=gene_feat_dim,
+            novae_dim=novae_dim,
         )
     elif context_encoder_type == "stpath":
         from src.models.stpath_encoder import STPathContextEncoder
@@ -258,6 +262,8 @@ class WAEGAN(BaseGenerativeModel):
                  lr: float = 1e-3, lr_disc: float = 1e-3,
                  image_encoder_type: str = "none", image_feat_dim: int = 64,
                  image_patch_size: int = 256, context_encoder_type: str = "builtin",
+                 gene_encoder_type: str = "raw", gene_feat_dim: int = 256,
+                 novae_dim: int | None = None,
                  stpath_gene_names: list[str] | None = None, stpath_gene_voc_path: str | None = None,
                  stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
                  stpath_tech_type: str = "Visium"):
@@ -270,6 +276,7 @@ class WAEGAN(BaseGenerativeModel):
             context_encoder_type=context_encoder_type,
             image_encoder_type=image_encoder_type, image_feat_dim=image_feat_dim,
             image_patch_size=image_patch_size,
+            gene_encoder_type=gene_encoder_type, gene_feat_dim=gene_feat_dim, novae_dim=novae_dim,
             stpath_gene_names=stpath_gene_names, stpath_gene_voc_path=stpath_gene_voc_path,
             stpath_model_weight_path=stpath_model_weight_path, stpath_organ_type=stpath_organ_type,
             stpath_tech_type=stpath_tech_type,
@@ -450,6 +457,8 @@ class FlowMatchingOT(BaseGenerativeModel):
                  edm_p_mean: float = -1.2, edm_p_std: float = 1.2,
                  image_encoder_type: str = "none", image_feat_dim: int = 64,
                  image_patch_size: int = 256, context_encoder_type: str = "builtin",
+                 gene_encoder_type: str = "raw", gene_feat_dim: int = 256,
+                 novae_dim: int | None = None,
                  stpath_gene_names: list[str] | None = None, stpath_gene_voc_path: str | None = None,
                  stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
                  stpath_tech_type: str = "Visium"):
@@ -461,6 +470,7 @@ class FlowMatchingOT(BaseGenerativeModel):
             context_encoder_type=context_encoder_type,
             image_encoder_type=image_encoder_type, image_feat_dim=image_feat_dim,
             image_patch_size=image_patch_size,
+            gene_encoder_type=gene_encoder_type, gene_feat_dim=gene_feat_dim, novae_dim=novae_dim,
             stpath_gene_names=stpath_gene_names, stpath_gene_voc_path=stpath_gene_voc_path,
             stpath_model_weight_path=stpath_model_weight_path, stpath_organ_type=stpath_organ_type,
             stpath_tech_type=stpath_tech_type,
@@ -638,6 +648,8 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  sample_temperature: float = 1.0, lr: float = 1e-3,
                  image_encoder_type: str = "none", image_feat_dim: int = 64,
                  image_patch_size: int = 256, context_encoder_type: str = "builtin",
+                 gene_encoder_type: str = "raw", gene_feat_dim: int = 256,
+                 novae_dim: int | None = None,
                  stpath_gene_names: list[str] | None = None, stpath_gene_voc_path: str | None = None,
                  stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
                  stpath_tech_type: str = "Visium"):
@@ -648,6 +660,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
             context_encoder_type=context_encoder_type,
             image_encoder_type=image_encoder_type, image_feat_dim=image_feat_dim,
             image_patch_size=image_patch_size,
+            gene_encoder_type=gene_encoder_type, gene_feat_dim=gene_feat_dim, novae_dim=novae_dim,
             stpath_gene_names=stpath_gene_names, stpath_gene_voc_path=stpath_gene_voc_path,
             stpath_model_weight_path=stpath_model_weight_path, stpath_organ_type=stpath_organ_type,
             stpath_tech_type=stpath_tech_type,

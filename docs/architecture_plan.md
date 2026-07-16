@@ -623,3 +623,82 @@ baseline, not counted as one of the three comparison models below.
   expression generation, would add a second output modality (a second
   loss, a second embedding space, a second set of metrics) — out of scope
   until the primary GEX pipeline is further along.
+- **Task #19 full matrix results (2026-07-16)**: real 10000-epoch runs
+  across expression-only, CNN, Gigapath, and STPath encoder variants.
+  **FM-OT + STPath is the standout**: PCC 0.4312, RMSE 0.3053, AUC 0.9127,
+  ST-FID 1.95 — dominant across every metric, the strongest result of the
+  project so far. CNN/Gigapath fused via `SpatialContextEncoder`'s simple
+  concatenation showed weak/inconsistent PCC effects by comparison (e.g.
+  FM-OT + Gigapath: PCC 0.0037) — not a clean uniform pattern, and FM-EDM
+  diverged between the two image encoders. Conclusion: STPath's own
+  fusion architecture (dedicated tokenized transformer, not raw
+  concatenation) is doing the real work, not image data or encoder
+  strength alone — motivated the GEX-encoder investigation below.
+- **Our own gene-expression branch has the identical weakness the user
+  suspected in STPath's (2026-07-16)**: STPath's paper (verified via its
+  own architecture section) feeds gene expression through a single
+  `nn.Linear` before its spatial Transformer — the user's own suspicion,
+  confirmed. Checking our OWN `SpatialContextEncoder` found the exact
+  same gap: raw expression was concatenated directly into `node_proj`'s
+  input, so our "gene encoder" was also effectively just one Linear
+  layer's worth of processing, with no dedicated nonlinear stage — image
+  features already get their own encoder classes
+  (`ImagePatchEncoder`/`GigapathPatchEncoder`); gene expression didn't.
+- **Literature/tooling research before building anything (2026-07-16,
+  "look for existing methods first" — standing project instruction)**:
+  surveyed recent ST/histology foundation models (STORM, HINGE,
+  scGPT-spatial, CellFM, Novae). Found **Novae** (Nature Methods 2025,
+  `github.com/MICS-Lab/novae`, `pip install novae`) — a graph-based,
+  panel-invariant ST foundation model pretrained on ~30M cells/18
+  tissues — is literally the gene-expression encoder inside **STORM**
+  (arXiv 2604.03630), a newer multimodal ST+histology foundation model
+  that already beats UNI/Virchow/OmiCLIP-based approaches across 11
+  tumor types. Same recipe as our own Route C plan (pretrained expression
+  FM + pretrained image FM + a spatial fusion layer), at pilot-project
+  scale rather than STORM's own 1.2M-spot foundation-model-scale
+  pretraining run. Novae's real API confirmed via its GitHub README
+  (`novae.spatial_neighbors(adata)` +
+  `Novae.from_pretrained(...).compute_representations(adata,
+  zero_shot=True)`) — its full docs site returned 403 when checked, so
+  the exact output `obsm` key/embedding dim were NOT independently
+  confirmed; `precompute_novae_features` (`conditioning.py`) handles this
+  defensively (diffs `adata.obsm` keys before/after the call, raises with
+  the real available keys if ambiguous) rather than hardcoding a guess —
+  verify against the real installed package before trusting silently.
+- **Two new `gene_encoder_type` options added to `SpatialContextEncoder`
+  (2026-07-16)**, mirroring the existing `image_encoder_type` switch:
+  `"mlp"` (`MLPGeneEncoder` — own, jointly-trained nonlinear encoder,
+  no external dependency) and `"novae"` (`NovaeGeneEncoder` — frozen
+  pretrained Novae + small trainable projection head, the same
+  frozen-big-model RAE pattern as `GigapathPatchEncoder`). Real structural
+  difference from every other per-modality encoder in this file: Novae's
+  `compute_representations(..., zero_shot=True)` call is inference-only
+  over a real `AnnData` + its own spatial neighbor graph — it cannot be
+  computed per-row inside a model's `forward()` the way an image patch
+  can, so unlike Gigapath, `NovaeGeneEncoder` has no raw-input fallback
+  path at all; features must be precomputed upstream
+  (`precompute_novae_features`, cached to disk via `get_novae_features`
+  in `train.py`, same pattern as `get_gigapath_features`). Wired through
+  `train.py`'s `main()` and `run_comparison.py`'s `_train_model`/
+  `_build_shared_eval`/`_evaluate` (new `_gene_features_for_model`,
+  mirroring `_images_for_model`'s "which format does THIS model expect"
+  dispatch for mixed-config comparison runs). `context_gene_features` is
+  a SEPARATE array from `expr` threaded through
+  `_build_masked_item`/`MaskedContextQueryDataset` — only replaces
+  `context["expression"]`; `target_expression` (the actual prediction
+  target) always stays real raw expression regardless of gene_encoder_type,
+  since predicting real gene expression is the task, not Novae's
+  embedding of it. New configs:
+  `exp_hest1k_{fm_ot,wae_gan}_he_gigapath_{novae,mlpgene}.yaml` — all
+  paired with frozen Gigapath (expression-only dropped from future
+  comparisons per user decision 2026-07-16: image conditioning
+  consistently wins, so every new arm includes it).
+- **Shuffle-image diagnostic added to `run_comparison.py`
+  (2026-07-16)**: `--shuffle-diagnostic` re-evaluates every image-using
+  model with query histology patches randomly permuted (context stays
+  real), reporting the same 6-metric table alongside the normal one. If
+  PCC/RMSE barely move under shuffling, that model is not actually using
+  its image conditioning to predict expression regardless of which image
+  encoder backs it — disambiguates "the image encoder is weak" from "the
+  fusion mechanism never learned to use images at all", directly
+  answering an open question from the task #19 results above.

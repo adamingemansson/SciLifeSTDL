@@ -1,0 +1,68 @@
+# GEX-encoder ablation of configs/exp_hest1k_fm_ot_he_gigapath.yaml
+# (2026-07-16, "is our own gene-expression branch also just a thin linear
+# projection" investigation — same critique the user raised about
+# STPath's GEX branch, verified true of our OWN SpatialContextEncoder too:
+# raw expression went straight into node_proj's concatenation, i.e. only
+# one Linear layer ever touched it). GigaPath stays frozen/unchanged here
+# (task #20) — only the gene-expression side swaps from raw concatenation
+# to NovaeGeneEncoder, a frozen pretrained ST foundation model (Novae et
+# al. 2025, Nature Methods — github.com/MICS-Lab/novae). Requires
+# `pip install novae` (Python >=3.11) — see
+# src/models/conditioning.py precompute_novae_features docstring for
+# setup/verification caveats (its obsm output key is defensively detected
+# at runtime, not hardcoded, since the docs site 403'd when checked).
+
+experiment_name: fm_ot_hest1k_pilot_he_gigapath_novae
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    image_encoder_type: gigapath
+    image_feat_dim: 64
+    image_patch_size: 224
+    gene_encoder_type: novae       # 2026-07-16: frozen pretrained Novae GEX encoder
+    gene_feat_dim: 256             # NovaeGeneEncoder's trainable projection output dim
+                                     # novae_dim is NOT set here — auto-injected from the
+                                     # real precomputed features' shape (see
+                                     # train.py inject_novae_dim / get_novae_features)
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_fm_ot.yaml
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 10000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

@@ -63,7 +63,7 @@ from src.training.train import (
     load_adata, make_context_query_split, MaskedContextQueryDataset,
     _load_images, _images_tensor, inject_stpath_gene_names,
     get_gigapath_features, save_trained_model, make_dataloader,
-    _downsample_patches,
+    _downsample_patches, get_novae_features, inject_novae_dim,
 )
 from src.evaluation import metrics as ev
 from src.evaluation.cell_type_classifier import cluster_pseudo_labels, CellTypePlausibilityClassifier
@@ -122,6 +122,14 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
     expr = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()
     slice_ids = adata.obs["slice_id"].to_numpy()
 
+    # gene_encoder_type="novae" (2026-07-16): same reasoning as
+    # src/training/train.py's main() — precompute once, row-aligned to
+    # THIS config's (possibly image-QC-filtered) adata, before building
+    # the model, so novae_dim can be injected into model_cfg.
+    context_gene_features = None
+    if cfg.model.get("params", {}).get("gene_encoder_type") == "novae":
+        context_gene_features = get_novae_features(cfg, adata)
+
     # .get() with the same default every real config's own YAML comment
     # documents, not a bare attribute access — configs that don't declare
     # checkpoint_dir (e.g. this file's own test_run_comparison.py synthetic
@@ -145,6 +153,8 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     inject_stpath_gene_names(model_cfg, adata)
+    if context_gene_features is not None:
+        inject_novae_dim(model_cfg, context_gene_features.shape[1])
     model = build_model(model_cfg)
     # UNRESOLVED copy, saved (not model_cfg above) so a STPath config's
     # ${oc.env:STPATH_GENE_VOC_PATH}/${oc.env:STPATH_MODEL_WEIGHT_PATH}
@@ -154,11 +164,14 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
     # bug this fixes (2026-07-15).
     unresolved_model_cfg = OmegaConf.to_container(cfg.model, resolve=False)
     inject_stpath_gene_names(unresolved_model_cfg, adata)
+    if context_gene_features is not None:
+        inject_novae_dim(unresolved_model_cfg, context_gene_features.shape[1])
 
     if list(model.parameters()):
         dataset = MaskedContextQueryDataset(
             coords3d, expr, slice_ids, cfg.masking,
             n_items=cfg.training.epochs, base_seed=cfg.training.seed, images=images,
+            context_gene_features=context_gene_features,
         )
         dataloader = make_dataloader(dataset, cfg)
         trainer = pl.Trainer(
@@ -219,12 +232,28 @@ def _images_for_model(model_params: dict, shared_eval: dict):
     return shared_eval["gigapath_images"] if needs_gigapath else shared_eval["raw_images"]
 
 
+def _gene_features_for_model(model_params: dict, shared_eval: dict):
+    """Pick the gene-expression FEATURE FORMAT this particular model
+    expects for its context — same reasoning/pattern as
+    _images_for_model: a single comparison run can mix gene_encoder_type
+    values across configs ("raw"/"mlp" want raw expression fed straight
+    in; "novae" wants shared_eval's precomputed Novae features), so
+    shared_eval carries both and each model picks its own. Returns None
+    for "raw"/"mlp" (meaning: use raw expr, exactly as before this
+    switch existed) or shared_eval["novae_features"] for "novae"."""
+    if model_params.get("gene_encoder_type") == "novae":
+        return shared_eval["novae_features"]
+    return None
+
+
 def _evaluate(model, model_params: dict, shared_eval: dict) -> tuple:
     context_mask, query_mask = shared_eval["context_mask"], shared_eval["query_mask"]
     coords3d, expr = shared_eval["coords3d"], shared_eval["expr"]
+    gene_features = _gene_features_for_model(model_params, shared_eval)
+    context_expr_source = expr if gene_features is None else gene_features
     context = {
         "coords": torch.tensor(coords3d[context_mask], dtype=torch.float32),
-        "expression": torch.tensor(expr[context_mask], dtype=torch.float32),
+        "expression": torch.tensor(context_expr_source[context_mask], dtype=torch.float32),
     }
     query = {"coords": torch.tensor(coords3d[query_mask], dtype=torch.float32)}
     images = _images_for_model(model_params, shared_eval)
@@ -255,6 +284,59 @@ def _evaluate(model, model_params: dict, shared_eval: dict) -> tuple:
     return pcc, rmse, auc, fid, mmd, plausibility
 
 
+def _evaluate_shuffled_images(model, model_params: dict, shared_eval: dict, seed: int = 0) -> tuple | None:
+    """Diagnostic (2026-07-16, from project research into why CNN/Gigapath
+    conditioning showed weak/inconsistent PCC effects): randomly permute
+    WHICH query location gets which histology patch at eval time, keeping
+    everything else (context, coords, real target expression) identical,
+    then re-run _evaluate's own metric computation. If a model is
+    genuinely using its query image to predict that query's expression,
+    shuffling should make PCC/RMSE meaningfully worse. If PCC barely
+    moves, the model is ignoring its image conditioning regardless of
+    which image encoder it uses — disambiguates "the image encoder is
+    weak" from "the fusion mechanism never learns to use images at all".
+
+    Only shuffles QUERY images (not context) — context images/expression
+    stay real/aligned throughout, since the question is specifically
+    whether a PREDICTION at query i reflects query i's own histology, not
+    whether the model can use context information at all. Returns None
+    for models that don't use images (nothing to shuffle)."""
+    images = _images_for_model(model_params, shared_eval)
+    if images is None:
+        return None
+    context_mask, query_mask = shared_eval["context_mask"], shared_eval["query_mask"]
+    coords3d = shared_eval["coords3d"]
+    gene_features = _gene_features_for_model(model_params, shared_eval)
+    context_expr_source = shared_eval["expr"] if gene_features is None else gene_features
+
+    context = {
+        "coords": torch.tensor(coords3d[context_mask], dtype=torch.float32),
+        "expression": torch.tensor(context_expr_source[context_mask], dtype=torch.float32),
+        "images": _images_tensor(images, context_mask),
+    }
+    query_images = _images_tensor(images, query_mask)
+    perm = np.random.default_rng(seed).permutation(query_images.shape[0])
+    query = {
+        "coords": torch.tensor(coords3d[query_mask], dtype=torch.float32),
+        "images": query_images[perm],
+    }
+
+    with torch.no_grad():
+        out = model.sample(context, query)
+    pred = out["expression"].detach().cpu().numpy()
+    target_expression = shared_eval["target_expression"]
+
+    pcc = np.nanmean(ev.pearson_per_gene(pred, target_expression))
+    rmse = ev.rmse(pred, target_expression)
+    auc = ev.nonzero_auc(pred, target_expression)
+    gen_patches = ev.pool_knn_neighborhood(coords3d[query_mask], pred, k=shared_eval["query_k"])
+    gen_embed = shared_eval["pca"].transform(gen_patches)
+    fid = ev.st_fid(shared_eval["real_embed"], gen_embed)
+    mmd = ev.st_mmd(shared_eval["real_embed"], gen_embed)
+    plausibility = shared_eval["clf"].plausibility_accuracy(pred, shared_eval["true_query_labels"])
+    return pcc, rmse, auc, fid, mmd, plausibility
+
+
 def _cnn_image_patch_size(model_config_paths: list[str], overrides: list[str] | None) -> int | None:
     """Scan every config in this invocation for a CNN-branch
     image_patch_size (every he_cnn config in this project uses the same
@@ -274,9 +356,25 @@ def _cnn_image_patch_size(model_config_paths: list[str], overrides: list[str] | 
     return None
 
 
+def _any_config_uses_novae(model_config_paths: list[str], overrides: list[str] | None) -> bool:
+    """Scan every config in this invocation for gene_encoder_type: "novae"
+    — same "scan all configs before building shared_eval" pattern as
+    _cnn_image_patch_size, for the same reason: shared_eval is built once
+    from the FIRST config, but a later config in the same run may be the
+    one that actually needs Novae features."""
+    for path in model_config_paths:
+        cfg = OmegaConf.load(path)
+        if overrides:
+            cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
+        if cfg.model.get("params", {}).get("gene_encoder_type") == "novae":
+            return True
+    return False
+
+
 def _build_shared_eval(cfg, adata, coords3d, expr, slice_ids, images,
                         k_neighborhood: int, pca_components: int,
-                        cnn_patch_size: int | None = None) -> dict:
+                        cnn_patch_size: int | None = None,
+                        compute_novae: bool = False) -> dict:
     """Built once, from the FIRST config's data — see module docstring on
     why mixed image-enabled/expression-only runs aren't supported. Every
     later config's own (coords3d, expr, slice_ids) must match this one for
@@ -286,9 +384,16 @@ def _build_shared_eval(cfg, adata, coords3d, expr, slice_ids, images,
     Computes BOTH raw patches and precomputed Gigapath features when
     images are enabled at all — not just whichever format the first
     config's own training happened to use — since later configs in the
-    same run may need the other format (see _images_for_model)."""
+    same run may need the other format (see _images_for_model). Same
+    reasoning for compute_novae/novae_features (see
+    _any_config_uses_novae/_gene_features_for_model) — Novae is
+    independent of images entirely (a pure gene-expression encoder), so
+    it's computed based on its own scan of the invocation's configs, not
+    tied to whether images are enabled."""
     context_mask, query_mask = make_context_query_split(coords3d, slice_ids, cfg.masking, EVAL_SEED)
     target_expression = expr[query_mask]
+
+    novae_features = get_novae_features(cfg, adata) if compute_novae else None
 
     raw_images, gigapath_images = None, None
     if images is not None:
@@ -326,18 +431,22 @@ def _build_shared_eval(cfg, adata, coords3d, expr, slice_ids, images,
         "context_mask": context_mask, "query_mask": query_mask,
         "coords3d": coords3d, "expr": expr, "target_expression": target_expression,
         "raw_images": raw_images, "gigapath_images": gigapath_images,
+        "novae_features": novae_features,
         "clf": clf, "true_query_labels": true_query_labels,
         "pca": pca, "real_embed": real_embed, "query_k": query_k,
     }
 
 
 def main(model_config_paths: list[str], k_neighborhood: int = 8, pca_components: int = 10,
-         overrides: list[str] | None = None, skip_training: bool = False):
+         overrides: list[str] | None = None, skip_training: bool = False,
+         shuffle_diagnostic: bool = False):
     rows = []
+    shuffle_rows = []
     interp_row = None
     shared_eval = None
     adata_cache: dict = {}  # shared across every config in this invocation — see _cached_load_adata
     cnn_patch_size = _cnn_image_patch_size(model_config_paths, overrides)
+    uses_novae = _any_config_uses_novae(model_config_paths, overrides)
 
     for path in model_config_paths:
         model, cfg, adata, coords3d, expr, slice_ids, images = _train_model(
@@ -348,7 +457,7 @@ def main(model_config_paths: list[str], k_neighborhood: int = 8, pca_components:
         if shared_eval is None:
             shared_eval = _build_shared_eval(
                 cfg, adata, coords3d, expr, slice_ids, images, k_neighborhood, pca_components,
-                cnn_patch_size,
+                cnn_patch_size, compute_novae=uses_novae,
             )
             interp_model = build_model({"name": "interp_baseline", "params": {}})
             interp_row = ("interp_baseline", *_evaluate(interp_model, {}, shared_eval))
@@ -359,6 +468,12 @@ def main(model_config_paths: list[str], k_neighborhood: int = 8, pca_components:
         # share a registered model name (e.g. fm_ot's OT and EDM path_type
         # variants both register as "fm_ot") and must stay distinct rows
         rows.append((cfg.experiment_name, *_evaluate(model, model_params, shared_eval)))
+        if shuffle_diagnostic:
+            # must run BEFORE `del model` below — same model instance, one
+            # extra forward pass with permuted query images
+            shuffled = _evaluate_shuffled_images(model, model_params, shared_eval)
+            if shuffled is not None:
+                shuffle_rows.append((cfg.experiment_name, *shuffled))
         del model  # evaluate-then-free, not accumulate-then-evaluate — see _release_torch_memory
         _release_torch_memory()
         print(f"trained + evaluated: {cfg.experiment_name}")
@@ -370,6 +485,18 @@ def main(model_config_paths: list[str], k_neighborhood: int = 8, pca_components:
     print("-" * len(header))
     for name, pcc, rmse, auc, fid, mmd, plaus in rows:
         print(f"{name:<18}{pcc:>10.4f}{rmse:>10.4f}{auc:>10.4f}{fid:>10.4f}{mmd:>10.4f}{plaus:>12.4f}")
+
+    if shuffle_diagnostic and shuffle_rows:
+        print(f"\nShuffle-image diagnostic (query histology patches randomly "
+              f"permuted at eval time — see _evaluate_shuffled_images docstring):")
+        print(header)
+        print("-" * len(header))
+        for name, pcc, rmse, auc, fid, mmd, plaus in shuffle_rows:
+            print(f"{name:<18}{pcc:>10.4f}{rmse:>10.4f}{auc:>10.4f}{fid:>10.4f}{mmd:>10.4f}{plaus:>12.4f}")
+        print("Compare each row above against its normal counterpart in the "
+              "main table: if PCC/RMSE barely change under shuffling, that "
+              "model is not actually using its image conditioning to predict "
+              "expression, regardless of which image encoder it uses.")
 
 
 if __name__ == "__main__":
@@ -386,5 +513,12 @@ if __name__ == "__main__":
                               "fast re-evaluation with a new/expanded metric set against "
                               "completed runs. Requires a prior run of this same config (without "
                               "--skip-training) to have actually saved a checkpoint there.")
+    parser.add_argument("--shuffle-diagnostic", action="store_true",
+                         help="also evaluate every image-using model with query histology "
+                              "patches randomly permuted, to check whether it's actually using "
+                              "image conditioning at all (see _evaluate_shuffled_images). Adds "
+                              "one extra forward pass per image-using model; no-op for models "
+                              "that don't use images.")
     args = parser.parse_args()
-    main(args.configs, overrides=args.override, skip_training=args.skip_training)
+    main(args.configs, overrides=args.override, skip_training=args.skip_training,
+         shuffle_diagnostic=args.shuffle_diagnostic)

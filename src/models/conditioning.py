@@ -320,6 +320,130 @@ class GigapathPatchEncoder(nn.Module):
         return self.proj(self.embedding_norm(x))
 
 
+class MLPGeneEncoder(nn.Module):
+    """
+    Nonlinear replacement for feeding the raw n_genes expression vector
+    straight into node_proj/query_proj. Motivated by the same critique the
+    user raised about STPath's gene-expression branch (a single nn.Linear)
+    — worth noting our OWN SpatialContextEncoder has the identical
+    weakness: today, raw expression is concatenated directly into
+    node_proj's input, so the "gene encoder" is effectively also just one
+    Linear layer (node_proj's first n_genes input columns), with no
+    dedicated nonlinear processing before fusion with coords/image
+    features. This class gives gene expression the same kind of dedicated
+    encoder image features already get (ImagePatchEncoder/
+    GigapathPatchEncoder), instead of being the only modality fused in raw.
+
+    Architecture follows the "nonlinear MLP autoencoder — best practical
+    starting point" recommendation surfaced in project research (2026-07-16,
+    comparing GEX-encoder options for the STPath-GEX-bottleneck question):
+    Linear(G, 2048) -> LayerNorm+GELU -> Linear(2048, 512) -> LayerNorm+GELU
+    -> Linear(512, feat_dim). Deliberately ENCODER-ONLY, no decoder/separate
+    reconstruction loss — unlike the autoencoder sketch that recommendation
+    was based on, this follows this codebase's own established convention
+    for per-modality encoders in this file (ImagePatchEncoder,
+    GigapathPatchEncoder: pure encoders, trained end-to-end from whatever
+    downstream generative loss the whole model uses, no separate
+    pretraining stage) rather than introducing a new training pattern.
+    """
+
+    def __init__(self, n_genes: int, feat_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_genes, 2048), nn.LayerNorm(2048), nn.GELU(),
+            nn.Linear(2048, 512), nn.LayerNorm(512), nn.GELU(),
+            nn.Linear(512, feat_dim),
+        )
+
+    def forward(self, expression: torch.Tensor) -> torch.Tensor:
+        return self.net(expression)
+
+
+def precompute_novae_features(adata, checkpoint: str = "prism-oncology/novae-human-0"):
+    """Run pretrained Novae (Novae et al. 2025, Nature Methods — graph-based
+    ST foundation model, github.com/MICS-Lab/novae) ONCE over a whole
+    sample's spots and cache the result, mirroring
+    precompute_gigapath_features above — same reasoning: Novae's own
+    published usage pattern is `model.compute_representations(adata,
+    zero_shot=True)`, an inference-only call (no documented gradient/
+    fine-tuning story — checked 2026-07-16, its docs site returned 403 so
+    this is based on the GitHub README's quickstart example, not fully
+    verified; re-check yourself if `novae`'s API has since added one).
+
+    Real structural difference from Gigapath/STPath's per-spot encoders:
+    Novae's representations depend on the sample's SPATIAL NEIGHBOR GRAPH
+    (`novae.spatial_neighbors(adata)`, called here), not just a single
+    spot's own data in isolation — so unlike an image patch, a Novae
+    embedding cannot even in principle be computed from one row at a time
+    inside a model's forward(). Precomputation here is therefore not just
+    a speed optimization (as it is for Gigapath) — it's structurally
+    required by what the model actually needs as input.
+
+    UNVERIFIED (docs site 403'd when checked): the exact `adata.obsm` key
+    `compute_representations` writes to. Defensively diffs obsm keys
+    before/after the call rather than hardcoding a guessed name, and
+    raises with the real available keys if that doesn't yield exactly one
+    new key — verify/hardcode the real key yourself once you can run this
+    against the actual package.
+
+    adata: real AnnData with spatial coords in .obsm (novae.spatial_neighbors
+    default) and expression in .X. Returns [N, novae_dim] float32 numpy array.
+    """
+    import novae
+
+    adata = adata.copy()  # spatial_neighbors/compute_representations mutate in place
+    keys_before = set(adata.obsm.keys())
+    novae.spatial_neighbors(adata)
+    model = novae.Novae.from_pretrained(checkpoint)
+    model.compute_representations(adata, zero_shot=True)
+    new_keys = [k for k in adata.obsm.keys() if k not in keys_before]
+    novae_keys = [k for k in new_keys if "novae" in k.lower()] or new_keys
+    if len(novae_keys) != 1:
+        raise RuntimeError(
+            f"Couldn't identify Novae's output obsm key unambiguously — "
+            f"new obsm keys after compute_representations: {new_keys!r} "
+            f"(all obsm keys: {list(adata.obsm.keys())!r}). Inspect the "
+            f"real novae package version installed and hardcode the "
+            f"correct key in precompute_novae_features."
+        )
+    return adata.obsm[novae_keys[0]].astype("float32")
+
+
+class NovaeGeneEncoder(nn.Module):
+    """
+    Wraps precomputed Novae embeddings (precompute_novae_features above) as
+    an alternative to raw expression / MLPGeneEncoder — frozen pretrained
+    "does a strong PRETRAINED, spatially-aware gene-expression encoder
+    help" arm, same RAE pattern (Zheng et al. 2025) already used for
+    GigapathPatchEncoder/STPathContextEncoder: frozen big representation +
+    small trainable LayerNorm+Linear head.
+
+    UNLIKE GigapathPatchEncoder, this does NOT accept raw expression as a
+    fallback uncached path — Novae's representations depend on the whole
+    sample's spatial neighbor graph (see precompute_novae_features), so
+    there is no meaningful "encode this one row from scratch" operation to
+    fall back to. forward() therefore always expects already-precomputed
+    [B, novae_dim] features; novae_dim is read from the real precomputed
+    array's shape at construction (never hardcoded/guessed — same
+    "probe, don't assume" reasoning as GigapathPatchEncoder's
+    _GIGAPATH_FEAT_DIM, except here there's no live model to probe against
+    inside this class, so the caller must supply it directly).
+    """
+
+    def __init__(self, novae_dim: int, feat_dim: int = 64):
+        super().__init__()
+        self.embedding_norm = nn.LayerNorm(novae_dim)
+        self.proj = nn.Linear(novae_dim, feat_dim)
+
+    def forward(self, novae_features: torch.Tensor) -> torch.Tensor:
+        if novae_features.dim() != 2:
+            raise ValueError(
+                f"NovaeGeneEncoder expects precomputed [B, novae_dim] features, "
+                f"got shape {tuple(novae_features.shape)} — see precompute_novae_features()"
+            )
+        return self.proj(self.embedding_norm(novae_features))
+
+
 class SpatialContextEncoder(nn.Module):
     """
     context (coords [N_obs, D], expression [N_obs, G]) + query coords
@@ -340,23 +464,61 @@ class SpatialContextEncoder(nn.Module):
     via concatenation, exactly as this module's original docstring
     promised ("designed so an image-encoder branch can be fused in
     later... without changing any generator model").
+
+    gene_encoder_type mirrors the same pattern for the expression side
+    (2026-07-16, "is our own gene-expression branch also just a thin
+    linear projection, same critique as STPath's" investigation):
+    "raw" (default, unchanged) concatenates the raw n_genes expression
+    vector directly, same as always. "mlp" swaps in MLPGeneEncoder (own,
+    trained-jointly nonlinear encoder). "novae" swaps in NovaeGeneEncoder
+    (frozen pretrained ST foundation model, precompute_novae_features
+    required upstream — see that function and _load_novae_features in
+    src/training/train.py). context_expression passed to forward() becomes
+    [N_obs, novae_dim] precomputed features instead of [N_obs, n_genes]
+    raw expression when gene_encoder_type="novae" — same "which tensor
+    this positional arg actually holds depends on config" pattern
+    context_images already has for image_encoder_type. Query locations
+    never carry a gene-encoder input at all — predicting expression AT
+    the query is the task, so this was already true for "raw"/"mlp" and
+    stays true for "novae" too.
     """
 
     def __init__(self, n_genes: int, coord_dim: int = 3, hidden_dim: int = 256,
                  n_message_layers: int = 2, k_neighbors: int = 10,
                  rff_features: int = 64, rff_sigma: float = 1.0,
                  image_encoder_type: str = "none", image_feat_dim: int = 64,
-                 image_patch_size: int = 256):
+                 image_patch_size: int = 256,
+                 gene_encoder_type: str = "raw", gene_feat_dim: int = 256,
+                 novae_dim: int | None = None):
         super().__init__()
         assert image_encoder_type in ("none", "cnn", "gigapath"), (
             f"unknown image_encoder_type {image_encoder_type!r}"
         )
+        assert gene_encoder_type in ("raw", "mlp", "novae"), (
+            f"unknown gene_encoder_type {gene_encoder_type!r}"
+        )
         self.k_neighbors = k_neighbors
         self.use_images = image_encoder_type != "none"
+        self.gene_encoder_type = gene_encoder_type
         self.coord_encoder = RandomFourierFeatures(coord_dim, rff_features, rff_sigma)
         coord_feat_dim = 2 * rff_features  # sin + cos
 
-        node_in_dim = n_genes + coord_feat_dim
+        if gene_encoder_type == "raw":
+            self.gene_encoder = None
+            gene_out_dim = n_genes
+        elif gene_encoder_type == "mlp":
+            self.gene_encoder = MLPGeneEncoder(n_genes, gene_feat_dim)
+            gene_out_dim = gene_feat_dim
+        else:  # novae
+            assert novae_dim is not None, (
+                "gene_encoder_type='novae' requires novae_dim (read it from "
+                "precompute_novae_features()'s real output shape — see "
+                "src/training/train.py's Novae-loading path)"
+            )
+            self.gene_encoder = NovaeGeneEncoder(novae_dim, gene_feat_dim)
+            gene_out_dim = gene_feat_dim
+
+        node_in_dim = gene_out_dim + coord_feat_dim
         query_in_dim = coord_feat_dim
         if image_encoder_type == "cnn":
             self.image_encoder = ImagePatchEncoder(image_patch_size, image_feat_dim)
@@ -374,15 +536,22 @@ class SpatialContextEncoder(nn.Module):
         self.query_proj = nn.Linear(query_in_dim, hidden_dim)
         self.query_attn = nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True)
 
+    def _encode_gene(self, expression: torch.Tensor) -> torch.Tensor:
+        return expression if self.gene_encoder is None else self.gene_encoder(expression)
+
     def forward(self, context_coords: torch.Tensor, context_expression: torch.Tensor,
                 query_coords: torch.Tensor, context_images: torch.Tensor | None = None,
                 query_images: torch.Tensor | None = None) -> torch.Tensor:
+        # NOTE: gene_encoder_type applies to context_expression only, same
+        # as "raw"/"mlp" always did — query locations never carry an
+        # expression feature at all (predicting it is the task), so there
+        # is no query-side counterpart to add here for "novae" either.
         if self.use_images and (context_images is None or query_images is None):
             raise ValueError("use_images=True requires context_images and query_images")
 
         # 1. embed each context node from its own expression + coordinate (+ image)
         context_coord_feat = self.coord_encoder(context_coords)
-        node_feats = [context_expression, context_coord_feat]
+        node_feats = [self._encode_gene(context_expression), context_coord_feat]
         if self.use_images:
             node_feats.append(self.image_encoder(context_images))
         node_repr = self.node_proj(torch.cat(node_feats, dim=-1))

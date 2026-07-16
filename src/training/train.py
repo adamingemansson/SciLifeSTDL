@@ -184,17 +184,30 @@ def _images_tensor(images: np.ndarray, mask: np.ndarray) -> torch.Tensor:
 
 
 def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.ndarray,
-                        masking_cfg, images: np.ndarray | None, seed: int) -> dict:
+                        masking_cfg, images: np.ndarray | None, seed: int,
+                        context_gene_features: np.ndarray | None = None) -> dict:
     """One {context, query, target_expression} training item for a SINGLE
     sample's data. Factored out of MaskedContextQueryDataset.__getitem__
     (2026-07-15) so MultiSampleMaskedContextQueryDataset below can reuse
     the exact same masking-draw logic per-sample, rather than duplicating
     it — the only new thing multi-sample training needs is WHICH sample
-    to draw from each item, not a different way of drawing from one."""
+    to draw from each item, not a different way of drawing from one.
+
+    context_gene_features (2026-07-16, gene_encoder_type="novae"):
+    optional [N, novae_dim] precomputed array, ROW-ALIGNED with expr/
+    coords3d/images, used INSTEAD of raw expr for context["expression"]
+    only — target_expression (the query prediction target) always comes
+    from the real raw expr, regardless of this argument, since the actual
+    task is predicting real gene expression, not Novae's embedding of it.
+    None (default, "raw"/"mlp" gene_encoder_type) preserves the original
+    behavior exactly: context["expression"] is also raw expr — MLPGeneEncoder
+    consumes raw expression itself (inside SpatialContextEncoder), so
+    unlike Novae it needs no separate precomputed array here at all."""
     context_mask, query_mask = make_context_query_split(coords3d, slice_ids, masking_cfg, seed)
+    context_expr_source = expr if context_gene_features is None else context_gene_features
     context = {
         "coords": torch.tensor(coords3d[context_mask], dtype=torch.float32),
-        "expression": torch.tensor(expr[context_mask], dtype=torch.float32),
+        "expression": torch.tensor(context_expr_source[context_mask], dtype=torch.float32),
     }
     query = {"coords": torch.tensor(coords3d[query_mask], dtype=torch.float32)}
     if images is not None:
@@ -212,7 +225,8 @@ class MaskedContextQueryDataset(Dataset):
 
     def __init__(self, coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.ndarray,
                  masking_cfg, n_items: int, base_seed: int = 0,
-                 images: np.ndarray | None = None):
+                 images: np.ndarray | None = None,
+                 context_gene_features: np.ndarray | None = None):
         self.coords3d = coords3d
         self.expr = expr
         self.slice_ids = slice_ids
@@ -226,6 +240,12 @@ class MaskedContextQueryDataset(Dataset):
         # ("gigapath"/"stpath" — see _load_images in this file). See
         # _images_tensor above for how the two cases are distinguished.
         self.images = images
+        # optional precomputed Novae features [N, novae_dim] float32,
+        # row-aligned with everything above (gene_encoder_type="novae" —
+        # see get_novae_features/_build_masked_item's context_gene_features
+        # docstring for why this is separate from expr rather than
+        # replacing it outright).
+        self.context_gene_features = context_gene_features
 
     def __len__(self):
         return self.n_items
@@ -233,7 +253,8 @@ class MaskedContextQueryDataset(Dataset):
     def __getitem__(self, idx):
         seed = self.base_seed + idx
         return _build_masked_item(
-            self.coords3d, self.expr, self.slice_ids, self.masking_cfg, self.images, seed
+            self.coords3d, self.expr, self.slice_ids, self.masking_cfg, self.images, seed,
+            context_gene_features=self.context_gene_features,
         )
 
 
@@ -372,6 +393,58 @@ def get_gigapath_features(cfg, patches: np.ndarray, barcodes: np.ndarray) -> np.
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(cache_path, features=features, barcodes=barcodes)
     return features
+
+
+def _novae_cache_path(cfg) -> Path:
+    """Where precomputed Novae features for this sample get cached across
+    runs — same reasoning as _gigapath_cache_path (Novae's forward pass
+    over a whole sample is a real one-time cost worth not repeating on
+    every `python -m src.training.train` invocation)."""
+    return Path(cfg.data.hest_data_dir) / "novae_cache" / f"{cfg.data.sample_id}.npz"
+
+
+def get_novae_features(cfg, adata) -> np.ndarray:
+    """Load cached Novae features for this adata (see _novae_cache_path)
+    if available, else compute + cache them. Cache keyed on obs_names
+    (not barcodes like Gigapath's cache, since this is called with the
+    already-QC'd/filtered adata directly, not a raw barcode array) so a
+    cache from before a QC-threshold change is correctly invalidated
+    rather than silently reused for a different spot set.
+
+    Row order of the returned array matches adata.obs_names exactly —
+    callers must not reorder/subset adata after this without recomputing."""
+    cache_path = _novae_cache_path(cfg)
+    obs_names = adata.obs_names.to_numpy()
+    if cache_path.exists():
+        cached = np.load(cache_path, allow_pickle=True)
+        if np.array_equal(cached["obs_names"], obs_names):
+            print(f"get_novae_features: loaded cached features for "
+                  f"{cached['features'].shape[0]} spots from {cache_path} "
+                  f"(delete this file to force a recompute).")
+            return cached["features"]
+        print(f"get_novae_features: cache at {cache_path} covers a different "
+              f"spot set than the current adata — recomputing.")
+    from src.models.conditioning import precompute_novae_features
+    print(f"Precomputing Novae features for {adata.n_obs} spots "
+          f"(one-time cost, cached to {cache_path} so future runs skip this step)...")
+    features = precompute_novae_features(adata)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(cache_path, features=features, obs_names=obs_names)
+    return features
+
+
+def inject_novae_dim(model_cfg: dict, novae_dim: int) -> None:
+    """If a config sets gene_encoder_type: "novae" (2026-07-16), auto-derive
+    novae_dim from the real precomputed features' shape rather than
+    requiring it hardcoded into a YAML file (same reasoning as
+    inject_stpath_gene_names — the real value is only known once Novae has
+    actually been run, and hardcoding a guessed number risks silently
+    drifting from whatever the installed novae package version actually
+    outputs). Mutates model_cfg["params"] in place; no-op for every other
+    config."""
+    params = model_cfg.get("params", {})
+    if params.get("gene_encoder_type") == "novae" and "novae_dim" not in params:
+        params["novae_dim"] = novae_dim
 
 
 def _load_images(cfg, adata):
@@ -532,22 +605,39 @@ def main(cfg_path: str, overrides: list[str] | None = None):
 
     adata, coords3d, expr, slice_ids, images = _load_data(cfg)
 
+    # gene_encoder_type="novae" (2026-07-16): precompute once, row-aligned
+    # to the (possibly image-QC-filtered) adata _load_data already
+    # returned — must happen before build_model, since novae_dim needs to
+    # be injected into model_cfg first, same ordering as
+    # inject_stpath_gene_names below.
+    context_gene_features = None
+    if cfg.model.get("params", {}).get("gene_encoder_type") == "novae":
+        context_gene_features = get_novae_features(cfg, adata)
+
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     inject_stpath_gene_names(model_cfg, adata)
+    if context_gene_features is not None:
+        inject_novae_dim(model_cfg, context_gene_features.shape[1])
     model = build_model(model_cfg)
     # UNRESOLVED copy, saved (not model_cfg above) so a STPath config's
     # ${oc.env:STPATH_GENE_VOC_PATH}/${oc.env:STPATH_MODEL_WEIGHT_PATH}
     # interpolations stay literal in the checkpoint rather than getting
     # baked in as THIS machine's resolved path — see load_trained_model's
     # docstring for the real cross-machine bug this fixes (2026-07-15).
+    # novae_dim, unlike the STPath paths, is a plain int with nothing
+    # machine-specific to resolve — injecting it here too just keeps the
+    # saved config self-consistent with model_cfg above.
     unresolved_model_cfg = OmegaConf.to_container(cfg.model, resolve=False)
     inject_stpath_gene_names(unresolved_model_cfg, adata)
+    if context_gene_features is not None:
+        inject_novae_dim(unresolved_model_cfg, context_gene_features.shape[1])
 
     # Train (skipped entirely for parameter-free baselines like interp_baseline) --
     if list(model.parameters()):
         dataset = MaskedContextQueryDataset(
             coords3d, expr, slice_ids, cfg.masking,
             n_items=cfg.training.epochs, base_seed=cfg.training.seed, images=images,
+            context_gene_features=context_gene_features,
         )
         dataloader = make_dataloader(dataset, cfg)
         trainer = pl.Trainer(
@@ -571,6 +661,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     eval_item = MaskedContextQueryDataset(
         coords3d, expr, slice_ids, cfg.masking,
         n_items=1, base_seed=cfg.training.seed + cfg.training.epochs + 1, images=images,
+        context_gene_features=context_gene_features,
     )[0]
     context, query = eval_item["context"], eval_item["query"]
     target_expression = eval_item["target_expression"].numpy()
