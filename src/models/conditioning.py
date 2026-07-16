@@ -142,6 +142,20 @@ def _load_gigapath_tile_encoder():
 _IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
 _IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
+# Prov-GigaPath's real tile-encoder output dim, confirmed via a real
+# forward pass (GigapathPatchEncoder's original construction-time probe)
+# and matching STPath's own hardcoded assumption
+# (stpath_encoder.py ImageTokenizer(feature_dim=1536)) — the same real
+# model, so the same real number. Kept as a named constant rather than
+# re-probed via a real forward pass at every GigapathPatchEncoder
+# construction (see that class for why: probing required loading
+# Gigapath from HuggingFace even when features are fully precomputed/
+# cached and the real model is never actually needed again — a real
+# blocking issue, 2026-07-15, HuggingFace HEAD-request timeouts on a
+# flaky network, even though the weights were already cached locally
+# from an earlier successful download).
+_GIGAPATH_FEAT_DIM = 1536
+
 
 def _gigapath_preprocess_and_encode(tile_encoder, patches: torch.Tensor) -> torch.Tensor:
     """Prov-GigaPath's own documented preprocessing (resize 256 -> center
@@ -239,16 +253,21 @@ class GigapathPatchEncoder(nn.Module):
     [B, gigapath_dim] (the fast, cached path real training should use —
     see precompute_gigapath_features above) — dispatches on tensor rank
     so callers don't need two different method names. Output feature dim
-    is read from a real forward pass at construction time rather than
-    hardcoded, since the tile encoder's exact embedding size isn't stated
-    in its own README.
+    uses the module-level _GIGAPATH_FEAT_DIM constant rather than probing
+    it via a real forward pass at construction time (an earlier version
+    did that, unconditionally, on every construction — real problem hit
+    2026-07-15: it required loading the actual Gigapath model from
+    HuggingFace even when features were fully precomputed/cached and the
+    real model was never going to be used again, which hung/timed out on
+    a flaky network despite the weights already being cached locally from
+    an earlier successful download). The tile encoder is now ONLY ever
+    loaded (and _GIGAPATH_FEAT_DIM cross-checked against its real output,
+    _ensure_tile_encoder below) if raw patches genuinely show up — never
+    in the real training path, which always uses precomputed features.
     """
 
     def __init__(self, feat_dim: int = 64):
         super().__init__()
-        tile_encoder = _load_gigapath_tile_encoder()
-        with torch.no_grad():
-            gigapath_dim = tile_encoder(torch.zeros(1, 3, 224, 224)).shape[-1]
         # Gigapath's own activation scale was optimized for its own
         # training objective, not for whatever an untrained nn.Linear
         # here expects — normalize before projecting rather than relying
@@ -258,24 +277,27 @@ class GigapathPatchEncoder(nn.Module):
         # (2026-07-15), added here too for consistency since both classes
         # are the same "frozen big model -> small trainable head" (RAE)
         # pattern.
-        self.embedding_norm = nn.LayerNorm(gigapath_dim)
-        self.proj = nn.Linear(gigapath_dim, feat_dim)
-        # Don't keep the ~4.4GB tile encoder resident after this dim
-        # probe: real training always passes precomputed features (2D,
-        # see precompute_gigapath_features), never raw patches (4D), so
-        # forward() below never actually calls it in practice. Reloaded
-        # lazily only if raw patches genuinely do show up (smoke tests /
-        # one-off calls) — same pattern as
+        self.embedding_norm = nn.LayerNorm(_GIGAPATH_FEAT_DIM)
+        self.proj = nn.Linear(_GIGAPATH_FEAT_DIM, feat_dim)
+        # Not loaded here at all (see class docstring) — real training
+        # never touches this. Loaded lazily only if raw patches genuinely
+        # show up (smoke tests / one-off calls) — same pattern as
         # stpath_encoder.py's STPathContextEncoder._ensure_tile_encoder,
         # both added 2026-07-15 after a real RAM crash running several
         # Gigapath/STPath-backed configs back to back
         # (src/evaluation/run_comparison.py _free()).
-        del tile_encoder
         self.tile_encoder = None
 
     def _ensure_tile_encoder(self, device: torch.device) -> nn.Module:
         if self.tile_encoder is None:
-            self.tile_encoder = _load_gigapath_tile_encoder().to(device)
+            tile_encoder = _load_gigapath_tile_encoder().to(device)
+            with torch.no_grad():
+                real_dim = tile_encoder(torch.zeros(1, 3, 224, 224, device=device)).shape[-1]
+            assert real_dim == _GIGAPATH_FEAT_DIM, (
+                f"Gigapath's real tile-encoder output dim ({real_dim}) doesn't match "
+                f"the hardcoded _GIGAPATH_FEAT_DIM ({_GIGAPATH_FEAT_DIM}) — update the constant"
+            )
+            self.tile_encoder = tile_encoder
         return self.tile_encoder
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

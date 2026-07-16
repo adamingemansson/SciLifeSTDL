@@ -84,23 +84,31 @@ def _run_gigapath_case():
 
     torch.manual_seed(0)
     n_context, n_query, n_genes, patch_size = 6, 3, 30, 256
-    try:
-        encoder = SpatialContextEncoder(n_genes=n_genes, coord_dim=3, hidden_dim=64,
-                                         k_neighbors=3, rff_features=16,
-                                         image_encoder_type="gigapath", image_feat_dim=16,
-                                         image_patch_size=patch_size)
-    except Exception as e:  # gated HF repo access not granted, no token, network, etc.
-        print(f"[image branch: gigapath] SKIPPED — could not load Gigapath ({e})")
-        return
-
+    encoder = SpatialContextEncoder(n_genes=n_genes, coord_dim=3, hidden_dim=64,
+                                     k_neighbors=3, rff_features=16,
+                                     image_encoder_type="gigapath", image_feat_dim=16,
+                                     image_patch_size=patch_size)
+    # Construction alone no longer touches Gigapath at all (2026-07-15 fix:
+    # GigapathPatchEncoder used to probe the tile encoder's output dim via a
+    # real forward pass at __init__ time, unconditionally — moved to only
+    # happen lazily, on first RAW-patch use, since real training never uses
+    # raw patches and that eager probe caused real HuggingFace network hangs
+    # even when features were fully cached locally). So the try/except that
+    # used to wrap construction now has to wrap this first raw-patch forward
+    # call instead — that's the actual first point Gigapath's real weights
+    # get loaded.
     context_coords = torch.randn(n_context, 3)
     context_expression = torch.rand(n_context, n_genes)
     context_images = torch.rand(n_context, 3, patch_size, patch_size)
     query_coords = torch.randn(n_query, 3)
     query_images = torch.rand(n_query, 3, patch_size, patch_size)
 
-    c = encoder(context_coords, context_expression, query_coords,
-                context_images=context_images, query_images=query_images)
+    try:
+        c = encoder(context_coords, context_expression, query_coords,
+                    context_images=context_images, query_images=query_images)
+    except Exception as e:  # gated HF repo access not granted, no token, network, etc.
+        print(f"[image branch: gigapath] SKIPPED — could not load Gigapath ({e})")
+        return
     assert c.shape == (n_query, 64)
     assert torch.isfinite(c).all()
     print(f"[image branch: gigapath] OK — output shape {tuple(c.shape)}")

@@ -522,6 +522,24 @@ baseline, not counted as one of the three comparison models below.
   real Mac crashes earlier this project), much less so on a server with
   far more system RAM. Use `--override training.num_workers=N` for a
   quick try without editing configs.
+- **`GigapathPatchEncoder` no longer needs network access when Gigapath
+  features are precomputed/cached (2026-07-15)** — real bug hit running
+  an `he_gigapath` config on the Mac: even with `INT1.npz`'s features
+  already cached on disk, construction unconditionally loaded the real
+  Gigapath model from HuggingFace just to probe its output dimension via
+  a real forward pass, then discarded it. That probe hung on
+  HuggingFace HEAD-request timeouts despite the weights already being
+  cached locally from an earlier successful download — real training
+  never needed the model loaded at all in this case. Fixed: the output
+  dim is now a module-level constant (`_GIGAPATH_FEAT_DIM = 1536`,
+  matching STPath's own hardcoded assumption for the same real model,
+  `ImageTokenizer(feature_dim=1536)`), verified against a real forward
+  pass only if raw patches genuinely show up (`_ensure_tile_encoder`,
+  same lazy pattern as the earlier RAM fix) — never in the real training
+  path. `tests/test_conditioning.py`'s gigapath-skip try/except moved
+  from wrapping construction to wrapping the first raw-patch `forward()`
+  call, since that's now the actual first point real network access
+  happens.
 - **Full histology image generation/reconstruction stays a deferred
   stretch goal**, separate from the conditioning use above. Filling in
   broken tissue *in the H&E image itself*, not just using H&E to condition
