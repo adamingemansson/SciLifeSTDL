@@ -55,15 +55,14 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from omegaconf import OmegaConf
 
 from src.models.registry import build_model
 from src.training.train import (
     load_adata, make_context_query_split, MaskedContextQueryDataset,
-    _collate_identity, _load_images, _images_tensor, inject_stpath_gene_names,
-    get_gigapath_features, save_trained_model,
+    _load_images, _images_tensor, inject_stpath_gene_names,
+    get_gigapath_features, save_trained_model, make_dataloader,
 )
 from src.evaluation import metrics as ev
 from src.evaluation.cell_type_classifier import cluster_pseudo_labels, CellTypePlausibilityClassifier
@@ -99,7 +98,7 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None):
             coords3d, expr, slice_ids, cfg.masking,
             n_items=cfg.training.epochs, base_seed=cfg.training.seed, images=images,
         )
-        dataloader = DataLoader(dataset, batch_size=1, collate_fn=_collate_identity)
+        dataloader = make_dataloader(dataset, cfg)
         trainer = pl.Trainer(
             max_epochs=1, accelerator="auto",
             log_every_n_steps=cfg.training.log_every_n_steps,

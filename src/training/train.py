@@ -273,6 +273,37 @@ def _collate_identity(batch_list):
     return batch_list[0]
 
 
+def make_dataloader(dataset, cfg) -> DataLoader:
+    """DataLoader construction shared by train.py/run_comparison.py, with
+    num_workers/pin_memory added 2026-07-15 after a real observation on
+    an A100 server: GPU utilization sat at ~22% during training, meaning
+    the GPU was idle most of the time waiting for the CPU-side
+    __getitem__ work (masking draw, image tensor conversion) to finish —
+    a classic CPU-bound-data-loading pattern that num_workers>0 exists to
+    fix, by overlapping the NEXT item's CPU prep with the CURRENT item's
+    GPU compute. This is the OPPOSITE situation from a small/slow
+    accelerator (a Mac's MPS backend, where the model's own forward/
+    backward pass is plausibly the bottleneck instead) — there,
+    num_workers wouldn't be expected to help much and was deliberately
+    not recommended (see this session's discussion). Defaults to 0
+    (current/previous behavior, unaffected unless a config opts in via
+    training.num_workers) since num_workers>0 has a real cost this
+    project has hit before: each worker gets its OWN COPY of the
+    Dataset's image array, multiplying RAM by num_workers — a serious
+    concern on a RAM-constrained machine (the Mac crashes earlier this
+    session), much less so on a data-center server with far more system
+    RAM. pin_memory is only actually useful with a CUDA accelerator
+    (speeds up host->device transfer), so it's tied to
+    torch.cuda.is_available() rather than always on."""
+    num_workers = cfg.training.get("num_workers", 0)
+    return DataLoader(
+        dataset, batch_size=1, collate_fn=_collate_identity,
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+
 def load_adata(cfg):
     """QC'd AnnData for this config's data section — factored out so
     src/evaluation/run_comparison.py (task #15) can get the AnnData object
@@ -445,7 +476,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
             coords3d, expr, slice_ids, cfg.masking,
             n_items=cfg.training.epochs, base_seed=cfg.training.seed, images=images,
         )
-        dataloader = DataLoader(dataset, batch_size=1, collate_fn=_collate_identity)
+        dataloader = make_dataloader(dataset, cfg)
         trainer = pl.Trainer(
             max_epochs=1,  # one pass over `n_items` fresh masking draws == old epoch count
             accelerator="auto",
