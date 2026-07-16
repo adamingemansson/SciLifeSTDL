@@ -1,7 +1,7 @@
 name: st3d
 channels:
   - pytorch
-  #- nvidia
+  - nvidia
   - conda-forge
   - bioconda
 dependencies:
@@ -17,7 +17,7 @@ dependencies:
   - jupyterlab
   - pytorch
   - torchvision
-  # - pytorch-cuda=12.1   # remove/adjust if no GPU or different CUDA version
+  - pytorch-cuda=12.1   # remove/adjust if no GPU or different CUDA version
   - pytorch-lightning
   - anndata
   - scanpy
