@@ -102,7 +102,8 @@ def _cached_load_adata(cfg, adata_cache: dict):
     return adata_cache[key]
 
 
-def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache: dict | None = None):
+def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache: dict | None = None,
+                  skip_training: bool = False):
     cfg = OmegaConf.load(cfg_path)
     if overrides:
         # dotlist overrides applied to EVERY config in this comparison run,
@@ -121,6 +122,27 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
     expr = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()
     slice_ids = adata.obs["slice_id"].to_numpy()
 
+    # .get() with the same default every real config's own YAML comment
+    # documents, not a bare attribute access — configs that don't declare
+    # checkpoint_dir (e.g. this file's own test_run_comparison.py synthetic
+    # configs) must still work, not crash on a missing key
+    checkpoint_dir = cfg.training.get("checkpoint_dir", f"results/checkpoints/{cfg.experiment_name}")
+
+    if skip_training:
+        # Re-evaluate an ALREADY-trained model without retraining
+        # (2026-07-15, added specifically so a new/expanded metric set -
+        # e.g. st_mmd - can be checked against real completed multi-
+        # thousand-epoch runs in minutes, not by re-running training from
+        # scratch). Requires this config's checkpoint_dir to already have
+        # a real checkpoint from an earlier save_trained_model() call —
+        # raises a clear FileNotFoundError (via load_trained_model) if
+        # not, rather than silently falling back to training.
+        from src.training.train import load_trained_model
+        print(f"--skip-training: loading {cfg.experiment_name} from {checkpoint_dir} (not retraining)")
+        model, _gene_names = load_trained_model(checkpoint_dir)
+        model.eval()
+        return model, cfg, adata, coords3d, expr, slice_ids, images
+
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     inject_stpath_gene_names(model_cfg, adata)
     model = build_model(model_cfg)
@@ -137,11 +159,6 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
             enable_checkpointing=False, logger=False,
         )
         trainer.fit(model, dataloader)
-        # .get() with the same default every real config's own YAML comment
-        # documents, not a bare attribute access — configs that don't
-        # declare checkpoint_dir (e.g. this file's own test_run_comparison.py
-        # synthetic configs) must still work, not crash on a missing key
-        checkpoint_dir = cfg.training.get("checkpoint_dir", f"results/checkpoints/{cfg.experiment_name}")
         saved_path = save_trained_model(model, model_cfg, adata.var_names.tolist(), checkpoint_dir)
         if saved_path is not None:
             print(f"Saved trained model (weights + config + gene names) to {saved_path.parent}")
@@ -217,10 +234,17 @@ def _evaluate(model, model_params: dict, shared_eval: dict) -> tuple:
     auc = ev.nonzero_auc(pred, target_expression)
 
     gen_patches = ev.pool_knn_neighborhood(coords3d[query_mask], pred, k=shared_eval["query_k"])
-    fid = ev.st_fid(shared_eval["real_embed"], shared_eval["pca"].transform(gen_patches))
+    gen_embed = shared_eval["pca"].transform(gen_patches)
+    fid = ev.st_fid(shared_eval["real_embed"], gen_embed)
+    # MMD (2026-07-15): drops st_fid's Gaussian assumption on the pooled
+    # PCA embedding space - same real_embed/gen_embed pair, so this is
+    # free (no extra forward pass, no extra fitting), and comparing the
+    # two numbers tells you whether that Gaussian assumption is actually
+    # reasonable for this data or distorting the ST-FID number.
+    mmd = ev.st_mmd(shared_eval["real_embed"], gen_embed)
 
     plausibility = shared_eval["clf"].plausibility_accuracy(pred, shared_eval["true_query_labels"])
-    return pcc, rmse, auc, fid, plausibility
+    return pcc, rmse, auc, fid, mmd, plausibility
 
 
 def _cnn_image_patch_size(model_config_paths: list[str], overrides: list[str] | None) -> int | None:
@@ -300,7 +324,7 @@ def _build_shared_eval(cfg, adata, coords3d, expr, slice_ids, images,
 
 
 def main(model_config_paths: list[str], k_neighborhood: int = 8, pca_components: int = 10,
-         overrides: list[str] | None = None):
+         overrides: list[str] | None = None, skip_training: bool = False):
     rows = []
     interp_row = None
     shared_eval = None
@@ -308,7 +332,9 @@ def main(model_config_paths: list[str], k_neighborhood: int = 8, pca_components:
     cnn_patch_size = _cnn_image_patch_size(model_config_paths, overrides)
 
     for path in model_config_paths:
-        model, cfg, adata, coords3d, expr, slice_ids, images = _train_model(path, overrides, adata_cache)
+        model, cfg, adata, coords3d, expr, slice_ids, images = _train_model(
+            path, overrides, adata_cache, skip_training
+        )
         model_params = cfg.model.get("params", {})
 
         if shared_eval is None:
@@ -331,11 +357,11 @@ def main(model_config_paths: list[str], k_neighborhood: int = 8, pca_components:
 
     rows.append(interp_row)
 
-    header = f"{'model':<18}{'PCC':>10}{'RMSE':>10}{'AUC':>10}{'ST-FID':>10}{'plausible':>12}"
+    header = f"{'model':<18}{'PCC':>10}{'RMSE':>10}{'AUC':>10}{'ST-FID':>10}{'ST-MMD':>10}{'plausible':>12}"
     print("\n" + header)
     print("-" * len(header))
-    for name, pcc, rmse, auc, fid, plaus in rows:
-        print(f"{name:<18}{pcc:>10.4f}{rmse:>10.4f}{auc:>10.4f}{fid:>10.4f}{plaus:>12.4f}")
+    for name, pcc, rmse, auc, fid, mmd, plaus in rows:
+        print(f"{name:<18}{pcc:>10.4f}{rmse:>10.4f}{auc:>10.4f}{fid:>10.4f}{mmd:>10.4f}{plaus:>12.4f}")
 
 
 if __name__ == "__main__":
@@ -346,5 +372,11 @@ if __name__ == "__main__":
     parser.add_argument("--override", nargs="*", default=[],
                          help="dotlist overrides applied to EVERY config, "
                               "e.g. --override training.epochs=2 for a quick smoke test")
+    parser.add_argument("--skip-training", action="store_true",
+                         help="load each config's already-saved weights from its "
+                              "training.checkpoint_dir instead of retraining from scratch — "
+                              "fast re-evaluation with a new/expanded metric set against "
+                              "completed runs. Requires a prior run of this same config (without "
+                              "--skip-training) to have actually saved a checkpoint there.")
     args = parser.parse_args()
-    main(args.configs, overrides=args.override)
+    main(args.configs, overrides=args.override, skip_training=args.skip_training)
