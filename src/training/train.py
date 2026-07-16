@@ -58,7 +58,17 @@ def save_trainable_state_dict(model, checkpoint_dir: str, filename: str = "train
     state = {k: v for k, v in model.state_dict().items() if k in trainable_names}
     path = Path(checkpoint_dir) / filename
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(state, path)
+    # atomic write (same reasoning/bug as _atomic_savez above) — under
+    # PyTorch Lightning's default multi-GPU DDP launcher, THIS function
+    # runs once per GPU subprocess (each re-executes the whole script),
+    # so multiple processes call this concurrently for the same path.
+    # torch.save's default format is also a zip file — concurrent writers
+    # to the same path can produce the same torn-zip crash _atomic_savez
+    # was added to fix. Write to a sibling temp file, then os.replace()
+    # (atomic on POSIX) into the real path.
+    tmp_path = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    torch.save(state, tmp_path)
+    os.replace(tmp_path, path)
     return path
 
 
@@ -84,10 +94,17 @@ def save_trained_model(model, model_cfg: dict, gene_names: list, checkpoint_dir:
     if weights_path is None:
         return None
     out_dir = weights_path.parent
-    with open(out_dir / "model_cfg.json", "w") as f:
-        json.dump(model_cfg, f)
-    with open(out_dir / "gene_names.json", "w") as f:
-        json.dump(list(gene_names), f)
+    # same concurrent-DDP-writer reasoning as save_trainable_state_dict's
+    # atomic torch.save above — plain-text JSON corrupts less
+    # catastrophically than a torn zip (a parse error, not a segfault),
+    # but it's still a real correctness bug under concurrent writers, so
+    # fixed the same way.
+    for name, payload in [("model_cfg.json", model_cfg), ("gene_names.json", list(gene_names))]:
+        final_path = out_dir / name
+        tmp_path = out_dir / f"{name}.tmp{os.getpid()}"
+        with open(tmp_path, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, final_path)
     return weights_path
 
 
@@ -356,6 +373,34 @@ def load_adata(cfg):
     )
 
 
+def _atomic_savez(cache_path: Path, **arrays) -> None:
+    """np.savez, but crash-safe under concurrent writers.
+
+    Real bug found 2026-07-16: running run_comparison.py with multiple
+    GPUs visible and no CUDA_VISIBLE_DEVICES pin makes PyTorch Lightning
+    auto-launch DDP, which works by RE-RUNNING THE ENTIRE SCRIPT once per
+    GPU as a separate subprocess — so get_novae_features/
+    get_gigapath_features's data-loading code (everything in _train_model
+    before trainer.fit()) runs independently in every subprocess, not
+    just once. When a cache file doesn't exist yet, every subprocess
+    raced to np.savez() the SAME path simultaneously — np.savez writes a
+    zip file, and two processes writing to the same path at once produces
+    a torn/corrupt zip that a subsequent np.load() can segfault on
+    reading (confirmed: a real 8-GPU run crashed with `Child process
+    terminated with code -11` reading a just-written novae_cache/*.npz).
+    Plain np.savez(cache_path, ...) was never safe against this — writing
+    to a sibling temp file first, then os.replace() (atomic on POSIX)
+    into the real path, means every concurrent writer either fully wins
+    or is fully overwritten by whichever finishes last; no reader can
+    ever observe a partially-written file. Doesn't eliminate the
+    redundant computation across subprocesses (a separate, real but
+    lower-severity waste — see get_novae_features/get_gigapath_features'
+    own docstrings), only the corruption risk."""
+    tmp_path = cache_path.with_suffix(cache_path.suffix + f".tmp{os.getpid()}")
+    np.savez(tmp_path, **arrays)
+    os.replace(tmp_path, cache_path)  # atomic on POSIX — no reader ever sees a partial file
+
+
 def _gigapath_cache_path(cfg) -> Path:
     """Where precomputed Gigapath features for this sample get cached
     across runs (see _load_images) — next to the HEST-1k data itself so
@@ -391,7 +436,7 @@ def get_gigapath_features(cfg, patches: np.ndarray, barcodes: np.ndarray) -> np.
           f"so future runs skip this step)...")
     features = precompute_gigapath_features(patches)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(cache_path, features=features, barcodes=barcodes)
+    _atomic_savez(cache_path, features=features, barcodes=barcodes)
     return features
 
 
@@ -429,7 +474,7 @@ def get_novae_features(cfg, adata) -> np.ndarray:
           f"(one-time cost, cached to {cache_path} so future runs skip this step)...")
     features = precompute_novae_features(adata)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(cache_path, features=features, obs_names=obs_names)
+    _atomic_savez(cache_path, features=features, obs_names=obs_names)
     return features
 
 
