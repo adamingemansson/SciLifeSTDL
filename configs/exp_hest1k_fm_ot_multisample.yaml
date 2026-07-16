@@ -1,0 +1,74 @@
+# FM-OT trained on MULTIPLE HEST-1k samples at once, with organ/technology
+# conditioning enabled (2026-07-16, item 1 of the multi-sample training +
+# OrganTechEmbedding follow-up — see src/models/conditioning.py
+# OrganTechEmbedding's own docstring for the real caveat this config
+# demonstrates without yet validating: INT1-INT24 are all-Visium, same
+# ccRCC cohort (docs/dataset_notes.md / loaders.load_multi_sample's
+# docstring), so organ/tech is a CONSTANT here — real signal requires
+# genuinely different organs/platforms, not available yet. This config
+# exists to exercise the mechanism end-to-end (multi-sample loading,
+# shared-gene-panel alignment, OrganTechEmbedding wiring, checkpointing)
+# on real data ahead of that, per src/training/train.py's
+# load_multi_sample_data/_main_multi_sample/inject_organ_tech_vocab.
+#
+# n_genes below is a PLACEholder — load_multi_sample's shared-gene-panel
+# intersection across INT1/INT2/INT3/INT4 will almost certainly differ
+# from any single sample's own gene count (exp_hest1k_fm_ot.yaml's 16570
+# is INT1 alone, pre-intersection) — check the real
+# "load_multi_sample: ... keeps N/M genes" console output on first run
+# and correct this value before trusting a full training run's results
+# (build_model constructs a fixed-width decoder from it, so a wrong value
+# doesn't crash — the extra/missing columns would just silently be
+# nonsense — this is exactly the kind of mismatch inject_stpath_gene_names/
+# inject_novae_dim's "must be verified against real data" pattern
+# elsewhere in this project exists to avoid; multi-sample n_genes doesn't
+# have an auto-injector yet, so it's manual here).
+
+experiment_name: fm_ot_hest1k_multisample_pilot
+
+data:
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_ids: [INT1, INT2, INT3, INT4]     # list, not sample_id -> triggers _main_multi_sample
+  organs: [Kidney, Kidney, Kidney, Kidney]  # constant today (see header) — real per-sample values once non-ccRCC/non-Visium samples are added
+  techs: [Visium, Visium, Visium, Visium]
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    n_genes: 16570                 # PLACEHOLDER — see header, verify against real shared-panel size
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+    use_organ_tech_conditioning: true  # consumed by inject_organ_tech_vocab, popped before build_model — see train.py
+
+training:
+  epochs: 10000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

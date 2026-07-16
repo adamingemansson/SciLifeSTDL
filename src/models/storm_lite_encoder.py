@@ -77,6 +77,7 @@ import torch.nn as nn
 from src.models.conditioning import (
     RandomFourierFeatures, GigapathPatchEncoder,
     MLPGeneEncoder, NovaeGeneEncoder, CombinedGeneEncoder, RelativePositionBias,
+    OrganTechEmbedding,
 )
 
 
@@ -85,7 +86,8 @@ class StormLiteContextEncoder(nn.Module):
                  hidden_dim: int = 256, rff_features: int = 64, rff_sigma: float = 1.0,
                  n_transformer_layers: int = 2, n_heads: int = 4,
                  gene_encoder_type: str = "both", use_relative_bias: bool = True,
-                 relative_bias_hidden_dim: int = 32):
+                 relative_bias_hidden_dim: int = 32,
+                 organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
         assert gene_encoder_type in ("mlp", "novae", "both"), (
             f"unknown gene_encoder_type {gene_encoder_type!r}"
@@ -137,6 +139,21 @@ class StormLiteContextEncoder(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_transformer_layers)
         self.hidden_dim = hidden_dim
 
+        # 2026-07-16, multi-sample training follow-up — same additive
+        # organ/tech offset as SpatialContextEncoder (see that class and
+        # OrganTechEmbedding's own docstring for the real caveat: only
+        # meaningful once training spans genuinely different
+        # organs/platforms). Added post-fusion (to `tokens`, before the
+        # transformer sees them) rather than to `fused`, so the fusion
+        # transformer's self-attention can actually condition on it —
+        # adding it only at the very end would make it a pure output
+        # offset every downstream model would trivially fold into its own
+        # bias term, same failure mode this project already corrected
+        # once for CombinedGeneEncoder's sum-vs-concat issue.
+        self.organ_tech_embed = None
+        if organ_vocab is not None and tech_vocab is not None:
+            self.organ_tech_embed = OrganTechEmbedding(organ_vocab, tech_vocab, hidden_dim)
+
     def _encode_gene(self, raw_expr: torch.Tensor,
                       novae_features: torch.Tensor | None) -> torch.Tensor:
         # log1p for numerical stability, same convention used for
@@ -158,7 +175,8 @@ class StormLiteContextEncoder(nn.Module):
     def forward(self, context_coords: torch.Tensor, context_expression: torch.Tensor,
                 query_coords: torch.Tensor, context_images: torch.Tensor,
                 query_images: torch.Tensor,
-                context_novae_features: torch.Tensor | None = None) -> torch.Tensor:
+                context_novae_features: torch.Tensor | None = None,
+                organ: str | None = None, tech: str | None = None) -> torch.Tensor:
         """context_images/query_images: raw H&E patches OR precomputed
         GigaPath features (GigapathPatchEncoder dispatches on tensor rank
         — see its own docstring). context_novae_features: [N_context,
@@ -189,6 +207,8 @@ class StormLiteContextEncoder(nn.Module):
         gene_embed[n_context:] = self.mask_token  # broadcasts over n_query rows
 
         tokens = img_embed + gene_embed + coord_embed  # [N_total, hidden_dim]
+        if self.organ_tech_embed is not None and organ is not None and tech is not None:
+            tokens = tokens + self.organ_tech_embed(organ, tech, n_total, device)
         # additive attention bias (Swin-V2-style CPB, see RelativePositionBias)
         # — a FloatTensor `mask` is documented PyTorch behavior for an
         # additive bias added to raw attention logits before softmax, not

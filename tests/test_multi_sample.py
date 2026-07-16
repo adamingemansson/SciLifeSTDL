@@ -86,8 +86,8 @@ def test_multi_sample_dataset_never_mixes_samples():
     slice_ids_b = np.array(["SAMPB"] * n_points)
 
     samples = [
-        (coords_a, expr_a, slice_ids_a, None),
-        (coords_b, expr_b, slice_ids_b, None),
+        (coords_a, expr_a, slice_ids_a, None, "Kidney", "Visium"),
+        (coords_b, expr_b, slice_ids_b, None, "Lung", "Visium"),
     ]
     masking_cfg = OmegaConf.create({
         "strategy": "random_dropout_patches",
@@ -105,6 +105,13 @@ def test_multi_sample_dataset_never_mixes_samples():
         in_a = bool((all_xy < 50_000.0).all())
         in_b = bool((all_xy >= 50_000.0).all())
         assert in_a or in_b, f"item {i} mixed coordinates from both samples — cross-sample leakage"
+        # organ/tech (2026-07-16) must match whichever sample the coords
+        # came from — same cross-sample-leakage concern, applied to the
+        # new per-sample metadata channel
+        expected_organ = "Kidney" if in_a else "Lung"
+        assert item["context"]["organ"] == expected_organ == item["query"]["organ"], (
+            f"item {i}: organ label doesn't match its own sample's coordinates"
+        )
         both_samples_seen.add("A" if in_a else "B")
 
     assert both_samples_seen == {"A", "B"}, (
@@ -114,8 +121,43 @@ def test_multi_sample_dataset_never_mixes_samples():
           f"never mixed samples within one draw, drew from both samples across the dataset")
 
 
+def test_load_multi_sample_organs_techs():
+    """organs/techs (2026-07-16, OrganTechEmbedding follow-up) — optional,
+    parallel to sample_ids, stored into each returned adata's .obs and
+    picked up by load_multi_sample_data (see that function's docstring)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        hest_dir = Path(tmp)
+        genes = [f"G{i}" for i in range(15)]
+        _make_synthetic_sample(hest_dir, "SAMPE", gene_names=genes, seed=0)
+        _make_synthetic_sample(hest_dir, "SAMPF", gene_names=genes, seed=1)
+
+        adatas = load_multi_sample(
+            hest_dir, ["SAMPE", "SAMPF"], min_genes=1, min_cells=1,
+            organs=["Kidney", "Lung"], techs=["Visium", "Visium"],
+        )
+        assert list(adatas[0].obs["organ"].unique()) == ["Kidney"]
+        assert list(adatas[1].obs["organ"].unique()) == ["Lung"]
+        assert set(adatas[0].obs["tech"].unique()) == {"Visium"}
+
+        # mismatched-length organs/techs must raise, not silently misalign
+        raised = False
+        try:
+            load_multi_sample(hest_dir, ["SAMPE", "SAMPF"], min_genes=1, min_cells=1,
+                               organs=["Kidney"])
+        except ValueError:
+            raised = True
+        assert raised, "organs with wrong length must raise, not silently misalign to sample_ids"
+
+        # omitted organs/techs default every sample to "unknown"
+        adatas_default = load_multi_sample(hest_dir, ["SAMPE", "SAMPF"], min_genes=1, min_cells=1)
+        assert list(adatas_default[0].obs["organ"].unique()) == ["unknown"]
+        print("[load_multi_sample organs/techs] OK — stored correctly, length-checked, "
+              "defaults to 'unknown'")
+
+
 if __name__ == "__main__":
     test_load_multi_sample_gene_intersection()
     test_load_multi_sample_zero_overlap_raises()
     test_multi_sample_dataset_never_mixes_samples()
+    test_load_multi_sample_organs_techs()
     print("\nAll multi-sample loader/dataset smoke tests passed.")

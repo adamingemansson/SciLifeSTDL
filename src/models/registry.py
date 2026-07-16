@@ -46,6 +46,7 @@ def _build_context_encoder(
     stpath_pretrained: bool = True,
     storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
     storm_lite_use_relative_bias: bool = True, storm_lite_relative_bias_hidden_dim: int = 32,
+    organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
 ):
     """Shared by WAE-GAN/FM-OT/VQ-VAE+AR so each model's __init__ doesn't
     repeat the context_encoder_type branching. "builtin" (default) is our
@@ -74,7 +75,17 @@ def _build_context_encoder(
     trained from scratch on our data" comparison arm — see
     STPathContextEncoder's own pretrained docstring) — stpath_gene_names/
     stpath_gene_voc_path are STILL required (fixed resources, not trained
-    parameters); stpath_model_weight_path is not (nothing to load)."""
+    parameters); stpath_model_weight_path is not (nothing to load).
+
+    organ_vocab/tech_vocab (2026-07-16, multi-sample training follow-up)
+    only apply to "builtin"/"storm_lite" (both route through
+    OrganTechEmbedding, see conditioning.py) — NOT "stpath", which already
+    has its own fixed-string stpath_organ_type/stpath_tech_type mechanism
+    (a single organ/tech per model, matching STPath's own real
+    IDTokenizer vocabulary loaded from model_weight_path, not a
+    data-driven vocab we build ourselves). Passing both None (default)
+    disables organ/tech conditioning entirely, same as before this
+    param existed — single-sample/single-organ training is unaffected."""
     if context_encoder_type == "builtin":
         return SpatialContextEncoder(
             n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim,
@@ -82,6 +93,7 @@ def _build_context_encoder(
             image_patch_size=image_patch_size,
             gene_encoder_type=gene_encoder_type, gene_feat_dim=gene_feat_dim,
             novae_dim=novae_dim,
+            organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
     elif context_encoder_type == "stpath":
         from src.models.stpath_encoder import STPathContextEncoder
@@ -111,6 +123,7 @@ def _build_context_encoder(
             n_transformer_layers=storm_lite_n_layers, n_heads=storm_lite_n_heads,
             use_relative_bias=storm_lite_use_relative_bias,
             relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
+            organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
     else:
         raise ValueError(f"unknown context_encoder_type {context_encoder_type!r}")
@@ -171,6 +184,7 @@ class BaseGenerativeModel(pl.LightningModule, abc.ABC):
             context["coords"], context["expression"], query["coords"],
             context_images=context.get("images"), query_images=query.get("images"),
             context_novae_features=context.get("novae_features"),
+            organ=context.get("organ"), tech=context.get("tech"),
         )
 
     @abc.abstractmethod
@@ -314,7 +328,8 @@ class WAEGAN(BaseGenerativeModel):
                  stpath_pretrained: bool = True,
                  storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
                  storm_lite_use_relative_bias: bool = True,
-                 storm_lite_relative_bias_hidden_dim: int = 32):
+                 storm_lite_relative_bias_hidden_dim: int = 32,
+                 organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False  # we alternate encoder/decoder vs. discriminator ourselves
@@ -333,6 +348,7 @@ class WAEGAN(BaseGenerativeModel):
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
             storm_lite_use_relative_bias=storm_lite_use_relative_bias,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
+            organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
         self.encoder = nn.Sequential(
             nn.Linear(n_genes, hidden_dim), nn.ReLU(),
@@ -519,7 +535,8 @@ class FlowMatchingOT(BaseGenerativeModel):
                  stpath_pretrained: bool = True,
                  storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
                  storm_lite_use_relative_bias: bool = True,
-                 storm_lite_relative_bias_hidden_dim: int = 32):
+                 storm_lite_relative_bias_hidden_dim: int = 32,
+                 organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
         self.save_hyperparameters()
         assert path_type in ("ot", "edm"), f"unknown path_type {path_type!r}"
@@ -537,6 +554,7 @@ class FlowMatchingOT(BaseGenerativeModel):
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
             storm_lite_use_relative_bias=storm_lite_use_relative_bias,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
+            organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
         # own autoencoder, own weights — compresses expression to a small
         # latent code the velocity net operates on instead of raw n_genes
@@ -720,7 +738,8 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  stpath_pretrained: bool = True,
                  storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
                  storm_lite_use_relative_bias: bool = True,
-                 storm_lite_relative_bias_hidden_dim: int = 32):
+                 storm_lite_relative_bias_hidden_dim: int = 32,
+                 organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
         self.save_hyperparameters()
         self.context_encoder = _build_context_encoder(
@@ -737,6 +756,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
             storm_lite_use_relative_bias=storm_lite_use_relative_bias,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
+            organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
         self.encoder = nn.Sequential(
             nn.Linear(n_genes, ae_hidden_dim), nn.ReLU(),

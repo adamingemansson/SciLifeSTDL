@@ -126,7 +126,8 @@ def align_patches_to_adata(adata: ad.AnnData, patches: np.ndarray, barcodes: np.
     return filtered_adata, patches[order]
 
 
-def load_hest_sample(hest_data_dir: str | Path, sample_id: str) -> ad.AnnData:
+def load_hest_sample(hest_data_dir: str | Path, sample_id: str,
+                      organ: str | None = None, tech: str | None = None) -> ad.AnnData:
     """
     Load one HEST-1k sample (docs/dataset_notes.md Track A primary pick) —
     a single 2D section, not part of a serial z-series, so `z` is a constant
@@ -138,7 +139,17 @@ def load_hest_sample(hest_data_dir: str | Path, sample_id: str) -> ad.AnnData:
     docs/dataset_notes.md). Searches for the sample's .h5ad file by pattern
     rather than assuming an exact folder nesting depth, since that layout
     wasn't independently confirmed byte-for-byte from documentation alone.
-    """
+
+    organ/tech (2026-07-16, multi-sample training + OrganTechEmbedding
+    follow-up, src/models/conditioning.py): supplied BY THE CALLER, not
+    auto-parsed from HEST-1k's metadata CSV — that CSV's exact
+    organ/technology column format was never independently verified in
+    this project (see load_multi_sample's own docstring on the same
+    caution), and a wrong silent auto-parse would be far worse than
+    requiring the caller to state it explicitly. Default "unknown" when
+    not given, so every sample always has SOME value (OrganTechEmbedding's
+    vocabulary just needs to be built to include "unknown" too, via
+    build_organ_tech_vocab, if any sample omits these)."""
     hest_data_dir = Path(hest_data_dir)
     matches = list(hest_data_dir.rglob(f"*{sample_id}*.h5ad"))
     if not matches:
@@ -151,11 +162,15 @@ def load_hest_sample(hest_data_dir: str | Path, sample_id: str) -> ad.AnnData:
     # (adata.obsm['spatial']), so no coordinate remapping needed here.
     adata.obs["slice_id"] = sample_id
     adata.obs["z"] = 0.0
+    adata.obs["organ"] = organ if organ is not None else "unknown"
+    adata.obs["tech"] = tech if tech is not None else "unknown"
     return adata
 
 
 def load_multi_sample(hest_data_dir: str | Path, sample_ids: list[str],
-                       min_genes: int = 200, min_cells: int = 3) -> list[ad.AnnData]:
+                       min_genes: int = 200, min_cells: int = 3,
+                       organs: list[str] | None = None,
+                       techs: list[str] | None = None) -> list[ad.AnnData]:
     """Multiple INDEPENDENT HEST-1k samples (different patients/sections,
     not a serial z-series of the same tissue block — for that, use
     load_multi_slice instead) for multi-sample training (scaffolding,
@@ -192,11 +207,26 @@ def load_multi_sample(hest_data_dir: str | Path, sample_ids: list[str],
     Visium ~20k-gene whole-transcriptome AND Xenium ~few-hundred-gene
     targeted panels, docs/dataset_notes.md — confirm sample_ids share a
     platform before pooling; INT1-INT24 are documented as all-Visium,
-    same ccRCC cohort, a well-grounded first choice)."""
+    same ccRCC cohort, a well-grounded first choice).
+
+    organs/techs (2026-07-16, OrganTechEmbedding follow-up): optional,
+    parallel to sample_ids — organs[i]/techs[i] is sample_ids[i]'s
+    organ/technology, passed straight through to load_hest_sample (see
+    that function's docstring on why this is caller-supplied rather than
+    auto-parsed). None (default) for either leaves every sample at
+    "unknown" for that field — harmless, since build_organ_tech_vocab
+    just builds whatever vocabulary the values actually given produce."""
+    if organs is not None and len(organs) != len(sample_ids):
+        raise ValueError(f"organs has {len(organs)} entries but sample_ids has {len(sample_ids)}")
+    if techs is not None and len(techs) != len(sample_ids):
+        raise ValueError(f"techs has {len(techs)} entries but sample_ids has {len(sample_ids)}")
     adatas = [
-        basic_qc_and_normalize(load_hest_sample(hest_data_dir, sid),
-                                min_genes=min_genes, min_cells=min_cells)
-        for sid in sample_ids
+        basic_qc_and_normalize(
+            load_hest_sample(hest_data_dir, sid,
+                              organ=organs[i] if organs is not None else None,
+                              tech=techs[i] if techs is not None else None),
+            min_genes=min_genes, min_cells=min_cells)
+        for i, sid in enumerate(sample_ids)
     ]
     shared_genes = sorted(set.intersection(*(set(a.var_names) for a in adatas)))
     if not shared_genes:

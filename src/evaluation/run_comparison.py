@@ -104,6 +104,14 @@ def _cached_load_adata(cfg, adata_cache: dict):
 
 def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache: dict | None = None,
                   skip_training: bool = False):
+    """NOTE (2026-07-16): single-sample only — does not yet support
+    cfg.data.sample_ids (multi-sample training + organ/tech conditioning,
+    see src/training/train.py's _main_multi_sample/load_multi_sample_data).
+    This function's shared-eval-set/adata-caching machinery below assumes
+    exactly one adata per config; extending it to multi-sample comparisons
+    is real follow-up work, not done here — use
+    `python -m src.training.train --config <multisample config>` directly
+    for now (see configs/exp_hest1k_fm_ot_multisample.yaml)."""
     cfg = OmegaConf.load(cfg_path)
     if overrides:
         # dotlist overrides applied to EVERY config in this comparison run,

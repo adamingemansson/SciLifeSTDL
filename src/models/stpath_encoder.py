@@ -344,7 +344,8 @@ class STPathContextEncoder(nn.Module):
     def forward(self, context_coords: torch.Tensor, context_expression: torch.Tensor,
                 query_coords: torch.Tensor, context_images: torch.Tensor,
                 query_images: torch.Tensor,
-                context_novae_features: torch.Tensor | None = None) -> torch.Tensor:
+                context_novae_features: torch.Tensor | None = None,
+                organ: str | None = None, tech: str | None = None) -> torch.Tensor:
         """context_images/query_images: raw H&E patches [N, 3, H, W] float
         in [0,1] — required (STPath has no meaningful expression-only
         mode). context_novae_features: [N_context, novae_dim] precomputed
@@ -352,6 +353,15 @@ class STPathContextEncoder(nn.Module):
         "novae" (see __init__) — a SEPARATE channel from context_expression
         (which STPath's own gene_embed pathway always needs raw, whatever
         new_gene_encoder_type is set to). Returns c [N_query, hidden_dim].
+
+        organ/tech: accepted-and-ignored (2026-07-16, multi-sample follow-up)
+        — exists only so BaseGenerativeModel._encode_context (registry.py)
+        can call every context encoder type with the same call signature.
+        This class already has a fixed organ/tech baked in at construction
+        (organ_type/tech_type, STPath's own real IDTokenizer vocabulary),
+        one per model instance — not a per-sample runtime value the way
+        SpatialContextEncoder/StormLiteContextEncoder's data-driven
+        OrganTechEmbedding is, so there is nothing to do with these here.
 
         Real bug found 2026-07-15: this method used to be decorated with
         @torch.no_grad(), disabling gradient tracking for the ENTIRE

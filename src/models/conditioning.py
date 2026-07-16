@@ -552,6 +552,73 @@ class CombinedGeneEncoder(nn.Module):
         return mlp_out + novae_out
 
 
+class OrganTechEmbedding(nn.Module):
+    """Learned per-organ/per-technology embedding, added identically to
+    every spot's representation within one sample (matches STPath's own
+    verified pattern — EncodeInputs sums img_embed + ge_embed + tech_embed
+    + organ_embed, confirmed via its real source, see stpath_encoder.py —
+    built as our own module here since we don't share STPath's
+    IDTokenizer/vocabulary).
+
+    Only meaningful for MULTI-sample training spanning genuinely
+    different organs/platforms (2026-07-16, multi-sample training
+    scaffolding follow-up — see MultiSampleMaskedContextQueryDataset in
+    src/training/train.py). On a single-sample or single-organ/single-
+    platform training run this contributes a CONSTANT offset every model
+    would trivially fold into its own bias terms — zero real signal.
+    Built now so the mechanism is ready and tested; not yet validated
+    against real organ/platform variation (as of this writing, INT1-
+    INT24 — this project's only confirmed-available HEST-1k samples —
+    are documented as all-Visium, same ccRCC cohort: see
+    load_multi_sample's own docstring in src/data/loaders.py; real
+    cross-organ signal requires additional samples not yet downloaded).
+
+    Fixed vocabulary, built ONCE from the training data before model
+    construction (same "vocabulary size must be fixed at construction
+    time" reasoning as inject_stpath_gene_names) — see
+    build_organ_tech_vocab below. Looking up a name outside that
+    vocabulary raises loudly rather than silently defaulting to
+    something, since defaulting to e.g. index 0 would silently and
+    incorrectly claim two different organs are the same."""
+
+    def __init__(self, organ_vocab: list[str], tech_vocab: list[str], hidden_dim: int):
+        super().__init__()
+        self.organ_to_id = {name: i for i, name in enumerate(organ_vocab)}
+        self.tech_to_id = {name: i for i, name in enumerate(tech_vocab)}
+        self.organ_embed = nn.Embedding(len(organ_vocab), hidden_dim)
+        self.tech_embed = nn.Embedding(len(tech_vocab), hidden_dim)
+
+    def forward(self, organ: str, tech: str, n: int, device) -> torch.Tensor:
+        """Returns [n, hidden_dim] — the same (organ, tech) embedding
+        broadcast to every one of this sample's n spots (context and
+        query combined, or called separately for each — same result
+        either way since it doesn't depend on n beyond the broadcast)."""
+        if organ not in self.organ_to_id:
+            raise KeyError(
+                f"organ {organ!r} not in vocab {sorted(self.organ_to_id)} — "
+                f"rebuild the vocabulary (build_organ_tech_vocab) to include it"
+            )
+        if tech not in self.tech_to_id:
+            raise KeyError(
+                f"tech {tech!r} not in vocab {sorted(self.tech_to_id)} — "
+                f"rebuild the vocabulary (build_organ_tech_vocab) to include it"
+            )
+        organ_t = torch.tensor(self.organ_to_id[organ], device=device)
+        tech_t = torch.tensor(self.tech_to_id[tech], device=device)
+        embed = self.organ_embed(organ_t) + self.tech_embed(tech_t)  # [hidden_dim]
+        return embed.unsqueeze(0).expand(n, -1)  # [n, hidden_dim]
+
+
+def build_organ_tech_vocab(organs: list[str], techs: list[str]) -> tuple[list[str], list[str]]:
+    """Sorted-unique vocabulary lists from real per-sample organ/tech
+    values (see load_multi_sample's organs/techs return) — sorted so the
+    resulting vocab (and therefore every embedding index) is deterministic
+    regardless of input/dict-iteration order, matching this project's
+    established practice for other data-driven vocabularies (e.g.
+    load_multi_sample's own shared_genes sorting)."""
+    return sorted(set(organs)), sorted(set(techs))
+
+
 class SpatialContextEncoder(nn.Module):
     """
     context (coords [N_obs, D], expression [N_obs, G]) + query coords
@@ -597,7 +664,8 @@ class SpatialContextEncoder(nn.Module):
                  image_encoder_type: str = "none", image_feat_dim: int = 64,
                  image_patch_size: int = 256,
                  gene_encoder_type: str = "raw", gene_feat_dim: int = 256,
-                 novae_dim: int | None = None):
+                 novae_dim: int | None = None,
+                 organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
         assert image_encoder_type in ("none", "cnn", "gigapath"), (
             f"unknown image_encoder_type {image_encoder_type!r}"
@@ -644,13 +712,25 @@ class SpatialContextEncoder(nn.Module):
         self.query_proj = nn.Linear(query_in_dim, hidden_dim)
         self.query_attn = nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True)
 
+        # 2026-07-16, multi-sample training follow-up (see OrganTechEmbedding's
+        # own docstring for the real caveat: only meaningful once training
+        # spans genuinely different organs/platforms). Added AFTER
+        # node_proj/query_proj (not concatenated into their input) so
+        # enabling/disabling it never changes node_in_dim/query_in_dim —
+        # a pure additive offset at hidden_dim, same fusion style as
+        # STPath's own verified organ_embed/tech_embed pattern.
+        self.organ_tech_embed = None
+        if organ_vocab is not None and tech_vocab is not None:
+            self.organ_tech_embed = OrganTechEmbedding(organ_vocab, tech_vocab, hidden_dim)
+
     def _encode_gene(self, expression: torch.Tensor) -> torch.Tensor:
         return expression if self.gene_encoder is None else self.gene_encoder(expression)
 
     def forward(self, context_coords: torch.Tensor, context_expression: torch.Tensor,
                 query_coords: torch.Tensor, context_images: torch.Tensor | None = None,
                 query_images: torch.Tensor | None = None,
-                context_novae_features: torch.Tensor | None = None) -> torch.Tensor:
+                context_novae_features: torch.Tensor | None = None,
+                organ: str | None = None, tech: str | None = None) -> torch.Tensor:
         # NOTE: gene_encoder_type applies to context_expression only, same
         # as "raw"/"mlp" always did — query locations never carry an
         # expression feature at all (predicting it is the task), so there
@@ -664,6 +744,14 @@ class SpatialContextEncoder(nn.Module):
         # STPathContextEncoder's Route-B residual, which needs both raw
         # expression AND Novae features simultaneously and so needs this
         # as a genuinely separate channel.
+        #
+        # organ/tech (2026-07-16, multi-sample follow-up): unlike gene
+        # expression, organ/platform metadata is fully known for BOTH
+        # context and query (it describes the whole sample, not a
+        # per-point measurement that could leak the prediction target),
+        # so the same embedding gets added to every node AND every query
+        # position — no context/query asymmetry needed here, unlike
+        # gene_encoder_type.
         if self.use_images and (context_images is None or query_images is None):
             raise ValueError("use_images=True requires context_images and query_images")
 
@@ -673,6 +761,10 @@ class SpatialContextEncoder(nn.Module):
         if self.use_images:
             node_feats.append(self.image_encoder(context_images))
         node_repr = self.node_proj(torch.cat(node_feats, dim=-1))
+        if self.organ_tech_embed is not None and organ is not None and tech is not None:
+            node_repr = node_repr + self.organ_tech_embed(
+                organ, tech, node_repr.shape[0], node_repr.device
+            )
 
         # 2. message-pass over the context's own k-NN graph
         context_knn = _knn_indices(context_coords, context_coords, self.k_neighbors)
@@ -685,6 +777,10 @@ class SpatialContextEncoder(nn.Module):
         if self.use_images:
             query_feats.append(self.image_encoder(query_images))
         query_feat = self.query_proj(torch.cat(query_feats, dim=-1))
+        if self.organ_tech_embed is not None and organ is not None and tech is not None:
+            query_feat = query_feat + self.organ_tech_embed(
+                organ, tech, query_feat.shape[0], query_feat.device
+            )
         neighbor_repr = node_repr[query_knn]                     # [N_query, k, hidden_dim]
         c, _ = self.query_attn(query_feat.unsqueeze(1), neighbor_repr, neighbor_repr)
         return c.squeeze(1)                                        # [N_query, hidden_dim]

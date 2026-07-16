@@ -203,7 +203,8 @@ def _images_tensor(images: np.ndarray, mask: np.ndarray) -> torch.Tensor:
 def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.ndarray,
                         masking_cfg, images: np.ndarray | None, seed: int,
                         context_gene_features: np.ndarray | None = None,
-                        context_novae_features: np.ndarray | None = None) -> dict:
+                        context_novae_features: np.ndarray | None = None,
+                        organ: str | None = None, tech: str | None = None) -> dict:
     """One {context, query, target_expression} training item for a SINGLE
     sample's data. Factored out of MaskedContextQueryDataset.__getitem__
     (2026-07-15) so MultiSampleMaskedContextQueryDataset below can reuse
@@ -233,7 +234,17 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
     with new_gene_encoder_type="novae", never both), but nothing here
     enforces that — the caller (train.py main()/run_comparison.py
     _train_model) decides which one to populate based on which config
-    option is actually set."""
+    option is actually set.
+
+    organ/tech (2026-07-16, multi-sample training + OrganTechEmbedding
+    follow-up): whole-sample metadata, not per-point — stashed identically
+    into BOTH context and query dicts (unlike context_gene_features/
+    context_novae_features, which are context-only since they'd leak the
+    prediction target at query positions; organ/tech describes the whole
+    section, so there's no such leak — see SpatialContextEncoder.forward's
+    own comment on this same asymmetry). None (default) preserves the
+    original behavior exactly — every existing single-sample config keeps
+    working unchanged."""
     context_mask, query_mask = make_context_query_split(coords3d, slice_ids, masking_cfg, seed)
     context_expr_source = expr if context_gene_features is None else context_gene_features
     context = {
@@ -248,6 +259,12 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
     if images is not None:
         context["images"] = _images_tensor(images, context_mask)
         query["images"] = _images_tensor(images, query_mask)
+    if organ is not None:
+        context["organ"] = organ
+        query["organ"] = organ
+    if tech is not None:
+        context["tech"] = tech
+        query["tech"] = tech
     target_expression = torch.tensor(expr[query_mask], dtype=torch.float32)
     return {"context": context, "query": query, "target_expression": target_expression}
 
@@ -262,7 +279,8 @@ class MaskedContextQueryDataset(Dataset):
                  masking_cfg, n_items: int, base_seed: int = 0,
                  images: np.ndarray | None = None,
                  context_gene_features: np.ndarray | None = None,
-                 context_novae_features: np.ndarray | None = None):
+                 context_novae_features: np.ndarray | None = None,
+                 organ: str | None = None, tech: str | None = None):
         self.coords3d = coords3d
         self.expr = expr
         self.slice_ids = slice_ids
@@ -287,6 +305,10 @@ class MaskedContextQueryDataset(Dataset):
         # context_novae_features docstring for why this can't reuse
         # context_gene_features above.
         self.context_novae_features = context_novae_features
+        # whole-sample metadata (2026-07-16, multi-sample follow-up) — see
+        # _build_masked_item's organ/tech docstring
+        self.organ = organ
+        self.tech = tech
 
     def __len__(self):
         return self.n_items
@@ -297,6 +319,7 @@ class MaskedContextQueryDataset(Dataset):
             self.coords3d, self.expr, self.slice_ids, self.masking_cfg, self.images, seed,
             context_gene_features=self.context_gene_features,
             context_novae_features=self.context_novae_features,
+            organ=self.organ, tech=self.tech,
         )
 
 
@@ -318,16 +341,20 @@ class MultiSampleMaskedContextQueryDataset(Dataset):
     function's design: keep samples separate, never concatenate their
     coordinate spaces).
 
-    samples: list of (coords3d, expr, slice_ids, images) tuples, one per
-    already-loaded/QC'd/gene-aligned sample (see
+    samples: list of (coords3d, expr, slice_ids, images, organ, tech) tuples,
+    one per already-loaded/QC'd/gene-aligned sample (see
     src/data/loaders.py load_multi_sample for the loading half — it
     returns a list of gene-aligned AnnData; callers derive these tuples
-    from that list the same way _load_data already does for one sample).
-    images is None throughout in the current scaffolding — H&E/Gigapath/
-    STPath support across multiple samples is real follow-up work, not
-    built here yet, since it adds real extra complexity (per-sample
-    Gigapath caching, image alignment) better scoped once this base case
-    (expression-only, multi-sample) is validated."""
+    from that list the same way _load_data already does for one sample,
+    see load_multi_sample_data below). images is None throughout in the
+    current scaffolding — H&E/Gigapath/STPath support across multiple
+    samples is real follow-up work, not built here yet, since it adds real
+    extra complexity (per-sample Gigapath caching, image alignment) better
+    scoped once this base case (expression-only, multi-sample) is
+    validated. organ/tech (2026-07-16) are per-SAMPLE strings (or None),
+    fed straight into _build_masked_item so OrganTechEmbedding can
+    condition on which sample the current item's split was drawn from —
+    see that function's own organ/tech docstring."""
 
     def __init__(self, samples: list[tuple], masking_cfg, n_items: int, base_seed: int = 0):
         assert samples, "samples must be non-empty"
@@ -345,8 +372,9 @@ class MultiSampleMaskedContextQueryDataset(Dataset):
         # itself (seed + 1, passed to _build_masked_item) so the two
         # choices aren't spuriously correlated through a shared seed
         sample_idx = int(np.random.default_rng(seed).integers(len(self.samples)))
-        coords3d, expr, slice_ids, images = self.samples[sample_idx]
-        return _build_masked_item(coords3d, expr, slice_ids, self.masking_cfg, images, seed + 1)
+        coords3d, expr, slice_ids, images, organ, tech = self.samples[sample_idx]
+        return _build_masked_item(coords3d, expr, slice_ids, self.masking_cfg, images, seed + 1,
+                                   organ=organ, tech=tech)
 
 
 def _collate_identity(batch_list):
@@ -642,13 +670,13 @@ def _load_data(cfg) -> tuple:
     return adata, coords3d, expr, slice_ids, images
 
 
-def load_multi_sample_data(cfg) -> list[tuple]:
-    """Multi-sample counterpart to _load_data (scaffolding, 2026-07-15;
-    not yet called from main() — this loads the data,
-    MultiSampleMaskedContextQueryDataset above is the dataset that
-    consumes it, wiring both into an actual training run/config is
-    later, real work). Reads cfg.data.sample_ids (a list), not the
-    single-sample configs' cfg.data.sample_id.
+def load_multi_sample_data(cfg) -> tuple[list[tuple], list]:
+    """Multi-sample counterpart to _load_data. Wired into main() below
+    (2026-07-16) via cfg.data.sample_ids — a list, in place of the
+    single-sample configs' cfg.data.sample_id. Reads optional
+    cfg.data.organs/cfg.data.techs (parallel lists, same meaning as
+    loaders.load_multi_sample's organs/techs param — see that function's
+    docstring for why these are caller-supplied, not auto-parsed).
 
     Deliberately expression-only for now (images always None per
     sample) — see MultiSampleMaskedContextQueryDataset's docstring for
@@ -656,19 +684,58 @@ def load_multi_sample_data(cfg) -> list[tuple]:
     loaders.load_multi_sample for the actual loading/QC/shared-gene-panel
     alignment (not reimplemented here) — this function's only job is
     converting that list of AnnData into the (coords3d, expr, slice_ids,
-    images) tuples MultiSampleMaskedContextQueryDataset expects, the same
-    conversion _load_data already does for the single-sample case."""
+    images, organ, tech) tuples MultiSampleMaskedContextQueryDataset
+    expects, the same conversion _load_data already does for the
+    single-sample case (minus organ/tech, which only exist in the
+    multi-sample path).
+
+    Returns (samples, adatas) — the adatas are also returned since
+    inject_organ_tech_vocab (below) needs each sample's real organ/tech
+    value to build the vocabulary, and re-deriving it from the tuples
+    would just mean unpacking the same thing twice."""
     adatas = loaders.load_multi_sample(
         cfg.data.hest_data_dir, list(cfg.data.sample_ids),
         min_genes=cfg.data.min_genes, min_cells=cfg.data.min_cells,
+        organs=list(cfg.data.organs) if cfg.data.get("organs") is not None else None,
+        techs=list(cfg.data.techs) if cfg.data.get("techs") is not None else None,
     )
     samples = []
     for adata in adatas:
         coords3d = loaders.get_coords_3d(adata)
         expr = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()
         slice_ids = adata.obs["slice_id"].to_numpy()
-        samples.append((coords3d, expr, slice_ids, None))
-    return samples
+        # organ/tech are constant across a whole sample's obs (see
+        # loaders.load_hest_sample) — any row's value is the sample's value
+        organ = str(adata.obs["organ"].iloc[0]) if "organ" in adata.obs else None
+        tech = str(adata.obs["tech"].iloc[0]) if "tech" in adata.obs else None
+        samples.append((coords3d, expr, slice_ids, None, organ, tech))
+    return samples, adatas
+
+
+def inject_organ_tech_vocab(model_cfg: dict, adatas: list) -> None:
+    """If a config sets use_organ_tech_conditioning: true (multi-sample
+    training only — see load_multi_sample_data/MultiSampleMaskedContext-
+    QueryDataset above), auto-derive organ_vocab/tech_vocab from the real
+    per-sample organ/tech values rather than requiring them hardcoded into
+    a YAML file — same "vocabulary size must be fixed at construction
+    time, and must exactly match what training data will supply" reasoning
+    as inject_stpath_gene_names/inject_novae_dim. use_organ_tech_conditioning
+    is consumed HERE ONLY (not a real param on any context encoder) — it
+    exists purely as an opt-in switch, since organ_vocab/tech_vocab=None
+    (the default) already means "no conditioning" for both SpatialContext-
+    Encoder and StormLiteContextEncoder (see OrganTechEmbedding's own
+    docstring on why this is a no-op on single-organ/single-platform data
+    like the currently-available INT1-INT24 samples). Mutates
+    model_cfg["params"] in place; no-op unless the switch is set."""
+    params = model_cfg.get("params", {})
+    if not params.pop("use_organ_tech_conditioning", False):
+        return
+    organs = [str(a.obs["organ"].iloc[0]) for a in adatas if "organ" in a.obs]
+    techs = [str(a.obs["tech"].iloc[0]) for a in adatas if "tech" in a.obs]
+    from src.models.conditioning import build_organ_tech_vocab
+    organ_vocab, tech_vocab = build_organ_tech_vocab(organs, techs)
+    params.setdefault("organ_vocab", organ_vocab)
+    params.setdefault("tech_vocab", tech_vocab)
 
 
 def inject_stpath_gene_names(model_cfg: dict, adata) -> None:
@@ -679,6 +746,62 @@ def inject_stpath_gene_names(model_cfg: dict, adata) -> None:
     params = model_cfg.get("params", {})
     if params.get("context_encoder_type") == "stpath" and "stpath_gene_names" not in params:
         params["stpath_gene_names"] = adata.var_names.tolist()
+
+
+def _main_multi_sample(cfg) -> None:
+    """Multi-sample training entry point (2026-07-16), called from main()
+    when cfg.data.sample_ids is set. Mirrors main()'s single-sample flow
+    (build model -> train on fresh masking draws -> save -> eval on one
+    held-out draw) but over MultiSampleMaskedContextQueryDataset instead
+    of MaskedContextQueryDataset — see that class's own docstring for why
+    samples are kept spatially separate rather than pooled.
+
+    Deliberately does not support images/Novae/STPath in this first cut
+    (see load_multi_sample_data's docstring) — only organ/tech
+    conditioning (this function's actual purpose) and the "raw"/"mlp"
+    gene_encoder_type paths of "builtin"/"storm_lite" work here today."""
+    samples, adatas = load_multi_sample_data(cfg)
+    gene_names = adatas[0].var_names.tolist()  # shared panel, same order across samples (load_multi_sample's guarantee)
+
+    model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
+    inject_organ_tech_vocab(model_cfg, adatas)
+    model = build_model(model_cfg)
+    # unresolved copy for checkpointing — same reasoning as main()'s own
+    # unresolved_model_cfg (keeps ${oc.env:...} interpolations literal)
+    unresolved_model_cfg = OmegaConf.to_container(cfg.model, resolve=False)
+    inject_organ_tech_vocab(unresolved_model_cfg, adatas)
+
+    if list(model.parameters()):
+        dataset = MultiSampleMaskedContextQueryDataset(
+            samples, cfg.masking, n_items=cfg.training.epochs, base_seed=cfg.training.seed,
+        )
+        dataloader = make_dataloader(dataset, cfg)
+        trainer = pl.Trainer(
+            max_epochs=1,
+            accelerator="auto",
+            log_every_n_steps=cfg.training.log_every_n_steps,
+            enable_checkpointing=False,
+            logger=False,
+        )
+        trainer.fit(model, dataloader)
+        checkpoint_dir = cfg.training.get("checkpoint_dir", f"results/checkpoints/{cfg.experiment_name}")
+        saved_path = save_trained_model(model, unresolved_model_cfg, gene_names, checkpoint_dir)
+        if saved_path is not None:
+            print(f"Saved trained model (weights + config + gene names) to {saved_path.parent}")
+
+    eval_item = MultiSampleMaskedContextQueryDataset(
+        samples, cfg.masking, n_items=1, base_seed=cfg.training.seed + cfg.training.epochs + 1,
+    )[0]
+    context, query = eval_item["context"], eval_item["query"]
+    target_expression = eval_item["target_expression"].numpy()
+
+    model.eval()
+    with torch.no_grad():
+        output = model.sample(context, query)
+    pred = output["expression"].detach().cpu().numpy()
+    pcc = ev.pearson_per_gene(pred, target_expression)
+    print(f"mean PCC: {np.nanmean(pcc):.4f}")
+    print(f"RMSE: {ev.rmse(pred, target_expression):.4f}")
 
 
 def main(cfg_path: str, overrides: list[str] | None = None):
@@ -698,6 +821,18 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     # MPS/CPU (the setting only affects CUDA matmuls).
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
+
+    # Multi-sample training (2026-07-16, cfg.data.sample_ids as a LIST in
+    # place of the single-sample configs' cfg.data.sample_id) — a genuinely
+    # separate, simpler code path rather than threading a branch through
+    # every line below, since load_multi_sample_data/
+    # MultiSampleMaskedContextQueryDataset deliberately don't support
+    # images/Novae/STPath yet (see those classes' own docstrings on why
+    # that's scoped separately) — trying to share one code path would just
+    # mean asserting those features are off throughout, no real benefit.
+    if cfg.data.get("sample_ids") is not None:
+        _main_multi_sample(cfg)
+        return
 
     adata, coords3d, expr, slice_ids, images = _load_data(cfg)
 
