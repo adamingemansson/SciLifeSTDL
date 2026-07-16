@@ -388,7 +388,11 @@ def _load_images(cfg, adata):
     file is on disk).
 
     For "cnn" (or no image use), images stays raw uint8 patches
-    [N, 224, 224, 3] — the CNN is trainable so its output can't be cached."""
+    [N, patch_size, patch_size, 3] — the CNN is trainable so its output
+    can't be cached, but the array IS downsampled once here (see
+    _downsample_patches) rather than kept at the native 224x224, since
+    that resolution reduction is what actually made image_patch_size do
+    something (see this function's real fix below)."""
     if not cfg.data.get("use_images", False):
         return adata, None
     patches, barcodes = loaders.load_hest_patches(cfg.data.hest_data_dir, cfg.data.sample_id)
@@ -403,7 +407,52 @@ def _load_images(cfg, adata):
         adata, images = loaders.align_patches_to_adata(adata, features, barcodes)
     else:
         adata, images = loaders.align_patches_to_adata(adata, patches, barcodes)
+        if model_params.get("image_encoder_type") == "cnn":
+            target_size = model_params.get("image_patch_size", 224)
+            if target_size != images.shape[1]:
+                print(f"_load_images: downsampling CNN input patches from "
+                      f"{images.shape[1]}x{images.shape[1]} to {target_size}x{target_size} "
+                      f"(image_patch_size) — real speed fix, 2026-07-15, see "
+                      f"_downsample_patches docstring.")
+                images = _downsample_patches(images, target_size)
     return adata, images
+
+
+def _downsample_patches(patches: np.ndarray, target_size: int) -> np.ndarray:
+    """Cheap nearest-neighbor downsample of raw uint8 H&E patches
+    [N, H, W, 3] -> [N, target_size, target_size, 3], via numpy index
+    striding (no new dependency, no torch/float conversion needed) — run
+    ONCE at data-loading time, on the raw uint8 array, before any per-step
+    cost, since every later masking draw just slices whatever array is
+    stored here.
+
+    Real fix (2026-07-15, user question: "why are CNN configs so slow"):
+    image_patch_size was already threaded through 4 layers of config/model
+    code (registry.py -> SpatialContextEncoder -> ImagePatchEncoder) but
+    ImagePatchEncoder never actually used it — accepted, then silently
+    ignored, since AdaptiveAvgPool2d(1) makes its conv stack agnostic to
+    input spatial size. Every CNN-branch training step was therefore
+    converting (uint8->float32) + transferring (host->device) +
+    convolving the FULL native 224x224 HEST-1k patches (up to ~700-900
+    per masking draw) regardless of this config value — real, substantial
+    cost that scales with pixel count, and the actual bottleneck (not
+    conv FLOPs alone, which are comparatively small for this tiny
+    network — the CPU-side conversion and the ~500MB+ per-step host-to-
+    device transfer at full resolution dominate). Downsampling ONCE here,
+    at load time, cuts all three simultaneously.
+
+    Nearest-neighbor (via np.linspace index selection, not e.g. bilinear/
+    area averaging) is a deliberate choice: ImagePatchEncoder was always
+    meant as a cheap "does ANY image signal help at all" ablation baseline
+    (task #17), not competing with Gigapath/STPath on image fidelity —
+    plain index-based downsampling is dependency-free and fast; a
+    higher-quality resize isn't worth the extra complexity for this arm."""
+    n, h, w, c = patches.shape
+    if h == target_size and w == target_size:
+        return patches
+    row_idx = np.linspace(0, h - 1, target_size).astype(np.int64)
+    col_idx = np.linspace(0, w - 1, target_size).astype(np.int64)
+    return patches[:, row_idx][:, :, col_idx]
 
 
 def _load_data(cfg) -> tuple:

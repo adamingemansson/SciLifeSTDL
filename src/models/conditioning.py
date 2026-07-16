@@ -94,7 +94,20 @@ class ImagePatchEncoder(nn.Module):
     as a separate arm precisely so the two-way ablation (does adding image
     info help at all vs. does a *strong pretrained* image encoder help
     more) stays clean. See src/data/loaders.py load_hest_patches() for
-    where the raw 256x256 uint8 patches come from.
+    where the raw 224x224 uint8 patches come from (HEST-1k's own native
+    size, not 256 — verified 2026-07-15 against a real downloaded file).
+
+    `patch_size` (constructor param below) is accepted but never actually
+    used inside this class — AdaptiveAvgPool2d(1) makes the conv stack
+    agnostic to input spatial size, so there's nothing here to resize.
+    The REAL resolution fed into this encoder is controlled by
+    `_downsample_patches()` in src/training/train.py, applied ONCE at
+    data-loading time (not per training step) — a real speed fix
+    (2026-07-15, user question: "why are CNN configs so slow"): every
+    training step was converting+transferring+convolving the full native
+    224x224 patches (up to ~700-900 per masking draw) regardless of any
+    config value, since nothing upstream of this class was actually
+    resizing anything before that fix.
     """
 
     def __init__(self, patch_size: int = 256, feat_dim: int = 64):

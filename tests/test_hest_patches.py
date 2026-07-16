@@ -81,6 +81,39 @@ def test_load_and_align():
         print("[align_patches_to_adata] OK — raises when there is zero overlap")
 
 
+def test_downsample_patches():
+    """_downsample_patches (src/training/train.py) — added 2026-07-15 as
+    the real fix for CNN-branch training being far slower than expected:
+    image_patch_size was threaded through 4 layers of config/model code
+    but ImagePatchEncoder never actually used it (AdaptiveAvgPool2d(1)
+    makes its conv stack size-agnostic), so every training step was
+    converting+transferring+convolving the FULL native 224x224 patches
+    regardless of config. Checks: correct output shape, no-op when
+    already at the target size, and that it's genuinely a real
+    (non-degenerate) downsample — corner pixels of the original should
+    still appear in the result, not get discarded or all collapse to one
+    value."""
+    from src.training.train import _downsample_patches
+
+    n, h, w = 5, 224, 224
+    rng = np.random.default_rng(0)
+    patches = rng.integers(0, 255, size=(n, h, w, 3), dtype=np.uint8)
+
+    small = _downsample_patches(patches, 64)
+    assert small.shape == (n, 64, 64, 3), f"expected (5, 64, 64, 3), got {small.shape}"
+    assert small.dtype == np.uint8, "downsampling must not change dtype (still raw uint8, converted to float later)"
+    # corners of the original image should be preserved (np.linspace index
+    # selection always includes index 0 and h-1/w-1) - a real regression
+    # would be e.g. off-by-one slicing that silently drops an edge
+    assert np.array_equal(small[:, 0, 0], patches[:, 0, 0])
+    assert np.array_equal(small[:, -1, -1], patches[:, -1, -1])
+
+    same = _downsample_patches(patches, 224)
+    assert same is patches, "no-op when already at the target size should return the same array, not copy"
+    print("[_downsample_patches] OK — correct shape, dtype preserved, corners preserved, no-op when already sized")
+
+
 if __name__ == "__main__":
     test_load_and_align()
+    test_downsample_patches()
     print("\nAll HEST-1k H&E patch loading smoke tests passed.")

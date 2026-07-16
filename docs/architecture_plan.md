@@ -559,6 +559,36 @@ baseline, not counted as one of the three comparison models below.
   for STPath specifically: `STPathContextEncoder.__init__` loads
   STPath's own pretrained weight file from disk fresh for every STPath
   config, since each gets a genuinely new model instance.
+- **`image_patch_size` made to actually do something for the CNN branch
+  (2026-07-15)** — real bug found from a real question ("why are CNN
+  configs so slow, Gigapath runs fine"): `image_patch_size` was already
+  threaded through 4 layers of config/model code (registry.py ->
+  `SpatialContextEncoder` -> `ImagePatchEncoder`) but `ImagePatchEncoder`
+  never actually used it — accepted, then silently ignored, since
+  `AdaptiveAvgPool2d(1)` makes its conv stack agnostic to input spatial
+  size. Every CNN-branch training step was therefore
+  converting+transferring+convolving the FULL native 224x224 HEST-1k
+  patches (up to ~700-900 per masking draw) regardless of this config
+  value — real, substantial cost (the CPU-side uint8->float32 conversion
+  and ~500MB+ per-step host->device transfer at full resolution, not
+  conv FLOPs alone, which are comparatively small for this tiny network).
+  Fixed via `_downsample_patches` (`train.py`) — cheap nearest-neighbor
+  downsample via numpy index striding, applied ONCE at data-loading time
+  (not per training step, since every later masking draw just slices
+  whatever array is stored), only for `image_encoder_type: "cnn"`
+  (Gigapath/STPath need the native 224x224 for their own fixed
+  preprocessing, untouched). All 4 `*_he_cnn.yaml` configs updated from
+  `image_patch_size: 224` (a no-op before this fix) to `64` (a real
+  ~12x pixel-count reduction). `run_comparison.py`'s
+  `_build_shared_eval` had the same gap in its own independent raw-patch
+  reload path (triggered when the first config in a mixed invocation
+  isn't itself CNN) — fixed via `_cnn_image_patch_size`, scanning all
+  configs in the invocation for a CNN branch's patch size, so a CNN
+  model never gets evaluated at a different resolution than it was
+  trained on. Verified in `tests/test_hest_patches.py`
+  (`test_downsample_patches`): correct output shape, dtype preserved,
+  corner pixels genuinely preserved (not silently dropped by an
+  off-by-one), no-op when already at the target size.
 - **Full histology image generation/reconstruction stays a deferred
   stretch goal**, separate from the conditioning use above. Filling in
   broken tissue *in the H&E image itself*, not just using H&E to condition

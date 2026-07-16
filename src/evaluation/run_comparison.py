@@ -63,6 +63,7 @@ from src.training.train import (
     load_adata, make_context_query_split, MaskedContextQueryDataset,
     _load_images, _images_tensor, inject_stpath_gene_names,
     get_gigapath_features, save_trained_model, make_dataloader,
+    _downsample_patches,
 )
 from src.evaluation import metrics as ev
 from src.evaluation.cell_type_classifier import cluster_pseudo_labels, CellTypePlausibilityClassifier
@@ -222,8 +223,28 @@ def _evaluate(model, model_params: dict, shared_eval: dict) -> tuple:
     return pcc, rmse, auc, fid, plausibility
 
 
+def _cnn_image_patch_size(model_config_paths: list[str], overrides: list[str] | None) -> int | None:
+    """Scan every config in this invocation for a CNN-branch
+    image_patch_size (every he_cnn config in this project uses the same
+    value). Needed so _build_shared_eval's raw_images fallback reload
+    (triggered when the FIRST config in the list isn't itself CNN)
+    downsamples to the SAME resolution the CNN was actually trained on
+    (see _downsample_patches, train.py) — not the native 224x224, which
+    would be a real train/eval resolution mismatch. Returns None if no
+    config in this invocation uses "cnn" (nothing to match)."""
+    for path in model_config_paths:
+        cfg = OmegaConf.load(path)
+        if overrides:
+            cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
+        params = cfg.model.get("params", {})
+        if params.get("image_encoder_type") == "cnn":
+            return params.get("image_patch_size", 224)
+    return None
+
+
 def _build_shared_eval(cfg, adata, coords3d, expr, slice_ids, images,
-                        k_neighborhood: int, pca_components: int) -> dict:
+                        k_neighborhood: int, pca_components: int,
+                        cnn_patch_size: int | None = None) -> dict:
     """Built once, from the FIRST config's data — see module docstring on
     why mixed image-enabled/expression-only runs aren't supported. Every
     later config's own (coords3d, expr, slice_ids) must match this one for
@@ -248,6 +269,8 @@ def _build_shared_eval(cfg, adata, coords3d, expr, slice_ids, images,
             patches, barcodes = _loaders.load_hest_patches(cfg.data.hest_data_dir, cfg.data.sample_id)
             if raw_images is None:
                 _, raw_images = _loaders.align_patches_to_adata(adata, patches, barcodes)
+                if cnn_patch_size is not None and cnn_patch_size != raw_images.shape[1]:
+                    raw_images = _downsample_patches(raw_images, cnn_patch_size)
             if gigapath_images is None:
                 features = get_gigapath_features(cfg, patches, barcodes)
                 _, gigapath_images = _loaders.align_patches_to_adata(adata, features, barcodes)
@@ -282,6 +305,7 @@ def main(model_config_paths: list[str], k_neighborhood: int = 8, pca_components:
     interp_row = None
     shared_eval = None
     adata_cache: dict = {}  # shared across every config in this invocation — see _cached_load_adata
+    cnn_patch_size = _cnn_image_patch_size(model_config_paths, overrides)
 
     for path in model_config_paths:
         model, cfg, adata, coords3d, expr, slice_ids, images = _train_model(path, overrides, adata_cache)
@@ -289,7 +313,8 @@ def main(model_config_paths: list[str], k_neighborhood: int = 8, pca_components:
 
         if shared_eval is None:
             shared_eval = _build_shared_eval(
-                cfg, adata, coords3d, expr, slice_ids, images, k_neighborhood, pca_components
+                cfg, adata, coords3d, expr, slice_ids, images, k_neighborhood, pca_components,
+                cnn_patch_size,
             )
             interp_model = build_model({"name": "interp_baseline", "params": {}})
             interp_row = ("interp_baseline", *_evaluate(interp_model, {}, shared_eval))

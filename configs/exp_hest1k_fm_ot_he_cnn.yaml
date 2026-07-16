@@ -29,7 +29,7 @@ model:
   params:
     image_encoder_type: cnn      # task #17: our own from-scratch CNN H&E encoder
     image_feat_dim: 64
-    image_patch_size: 224            # real HEST-1k patches are 224x224, not 256 (verified 2026-07-15)
+    image_patch_size: 64             # downsampled from native 224x224 at load time (2026-07-15 speed fix - see _downsample_patches in train.py; this value now actually takes effect, unlike before)
     n_genes: 16570                # INT1 after QC, same as exp_hest1k_wae_gan.yaml
     coord_dim: 3
     cond_hidden_dim: 256
