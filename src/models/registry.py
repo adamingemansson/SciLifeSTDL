@@ -43,6 +43,8 @@ def _build_context_encoder(
     stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
     stpath_tech_type: str = "Visium",
     stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None,
+    stpath_pretrained: bool = True,
+    storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
 ):
     """Shared by WAE-GAN/FM-OT/VQ-VAE+AR so each model's __init__ doesn't
     repeat the context_encoder_type branching. "builtin" (default) is our
@@ -52,6 +54,11 @@ def _build_context_encoder(
     STPathContextEncoder — see src/models/stpath_encoder.py for the full
     setup requirements and grounding; imported lazily since the `stpath`
     package is an opt-in external dependency, not installed by default.
+    "storm_lite" (2026-07-16) replaces it with StormLiteContextEncoder
+    (src/models/storm_lite_encoder.py) — reuses gene_encoder_type/
+    novae_dim (same meaning: which gene encoder, and Novae's real
+    dimensionality) since "builtin"/"storm_lite" are mutually exclusive
+    per model, no risk of the two conflating.
 
     stpath_new_gene_encoder_type/stpath_novae_dim (2026-07-16, "Route B"
     GEX-encoder-bottleneck follow-up) are DELIBERATELY separate params
@@ -60,7 +67,13 @@ def _build_context_encoder(
     signal ON TOP of STPath's real pretrained fusion (see
     STPathContextEncoder's new_gene_encoder_type) — different mechanism,
     different meaning, kept as distinctly-named params so a config can't
-    accidentally conflate the two."""
+    accidentally conflate the two.
+
+    stpath_pretrained=False (2026-07-16, "STPath's own architecture
+    trained from scratch on our data" comparison arm — see
+    STPathContextEncoder's own pretrained docstring) — stpath_gene_names/
+    stpath_gene_voc_path are STILL required (fixed resources, not trained
+    parameters); stpath_model_weight_path is not (nothing to load)."""
     if context_encoder_type == "builtin":
         return SpatialContextEncoder(
             n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim,
@@ -71,15 +84,30 @@ def _build_context_encoder(
         )
     elif context_encoder_type == "stpath":
         from src.models.stpath_encoder import STPathContextEncoder
-        assert stpath_gene_names and stpath_gene_voc_path and stpath_model_weight_path, (
-            "context_encoder_type='stpath' requires stpath_gene_names, "
-            "stpath_gene_voc_path, and stpath_model_weight_path"
+        assert stpath_gene_names and stpath_gene_voc_path, (
+            "context_encoder_type='stpath' requires stpath_gene_names and stpath_gene_voc_path"
+        )
+        assert not stpath_pretrained or stpath_model_weight_path, (
+            "context_encoder_type='stpath' with stpath_pretrained=True (default) "
+            "requires stpath_model_weight_path"
         )
         return STPathContextEncoder(
             gene_names=stpath_gene_names, gene_voc_path=stpath_gene_voc_path,
             model_weight_path=stpath_model_weight_path, organ_type=stpath_organ_type,
             tech_type=stpath_tech_type, hidden_dim=cond_hidden_dim,
             new_gene_encoder_type=stpath_new_gene_encoder_type, novae_dim=stpath_novae_dim,
+            pretrained=stpath_pretrained,
+        )
+    elif context_encoder_type == "storm_lite":
+        from src.models.storm_lite_encoder import StormLiteContextEncoder
+        assert gene_encoder_type in ("mlp", "novae", "both"), (
+            f"context_encoder_type='storm_lite' requires gene_encoder_type in "
+            f"('mlp', 'novae', 'both'), got {gene_encoder_type!r}"
+        )
+        return StormLiteContextEncoder(
+            n_genes=n_genes, novae_dim=novae_dim, coord_dim=coord_dim,
+            hidden_dim=cond_hidden_dim, gene_encoder_type=gene_encoder_type,
+            n_transformer_layers=storm_lite_n_layers, n_heads=storm_lite_n_heads,
         )
     else:
         raise ValueError(f"unknown context_encoder_type {context_encoder_type!r}")
@@ -279,7 +307,9 @@ class WAEGAN(BaseGenerativeModel):
                  stpath_gene_names: list[str] | None = None, stpath_gene_voc_path: str | None = None,
                  stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
                  stpath_tech_type: str = "Visium",
-                 stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None):
+                 stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None,
+                 stpath_pretrained: bool = True,
+                 storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False  # we alternate encoder/decoder vs. discriminator ourselves
@@ -294,6 +324,8 @@ class WAEGAN(BaseGenerativeModel):
             stpath_model_weight_path=stpath_model_weight_path, stpath_organ_type=stpath_organ_type,
             stpath_tech_type=stpath_tech_type,
             stpath_new_gene_encoder_type=stpath_new_gene_encoder_type, stpath_novae_dim=stpath_novae_dim,
+            stpath_pretrained=stpath_pretrained,
+            storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
         )
         self.encoder = nn.Sequential(
             nn.Linear(n_genes, hidden_dim), nn.ReLU(),
@@ -476,7 +508,9 @@ class FlowMatchingOT(BaseGenerativeModel):
                  stpath_gene_names: list[str] | None = None, stpath_gene_voc_path: str | None = None,
                  stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
                  stpath_tech_type: str = "Visium",
-                 stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None):
+                 stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None,
+                 stpath_pretrained: bool = True,
+                 storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4):
         super().__init__()
         self.save_hyperparameters()
         assert path_type in ("ot", "edm"), f"unknown path_type {path_type!r}"
@@ -490,6 +524,8 @@ class FlowMatchingOT(BaseGenerativeModel):
             stpath_model_weight_path=stpath_model_weight_path, stpath_organ_type=stpath_organ_type,
             stpath_tech_type=stpath_tech_type,
             stpath_new_gene_encoder_type=stpath_new_gene_encoder_type, stpath_novae_dim=stpath_novae_dim,
+            stpath_pretrained=stpath_pretrained,
+            storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
         )
         # own autoencoder, own weights — compresses expression to a small
         # latent code the velocity net operates on instead of raw n_genes
@@ -669,7 +705,9 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  stpath_gene_names: list[str] | None = None, stpath_gene_voc_path: str | None = None,
                  stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
                  stpath_tech_type: str = "Visium",
-                 stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None):
+                 stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None,
+                 stpath_pretrained: bool = True,
+                 storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4):
         super().__init__()
         self.save_hyperparameters()
         self.context_encoder = _build_context_encoder(
@@ -682,6 +720,8 @@ class VQVAEAutoregressive(BaseGenerativeModel):
             stpath_model_weight_path=stpath_model_weight_path, stpath_organ_type=stpath_organ_type,
             stpath_tech_type=stpath_tech_type,
             stpath_new_gene_encoder_type=stpath_new_gene_encoder_type, stpath_novae_dim=stpath_novae_dim,
+            stpath_pretrained=stpath_pretrained,
+            storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
         )
         self.encoder = nn.Sequential(
             nn.Linear(n_genes, ae_hidden_dim), nn.ReLU(),

@@ -128,12 +128,16 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
     # THIS config's (possibly image-QC-filtered) adata, before building
     # the model, so the right *_novae_dim can be injected into model_cfg.
     train_model_params = cfg.model.get("params", {})
+    train_context_encoder_type = train_model_params.get("context_encoder_type", "builtin")
     context_gene_features = None
     context_novae_features = None
-    if train_model_params.get("gene_encoder_type") == "novae":
+    if train_context_encoder_type == "builtin" and train_model_params.get("gene_encoder_type") == "novae":
         context_gene_features = get_novae_features(cfg, adata)
-    elif (train_model_params.get("context_encoder_type") == "stpath"
+    elif (train_context_encoder_type == "stpath"
           and train_model_params.get("stpath_new_gene_encoder_type") in ("novae", "both")):
+        context_novae_features = get_novae_features(cfg, adata)
+    elif (train_context_encoder_type == "storm_lite"
+          and train_model_params.get("gene_encoder_type") in ("novae", "both")):
         context_novae_features = get_novae_features(cfg, adata)
 
     # .get() with the same default every real config's own YAML comment
@@ -162,7 +166,10 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
     if context_gene_features is not None:
         inject_novae_dim(model_cfg, context_gene_features.shape[1])
     if context_novae_features is not None:
-        inject_stpath_novae_dim(model_cfg, context_novae_features.shape[1])
+        if train_context_encoder_type == "storm_lite":
+            inject_novae_dim(model_cfg, context_novae_features.shape[1])
+        else:
+            inject_stpath_novae_dim(model_cfg, context_novae_features.shape[1])
     model = build_model(model_cfg)
     # UNRESOLVED copy, saved (not model_cfg above) so a STPath config's
     # ${oc.env:STPATH_GENE_VOC_PATH}/${oc.env:STPATH_MODEL_WEIGHT_PATH}
@@ -175,7 +182,10 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
     if context_gene_features is not None:
         inject_novae_dim(unresolved_model_cfg, context_gene_features.shape[1])
     if context_novae_features is not None:
-        inject_stpath_novae_dim(unresolved_model_cfg, context_novae_features.shape[1])
+        if train_context_encoder_type == "storm_lite":
+            inject_novae_dim(unresolved_model_cfg, context_novae_features.shape[1])
+        else:
+            inject_stpath_novae_dim(unresolved_model_cfg, context_novae_features.shape[1])
 
     if list(model.parameters()):
         dataset = MaskedContextQueryDataset(
@@ -237,9 +247,9 @@ def _images_for_model(model_params: dict, shared_eval: dict):
         return None
     image_encoder_type = model_params.get("image_encoder_type", "none")
     context_encoder_type = model_params.get("context_encoder_type", "builtin")
-    if image_encoder_type == "none" and context_encoder_type != "stpath":
+    if image_encoder_type == "none" and context_encoder_type not in ("stpath", "storm_lite"):
         return None  # this model doesn't use images at all (e.g. interp_baseline)
-    needs_gigapath = image_encoder_type == "gigapath" or context_encoder_type == "stpath"
+    needs_gigapath = image_encoder_type == "gigapath" or context_encoder_type in ("stpath", "storm_lite")
     return shared_eval["gigapath_images"] if needs_gigapath else shared_eval["raw_images"]
 
 
@@ -250,25 +260,36 @@ def _gene_features_for_model(model_params: dict, shared_eval: dict):
     values across configs ("raw"/"mlp" want raw expression fed straight
     in; "novae" wants shared_eval's precomputed Novae features), so
     shared_eval carries both and each model picks its own. Returns None
-    for "raw"/"mlp" (meaning: use raw expr, exactly as before this
-    switch existed) or shared_eval["novae_features"] for "novae"."""
-    if model_params.get("gene_encoder_type") == "novae":
+    for "raw"/"mlp" (meaning: use raw expr, exactly as before this switch
+    existed) or shared_eval["novae_features"] for "novae" — ONLY for
+    context_encoder_type="builtin" (default): storm_lite reuses the same
+    gene_encoder_type param name but needs the ADDITIVE channel instead
+    (see _stpath_novae_features_for_model below), never a replacement."""
+    if (model_params.get("context_encoder_type", "builtin") == "builtin"
+            and model_params.get("gene_encoder_type") == "novae"):
         return shared_eval["novae_features"]
     return None
 
 
 def _stpath_novae_features_for_model(model_params: dict, shared_eval: dict):
-    """STPathContextEncoder's Route-B residual counterpart to
-    _gene_features_for_model above (2026-07-16) — genuinely different
-    from it, not reusable: this is an ADDITIVE channel (context["novae_
-    features"]), never a replacement for context["expression"] (STPath's
-    own gene_embed pathway always needs real raw expression regardless of
-    stpath_new_gene_encoder_type — see _build_masked_item's
-    context_novae_features docstring in train.py for the full reasoning).
-    Returns None unless this model is context_encoder_type="stpath" with
-    stpath_new_gene_encoder_type in ("novae", "both")."""
+    """ADDITIVE Novae-features counterpart to _gene_features_for_model
+    above (2026-07-16) — genuinely different from it, not reusable: this
+    is an ADDITIVE channel (context["novae_features"]), never a
+    replacement for context["expression"] (STPath's own gene_embed
+    pathway, and StormLiteContextEncoder's own raw-expression path in
+    "both" mode, both always need real raw expression too — see
+    _build_masked_item's context_novae_features docstring in train.py
+    for the full reasoning). Covers TWO real callers despite the STPath-
+    specific name (kept for git history continuity, not renamed): STPath's
+    Route-B residual (context_encoder_type="stpath" +
+    stpath_new_gene_encoder_type in ("novae","both")) AND
+    StormLiteContextEncoder (context_encoder_type="storm_lite" +
+    gene_encoder_type in ("novae","both"))."""
     if (model_params.get("context_encoder_type") == "stpath"
             and model_params.get("stpath_new_gene_encoder_type") in ("novae", "both")):
+        return shared_eval["novae_features"]
+    if (model_params.get("context_encoder_type") == "storm_lite"
+            and model_params.get("gene_encoder_type") in ("novae", "both")):
         return shared_eval["novae_features"]
     return None
 
@@ -405,9 +426,14 @@ def _any_config_uses_novae(model_config_paths: list[str], overrides: list[str] |
         if overrides:
             cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
         params = cfg.model.get("params", {})
-        if (params.get("gene_encoder_type") == "novae"
-                or (params.get("context_encoder_type") == "stpath"
-                    and params.get("stpath_new_gene_encoder_type") in ("novae", "both"))):
+        params_context_encoder_type = params.get("context_encoder_type", "builtin")
+        if (params_context_encoder_type == "builtin" and params.get("gene_encoder_type") == "novae"):
+            return True
+        if (params_context_encoder_type == "stpath"
+                and params.get("stpath_new_gene_encoder_type") in ("novae", "both")):
+            return True
+        if (params_context_encoder_type == "storm_lite"
+                and params.get("gene_encoder_type") in ("novae", "both")):
             return True
     return False
 

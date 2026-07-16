@@ -156,15 +156,29 @@ class _ResidualEncodeInputs(nn.Module):
 
 
 class STPathContextEncoder(nn.Module):
-    def __init__(self, gene_names: list[str], gene_voc_path: str, model_weight_path: str,
+    def __init__(self, gene_names: list[str], gene_voc_path: str, model_weight_path: str | None = None,
                  organ_type: str = "Kidney", tech_type: str = "Visium",
                  hidden_dim: int = 256, device: str = "cpu",
-                 new_gene_encoder_type: str = "none", novae_dim: int | None = None):
+                 new_gene_encoder_type: str = "none", novae_dim: int | None = None,
+                 pretrained: bool = True):
+        """pretrained=False (2026-07-16, "STPath's own architecture trained
+        from scratch on our pilot data" arm — the fair counterpart to a
+        STORM-lite comparison, see src/models/storm_lite_encoder.py):
+        skips loading model_weight_path (can be None) and skips freezing
+        STFM's parameters — the WHOLE architecture (image/gene/organ/tech
+        embeddings + spatial transformer) trains jointly via the SAME
+        downstream generative loss FM-OT already provides, exactly like
+        every other from-scratch component in this codebase (no separate
+        pretraining stage). gene_voc_path is STILL required even when
+        pretrained=False — it's a fixed gene-vocabulary RESOURCE (symbol
+        -> id mapping), not a trained parameter, needed regardless of
+        whether STFM's weights are pretrained or random."""
         super().__init__()
         assert new_gene_encoder_type in ("none", "mlp", "novae", "both"), (
             f"unknown new_gene_encoder_type {new_gene_encoder_type!r}"
         )
         self.new_gene_encoder_type = new_gene_encoder_type
+        self.pretrained = pretrained
         from stpath.model.model import STFM
         from stpath.model.nn_utils.config import ModelConfig
         from stpath.tokenization import (
@@ -198,10 +212,18 @@ class STPathContextEncoder(nn.Module):
         self.d_model = config.d_model
 
         self.model = STFM(config).to(device)
-        self.model.load_state_dict(torch.load(model_weight_path, map_location=device))
-        self.model.eval()
-        for p in self.model.parameters():
-            p.requires_grad_(False)
+        if pretrained:
+            assert model_weight_path is not None, (
+                "pretrained=True requires model_weight_path"
+            )
+            self.model.load_state_dict(torch.load(model_weight_path, map_location=device))
+            self.model.eval()
+            for p in self.model.parameters():
+                p.requires_grad_(False)
+        # else: pretrained=False — STFM stays randomly initialized and
+        # fully trainable (default nn.Module train() mode, every param's
+        # default requires_grad=True) — the "STPath's own architecture,
+        # trained from scratch on our data" comparison arm.
 
         # Route B (2026-07-16, GEX-encoder-bottleneck investigation): test
         # whether a better gene encoder helps STPath's REAL pretrained
@@ -385,9 +407,17 @@ class STPathContextEncoder(nn.Module):
                 mlp_input = torch.log1p(context_expression)
                 extra_embed[:n_context] = self.new_gene_encoder(mlp_input, context_novae_features)
             self.model.input_encoder.set_extra_embed(extra_embed)
-            # NO torch.no_grad() here — see forward()'s own docstring for
-            # why: gradient must flow through the frozen layers to reach
-            # new_gene_encoder/residual_proj on the other side of them.
+
+        # Gradient must flow through STFM's own layers (using their current
+        # weights, frozen or not) whenever there's something trainable on
+        # the other side of them that needs it — either a residual
+        # (new_gene_encoder is not None) or STFM itself (pretrained=False,
+        # the whole model is trainable). torch.no_grad() is only correct
+        # when NEITHER is true — see this method's own docstring for the
+        # real bug this distinction fixes (residual gradient silently
+        # killed by a blanket no_grad).
+        needs_grad = self.new_gene_encoder is not None or not self.pretrained
+        if needs_grad:
             _, x = self.model.prediction_head(
                 img_tokens=img_feats,
                 coords=coords,

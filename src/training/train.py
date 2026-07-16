@@ -504,16 +504,20 @@ def get_novae_features(cfg, adata) -> np.ndarray:
 
 
 def inject_novae_dim(model_cfg: dict, novae_dim: int) -> None:
-    """If a config sets gene_encoder_type: "novae" (2026-07-16), auto-derive
-    novae_dim from the real precomputed features' shape rather than
-    requiring it hardcoded into a YAML file (same reasoning as
-    inject_stpath_gene_names — the real value is only known once Novae has
-    actually been run, and hardcoding a guessed number risks silently
-    drifting from whatever the installed novae package version actually
-    outputs). Mutates model_cfg["params"] in place; no-op for every other
-    config."""
+    """If a config sets gene_encoder_type: "novae" or "both" (2026-07-16;
+    "both" added for StormLiteContextEncoder's CombinedGeneEncoder mode —
+    see storm_lite_encoder.py), auto-derive novae_dim from the real
+    precomputed features' shape rather than requiring it hardcoded into a
+    YAML file (same reasoning as inject_stpath_gene_names — the real
+    value is only known once Novae has actually been run, and hardcoding
+    a guessed number risks silently drifting from whatever the installed
+    novae package version actually outputs). Shared by "builtin"
+    (SpatialContextEncoder) and "storm_lite" (StormLiteContextEncoder) —
+    both use the same gene_encoder_type/novae_dim param names, mutually
+    exclusive per model so there's no risk of conflating them. Mutates
+    model_cfg["params"] in place; no-op for every other config."""
     params = model_cfg.get("params", {})
-    if params.get("gene_encoder_type") == "novae" and "novae_dim" not in params:
+    if params.get("gene_encoder_type") in ("novae", "both") and "novae_dim" not in params:
         params["novae_dim"] = novae_dim
 
 
@@ -574,7 +578,7 @@ def _load_images(cfg, adata):
     model_params = cfg.model.get("params", {})
     uses_frozen_gigapath = (
         model_params.get("image_encoder_type") == "gigapath"
-        or model_params.get("context_encoder_type") == "stpath"
+        or model_params.get("context_encoder_type") in ("stpath", "storm_lite")
     )
     if uses_frozen_gigapath:
         features = get_gigapath_features(cfg, patches, barcodes)
@@ -708,12 +712,23 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     # _build_masked_item's context_novae_features docstring for why they
     # can't share a mechanism.
     model_params = cfg.model.get("params", {})
+    context_encoder_type = model_params.get("context_encoder_type", "builtin")
     context_gene_features = None
     context_novae_features = None
-    if model_params.get("gene_encoder_type") == "novae":
+    if context_encoder_type == "builtin" and model_params.get("gene_encoder_type") == "novae":
+        # REPLACES context["expression"] — SpatialContextEncoder's own switch
         context_gene_features = get_novae_features(cfg, adata)
-    elif (model_params.get("context_encoder_type") == "stpath"
+    elif (context_encoder_type == "stpath"
           and model_params.get("stpath_new_gene_encoder_type") in ("novae", "both")):
+        # ADDITIVE context["novae_features"] — STPath's Route-B residual
+        context_novae_features = get_novae_features(cfg, adata)
+    elif (context_encoder_type == "storm_lite"
+          and model_params.get("gene_encoder_type") in ("novae", "both")):
+        # ADDITIVE context["novae_features"] too — StormLiteContextEncoder
+        # reuses the gene_encoder_type param name but, like STPath, needs
+        # this as a separate channel from raw context["expression"], never
+        # a replacement (its "both" mode needs BOTH simultaneously) — see
+        # storm_lite_encoder.py's own forward()/_encode_gene.
         context_novae_features = get_novae_features(cfg, adata)
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
@@ -721,7 +736,13 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     if context_gene_features is not None:
         inject_novae_dim(model_cfg, context_gene_features.shape[1])
     if context_novae_features is not None:
-        inject_stpath_novae_dim(model_cfg, context_novae_features.shape[1])
+        # storm_lite reuses novae_dim's param name (inject_novae_dim);
+        # STPath's residual uses the distinct stpath_novae_dim
+        # (inject_stpath_novae_dim) — see each function's own docstring.
+        if context_encoder_type == "storm_lite":
+            inject_novae_dim(model_cfg, context_novae_features.shape[1])
+        else:
+            inject_stpath_novae_dim(model_cfg, context_novae_features.shape[1])
     model = build_model(model_cfg)
     # UNRESOLVED copy, saved (not model_cfg above) so a STPath config's
     # ${oc.env:STPATH_GENE_VOC_PATH}/${oc.env:STPATH_MODEL_WEIGHT_PATH}
@@ -736,7 +757,10 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     if context_gene_features is not None:
         inject_novae_dim(unresolved_model_cfg, context_gene_features.shape[1])
     if context_novae_features is not None:
-        inject_stpath_novae_dim(unresolved_model_cfg, context_novae_features.shape[1])
+        if context_encoder_type == "storm_lite":
+            inject_novae_dim(unresolved_model_cfg, context_novae_features.shape[1])
+        else:
+            inject_stpath_novae_dim(unresolved_model_cfg, context_novae_features.shape[1])
 
     # Train (skipped entirely for parameter-free baselines like interp_baseline) --
     if list(model.parameters()):

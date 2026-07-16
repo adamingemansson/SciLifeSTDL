@@ -1,0 +1,68 @@
+# STORM-lite fusion transformer (2026-07-16) — see
+# src/models/storm_lite_encoder.py for the full architecture/reasoning
+# and its explicitly-flagged simplifications vs the real STORM paper
+# (arXiv 2604.03630, not independently verified — its domain is blocked
+# by this project's network proxy). Reuses frozen pretrained GigaPath for
+# images; gene_encoder_type picks which gene-side encoder feeds the
+# fusion transformer — this variant uses ONLY MLPGeneEncoder
+# (task-trained, no pretraining). Companion configs:
+# exp_hest1k_fm_ot_stormlite_novae.yaml (Novae only),
+# exp_hest1k_fm_ot_stormlite_both.yaml (MLP+Novae summed).
+#
+# Direct comparison target: exp_hest1k_fm_ot_stpath_unfrozen.yaml — same
+# "train the fusion on our own pilot data" starting point, testing
+# whether reusing MORE pretrained pieces (both modalities here, vs just
+# GigaPath for STPath-unfrozen) needs less data to produce a working
+# fusion.
+
+experiment_name: fm_ot_hest1k_pilot_stormlite_mlp
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: storm_lite
+    gene_encoder_type: mlp          # 2026-07-16: MLPGeneEncoder only (no Novae)
+    # novae_dim not needed for gene_encoder_type=mlp
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_fm_ot_stpath.yaml
+    coord_dim: 3
+    cond_hidden_dim: 256           # also StormLiteContextEncoder's internal token dim
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 10000                  # same as exp_hest1k_fm_ot_stpath.yaml - fair comparison
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab
