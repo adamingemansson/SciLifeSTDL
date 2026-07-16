@@ -45,6 +45,7 @@ def _build_context_encoder(
     stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None,
     stpath_pretrained: bool = True,
     storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
+    storm_lite_use_relative_bias: bool = True, storm_lite_relative_bias_hidden_dim: int = 32,
 ):
     """Shared by WAE-GAN/FM-OT/VQ-VAE+AR so each model's __init__ doesn't
     repeat the context_encoder_type branching. "builtin" (default) is our
@@ -108,6 +109,8 @@ def _build_context_encoder(
             n_genes=n_genes, novae_dim=novae_dim, coord_dim=coord_dim,
             hidden_dim=cond_hidden_dim, gene_encoder_type=gene_encoder_type,
             n_transformer_layers=storm_lite_n_layers, n_heads=storm_lite_n_heads,
+            use_relative_bias=storm_lite_use_relative_bias,
+            relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
         )
     else:
         raise ValueError(f"unknown context_encoder_type {context_encoder_type!r}")
@@ -309,7 +312,9 @@ class WAEGAN(BaseGenerativeModel):
                  stpath_tech_type: str = "Visium",
                  stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None,
                  stpath_pretrained: bool = True,
-                 storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4):
+                 storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
+                 storm_lite_use_relative_bias: bool = True,
+                 storm_lite_relative_bias_hidden_dim: int = 32):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False  # we alternate encoder/decoder vs. discriminator ourselves
@@ -326,6 +331,8 @@ class WAEGAN(BaseGenerativeModel):
             stpath_new_gene_encoder_type=stpath_new_gene_encoder_type, stpath_novae_dim=stpath_novae_dim,
             stpath_pretrained=stpath_pretrained,
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
+            storm_lite_use_relative_bias=storm_lite_use_relative_bias,
+            storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
         )
         self.encoder = nn.Sequential(
             nn.Linear(n_genes, hidden_dim), nn.ReLU(),
@@ -510,7 +517,9 @@ class FlowMatchingOT(BaseGenerativeModel):
                  stpath_tech_type: str = "Visium",
                  stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None,
                  stpath_pretrained: bool = True,
-                 storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4):
+                 storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
+                 storm_lite_use_relative_bias: bool = True,
+                 storm_lite_relative_bias_hidden_dim: int = 32):
         super().__init__()
         self.save_hyperparameters()
         assert path_type in ("ot", "edm"), f"unknown path_type {path_type!r}"
@@ -526,6 +535,8 @@ class FlowMatchingOT(BaseGenerativeModel):
             stpath_new_gene_encoder_type=stpath_new_gene_encoder_type, stpath_novae_dim=stpath_novae_dim,
             stpath_pretrained=stpath_pretrained,
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
+            storm_lite_use_relative_bias=storm_lite_use_relative_bias,
+            storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
         )
         # own autoencoder, own weights — compresses expression to a small
         # latent code the velocity net operates on instead of raw n_genes
@@ -707,7 +718,9 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  stpath_tech_type: str = "Visium",
                  stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None,
                  stpath_pretrained: bool = True,
-                 storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4):
+                 storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
+                 storm_lite_use_relative_bias: bool = True,
+                 storm_lite_relative_bias_hidden_dim: int = 32):
         super().__init__()
         self.save_hyperparameters()
         self.context_encoder = _build_context_encoder(
@@ -722,6 +735,8 @@ class VQVAEAutoregressive(BaseGenerativeModel):
             stpath_new_gene_encoder_type=stpath_new_gene_encoder_type, stpath_novae_dim=stpath_novae_dim,
             stpath_pretrained=stpath_pretrained,
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
+            storm_lite_use_relative_bias=storm_lite_use_relative_bias,
+            storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
         )
         self.encoder = nn.Sequential(
             nn.Linear(n_genes, ae_hidden_dim), nn.ReLU(),

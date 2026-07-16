@@ -53,11 +53,16 @@ Simplifications, explicit:
     (if the 5x5 detail above is accurate) is a scaling optimization for
     much higher-density data (Visium HD), not fundamental to the
     question this class tests.
-  - Coordinate handling: RandomFourierFeatures (already used throughout
-    this file), concatenated additively into each token — not STPath's
-    own geometry-aware frame-averaging attention bias (verified via
-    STPath's real source, see stpath_encoder.py), which STORM may or may
-    not also use — unconfirmed either way.
+  - Coordinate handling: RandomFourierFeatures (absolute, concatenated
+    into each token) PLUS, as of 2026-07-16, RelativePositionBias (a
+    Swin-V2-style continuous position bias — an MLP over pairwise
+    relative coordinates, added directly to attention logits, see
+    conditioning.py). Still not STPath's own geometry-aware
+    frame-averaging attention bias (verified via STPath's real source),
+    which STORM may or may not also use — unconfirmed either way — but
+    now at least gives this class a genuine relative-geometry signal
+    rather than only absolute position, closing what was previously a
+    real gap versus STPath.
   - STORM's own image encoder is H0-mini, not GigaPath — kept GigaPath
     here for consistency with every other arm in this project's
     comparisons (isolates the fusion-architecture question from a
@@ -71,7 +76,7 @@ import torch.nn as nn
 
 from src.models.conditioning import (
     RandomFourierFeatures, GigapathPatchEncoder,
-    MLPGeneEncoder, NovaeGeneEncoder, CombinedGeneEncoder,
+    MLPGeneEncoder, NovaeGeneEncoder, CombinedGeneEncoder, RelativePositionBias,
 )
 
 
@@ -79,12 +84,21 @@ class StormLiteContextEncoder(nn.Module):
     def __init__(self, n_genes: int, novae_dim: int | None = None, coord_dim: int = 3,
                  hidden_dim: int = 256, rff_features: int = 64, rff_sigma: float = 1.0,
                  n_transformer_layers: int = 2, n_heads: int = 4,
-                 gene_encoder_type: str = "both"):
+                 gene_encoder_type: str = "both", use_relative_bias: bool = True,
+                 relative_bias_hidden_dim: int = 32):
         super().__init__()
         assert gene_encoder_type in ("mlp", "novae", "both"), (
             f"unknown gene_encoder_type {gene_encoder_type!r}"
         )
         self.gene_encoder_type = gene_encoder_type
+        # 2026-07-16: Swin-V2-style continuous position bias (see
+        # RelativePositionBias's own docstring in conditioning.py) — closes
+        # the gap versus STPath's verified geometry-aware attention bias,
+        # which this class previously had no counterpart for (only
+        # absolute RandomFourierFeatures baked into each token below).
+        self.use_relative_bias = use_relative_bias
+        self.rel_pos_bias = RelativePositionBias(coord_dim, relative_bias_hidden_dim) \
+            if use_relative_bias else None
 
         # Per-modality encoders, each projecting to hidden_dim so they can
         # be summed into one token — same additive-fusion pattern STPath's
@@ -175,5 +189,11 @@ class StormLiteContextEncoder(nn.Module):
         gene_embed[n_context:] = self.mask_token  # broadcasts over n_query rows
 
         tokens = img_embed + gene_embed + coord_embed  # [N_total, hidden_dim]
-        fused = self.transformer(tokens.unsqueeze(0)).squeeze(0)  # self-attention over ALL spots
+        # additive attention bias (Swin-V2-style CPB, see RelativePositionBias)
+        # — a FloatTensor `mask` is documented PyTorch behavior for an
+        # additive bias added to raw attention logits before softmax, not
+        # a boolean keep/drop mask; None (use_relative_bias=False)
+        # preserves the original plain-self-attention behavior exactly.
+        bias = self.rel_pos_bias(coords) if self.use_relative_bias else None
+        fused = self.transformer(tokens.unsqueeze(0), mask=bias).squeeze(0)  # self-attention over ALL spots
         return fused[n_context:]  # query positions only

@@ -60,6 +60,54 @@ def _knn_indices(queries: torch.Tensor, keys: torch.Tensor, k: int) -> torch.Ten
     return idx
 
 
+class RelativePositionBias(nn.Module):
+    """Continuous relative-position attention bias (Liu et al., CVPR 2022,
+    "Swin Transformer V2: Scaling Up Capacity and Resolution" — its CPB,
+    "continuous position bias", is a small MLP over relative coordinates
+    producing an additive attention-score bias) — added 2026-07-16 for
+    StormLiteContextEncoder, which previously only had ABSOLUTE position
+    information (RandomFourierFeatures concatenated into each token). An
+    absolute encoding lets the model infer *something* about geometry
+    indirectly through attention's learned Q/K projections, but it has no
+    direct signal for "these two spots are close/far" the way STPath's
+    own verified geometry-aware frame-averaging attention bias does
+    (stpath_encoder.py) — this closes that specific gap for our own
+    from-scratch fusion transformer.
+
+    Adapted from Swin V2's 2D windowed-vision setting to arbitrary 3D
+    point-cloud coordinates (not a regular grid): for every pair of
+    tokens, the MLP takes (dx, dy, dz, euclidean_distance) and outputs a
+    single scalar bias, added directly to that pair's raw attention
+    logit before softmax (via nn.TransformerEncoder's own `mask` — a
+    FloatTensor mask is documented PyTorch behavior for an ADDITIVE bias,
+    not a boolean mask — no custom attention implementation needed).
+
+    Simplification flagged explicitly: one shared bias broadcast across
+    all attention heads and the batch dimension, not Swin V2's per-head
+    bias — this project's models run with batch_size=1 by construction
+    (one masking draw at a time, see MaskedContextQueryDataset's own
+    docstring), and per-head biases would need one MLP output per head
+    rather than a scalar; kept simple for a first version, easy to
+    extend later if a per-head bias turns out to matter."""
+
+    def __init__(self, coord_dim: int = 3, hidden_dim: int = 32):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(coord_dim + 1, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        """coords: [N, coord_dim]. Returns [N, N] additive attention bias
+        (bias[i, j] = how much token i's attention to token j should be
+        adjusted based on their relative position)."""
+        diff = coords.unsqueeze(1) - coords.unsqueeze(0)  # [N, N, coord_dim]
+        dist = diff.norm(dim=-1, keepdim=True)             # [N, N, 1]
+        feat = torch.cat([diff, dist], dim=-1)              # [N, N, coord_dim+1]
+        return self.mlp(feat).squeeze(-1)                    # [N, N]
+
+
 class _KNNMessageLayer(nn.Module):
     """One round of message passing: each context node attends to its own
     k nearest neighbours. Stacking a few of these lets information from a
