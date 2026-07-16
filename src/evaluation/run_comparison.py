@@ -196,11 +196,18 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
             inject_stpath_novae_dim(unresolved_model_cfg, context_novae_features.shape[1])
 
     if list(model.parameters()):
+        # augment_coords (2026-07-16, src/data/augmentation.py) applies
+        # ONLY to the training draws here, never to the shared held-out
+        # eval set built elsewhere in this file (that set must stay fixed/
+        # unaugmented so every model in a comparison run is scored against
+        # the exact same query points — see this module's own shared-eval
+        # comments).
         dataset = MaskedContextQueryDataset(
             coords3d, expr, slice_ids, cfg.masking,
             n_items=cfg.training.epochs, base_seed=cfg.training.seed, images=images,
             context_gene_features=context_gene_features,
             context_novae_features=context_novae_features,
+            augment=cfg.training.get("augment_coords", False),
         )
         dataloader = make_dataloader(dataset, cfg)
         trainer = pl.Trainer(

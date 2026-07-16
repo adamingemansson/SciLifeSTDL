@@ -1,0 +1,77 @@
+# Same as exp_hest1k_fm_ot_stpath_bothresidual.yaml (this project's
+# current best-performing arm — see that config's header for the full
+# derivation) but with training.augment_coords: true (2026-07-16,
+# src/data/augmentation.py augment_coords_xy) — every training AND eval
+# draw gets a random rotation+reflection of the xy plane applied
+# identically to its whole context+query set before the masking split.
+#
+# Purpose: real tissue orientation on a slide is arbitrary (an artifact of
+# mounting), not a biological feature — this config tests whether removing
+# the model's ability to lean on absolute position (RandomFourierFeatures
+# encodes it directly) as a memorization shortcut changes performance,
+# and specifically whether it helps or hurts relative to the identical,
+# unaugmented bothresidual config. A meaningful drop would suggest the
+# model WAS exploiting absolute position in a way that doesn't generalize;
+# a neutral/positive result would suggest that isn't a live concern on
+# this single-sample pilot (with only ONE tissue orientation ever seen
+# regardless, augmentation's ceiling benefit here is inherently limited —
+# real value is expected to show up once training spans multiple samples,
+# see exp_hest1k_fm_ot_multisample.yaml, each with its own natural
+# orientation).
+#
+# Direct comparison target: exp_hest1k_fm_ot_stpath_bothresidual.yaml
+# itself (identical model config, only training.augment_coords differs).
+
+experiment_name: fm_ot_hest1k_pilot_stpath_bothresidual_augment
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: stpath
+    stpath_gene_voc_path: ${oc.env:STPATH_GENE_VOC_PATH}
+    stpath_model_weight_path: ${oc.env:STPATH_MODEL_WEIGHT_PATH}
+    stpath_organ_type: Kidney      # INT1 is ccRCC (renal cell carcinoma)
+    stpath_tech_type: Visium
+    stpath_new_gene_encoder_type: both
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_fm_ot_stpath.yaml
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 10000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+  augment_coords: true           # 2026-07-16 — see header
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

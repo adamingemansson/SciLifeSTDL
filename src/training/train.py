@@ -33,6 +33,7 @@ import pytorch_lightning as pl
 from omegaconf import OmegaConf
 
 from src.data import loaders, masking
+from src.data.augmentation import augment_coords_xy
 from src.models.registry import build_model
 from src.evaluation import metrics as ev
 
@@ -221,7 +222,8 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
                         masking_cfg, images: np.ndarray | None, seed: int,
                         context_gene_features: np.ndarray | None = None,
                         context_novae_features: np.ndarray | None = None,
-                        organ: str | None = None, tech: str | None = None) -> dict:
+                        organ: str | None = None, tech: str | None = None,
+                        augment: bool = False) -> dict:
     """One {context, query, target_expression} training item for a SINGLE
     sample's data. Factored out of MaskedContextQueryDataset.__getitem__
     (2026-07-15) so MultiSampleMaskedContextQueryDataset below can reuse
@@ -261,7 +263,25 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
     section, so there's no such leak — see SpatialContextEncoder.forward's
     own comment on this same asymmetry). None (default) preserves the
     original behavior exactly — every existing single-sample config keeps
-    working unchanged."""
+    working unchanged.
+
+    augment (2026-07-16, cfg.training.augment_coords follow-up — see
+    src/data/augmentation.py augment_coords_xy's own docstring for the
+    real motivation): applies ONE random rotation+reflection to the
+    WHOLE coords3d array before the masking split, so context and query
+    share exactly the same rigid transform (preserving every pairwise
+    relationship the model reasons over) and the masking split's own
+    randomly-chosen hole centers/radii are drawn AFTER augmentation (still
+    valid — an isometry doesn't change what a circular/elliptical/blob
+    hole around some point looks like, only which absolute frame it's
+    expressed in). Uses seed+2 (distinct from the seed passed to
+    make_context_query_split, and distinct from the seed+1 used for
+    "which sample" in MultiSampleMaskedContextQueryDataset) so the three
+    random choices this pipeline can make per item never correlate through
+    a shared seed. False (default) leaves coords3d byte-identical to the
+    original, unaugmented behavior."""
+    if augment:
+        coords3d = augment_coords_xy(coords3d, seed=seed + 2)
     context_mask, query_mask = make_context_query_split(coords3d, slice_ids, masking_cfg, seed)
     context_expr_source = expr if context_gene_features is None else context_gene_features
     context = {
@@ -297,7 +317,8 @@ class MaskedContextQueryDataset(Dataset):
                  images: np.ndarray | None = None,
                  context_gene_features: np.ndarray | None = None,
                  context_novae_features: np.ndarray | None = None,
-                 organ: str | None = None, tech: str | None = None):
+                 organ: str | None = None, tech: str | None = None,
+                 augment: bool = False):
         self.coords3d = coords3d
         self.expr = expr
         self.slice_ids = slice_ids
@@ -326,6 +347,10 @@ class MaskedContextQueryDataset(Dataset):
         # _build_masked_item's organ/tech docstring
         self.organ = organ
         self.tech = tech
+        # opt-in rotation/reflection augmentation (2026-07-16) — see
+        # _build_masked_item's own augment docstring / src/data/
+        # augmentation.py augment_coords_xy
+        self.augment = augment
 
     def __len__(self):
         return self.n_items
@@ -336,15 +361,16 @@ class MaskedContextQueryDataset(Dataset):
             self.coords3d, self.expr, self.slice_ids, self.masking_cfg, self.images, seed,
             context_gene_features=self.context_gene_features,
             context_novae_features=self.context_novae_features,
-            organ=self.organ, tech=self.tech,
+            organ=self.organ, tech=self.tech, augment=self.augment,
         )
 
 
 class MultiSampleMaskedContextQueryDataset(Dataset):
     """Multi-sample generalization of MaskedContextQueryDataset (task
-    #19 follow-up scaffolding, 2026-07-15 — not yet wired into
-    train.py's/run_comparison.py's CLI, which still train on one sample;
-    this is the dataset half of extending to real multi-sample training).
+    #19 follow-up, 2026-07-15 scaffolding; wired into a real train.py
+    entry point, _main_multi_sample, 2026-07-16 — see that function and
+    load_multi_sample_data below. run_comparison.py's _train_model does
+    NOT support this path yet — see its own docstring note).
 
     Each item picks ONE sample (uniformly at random, reseeded per item)
     and draws its masking split from JUST that sample via
@@ -373,12 +399,14 @@ class MultiSampleMaskedContextQueryDataset(Dataset):
     condition on which sample the current item's split was drawn from —
     see that function's own organ/tech docstring."""
 
-    def __init__(self, samples: list[tuple], masking_cfg, n_items: int, base_seed: int = 0):
+    def __init__(self, samples: list[tuple], masking_cfg, n_items: int, base_seed: int = 0,
+                 augment: bool = False):
         assert samples, "samples must be non-empty"
         self.samples = samples
         self.masking_cfg = masking_cfg
         self.n_items = n_items
         self.base_seed = base_seed
+        self.augment = augment
 
     def __len__(self):
         return self.n_items
@@ -391,7 +419,7 @@ class MultiSampleMaskedContextQueryDataset(Dataset):
         sample_idx = int(np.random.default_rng(seed).integers(len(self.samples)))
         coords3d, expr, slice_ids, images, organ, tech = self.samples[sample_idx]
         return _build_masked_item(coords3d, expr, slice_ids, self.masking_cfg, images, seed + 1,
-                                   organ=organ, tech=tech)
+                                   organ=organ, tech=tech, augment=self.augment)
 
 
 def _collate_identity(batch_list):
@@ -779,6 +807,7 @@ def _main_multi_sample(cfg) -> None:
     gene_encoder_type paths of "builtin"/"storm_lite" work here today."""
     samples, adatas = load_multi_sample_data(cfg)
     gene_names = adatas[0].var_names.tolist()  # shared panel, same order across samples (load_multi_sample's guarantee)
+    augment = cfg.training.get("augment_coords", False)
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     inject_organ_tech_vocab(model_cfg, adatas)
@@ -791,6 +820,7 @@ def _main_multi_sample(cfg) -> None:
     if list(model.parameters()):
         dataset = MultiSampleMaskedContextQueryDataset(
             samples, cfg.masking, n_items=cfg.training.epochs, base_seed=cfg.training.seed,
+            augment=augment,
         )
         dataloader = make_dataloader(dataset, cfg)
         trainer = pl.Trainer(
@@ -808,6 +838,7 @@ def _main_multi_sample(cfg) -> None:
 
     eval_item = MultiSampleMaskedContextQueryDataset(
         samples, cfg.masking, n_items=1, base_seed=cfg.training.seed + cfg.training.epochs + 1,
+        augment=augment,
     )[0]
     context, query = eval_item["context"], eval_item["query"]
     target_expression = eval_item["target_expression"].numpy()
@@ -915,12 +946,14 @@ def main(cfg_path: str, overrides: list[str] | None = None):
             inject_stpath_novae_dim(unresolved_model_cfg, context_novae_features.shape[1])
 
     # Train (skipped entirely for parameter-free baselines like interp_baseline) --
+    augment = cfg.training.get("augment_coords", False)
     if list(model.parameters()):
         dataset = MaskedContextQueryDataset(
             coords3d, expr, slice_ids, cfg.masking,
             n_items=cfg.training.epochs, base_seed=cfg.training.seed, images=images,
             context_gene_features=context_gene_features,
             context_novae_features=context_novae_features,
+            augment=augment,
         )
         dataloader = make_dataloader(dataset, cfg)
         trainer = pl.Trainer(
@@ -946,6 +979,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
         n_items=1, base_seed=cfg.training.seed + cfg.training.epochs + 1, images=images,
         context_gene_features=context_gene_features,
         context_novae_features=context_novae_features,
+        augment=augment,
     )[0]
     context, query = eval_item["context"], eval_item["query"]
     target_expression = eval_item["target_expression"].numpy()
