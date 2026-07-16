@@ -540,6 +540,25 @@ baseline, not counted as one of the three comparison models below.
   from wrapping construction to wrapping the first raw-patch `forward()`
   call, since that's now the actual first point real network access
   happens.
+- **AnnData loading/QC cached across configs within one
+  `run_comparison.py` invocation (2026-07-15)** — real inefficiency
+  found from a real question ("why is there such a long gap between
+  models starting on the SSH session"): `_train_model` called
+  `load_adata(cfg)` fresh for EVERY config — rereading the `.h5ad` from
+  disk and rerunning scanpy's full QC/normalize pipeline every single
+  time — even though every config in one invocation is REQUIRED to
+  point at the same underlying sample (this module's own docstring), so
+  the result is always identical. Worse on NFS-mounted storage (the
+  A100 server's `/nfs/scratch1`), where repeated file reads carry more
+  latency than local disk. Fixed via `_cached_load_adata`, keyed by
+  (source, hest_data_dir/sample_id or paths/z_positions, min_genes,
+  min_cells) — safe to return the same object across configs since
+  nothing downstream mutates an AnnData in place (`_load_images`/
+  `align_patches_to_adata`/`cluster_pseudo_labels` all return/operate on
+  their own `.copy()`). Remaining real (less avoidable) per-config cost
+  for STPath specifically: `STPathContextEncoder.__init__` loads
+  STPath's own pretrained weight file from disk fresh for every STPath
+  config, since each gets a genuinely new model instance.
 - **Full histology image generation/reconstruction stays a deferred
   stretch goal**, separate from the conditioning use above. Filling in
   broken tissue *in the H&E image itself*, not just using H&E to condition

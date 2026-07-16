@@ -70,7 +70,38 @@ from src.evaluation.cell_type_classifier import cluster_pseudo_labels, CellTypeP
 EVAL_SEED = 999_999  # disjoint from every per-model config's own training seed range
 
 
-def _train_model(cfg_path: str, overrides: list[str] | None = None):
+def _cached_load_adata(cfg, adata_cache: dict):
+    """load_adata(cfg), cached across configs within ONE
+    run_comparison.py invocation. Real inefficiency found 2026-07-15 (a
+    long gap observed between models starting during a real run on an
+    SSH session): _train_model used to call load_adata(cfg) fresh for
+    EVERY config — rereading the .h5ad from disk and rerunning scanpy's
+    full QC/normalize pipeline every single time — even though every
+    config in one invocation is REQUIRED to point at the same underlying
+    sample (this module's own docstring), so the result is always
+    identical. Worse on NFS-mounted storage (a real case hit — repeated
+    file reads carry more latency there than local disk).
+
+    Safe to return the SAME object, not a fresh .copy() per use: nothing
+    downstream mutates it in place — _load_images/align_patches_to_adata
+    return NEW filtered objects via their own .copy() calls, and
+    cluster_pseudo_labels copies internally too
+    (cell_type_classifier.py). If a future change ever DOES mutate an
+    AnnData in place somewhere downstream, that mutation would leak
+    across configs sharing this cache — worth keeping in mind before
+    adding any such code."""
+    if cfg.data.get("source") == "hest1k":
+        key = ("hest1k", str(cfg.data.hest_data_dir), cfg.data.sample_id,
+               cfg.data.min_genes, cfg.data.min_cells)
+    else:
+        key = ("multi_slice", tuple(cfg.data.paths), tuple(cfg.data.get("z_positions") or []),
+               cfg.data.min_genes, cfg.data.min_cells)
+    if key not in adata_cache:
+        adata_cache[key] = load_adata(cfg)
+    return adata_cache[key]
+
+
+def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache: dict | None = None):
     cfg = OmegaConf.load(cfg_path)
     if overrides:
         # dotlist overrides applied to EVERY config in this comparison run,
@@ -79,7 +110,7 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None):
         # to full-length training on each)
         cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
     torch.manual_seed(cfg.training.seed)
-    adata = load_adata(cfg)
+    adata = _cached_load_adata(cfg, adata_cache if adata_cache is not None else {})
     from src.data import loaders
     # adata may come back as a SUBSET (align_patches_to_adata drops spots
     # with no matching H&E patch, a normal gap, not an error) - always use
@@ -250,9 +281,10 @@ def main(model_config_paths: list[str], k_neighborhood: int = 8, pca_components:
     rows = []
     interp_row = None
     shared_eval = None
+    adata_cache: dict = {}  # shared across every config in this invocation — see _cached_load_adata
 
     for path in model_config_paths:
-        model, cfg, adata, coords3d, expr, slice_ids, images = _train_model(path, overrides)
+        model, cfg, adata, coords3d, expr, slice_ids, images = _train_model(path, overrides, adata_cache)
         model_params = cfg.model.get("params", {})
 
         if shared_eval is None:
