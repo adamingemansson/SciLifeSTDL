@@ -173,7 +173,24 @@ def make_context_query_split(coords3d: np.ndarray, slice_ids: np.ndarray, maskin
         held_out = rng.choice(np.unique(slice_ids))
         context_mask, query_mask = masking.hold_out_slice(coords3d[:, 2], held_out, slice_ids)
     elif strategy == "random_dropout_patches":
+        # 2026-07-16: masking_cfg.params can now include shape=
+        # "circle"/"ellipse"/"irregular"/"mixed" (default "circle", exact
+        # previous behavior) — see masking.random_dropout_patches's own
+        # docstring. No new strategy name needed for this axis since it's
+        # a pure param, unlike sparse_spot_dropout/mixed_dropout below
+        # (genuinely different mask STRUCTURE, not just hole shape).
         context_mask, query_mask = masking.random_dropout_patches(
+            coords3d[:, :2], slice_ids, seed=seed, **masking_cfg.params
+        )
+    elif strategy == "sparse_spot_dropout":
+        context_mask, query_mask = masking.sparse_spot_dropout(
+            coords3d[:, :2], slice_ids, seed=seed, **masking_cfg.params
+        )
+    elif strategy == "mixed_dropout":
+        # combines contiguous varied-shape holes + sparse dropout in one
+        # draw (2026-07-16, "better masks" follow-up) — see
+        # masking.mixed_dropout's own docstring
+        context_mask, query_mask = masking.mixed_dropout(
             coords3d[:, :2], slice_ids, seed=seed, **masking_cfg.params
         )
     else:

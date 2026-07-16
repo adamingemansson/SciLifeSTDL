@@ -1,0 +1,77 @@
+# Same as exp_hest1k_fm_ot_stpath_bothresidual.yaml (this project's
+# current best-performing arm, PCC 0.3694 / see that config's header for
+# the full derivation) but trained AND evaluated against mixed_dropout
+# masking (2026-07-16, "better masks" — item 3 of the overnight plan)
+# instead of plain circular random_dropout_patches: contiguous holes of
+# randomly varied shape (circle/ellipse/irregular blob, shape="mixed")
+# PLUS scattered independent single-spot dropout, unioned into one query
+# set — see src/data/masking.py mixed_dropout's docstring.
+#
+# Purpose: check whether this model's real advantage (best PCC/RMSE/AUC
+# among the Route-B residual arms) holds up under masking geometry it
+# never saw a matching shape for during any earlier comparison — every
+# prior config in this project used pure circular holes. A model that
+# overfit to "the context boundary is always a clean circle at some fixed
+# distance" would be expected to do WORSE here than on the plain-circle
+# eval despite training on the SAME geometry it's tested on (this config
+# trains AND evals on mixed_dropout, so it isn't a train/test-mismatch
+# question — it's whether irregular/scattered gaps are simply harder to
+# interpolate across, independent of any shape-specific shortcut).
+#
+# Direct comparison target: exp_hest1k_fm_ot_stpath_bothresidual.yaml
+# itself (identical model config, only masking.strategy/params differ).
+
+experiment_name: fm_ot_hest1k_pilot_stpath_bothresidual_mixedmask
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: mixed_dropout
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+    sparse_fraction: 0.02
+    shape: mixed
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: stpath
+    stpath_gene_voc_path: ${oc.env:STPATH_GENE_VOC_PATH}
+    stpath_model_weight_path: ${oc.env:STPATH_MODEL_WEIGHT_PATH}
+    stpath_organ_type: Kidney      # INT1 is ccRCC (renal cell carcinoma)
+    stpath_tech_type: Visium
+    stpath_new_gene_encoder_type: both
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_fm_ot_stpath.yaml
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 10000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab
