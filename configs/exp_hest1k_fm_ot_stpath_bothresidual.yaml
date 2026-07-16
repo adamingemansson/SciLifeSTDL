@@ -1,13 +1,26 @@
 # Route B combined arm (2026-07-16): STPath's REAL pretrained fusion +
 # BOTH new gene-expression signals (MLPGeneEncoder + frozen pretrained
-# Novae, summed via CombinedGeneEncoder) injected as one residual — see
+# Novae, combined via CombinedGeneEncoder) injected as one residual — see
 # src/models/conditioning.py CombinedGeneEncoder and
 # src/models/stpath_encoder.py's new_gene_encoder_type="both" branch.
 #
-# Motivated by the real 3-way result (2026-07-16): MLP residual alone beat
-# both the STPath baseline and the Novae residual on 5/6 metrics (PCC
-# 0.4291 vs 0.3961 vs 0.3904; ST-FID 2.86 vs 5.00 vs 4.31), but Novae
-# residual alone was the ONLY arm to meaningfully improve cell-type
+# UPDATED 2026-07-16 (real architecture fix, retrain needed — old
+# checkpoints under this experiment_name are now INCOMPATIBLE, different
+# residual_proj input width): CombinedGeneEncoder now uses
+# combine_mode="concat" here, not the original "sum". Real result that
+# motivated the fix: the first (sum-mode) run of this exact config came
+# back WORSE than MLP-alone on PCC/RMSE/AUC (0.3694 vs 0.4291) despite
+# genuinely better ST-FID/ST-MMD — traced to summing MLP+Novae into one
+# vector BEFORE the zero-init residual_proj sees it, which mathematically
+# cannot let residual_proj weight the two sources independently (a Linear
+# layer applied to a+b is not the same as independently-weighted a and
+# b). Concatenation keeps both sources separate going into residual_proj,
+# so it actually can learn to weight them differently.
+#
+# Motivated by the earlier 3-way result (2026-07-16): MLP residual alone
+# beat both the STPath baseline and the Novae residual on 5/6 metrics
+# (PCC 0.4291 vs 0.3961 vs 0.3904; ST-FID 2.86 vs 5.00 vs 4.31), but
+# Novae residual alone was the ONLY arm to meaningfully improve cell-type
 # plausibility (0.4762 vs 0.3333 vs 0.2381) — this config tests whether
 # those two gains are complementary (additive, since MLP's signal is
 # task-trained-from-scratch while Novae's is pretrained-for-a-different-

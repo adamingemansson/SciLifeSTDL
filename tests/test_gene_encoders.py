@@ -71,7 +71,22 @@ def test_combined_gene_encoder():
     # the combined output since novae's contribution is nonzero
     mlp_only = encoder.mlp(raw_expr)
     assert not torch.allclose(out, mlp_only), "novae contribution appears to be zero/ignored"
-    print(f"[CombinedGeneEncoder] OK — output shape {tuple(out.shape)}, both sub-encoders contribute")
+    assert encoder.output_dim_multiplier == 1
+    print(f"[CombinedGeneEncoder sum] OK — output shape {tuple(out.shape)}, both sub-encoders contribute")
+
+    # concat mode (2026-07-16 fix): output must be 2*feat_dim, with the
+    # first half exactly equal to the MLP-alone output and the second
+    # half exactly equal to the Novae-alone output — concatenation, not
+    # a mix — this is the real property that makes a downstream Linear
+    # able to weight the two sources independently, unlike sum mode.
+    concat_encoder = CombinedGeneEncoder(n_genes, novae_dim, feat_dim, combine_mode="concat")
+    concat_out = concat_encoder(raw_expr, novae_features)
+    assert concat_out.shape == (n, 2 * feat_dim), concat_out.shape
+    assert concat_encoder.output_dim_multiplier == 2
+    assert torch.allclose(concat_out[:, :feat_dim], concat_encoder.mlp(raw_expr))
+    assert torch.allclose(concat_out[:, feat_dim:], concat_encoder.novae(novae_features))
+    print(f"[CombinedGeneEncoder concat] OK — output shape {tuple(concat_out.shape)}, "
+          f"sources kept genuinely separate")
 
 
 def test_spatial_context_encoder_gene_encoder_types():

@@ -134,12 +134,21 @@ class _ResidualEncodeInputs(nn.Module):
     call (a side-channel, not a forward() parameter) because STPath's own
     `STFM.inference`/`prediction_head` calls this module internally with a
     fixed signature we don't control — see STPathContextEncoder.forward()
-    for where it's actually set."""
+    for where it's actually set.
 
-    def __init__(self, original: nn.Module, d_model: int):
+    extra_embed_dim (2026-07-16, real bug fix): the INPUT width
+    residual_proj expects — defaults to d_model (matches a single
+    MLPGeneEncoder/NovaeGeneEncoder's output), but must be set to
+    2*d_model when new_gene_encoder is a CombinedGeneEncoder in
+    combine_mode="concat" (see that class's own docstring for the real
+    result this fixes: summing MLP+Novae before this layer denied it any
+    ability to weight the two sources independently — concatenation
+    keeps them separate so residual_proj actually can)."""
+
+    def __init__(self, original: nn.Module, d_model: int, extra_embed_dim: int | None = None):
         super().__init__()
         self.original = original
-        self.residual_proj = nn.Linear(d_model, d_model)
+        self.residual_proj = nn.Linear(extra_embed_dim or d_model, d_model)
         nn.init.zeros_(self.residual_proj.weight)
         nn.init.zeros_(self.residual_proj.bias)
         self._extra_embed: torch.Tensor | None = None
@@ -248,10 +257,25 @@ class STPathContextEncoder(nn.Module):
             )
             if new_gene_encoder_type == "novae":
                 self.new_gene_encoder = NovaeGeneEncoder(novae_dim, self.d_model)
-            else:  # "both" — 2026-07-16, see CombinedGeneEncoder's own docstring
-                self.new_gene_encoder = CombinedGeneEncoder(len(gene_names), novae_dim, self.d_model)
+            else:  # "both" — 2026-07-16, see CombinedGeneEncoder's own docstring.
+                # combine_mode="concat" (not the default "sum") is REQUIRED
+                # here specifically — this is exactly the caller
+                # CombinedGeneEncoder's own docstring describes as needing
+                # concat: residual_proj below applies a further learned
+                # linear layer on top, and only concat lets it weight the
+                # two sources independently (a real bug, confirmed by an
+                # actual run: sum-mode "both" was worse than MLP alone on
+                # PCC/RMSE/AUC).
+                self.new_gene_encoder = CombinedGeneEncoder(
+                    len(gene_names), novae_dim, self.d_model, combine_mode="concat"
+                )
         if self.new_gene_encoder is not None:
-            self.model.input_encoder = _ResidualEncodeInputs(self.model.input_encoder, self.d_model)
+            extra_embed_dim = self.d_model
+            if isinstance(self.new_gene_encoder, CombinedGeneEncoder):
+                extra_embed_dim = self.d_model * self.new_gene_encoder.output_dim_multiplier
+            self.model.input_encoder = _ResidualEncodeInputs(
+                self.model.input_encoder, self.d_model, extra_embed_dim=extra_embed_dim
+            )
 
         # Gigapath tile encoder (frozen) turns our raw H&E patches into the
         # 1536-dim features STPath's image tokenizer expects — shares the
@@ -383,7 +407,13 @@ class STPathContextEncoder(nn.Module):
             # query positions get zero extra signal, same treatment STPath's
             # own ge_tokens already give query positions (mask token, no
             # real expression) — only context rows carry real information.
-            extra_embed = torch.zeros(n_total, self.d_model, device=device)
+            # Width matches residual_proj's real input dim (d_model for
+            # mlp/novae alone, 2*d_model for "both" in concat mode — see
+            # __init__'s extra_embed_dim / CombinedGeneEncoder.output_dim_multiplier).
+            extra_embed_width = self.d_model
+            if isinstance(self.new_gene_encoder, CombinedGeneEncoder):
+                extra_embed_width = self.d_model * self.new_gene_encoder.output_dim_multiplier
+            extra_embed = torch.zeros(n_total, extra_embed_width, device=device)
             # log1p for numerical stability (matches STPath's own convention
             # for its ge_tokens above) — MUST use the FULL, unfiltered
             # context_expression (all our genes), not STPath's `expr` above

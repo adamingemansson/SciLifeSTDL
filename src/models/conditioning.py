@@ -445,33 +445,63 @@ class NovaeGeneEncoder(nn.Module):
 
 
 class CombinedGeneEncoder(nn.Module):
-    """Sums MLPGeneEncoder(raw_expr) + NovaeGeneEncoder(novae_features),
-    both already projecting to the same feat_dim — added 2026-07-16 after
-    the real STPath-residual comparison (task #19-followup "Route B")
-    showed MLP residual beating both the STPath baseline AND the Novae
-    residual on 5/6 metrics, while Novae residual alone was the only arm
-    to improve cell-type plausibility — motivating a combined arm to see
-    whether MLP's pointwise-accuracy gain and Novae's plausibility gain
-    are complementary (additive) or the same underlying signal.
+    """Combines MLPGeneEncoder(raw_expr) + NovaeGeneEncoder(novae_features),
+    both already projecting to feat_dim — added 2026-07-16 after the real
+    STPath-residual comparison (task #19-followup "Route B") showed MLP
+    residual beating both the STPath baseline AND the Novae residual on
+    5/6 metrics, while Novae residual alone was the only arm to improve
+    cell-type plausibility — motivating a combined arm to see whether
+    MLP's pointwise-accuracy gain and Novae's plausibility gain are
+    complementary or the same underlying signal.
 
-    Each sub-encoder keeps its own independent weights (not a shared
-    trunk) — same per-modality-own-weights reasoning used throughout this
-    file. A straight sum, not concatenation+projection: both
-    sub-encoders already end in their own Linear to feat_dim, so this
-    keeps the combined encoder's parameter count to just the two existing
-    encoders, no extra combiner layer — the caller (STPathContextEncoder's
-    _ResidualEncodeInputs.residual_proj) already applies a further
-    zero-initialized Linear on top of whatever this returns, which can
-    itself learn to weight the two contributions differently if a plain
-    sum isn't optimal."""
+    combine_mode="sum" (default): straight elementwise sum, output stays
+    feat_dim — no extra combiner layer, cheapest option. Used by
+    StormLiteContextEncoder's additive token fusion (matches STPath's own
+    verified img_embed + ge_embed + ... pattern there).
 
-    def __init__(self, n_genes: int, novae_dim: int, feat_dim: int):
+    combine_mode="concat": output is 2*feat_dim (both sub-encoders' raw
+    outputs kept separate, not pre-mixed) — REQUIRED when the caller
+    itself applies a further learned linear layer on the combined output
+    and wants that layer able to weight each source independently.
+    Real bug this fixes (2026-07-16): this class's own earlier docstring
+    claimed STPathContextEncoder's zero-init residual_proj (a Linear
+    applied AFTER this class's output) "can learn to weight the two
+    contributions differently if a plain sum isn't optimal" — false. Once
+    two vectors are summed into one, a linear layer applied to the SUM
+    cannot recover or separately reweight what went into it (a Linear
+    layer applied to (a+b) is mathematically NOT equivalent in general to
+    independently-weighted a and b — that would require seeing a and b
+    as separate inputs). Confirmed by a real run: the combined ("both",
+    sum-mode) residual was WORSE than MLP alone on PCC/RMSE/AUC despite
+    Novae residual alone being fine on those axes — consistent with the
+    optimizer being forced into a single compromise weighting of the
+    pre-mixed sum rather than freely calibrating each source. Use
+    combine_mode="concat" wherever the caller needs genuine independent
+    weighting; sum is still fine (and cheaper) wherever the caller has no
+    further learned layer to exploit the distinction, e.g. StormLite's
+    additive token fusion above."""
+
+    def __init__(self, n_genes: int, novae_dim: int, feat_dim: int, combine_mode: str = "sum"):
         super().__init__()
+        assert combine_mode in ("sum", "concat"), f"unknown combine_mode {combine_mode!r}"
+        self.combine_mode = combine_mode
         self.mlp = MLPGeneEncoder(n_genes, feat_dim)
         self.novae = NovaeGeneEncoder(novae_dim, feat_dim)
 
+    @property
+    def output_dim_multiplier(self) -> int:
+        """1 for "sum" (output is feat_dim), 2 for "concat" (output is
+        2*feat_dim) — callers that need to size a downstream layer (e.g.
+        STPathContextEncoder's residual_proj) read this rather than
+        hardcoding the multiplier themselves."""
+        return 2 if self.combine_mode == "concat" else 1
+
     def forward(self, raw_expr: torch.Tensor, novae_features: torch.Tensor) -> torch.Tensor:
-        return self.mlp(raw_expr) + self.novae(novae_features)
+        mlp_out = self.mlp(raw_expr)
+        novae_out = self.novae(novae_features)
+        if self.combine_mode == "concat":
+            return torch.cat([mlp_out, novae_out], dim=-1)
+        return mlp_out + novae_out
 
 
 class SpatialContextEncoder(nn.Module):
