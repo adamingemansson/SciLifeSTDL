@@ -440,6 +440,12 @@ def _build_shared_eval(cfg, adata, coords3d, expr, slice_ids, images,
 def main(model_config_paths: list[str], k_neighborhood: int = 8, pca_components: int = 10,
          overrides: list[str] | None = None, skip_training: bool = False,
          shuffle_diagnostic: bool = False):
+    # 2026-07-16: same reasoning as train.py's main() — free Tensor Core
+    # speedup on Ampere+ GPUs, set once here rather than per-config inside
+    # _train_model (it's a process-wide torch setting, not per-model).
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+
     rows = []
     shuffle_rows = []
     interp_row = None

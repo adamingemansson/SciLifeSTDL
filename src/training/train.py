@@ -647,6 +647,14 @@ def main(cfg_path: str, overrides: list[str] | None = None):
         # training on each)
         cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
     torch.manual_seed(cfg.training.seed)
+    # 2026-07-16: free speedup on Ampere+ GPUs (A100 etc, Tensor Cores) -
+    # PyTorch defaults FP32 matmuls to full precision even where TF32
+    # would do, leaving Tensor Core throughput on the table. "high"
+    # (TF32) is the standard/recommended default for training - real,
+    # negligible-in-practice precision cost, meaningful speedup. No-op on
+    # MPS/CPU (the setting only affects CUDA matmuls).
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
 
     adata, coords3d, expr, slice_ids, images = _load_data(cfg)
 
