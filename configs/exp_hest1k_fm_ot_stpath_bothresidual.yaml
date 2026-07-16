@@ -1,0 +1,80 @@
+# Route B combined arm (2026-07-16): STPath's REAL pretrained fusion +
+# BOTH new gene-expression signals (MLPGeneEncoder + frozen pretrained
+# Novae, summed via CombinedGeneEncoder) injected as one residual — see
+# src/models/conditioning.py CombinedGeneEncoder and
+# src/models/stpath_encoder.py's new_gene_encoder_type="both" branch.
+#
+# Motivated by the real 3-way result (2026-07-16): MLP residual alone beat
+# both the STPath baseline and the Novae residual on 5/6 metrics (PCC
+# 0.4291 vs 0.3961 vs 0.3904; ST-FID 2.86 vs 5.00 vs 4.31), but Novae
+# residual alone was the ONLY arm to meaningfully improve cell-type
+# plausibility (0.4762 vs 0.3333 vs 0.2381) — this config tests whether
+# those two gains are complementary (additive, since MLP's signal is
+# task-trained-from-scratch while Novae's is pretrained-for-a-different-
+# objective) or the same underlying signal duplicated.
+#
+# Direct comparison targets: configs/exp_hest1k_fm_ot_stpath.yaml
+# (baseline), exp_hest1k_fm_ot_stpath_novaeresidual.yaml,
+# exp_hest1k_fm_ot_stpath_mlpresidual.yaml — same everything else.
+#
+# Requires `pip install novae` (Python >=3.11) — see
+# src/models/conditioning.py precompute_novae_features docstring for
+# setup/verification caveats.
+
+experiment_name: fm_ot_hest1k_pilot_stpath_bothresidual
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: stpath
+    stpath_gene_voc_path: ${oc.env:STPATH_GENE_VOC_PATH}
+    stpath_model_weight_path: ${oc.env:STPATH_MODEL_WEIGHT_PATH}
+    stpath_organ_type: Kidney      # INT1 is ccRCC (renal cell carcinoma)
+    stpath_tech_type: Visium
+    stpath_new_gene_encoder_type: both   # 2026-07-16: combined MLP+Novae residual (see header)
+    # stpath_novae_dim is NOT set here — auto-injected from the real
+    # precomputed Novae features' shape (see train.py
+    # inject_stpath_novae_dim / get_novae_features)
+    # stpath_gene_names auto-derived from the loaded AnnData at load time
+    # (train.py/run_comparison.py inject_stpath_gene_names) - do not set here
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_fm_ot_stpath.yaml
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 10000                  # same as exp_hest1k_fm_ot_stpath.yaml - fair comparison
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

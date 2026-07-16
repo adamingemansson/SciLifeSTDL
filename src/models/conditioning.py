@@ -444,6 +444,36 @@ class NovaeGeneEncoder(nn.Module):
         return self.proj(self.embedding_norm(novae_features))
 
 
+class CombinedGeneEncoder(nn.Module):
+    """Sums MLPGeneEncoder(raw_expr) + NovaeGeneEncoder(novae_features),
+    both already projecting to the same feat_dim — added 2026-07-16 after
+    the real STPath-residual comparison (task #19-followup "Route B")
+    showed MLP residual beating both the STPath baseline AND the Novae
+    residual on 5/6 metrics, while Novae residual alone was the only arm
+    to improve cell-type plausibility — motivating a combined arm to see
+    whether MLP's pointwise-accuracy gain and Novae's plausibility gain
+    are complementary (additive) or the same underlying signal.
+
+    Each sub-encoder keeps its own independent weights (not a shared
+    trunk) — same per-modality-own-weights reasoning used throughout this
+    file. A straight sum, not concatenation+projection: both
+    sub-encoders already end in their own Linear to feat_dim, so this
+    keeps the combined encoder's parameter count to just the two existing
+    encoders, no extra combiner layer — the caller (STPathContextEncoder's
+    _ResidualEncodeInputs.residual_proj) already applies a further
+    zero-initialized Linear on top of whatever this returns, which can
+    itself learn to weight the two contributions differently if a plain
+    sum isn't optimal."""
+
+    def __init__(self, n_genes: int, novae_dim: int, feat_dim: int):
+        super().__init__()
+        self.mlp = MLPGeneEncoder(n_genes, feat_dim)
+        self.novae = NovaeGeneEncoder(novae_dim, feat_dim)
+
+    def forward(self, raw_expr: torch.Tensor, novae_features: torch.Tensor) -> torch.Tensor:
+        return self.mlp(raw_expr) + self.novae(novae_features)
+
+
 class SpatialContextEncoder(nn.Module):
     """
     context (coords [N_obs, D], expression [N_obs, G]) + query coords

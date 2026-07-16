@@ -133,7 +133,7 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
     if train_model_params.get("gene_encoder_type") == "novae":
         context_gene_features = get_novae_features(cfg, adata)
     elif (train_model_params.get("context_encoder_type") == "stpath"
-          and train_model_params.get("stpath_new_gene_encoder_type") == "novae"):
+          and train_model_params.get("stpath_new_gene_encoder_type") in ("novae", "both")):
         context_novae_features = get_novae_features(cfg, adata)
 
     # .get() with the same default every real config's own YAML comment
@@ -266,9 +266,9 @@ def _stpath_novae_features_for_model(model_params: dict, shared_eval: dict):
     stpath_new_gene_encoder_type — see _build_masked_item's
     context_novae_features docstring in train.py for the full reasoning).
     Returns None unless this model is context_encoder_type="stpath" with
-    stpath_new_gene_encoder_type="novae"."""
+    stpath_new_gene_encoder_type in ("novae", "both")."""
     if (model_params.get("context_encoder_type") == "stpath"
-            and model_params.get("stpath_new_gene_encoder_type") == "novae"):
+            and model_params.get("stpath_new_gene_encoder_type") in ("novae", "both")):
         return shared_eval["novae_features"]
     return None
 
@@ -407,7 +407,7 @@ def _any_config_uses_novae(model_config_paths: list[str], overrides: list[str] |
         params = cfg.model.get("params", {})
         if (params.get("gene_encoder_type") == "novae"
                 or (params.get("context_encoder_type") == "stpath"
-                    and params.get("stpath_new_gene_encoder_type") == "novae")):
+                    and params.get("stpath_new_gene_encoder_type") in ("novae", "both"))):
             return True
     return False
 

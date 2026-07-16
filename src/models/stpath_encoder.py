@@ -92,7 +92,7 @@ import torch.nn as nn
 
 from src.models.conditioning import (
     _load_gigapath_tile_encoder, _gigapath_preprocess_and_encode,
-    MLPGeneEncoder, NovaeGeneEncoder,
+    MLPGeneEncoder, NovaeGeneEncoder, CombinedGeneEncoder,
 )
 
 
@@ -161,9 +161,10 @@ class STPathContextEncoder(nn.Module):
                  hidden_dim: int = 256, device: str = "cpu",
                  new_gene_encoder_type: str = "none", novae_dim: int | None = None):
         super().__init__()
-        assert new_gene_encoder_type in ("none", "mlp", "novae"), (
+        assert new_gene_encoder_type in ("none", "mlp", "novae", "both"), (
             f"unknown new_gene_encoder_type {new_gene_encoder_type!r}"
         )
+        self.new_gene_encoder_type = new_gene_encoder_type
         from stpath.model.model import STFM
         from stpath.model.nn_utils.config import ModelConfig
         from stpath.tokenization import (
@@ -218,12 +219,15 @@ class STPathContextEncoder(nn.Module):
         self.new_gene_encoder = None
         if new_gene_encoder_type == "mlp":
             self.new_gene_encoder = MLPGeneEncoder(len(gene_names), self.d_model)
-        elif new_gene_encoder_type == "novae":
+        elif new_gene_encoder_type in ("novae", "both"):
             assert novae_dim is not None, (
-                "new_gene_encoder_type='novae' requires novae_dim (see "
-                "precompute_novae_features()'s real output shape)"
+                f"new_gene_encoder_type={new_gene_encoder_type!r} requires novae_dim "
+                f"(see precompute_novae_features()'s real output shape)"
             )
-            self.new_gene_encoder = NovaeGeneEncoder(novae_dim, self.d_model)
+            if new_gene_encoder_type == "novae":
+                self.new_gene_encoder = NovaeGeneEncoder(novae_dim, self.d_model)
+            else:  # "both" — 2026-07-16, see CombinedGeneEncoder's own docstring
+                self.new_gene_encoder = CombinedGeneEncoder(len(gene_names), novae_dim, self.d_model)
         if self.new_gene_encoder is not None:
             self.model.input_encoder = _ResidualEncodeInputs(self.model.input_encoder, self.d_model)
 
@@ -358,20 +362,28 @@ class STPathContextEncoder(nn.Module):
             # own ge_tokens already give query positions (mask token, no
             # real expression) — only context rows carry real information.
             extra_embed = torch.zeros(n_total, self.d_model, device=device)
-            if isinstance(self.new_gene_encoder, MLPGeneEncoder):
-                # log1p for numerical stability (matches STPath's own
-                # convention for its ge_tokens above) — MUST use the FULL,
-                # unfiltered context_expression (all our genes), not
-                # STPath's `expr` above (that one's already restricted to
-                # _valid_gene_pos, a different width than what
-                # MLPGeneEncoder was constructed for: len(gene_names)).
+            # log1p for numerical stability (matches STPath's own convention
+            # for its ge_tokens above) — MUST use the FULL, unfiltered
+            # context_expression (all our genes), not STPath's `expr` above
+            # (that one's already restricted to _valid_gene_pos, a different
+            # width than what MLPGeneEncoder/CombinedGeneEncoder were
+            # constructed for: len(gene_names)). Branches on the stored type
+            # string, not isinstance, so "both" (CombinedGeneEncoder, needing
+            # BOTH inputs at once) fits the same dispatch cleanly.
+            if self.new_gene_encoder_type == "mlp":
                 mlp_input = torch.log1p(context_expression)
                 extra_embed[:n_context] = self.new_gene_encoder(mlp_input)
-            else:  # NovaeGeneEncoder
+            elif self.new_gene_encoder_type == "novae":
                 assert context_novae_features is not None, (
                     "new_gene_encoder_type='novae' requires context_novae_features"
                 )
                 extra_embed[:n_context] = self.new_gene_encoder(context_novae_features)
+            else:  # "both" — CombinedGeneEncoder(raw_expr, novae_features)
+                assert context_novae_features is not None, (
+                    "new_gene_encoder_type='both' requires context_novae_features"
+                )
+                mlp_input = torch.log1p(context_expression)
+                extra_embed[:n_context] = self.new_gene_encoder(mlp_input, context_novae_features)
             self.model.input_encoder.set_extra_embed(extra_embed)
             # NO torch.no_grad() here — see forward()'s own docstring for
             # why: gradient must flow through the frozen layers to reach

@@ -526,7 +526,7 @@ def inject_stpath_novae_dim(model_cfg: dict, novae_dim: int) -> None:
     docstring)."""
     params = model_cfg.get("params", {})
     if (params.get("context_encoder_type") == "stpath"
-            and params.get("stpath_new_gene_encoder_type") == "novae"
+            and params.get("stpath_new_gene_encoder_type") in ("novae", "both")
             and "stpath_novae_dim" not in params):
         params["stpath_novae_dim"] = novae_dim
 
@@ -713,7 +713,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     if model_params.get("gene_encoder_type") == "novae":
         context_gene_features = get_novae_features(cfg, adata)
     elif (model_params.get("context_encoder_type") == "stpath"
-          and model_params.get("stpath_new_gene_encoder_type") == "novae"):
+          and model_params.get("stpath_new_gene_encoder_type") in ("novae", "both")):
         context_novae_features = get_novae_features(cfg, adata)
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)

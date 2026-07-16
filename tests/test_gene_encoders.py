@@ -18,7 +18,9 @@ Run with:
 import numpy as np
 import torch
 
-from src.models.conditioning import MLPGeneEncoder, NovaeGeneEncoder, SpatialContextEncoder
+from src.models.conditioning import (
+    MLPGeneEncoder, NovaeGeneEncoder, CombinedGeneEncoder, SpatialContextEncoder,
+)
 
 
 def test_mlp_gene_encoder():
@@ -53,6 +55,23 @@ def test_novae_gene_encoder():
         raised = True
     assert raised, "NovaeGeneEncoder must reject non-2D input, not silently misuse it"
     print("[NovaeGeneEncoder] OK — output shape correct, rejects malformed input")
+
+
+def test_combined_gene_encoder():
+    torch.manual_seed(0)
+    n, n_genes, novae_dim, feat_dim = 6, 20, 64, 8
+    encoder = CombinedGeneEncoder(n_genes, novae_dim, feat_dim)
+    raw_expr = torch.rand(n, n_genes)
+    novae_features = torch.rand(n, novae_dim)
+    out = encoder(raw_expr, novae_features)
+    assert out.shape == (n, feat_dim), out.shape
+    assert torch.isfinite(out).all()
+    # real check that BOTH sub-encoders actually contribute, not just one
+    # silently dominating/zeroing the other — mlp_only should differ from
+    # the combined output since novae's contribution is nonzero
+    mlp_only = encoder.mlp(raw_expr)
+    assert not torch.allclose(out, mlp_only), "novae contribution appears to be zero/ignored"
+    print(f"[CombinedGeneEncoder] OK — output shape {tuple(out.shape)}, both sub-encoders contribute")
 
 
 def test_spatial_context_encoder_gene_encoder_types():
@@ -130,6 +149,7 @@ def test_precompute_novae_features():
 if __name__ == "__main__":
     test_mlp_gene_encoder()
     test_novae_gene_encoder()
+    test_combined_gene_encoder()
     test_spatial_context_encoder_gene_encoder_types()
     test_precompute_novae_features()
     print("\nAll gene-encoder smoke tests done (see above for SKIPPED vs OK).")
