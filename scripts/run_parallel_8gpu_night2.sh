@@ -64,5 +64,5 @@ echo "Quick summary (last comparison table line per job):"
 for cfg in "${CONFIGS[@]}"; do
     name=$(basename "$cfg" .yaml)
     echo "--- $name ---"
-    grep -A2 "^model " "logs/parallel_run_night2/${name}.log" | tail -2
+    grep -m1 -A2 "^model " "logs/parallel_run_night2/${name}.log" | tail -2
 done
