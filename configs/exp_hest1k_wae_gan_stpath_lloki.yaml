@@ -41,7 +41,13 @@ model:
     stpath_organ_type: Kidney      # INT1 is ccRCC (renal cell carcinoma)
     stpath_tech_type: Visium
     decoder_type: lloki             # 2026-07-17: see header
-    tech_vocab: ["Visium"]          # required by LLOKIStyleDecoder
+    # 2026-07-17 fix: load_adata never passes organ/tech into
+    # load_hest_sample for single-sample configs, so adata.obs["tech"] is
+    # always the literal string "unknown" here, not "Visium" — see
+    # loaders.load_hest_sample's own organ/tech default handling. Real,
+    # not a workaround: LLOKIStyleDecoder can only condition on values
+    # that actually appear, and this is the one that does.
+    tech_vocab: ["unknown"]
     decoder_lloki_tech_embed_dim: 10
     decoder_lloki_hidden_dims: [512, 256, 128]  # LLOKI-CAE's real published shape
     n_genes: 16570                # INT1 after QC, same as exp_hest1k_wae_gan_stpath.yaml
