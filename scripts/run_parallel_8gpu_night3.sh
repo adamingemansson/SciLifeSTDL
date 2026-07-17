@@ -30,18 +30,26 @@
 #    directly within the same run's output.
 #
 # Usage: bash scripts/run_parallel_8gpu_night3.sh
-# Logs: logs/parallel_run_night3/<name>.log
+# Logs: logs/parallel_run_night3_<epochs>ep/<name>.log — the directory
+# name includes EPOCHS (2026-07-17) so re-running at a different epoch
+# count (e.g. investigating the training-length-dependent instability
+# found on 2026-07-17 — the bothresidual reference anchor scored 0.4717
+# @ 40000 epochs, 0.3694 @ 10000, but only 0.0364 @ 20000, non-monotonic
+# and unexplained by any code change traced so far) gets its OWN log
+# directory instead of either colliding with the resume/skip logic below
+# or silently overwriting a previous epoch count's results that are
+# still useful to keep for comparison.
 #
-# Resumable (2026-07-17): safe to re-run after an interrupted invocation
-# (lost connection, killed job, etc.) — a config is SKIPPED if its log
-# already contains the final "model ..." metrics table line (proof
-# run_comparison.py reached the end successfully), and (re-)RUN, from
-# scratch, otherwise (covers both "never started" and "started but got
-# cut off mid-training" — there's no partial-checkpoint resume in this
-# codebase, so an interrupted job's only real option is a clean restart,
-# which just means letting its log file get overwritten). To force a
-# specific config to rerun even though it already completed, delete its
-# log file first: rm logs/parallel_run_night3/<name>.log
+# Resumable: safe to re-run after an interrupted invocation (lost
+# connection, killed job, etc.) — a config is SKIPPED if its log (for
+# THIS EPOCHS value) already contains the final "model ..." metrics
+# table line (proof run_comparison.py reached the end successfully), and
+# (re-)RUN, from scratch, otherwise (covers both "never started" and
+# "started but got cut off mid-training" — there's no partial-checkpoint
+# resume in this codebase, so an interrupted job's only real option is a
+# clean restart, which just means letting its log file get overwritten).
+# To force a specific config to rerun even though it already completed
+# at this epoch count, delete its log file first.
 
 set -u
 
@@ -53,9 +61,10 @@ CONFIGS=(
     "configs/exp_hest1k_fm_ot_stormlite_mlp.yaml"
     "configs/exp_hest1k_fm_ot_stormlite_novae.yaml"
     "configs/exp_hest1k_fm_ot_stormlite_both.yaml"
-    "configs/exp_hest1k_fm_ot_stpath_bothresidual.yaml"   # PRETRAINED reference anchor (current best result, PCC 0.4717 at 40000 epochs) — direct comparison point for every unfrozen/StormLite arm above in the same run
+    "configs/exp_hest1k_fm_ot_stpath_bothresidual.yaml"   # PRETRAINED reference anchor — known-good result at THIS epoch count (0.3694 @ 10000, 0.4717 @ 40000) is the trust check for the whole run
 )
-EPOCHS=20000
+EPOCHS=10000
+LOG_DIR="logs/parallel_run_night3_${EPOCHS}ep"
 EXTRA_ARGS="--shuffle-diagnostic"
 
 N_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
@@ -68,13 +77,13 @@ if [ "${#CONFIGS[@]}" -gt "$N_GPUS" ]; then
     exit 1
 fi
 
-mkdir -p logs/parallel_run_night3
-echo "Launching ${#CONFIGS[@]} jobs across GPUs 0-$((${#CONFIGS[@]}-1)), ${THREADS_PER_JOB} CPU threads each..."
+mkdir -p "$LOG_DIR"
+echo "Launching ${#CONFIGS[@]} jobs across GPUs 0-$((${#CONFIGS[@]}-1)), ${THREADS_PER_JOB} CPU threads each, logs in $LOG_DIR..."
 
 for i in "${!CONFIGS[@]}"; do
     cfg="${CONFIGS[$i]}"
     name=$(basename "$cfg" .yaml)
-    logfile="logs/parallel_run_night3/${name}.log"
+    logfile="$LOG_DIR/${name}.log"
     if [ -f "$logfile" ] && grep -q "^model " "$logfile"; then
         echo "  GPU $i: $cfg -> SKIPPING, already completed (see $logfile)"
         continue
@@ -92,10 +101,10 @@ done
 n_launched=$(jobs -p | wc -l)
 echo "$n_launched job(s) launched (PIDs: $(jobs -p | tr '\n' ' ')), $((${#CONFIGS[@]} - n_launched)) skipped as already-completed. Waiting for completion..."
 wait
-echo "All jobs finished. Check logs/parallel_run_night3/*.log for each model's table."
+echo "All jobs finished. Check $LOG_DIR/*.log for each model's table."
 echo "Quick summary (last comparison table line per job):"
 for cfg in "${CONFIGS[@]}"; do
     name=$(basename "$cfg" .yaml)
     echo "--- $name ---"
-    grep -A2 "^model " "logs/parallel_run_night3/${name}.log" | tail -2
+    grep -A2 "^model " "$LOG_DIR/${name}.log" | tail -2
 done
