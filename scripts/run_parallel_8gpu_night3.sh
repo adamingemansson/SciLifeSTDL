@@ -31,6 +31,17 @@
 #
 # Usage: bash scripts/run_parallel_8gpu_night3.sh
 # Logs: logs/parallel_run_night3/<name>.log
+#
+# Resumable (2026-07-17): safe to re-run after an interrupted invocation
+# (lost connection, killed job, etc.) — a config is SKIPPED if its log
+# already contains the final "model ..." metrics table line (proof
+# run_comparison.py reached the end successfully), and (re-)RUN, from
+# scratch, otherwise (covers both "never started" and "started but got
+# cut off mid-training" — there's no partial-checkpoint resume in this
+# codebase, so an interrupted job's only real option is a clean restart,
+# which just means letting its log file get overwritten). To force a
+# specific config to rerun even though it already completed, delete its
+# log file first: rm logs/parallel_run_night3/<name>.log
 
 set -u
 
@@ -64,6 +75,10 @@ for i in "${!CONFIGS[@]}"; do
     cfg="${CONFIGS[$i]}"
     name=$(basename "$cfg" .yaml)
     logfile="logs/parallel_run_night3/${name}.log"
+    if [ -f "$logfile" ] && grep -q "^model " "$logfile"; then
+        echo "  GPU $i: $cfg -> SKIPPING, already completed (see $logfile)"
+        continue
+    fi
     echo "  GPU $i: $cfg -> $logfile"
     CUDA_VISIBLE_DEVICES=$i \
     OMP_NUM_THREADS=$THREADS_PER_JOB \
@@ -74,7 +89,8 @@ for i in "${!CONFIGS[@]}"; do
         > "$logfile" 2>&1 &
 done
 
-echo "All ${#CONFIGS[@]} jobs launched (PIDs: $(jobs -p | tr '\n' ' ')). Waiting for completion..."
+n_launched=$(jobs -p | wc -l)
+echo "$n_launched job(s) launched (PIDs: $(jobs -p | tr '\n' ' ')), $((${#CONFIGS[@]} - n_launched)) skipped as already-completed. Waiting for completion..."
 wait
 echo "All jobs finished. Check logs/parallel_run_night3/*.log for each model's table."
 echo "Quick summary (last comparison table line per job):"
