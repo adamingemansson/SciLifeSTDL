@@ -573,8 +573,16 @@ def _atomic_savez(cache_path: Path, **arrays) -> None:
     ever observe a partially-written file. Doesn't eliminate the
     redundant computation across subprocesses (a separate, real but
     lower-severity waste — see get_novae_features/get_gigapath_features'
-    own docstrings), only the corruption risk."""
-    tmp_path = cache_path.with_suffix(cache_path.suffix + f".tmp{os.getpid()}")
+    own docstrings), only the corruption risk.
+
+    Real bug found 2026-07-17 (smoke test): np.savez SILENTLY APPENDS
+    ".npz" to any string/Path target that doesn't already end in ".npz"
+    (a well-known numpy gotcha). The original tmp_path here was
+    "INT2.npz.tmp<pid>" — doesn't end in ".npz", so numpy actually wrote
+    "INT2.npz.tmp<pid>.npz", and the os.replace() below then raised
+    FileNotFoundError looking for the path numpy never created. Fixed by
+    keeping ".npz" as the tmp path's actual suffix."""
+    tmp_path = cache_path.with_name(f"{cache_path.stem}.tmp{os.getpid()}.npz")
     np.savez(tmp_path, **arrays)
     os.replace(tmp_path, cache_path)  # atomic on POSIX — no reader ever sees a partial file
 
