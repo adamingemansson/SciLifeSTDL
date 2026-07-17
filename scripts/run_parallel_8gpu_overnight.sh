@@ -14,9 +14,15 @@
 #   1. mome_both_bigger @ 40000 epochs (single-sample) — 4 layers/8 heads/
 #      512-dim tokens instead of 2/4/256 (StormLite's capacity is much
 #      smaller than STPath's real architecture)
-#   2. mome_both_relpos @ 40000 epochs (single-sample) — relative_position
-#      bias instead of frame_averaging, first real test at MoME scale
-#      (every earlier bias_type sweep predates the MoME-FFN fix)
+#   2. mome_both_paneldecoder_add @ 40000 epochs (single-sample) — swapped
+#      in for bias_type (user request: at least one decoder-focused job
+#      tonight). PanelInvariantGeneDecoder, combine_mode="add" — already
+#      validated safe at 10k (PCC 0.2622, dense decoder got 0.2798 same
+#      epoch count) — tests whether that gap narrows or persists at 40k
+#      scale, same question the dense-vs-STPath comparison is already
+#      asking. NOT decoder_type="lloki" (confirmed NaN-collapse with
+#      gene_encoder_type="both" specifically, see docs/results_log.md —
+#      not safe for an unsupervised overnight run).
 #   3-6. the 4 multi-sample configs (StormLite mome_both/mome_novae,
 #      STPath bothresidual anchor, WAE-GAN novaeresidual), INT1-INT8,
 #      40000 epochs
@@ -50,12 +56,12 @@ set -u
 SINGLE_CONFIGS=(
     "configs/exp_hest1k_fm_ot_stormlite_mome_both.yaml"
     "configs/exp_hest1k_fm_ot_stormlite_mome_both_bigger.yaml"
-    "configs/exp_hest1k_fm_ot_stormlite_mome_both_relpos.yaml"
+    "configs/exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder_add.yaml"
 )
 SINGLE_EXTRA_OVERRIDES=(
     "training.epochs=80000 training.checkpoint_every_n_steps=10000"
     ""
-    ""
+    "training.epochs=40000 training.checkpoint_every_n_steps=10000"
 )
 MULTI_CONFIGS=(
     "configs/exp_multisample_fm_ot_stormlite_mome_both.yaml"
