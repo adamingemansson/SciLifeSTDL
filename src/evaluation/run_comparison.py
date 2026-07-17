@@ -211,11 +211,19 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
         # unaugmented so every model in a comparison run is scored against
         # the exact same query points — see this module's own shared-eval
         # comments).
+        # organ/tech (2026-07-17, real bug fix — see _build_shared_eval's
+        # own comment on this same fix for the full reasoning: these were
+        # NEVER populated anywhere in this file before, silently leaving
+        # context["tech"]/query["tech"] None for every training step of
+        # every config ever run through this script).
+        organ = str(adata.obs["organ"].iloc[0]) if "organ" in adata.obs else None
+        tech = str(adata.obs["tech"].iloc[0]) if "tech" in adata.obs else None
         dataset = MaskedContextQueryDataset(
             coords3d, expr, slice_ids, cfg.masking,
             n_items=cfg.training.epochs, base_seed=cfg.training.seed, images=images,
             context_gene_features=context_gene_features,
             context_novae_features=context_novae_features,
+            organ=organ, tech=tech,
             augment=cfg.training.get("augment_coords", False),
         )
         dataloader = make_dataloader(dataset, cfg)
@@ -333,6 +341,8 @@ def _evaluate(model, model_params: dict, shared_eval: dict) -> tuple:
             stpath_novae_features[context_mask], dtype=torch.float32
         )
     query = {"coords": torch.tensor(coords3d[query_mask], dtype=torch.float32)}
+    context["organ"], context["tech"] = shared_eval["organ"], shared_eval["tech"]
+    query["organ"], query["tech"] = shared_eval["organ"], shared_eval["tech"]
     images = _images_for_model(model_params, shared_eval)
     if images is not None:
         context["images"] = _images_tensor(images, context_mask)
@@ -402,6 +412,8 @@ def _evaluate_shuffled_images(model, model_params: dict, shared_eval: dict, seed
         "coords": torch.tensor(coords3d[query_mask], dtype=torch.float32),
         "images": query_images[perm],
     }
+    context["organ"], context["tech"] = shared_eval["organ"], shared_eval["tech"]
+    query["organ"], query["tech"] = shared_eval["organ"], shared_eval["tech"]
 
     with torch.no_grad():
         out = model.sample(context, query)
@@ -525,6 +537,19 @@ def _build_shared_eval(cfg, adata, coords3d, expr, slice_ids, images,
         "novae_features": novae_features,
         "clf": clf, "true_query_labels": true_query_labels,
         "pca": pca, "real_embed": real_embed, "query_k": query_k,
+        # 2026-07-17: real bug fix — organ/tech were NEVER populated
+        # anywhere in this file, meaning context["tech"]/query["tech"]
+        # were always None for every config ever run through this script,
+        # regardless of whether adata.obs actually had real values (HEST-1k
+        # samples always have "tech"="Visium"). Harmless for every
+        # existing consumer (OrganTechEmbedding is gated on organ_vocab/
+        # tech_vocab being set at construction, which no single-sample
+        # config here does) but a REAL crash for LLOKIStyleDecoder
+        # (decoder_type="lloki"), whose forward() requires a valid,
+        # non-None tech string — this is what actually broke it on real
+        # data (see docs/results_log.md's 2026-07-17 entry).
+        "organ": str(adata.obs["organ"].iloc[0]) if "organ" in adata.obs else None,
+        "tech": str(adata.obs["tech"].iloc[0]) if "tech" in adata.obs else None,
     }
 
 

@@ -384,20 +384,34 @@ class MultiSampleMaskedContextQueryDataset(Dataset):
     function's design: keep samples separate, never concatenate their
     coordinate spaces).
 
-    samples: list of (coords3d, expr, slice_ids, images, organ, tech) tuples,
-    one per already-loaded/QC'd/gene-aligned sample (see
-    src/data/loaders.py load_multi_sample for the loading half — it
-    returns a list of gene-aligned AnnData; callers derive these tuples
-    from that list the same way _load_data already does for one sample,
-    see load_multi_sample_data below). images is None throughout in the
-    current scaffolding — H&E/Gigapath/STPath support across multiple
-    samples is real follow-up work, not built here yet, since it adds real
-    extra complexity (per-sample Gigapath caching, image alignment) better
-    scoped once this base case (expression-only, multi-sample) is
-    validated. organ/tech (2026-07-16) are per-SAMPLE strings (or None),
-    fed straight into _build_masked_item so OrganTechEmbedding can
-    condition on which sample the current item's split was drawn from —
-    see that function's own organ/tech docstring."""
+    samples: list of (coords3d, expr, slice_ids, images, organ, tech,
+    context_gene_features, context_novae_features) tuples, one per
+    already-loaded/QC'd/gene-aligned sample (see src/data/loaders.py
+    load_multi_sample for the loading half — it returns a list of
+    gene-aligned AnnData; callers derive these tuples from that list the
+    same way _load_data already does for one sample, see
+    load_multi_sample_data below). organ/tech (2026-07-16) are per-SAMPLE
+    strings (or None), fed straight into _build_masked_item so
+    OrganTechEmbedding can condition on which sample the current item's
+    split was drawn from — see that function's own organ/tech docstring.
+
+    images/context_gene_features/context_novae_features (2026-07-17, real
+    gap closed — previously ALWAYS None/None/None here, meaning
+    StormLite/STPath/Novae literally could not be exercised through this
+    multi-sample path at all, only "builtin"/"storm_lite" with
+    gene_encoder_type="raw"/"mlp". Each is now the SAME per-sample
+    precomputed array _load_data/main()'s single-sample flow already
+    produces (see load_multi_sample_data below for how they're computed
+    per sample_ids entry) — meaning, exactly like everywhere else in this
+    codebase, images is EITHER raw uint8 patches (image_encoder_type=
+    "cnn") OR precomputed frozen Gigapath features
+    (image_encoder_type="gigapath"/context_encoder_type in
+    ("stpath", "storm_lite")), and context_gene_features/
+    context_novae_features follow _build_masked_item's own
+    replace-vs-additive distinction (see that function's own docstring) —
+    this class doesn't re-decide any of that, just carries whichever
+    arrays load_multi_sample_data already computed straight through to
+    _build_masked_item, per sample, per item."""
 
     def __init__(self, samples: list[tuple], masking_cfg, n_items: int, base_seed: int = 0,
                  augment: bool = False):
@@ -417,9 +431,14 @@ class MultiSampleMaskedContextQueryDataset(Dataset):
         # itself (seed + 1, passed to _build_masked_item) so the two
         # choices aren't spuriously correlated through a shared seed
         sample_idx = int(np.random.default_rng(seed).integers(len(self.samples)))
-        coords3d, expr, slice_ids, images, organ, tech = self.samples[sample_idx]
-        return _build_masked_item(coords3d, expr, slice_ids, self.masking_cfg, images, seed + 1,
-                                   organ=organ, tech=tech, augment=self.augment)
+        (coords3d, expr, slice_ids, images, organ, tech,
+         context_gene_features, context_novae_features) = self.samples[sample_idx]
+        return _build_masked_item(
+            coords3d, expr, slice_ids, self.masking_cfg, images, seed + 1,
+            context_gene_features=context_gene_features,
+            context_novae_features=context_novae_features,
+            organ=organ, tech=tech, augment=self.augment,
+        )
 
 
 def _collate_identity(batch_list):
@@ -499,15 +518,23 @@ def _atomic_savez(cache_path: Path, **arrays) -> None:
     os.replace(tmp_path, cache_path)  # atomic on POSIX — no reader ever sees a partial file
 
 
-def _gigapath_cache_path(cfg) -> Path:
+def _gigapath_cache_path(cfg, sample_id: str | None = None) -> Path:
     """Where precomputed Gigapath features for this sample get cached
     across runs (see _load_images) — next to the HEST-1k data itself so
     it's obvious it belongs to that sample, not somewhere in /tmp that
-    would silently vanish between sessions."""
-    return Path(cfg.data.hest_data_dir) / "gigapath_cache" / f"{cfg.data.sample_id}.npz"
+    would silently vanish between sessions.
+
+    sample_id (2026-07-17, multi-sample image/Novae support — see
+    load_multi_sample_data's own docstring for the real gap this closes):
+    explicit override for per-sample cache paths when iterating over
+    cfg.data.sample_ids. Defaults to cfg.data.sample_id, so every
+    single-sample call site's behavior is completely unchanged."""
+    sid = sample_id if sample_id is not None else cfg.data.sample_id
+    return Path(cfg.data.hest_data_dir) / "gigapath_cache" / f"{sid}.npz"
 
 
-def get_gigapath_features(cfg, patches: np.ndarray, barcodes: np.ndarray) -> np.ndarray:
+def get_gigapath_features(cfg, patches: np.ndarray, barcodes: np.ndarray,
+                           sample_id: str | None = None) -> np.ndarray:
     """Load cached Gigapath features for these patches (see
     _gigapath_cache_path) if available, else compute + cache them.
     Factored out of _load_images (2026-07-15) so
@@ -517,8 +544,10 @@ def get_gigapath_features(cfg, patches: np.ndarray, barcodes: np.ndarray) -> np.
     produce — see run_comparison.py's _build_shared_eval for why that
     was a real bug (raw patches fed into a Gigapath/STPath model at eval
     time forced an unbatched full-ViT forward pass over the whole eval
-    set at once, a real ~25GB RAM crash)."""
-    cache_path = _gigapath_cache_path(cfg)
+    set at once, a real ~25GB RAM crash).
+
+    sample_id: see _gigapath_cache_path's own docstring."""
+    cache_path = _gigapath_cache_path(cfg, sample_id=sample_id)
     if cache_path.exists():
         cached = np.load(cache_path)
         if np.array_equal(cached["barcodes"], barcodes):
@@ -538,15 +567,19 @@ def get_gigapath_features(cfg, patches: np.ndarray, barcodes: np.ndarray) -> np.
     return features
 
 
-def _novae_cache_path(cfg) -> Path:
+def _novae_cache_path(cfg, sample_id: str | None = None) -> Path:
     """Where precomputed Novae features for this sample get cached across
     runs — same reasoning as _gigapath_cache_path (Novae's forward pass
     over a whole sample is a real one-time cost worth not repeating on
-    every `python -m src.training.train` invocation)."""
-    return Path(cfg.data.hest_data_dir) / "novae_cache" / f"{cfg.data.sample_id}.npz"
+    every `python -m src.training.train` invocation).
+
+    sample_id: see _gigapath_cache_path's own docstring (same 2026-07-17
+    multi-sample follow-up, same "defaults to cfg.data.sample_id" contract)."""
+    sid = sample_id if sample_id is not None else cfg.data.sample_id
+    return Path(cfg.data.hest_data_dir) / "novae_cache" / f"{sid}.npz"
 
 
-def get_novae_features(cfg, adata) -> np.ndarray:
+def get_novae_features(cfg, adata, sample_id: str | None = None) -> np.ndarray:
     """Load cached Novae features for this adata (see _novae_cache_path)
     if available, else compute + cache them. Cache keyed on obs_names
     (not barcodes like Gigapath's cache, since this is called with the
@@ -555,8 +588,10 @@ def get_novae_features(cfg, adata) -> np.ndarray:
     rather than silently reused for a different spot set.
 
     Row order of the returned array matches adata.obs_names exactly —
-    callers must not reorder/subset adata after this without recomputing."""
-    cache_path = _novae_cache_path(cfg)
+    callers must not reorder/subset adata after this without recomputing.
+
+    sample_id: see _gigapath_cache_path's own docstring."""
+    cache_path = _novae_cache_path(cfg, sample_id=sample_id)
     obs_names = adata.obs_names.to_numpy()
     if cache_path.exists():
         cached = np.load(cache_path, allow_pickle=True)
@@ -626,7 +661,7 @@ def inject_stpath_novae_dim(model_cfg: dict, novae_dim: int) -> None:
         params["stpath_novae_dim"] = novae_dim
 
 
-def _load_images(cfg, adata):
+def _load_images(cfg, adata, sample_id: str | None = None):
     """Optional H&E patches (task #17) — only loaded when
     cfg.data.use_images is set, since every existing pilot config stays
     expression-only by default. Returns (adata, images): adata may come
@@ -634,6 +669,12 @@ def _load_images(cfg, adata):
     with no matching patch (a normal partial gap in HEST-1k's own patch
     extraction, not an error) — so callers must use the returned adata,
     not their original one, for everything downstream.
+
+    sample_id (2026-07-17, multi-sample image support — see
+    load_multi_sample_data's own docstring): explicit override so
+    load_multi_sample_data can call this once per sample_ids entry.
+    Defaults to cfg.data.sample_id, so every single-sample call site's
+    behavior (main()'s own _load_data) is completely unchanged.
 
     For image_encoder_type "gigapath" or context_encoder_type "stpath",
     images comes back as PRECOMPUTED Gigapath features [N, gigapath_dim]
@@ -664,7 +705,8 @@ def _load_images(cfg, adata):
     something (see this function's real fix below)."""
     if not cfg.data.get("use_images", False):
         return adata, None
-    patches, barcodes = loaders.load_hest_patches(cfg.data.hest_data_dir, cfg.data.sample_id)
+    sid = sample_id if sample_id is not None else cfg.data.sample_id
+    patches, barcodes = loaders.load_hest_patches(cfg.data.hest_data_dir, sid)
 
     model_params = cfg.model.get("params", {})
     uses_frozen_gigapath = (
@@ -672,7 +714,7 @@ def _load_images(cfg, adata):
         or model_params.get("context_encoder_type") in ("stpath", "storm_lite")
     )
     if uses_frozen_gigapath:
-        features = get_gigapath_features(cfg, patches, barcodes)
+        features = get_gigapath_features(cfg, patches, barcodes, sample_id=sid)
         adata, images = loaders.align_patches_to_adata(adata, features, barcodes)
     else:
         adata, images = loaders.align_patches_to_adata(adata, patches, barcodes)
@@ -741,29 +783,73 @@ def load_multi_sample_data(cfg) -> tuple[list[tuple], list]:
     loaders.load_multi_sample's organs/techs param — see that function's
     docstring for why these are caller-supplied, not auto-parsed).
 
-    Deliberately expression-only for now (images always None per
-    sample) — see MultiSampleMaskedContextQueryDataset's docstring for
-    why H&E support is scoped separately. Uses
-    loaders.load_multi_sample for the actual loading/QC/shared-gene-panel
-    alignment (not reimplemented here) — this function's only job is
-    converting that list of AnnData into the (coords3d, expr, slice_ids,
-    images, organ, tech) tuples MultiSampleMaskedContextQueryDataset
-    expects, the same conversion _load_data already does for the
-    single-sample case (minus organ/tech, which only exist in the
-    multi-sample path).
+    UPDATED 2026-07-17 (real gap closed — this function used to hardcode
+    images=None and never compute Novae features, meaning StormLite/
+    STPath/Novae literally could not be exercised through the multi-sample
+    path at all, only "builtin"/"storm_lite" with gene_encoder_type=
+    "raw"/"mlp" worked): now loads images (_load_images, per sample_id —
+    same real Gigapath/CNN-patch handling as the single-sample path, just
+    called once per sample with its own cache path) and precomputes Novae
+    features per sample (get_novae_features, same per-sample cache path)
+    whenever the model config actually needs them — mirrors main()'s own
+    single-sample dispatch logic EXACTLY (see main()'s
+    context_gene_features/context_novae_features block): "builtin" +
+    gene_encoder_type="novae" REPLACES context["expression"]
+    (context_gene_features); "storm_lite" with gene_encoder_type in
+    ("novae","both") and "stpath" with stpath_new_gene_encoder_type in
+    ("novae","both") both use the ADDITIVE channel (context_novae_features)
+    instead — see _build_masked_item's own docstring for why these are
+    genuinely different mechanisms, not interchangeable.
 
-    Returns (samples, adatas) — the adatas are also returned since
-    inject_organ_tech_vocab (below) needs each sample's real organ/tech
-    value to build the vocabulary, and re-deriving it from the tuples
-    would just mean unpacking the same thing twice."""
+    STPath itself is NOT fully multi-sample-aware even with this fix:
+    STPathContextEncoder still uses ONE FIXED stpath_organ_type/
+    stpath_tech_type string across every sample (its real IDTokenizer
+    vocabulary, loaded once at construction — not a per-sample-dynamic
+    mechanism the way OrganTechEmbedding is). Fine for single-organ/
+    single-platform data like the currently-available INT1-INT24 (all
+    ccRCC, all Visium, per docs/dataset_notes.md) — a real limitation
+    only if genuinely mixed-organ/platform samples are used with STPath
+    specifically; StormLite has no such limitation (OrganTechEmbedding is
+    real per-sample conditioning throughout).
+
+    Per-sample image loading can drop spots with no matching H&E patch
+    (a normal partial gap, not an error — see _load_images's own
+    docstring) — the returned adata for that sample reflects that
+    subset, and every array derived below (coords3d/expr/slice_ids/
+    organ/tech/novae features) is derived from that SAME
+    possibly-subsetted adata, never the pre-image-loading one, so nothing
+    can end up row-misaligned.
+
+    Uses loaders.load_multi_sample for the actual loading/QC/shared-gene-
+    panel alignment (not reimplemented here) — this function's job is
+    converting that list of AnnData into the (coords3d, expr, slice_ids,
+    images, organ, tech, context_gene_features, context_novae_features)
+    tuples MultiSampleMaskedContextQueryDataset expects.
+
+    Returns (samples, adatas) — the (possibly per-sample image-QC-
+    adjusted) adatas are also returned since inject_organ_tech_vocab/
+    inject_decoder_gene_names/inject_novae_dim (below) need each sample's
+    real organ/tech value and gene panel, and re-deriving it from the
+    tuples would just mean unpacking the same thing twice. Image QC only
+    ever drops ROWS (spots), never gene columns, so the shared gene panel
+    load_multi_sample already aligned stays valid regardless."""
     adatas = loaders.load_multi_sample(
         cfg.data.hest_data_dir, list(cfg.data.sample_ids),
         min_genes=cfg.data.min_genes, min_cells=cfg.data.min_cells,
         organs=list(cfg.data.organs) if cfg.data.get("organs") is not None else None,
         techs=list(cfg.data.techs) if cfg.data.get("techs") is not None else None,
     )
+    model_params = cfg.model.get("params", {})
+    context_encoder_type = model_params.get("context_encoder_type", "builtin")
+    use_images = cfg.data.get("use_images", False)
+
     samples = []
-    for adata in adatas:
+    updated_adatas = []
+    for sample_id, adata in zip(cfg.data.sample_ids, adatas):
+        images = None
+        if use_images:
+            adata, images = _load_images(cfg, adata, sample_id=sample_id)
+
         coords3d = loaders.get_coords_3d(adata)
         expr = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()
         slice_ids = adata.obs["slice_id"].to_numpy()
@@ -771,8 +857,22 @@ def load_multi_sample_data(cfg) -> tuple[list[tuple], list]:
         # loaders.load_hest_sample) — any row's value is the sample's value
         organ = str(adata.obs["organ"].iloc[0]) if "organ" in adata.obs else None
         tech = str(adata.obs["tech"].iloc[0]) if "tech" in adata.obs else None
-        samples.append((coords3d, expr, slice_ids, None, organ, tech))
-    return samples, adatas
+
+        context_gene_features = None
+        context_novae_features = None
+        if context_encoder_type == "builtin" and model_params.get("gene_encoder_type") == "novae":
+            context_gene_features = get_novae_features(cfg, adata, sample_id=sample_id)
+        elif (context_encoder_type == "stpath"
+              and model_params.get("stpath_new_gene_encoder_type") in ("novae", "both")):
+            context_novae_features = get_novae_features(cfg, adata, sample_id=sample_id)
+        elif (context_encoder_type == "storm_lite"
+              and model_params.get("gene_encoder_type") in ("novae", "both")):
+            context_novae_features = get_novae_features(cfg, adata, sample_id=sample_id)
+
+        samples.append((coords3d, expr, slice_ids, images, organ, tech,
+                         context_gene_features, context_novae_features))
+        updated_adatas.append(adata)
+    return samples, updated_adatas
 
 
 def inject_organ_tech_vocab(model_cfg: dict, adatas: list) -> None:
@@ -865,10 +965,9 @@ def _main_multi_sample(cfg) -> None:
     of MaskedContextQueryDataset — see that class's own docstring for why
     samples are kept spatially separate rather than pooled.
 
-    Deliberately does not support images/Novae/STPath in this first cut
-    (see load_multi_sample_data's docstring) — only organ/tech
-    conditioning (this function's actual purpose) and the "raw"/"mlp"
-    gene_encoder_type paths of "builtin"/"storm_lite" work here today."""
+    UPDATED 2026-07-17: images/Novae/STPath ARE now supported (see
+    load_multi_sample_data's own updated docstring for the real gap this
+    closes and the STPath organ/tech caveat that still applies)."""
     samples, adatas = load_multi_sample_data(cfg)
     gene_names = adatas[0].var_names.tolist()  # shared panel, same order across samples (load_multi_sample's guarantee)
     augment = cfg.training.get("augment_coords", False)
@@ -880,11 +979,29 @@ def _main_multi_sample(cfg) -> None:
     # (same "confirm sample_ids share a platform before pooling"
     # assumption load_multi_sample's own docstring already documents).
     coord_scale = float(samples[0][0][:, :2].std())
+    # context_gene_features/context_novae_features (2026-07-17): a
+    # per-CONFIG decision (context_encoder_type/gene_encoder_type), not
+    # per-sample data — every sample in `samples` has them set (or all
+    # None), see load_multi_sample_data's own dispatch loop, so any one
+    # sample's shape is representative for injecting *_novae_dim below.
+    context_encoder_type = cfg.model.get("params", {}).get("context_encoder_type", "builtin")
+    context_gene_features, context_novae_features = samples[0][6], samples[0][7]
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     inject_organ_tech_vocab(model_cfg, adatas)
     inject_coord_scale(model_cfg, coord_scale)
     inject_decoder_gene_names(model_cfg, adatas[0])
+    inject_stpath_gene_names(model_cfg, adatas[0])
+    if context_gene_features is not None:
+        inject_novae_dim(model_cfg, context_gene_features.shape[1])
+    if context_novae_features is not None:
+        # storm_lite reuses novae_dim's param name; STPath's residual uses
+        # the distinct stpath_novae_dim — same dispatch as main()'s own
+        # single-sample injection block.
+        if context_encoder_type == "storm_lite":
+            inject_novae_dim(model_cfg, context_novae_features.shape[1])
+        else:
+            inject_stpath_novae_dim(model_cfg, context_novae_features.shape[1])
     model = build_model(model_cfg)
     # unresolved copy for checkpointing — same reasoning as main()'s own
     # unresolved_model_cfg (keeps ${oc.env:...} interpolations literal)
@@ -892,6 +1009,14 @@ def _main_multi_sample(cfg) -> None:
     inject_organ_tech_vocab(unresolved_model_cfg, adatas)
     inject_coord_scale(unresolved_model_cfg, coord_scale)
     inject_decoder_gene_names(unresolved_model_cfg, adatas[0])
+    inject_stpath_gene_names(unresolved_model_cfg, adatas[0])
+    if context_gene_features is not None:
+        inject_novae_dim(unresolved_model_cfg, context_gene_features.shape[1])
+    if context_novae_features is not None:
+        if context_encoder_type == "storm_lite":
+            inject_novae_dim(unresolved_model_cfg, context_novae_features.shape[1])
+        else:
+            inject_stpath_novae_dim(unresolved_model_cfg, context_novae_features.shape[1])
 
     if list(model.parameters()):
         dataset = MultiSampleMaskedContextQueryDataset(
@@ -1031,12 +1156,20 @@ def main(cfg_path: str, overrides: list[str] | None = None):
 
     # Train (skipped entirely for parameter-free baselines like interp_baseline) --
     augment = cfg.training.get("augment_coords", False)
+    # organ/tech (2026-07-17, real bug fix — see
+    # src/evaluation/run_comparison.py's _build_shared_eval for the same
+    # fix and full reasoning): these were NEVER populated for the
+    # single-sample path, silently leaving context["tech"]/query["tech"]
+    # None for every training step.
+    organ = str(adata.obs["organ"].iloc[0]) if "organ" in adata.obs else None
+    tech = str(adata.obs["tech"].iloc[0]) if "tech" in adata.obs else None
     if list(model.parameters()):
         dataset = MaskedContextQueryDataset(
             coords3d, expr, slice_ids, cfg.masking,
             n_items=cfg.training.epochs, base_seed=cfg.training.seed, images=images,
             context_gene_features=context_gene_features,
             context_novae_features=context_novae_features,
+            organ=organ, tech=tech,
             augment=augment,
         )
         dataloader = make_dataloader(dataset, cfg)
@@ -1063,6 +1196,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
         n_items=1, base_seed=cfg.training.seed + cfg.training.epochs + 1, images=images,
         context_gene_features=context_gene_features,
         context_novae_features=context_novae_features,
+        organ=organ, tech=tech,
         augment=augment,
     )[0]
     context, query = eval_item["context"], eval_item["query"]

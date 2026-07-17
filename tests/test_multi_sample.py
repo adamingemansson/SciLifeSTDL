@@ -86,8 +86,8 @@ def test_multi_sample_dataset_never_mixes_samples():
     slice_ids_b = np.array(["SAMPB"] * n_points)
 
     samples = [
-        (coords_a, expr_a, slice_ids_a, None, "Kidney", "Visium"),
-        (coords_b, expr_b, slice_ids_b, None, "Lung", "Visium"),
+        (coords_a, expr_a, slice_ids_a, None, "Kidney", "Visium", None, None),
+        (coords_b, expr_b, slice_ids_b, None, "Lung", "Visium", None, None),
     ]
     masking_cfg = OmegaConf.create({
         "strategy": "random_dropout_patches",
