@@ -1,0 +1,63 @@
+# Multi-sample run (2026-07-17), StormLite+MoME's Novae-only gene branch
+# — see exp_multisample_fm_ot_stormlite_mome_both.yaml's header for the
+# full reasoning (sample_ids assumption, n_genes auto-injection,
+# organ/tech-off rationale). Diversifies tonight's batch beyond just
+# "both", mirroring the single-sample gene_encoder_type ablation already
+# done for INT1 alone.
+#
+# Direct comparison target: exp_hest1k_fm_ot_stormlite_mome_novae.yaml
+# (single-sample, INT1 only, PCC 0.2968 @ 10k, plateaued through 40k).
+#
+# Requires `pip install novae` (Python >=3.11).
+
+experiment_name: multisample_fm_ot_stormlite_mome_novae
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_ids: [INT1, INT2, INT3, INT4, INT5, INT6, INT7, INT8]
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: storm_lite
+    gene_encoder_type: novae
+    storm_lite_fusion_mode: mome
+    # n_genes is NOT set — auto-injected, see companion config's header
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 10000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

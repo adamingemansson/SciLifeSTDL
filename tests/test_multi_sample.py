@@ -23,7 +23,7 @@ import anndata as ad
 from omegaconf import OmegaConf
 
 from src.data.loaders import load_multi_sample
-from src.training.train import MultiSampleMaskedContextQueryDataset
+from src.training.train import MultiSampleMaskedContextQueryDataset, inject_multi_sample_n_genes
 
 
 def _make_synthetic_sample(hest_dir: Path, sample_id: str, gene_names: list[str],
@@ -155,9 +155,82 @@ def test_load_multi_sample_organs_techs():
               "defaults to 'unknown'")
 
 
+def test_multi_sample_dataset_carries_gene_features_per_sample():
+    """2026-07-17 real gap closed — MultiSampleMaskedContextQueryDataset's
+    sample tuples used to carry ONLY (coords, expr, slice_ids, images,
+    organ, tech); context_gene_features/context_novae_features were never
+    threaded through at all, meaning gene_encoder_type="novae"/"both" and
+    STPath's Route-B residual literally could not be exercised via
+    multi-sample training. Verifies the extra two tuple slots actually
+    reach _build_masked_item's output, per-sample (sample A's own
+    features, not sample B's, and vice versa) — not just that the
+    class accepts 8-tuples without crashing."""
+    n_genes, n_points, novae_dim = 12, 30, 5
+    rng = np.random.default_rng(0)
+
+    coords_a = np.concatenate([rng.uniform(0, 100, size=(n_points, 2)),
+                                np.zeros((n_points, 1))], axis=1)
+    expr_a = rng.random((n_points, n_genes)).astype(np.float32)
+    slice_ids_a = np.array(["SAMPA"] * n_points)
+    novae_a = np.full((n_points, novae_dim), 1.0, dtype=np.float32)  # marker value: all 1s
+
+    coords_b = np.concatenate([rng.uniform(0, 100, size=(n_points, 2)) + 100_000.0,
+                                np.zeros((n_points, 1))], axis=1)
+    expr_b = rng.random((n_points, n_genes)).astype(np.float32)
+    slice_ids_b = np.array(["SAMPB"] * n_points)
+    novae_b = np.full((n_points, novae_dim), 2.0, dtype=np.float32)  # marker value: all 2s
+
+    samples = [
+        (coords_a, expr_a, slice_ids_a, None, "Kidney", "Visium", None, novae_a),
+        (coords_b, expr_b, slice_ids_b, None, "Lung", "Visium", None, novae_b),
+    ]
+    masking_cfg = OmegaConf.create({
+        "strategy": "random_dropout_patches",
+        "params": {"n_patches": 2, "radius_range": [10, 30]},
+    })
+    dataset = MultiSampleMaskedContextQueryDataset(samples, masking_cfg, n_items=20, base_seed=0)
+
+    for i in range(len(dataset)):
+        item = dataset[i]
+        context_xy = item["context"]["coords"][:, :2].numpy()
+        in_a = bool((context_xy < 50_000.0).all())
+        novae_feat = item["context"]["novae_features"].numpy()
+        expected_marker = 1.0 if in_a else 2.0
+        assert np.allclose(novae_feat, expected_marker), (
+            f"item {i}: context_novae_features didn't match its own sample "
+            f"(expected all {expected_marker}, got values {novae_feat[:3]})"
+        )
+    print("[MultiSampleMaskedContextQueryDataset] OK — context_novae_features "
+          "correctly carried through per-sample, never cross-contaminated")
+
+
+def test_inject_multi_sample_n_genes():
+    """2026-07-17 real gap closed — multi-sample n_genes previously had no
+    auto-injector at all (see exp_hest1k_fm_ot_multisample.yaml's own
+    header, which required manually checking real console output and
+    hand-correcting a placeholder value). A duck-typed stand-in is enough
+    here since inject_multi_sample_n_genes only ever reads .n_vars."""
+    class _FakeAdata:
+        def __init__(self, n_vars):
+            self.n_vars = n_vars
+
+    model_cfg = {"params": {}}
+    inject_multi_sample_n_genes(model_cfg, [_FakeAdata(37), _FakeAdata(37)])
+    assert model_cfg["params"]["n_genes"] == 37
+
+    # explicit config value always wins, never silently overridden
+    model_cfg_explicit = {"params": {"n_genes": 999}}
+    inject_multi_sample_n_genes(model_cfg_explicit, [_FakeAdata(37)])
+    assert model_cfg_explicit["params"]["n_genes"] == 999
+    print("[inject_multi_sample_n_genes] OK — auto-derives from real data, "
+          "never overrides an explicit config value")
+
+
 if __name__ == "__main__":
     test_load_multi_sample_gene_intersection()
     test_load_multi_sample_zero_overlap_raises()
     test_multi_sample_dataset_never_mixes_samples()
     test_load_multi_sample_organs_techs()
+    test_multi_sample_dataset_carries_gene_features_per_sample()
+    test_inject_multi_sample_n_genes()
     print("\nAll multi-sample loader/dataset smoke tests passed.")

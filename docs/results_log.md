@@ -171,4 +171,93 @@ Queued for the 2026-07-17 night9 batch (`scripts/run_parallel_7gpu_night9.sh`,
 bothresidual; `panel_invariant` with `combine_mode="add"` on StormLite's
 mlp branch; `lloki` on WAE-GAN+StormLite (diagnostic — does a different
 decoder change the confirmed mode collapse, or is it entirely upstream).
-Results not yet available as of this entry.
+
+## 2026-07-17: night9 real bug — tech/organ never populated, breaking `lloki`
+
+**All 4 `lloki` configs crashed** on their first real run. Root cause:
+`run_comparison.py` (the actual pipeline every parallel script uses) never
+set `context["tech"]`/`query["tech"]` anywhere in the file — always
+`None`, regardless of `adata.obs`'s real values. Harmless for every other
+consumer (`OrganTechEmbedding` is gated on `organ_vocab`/`tech_vocab`
+being set at construction, which no single-sample config does), but
+`LLOKIStyleDecoder.forward()` requires a valid, non-`None` `tech` string
+with no default — so it crashed immediately on `assert tech in
+self.tech_to_id`. Fixed at the source (`_build_shared_eval`, `_evaluate`,
+`_evaluate_shuffled_images`, and the training-dataset construction in
+both `run_comparison.py` and `train.py`'s `main()`) rather than patched
+around the symptom.
+
+**The 3 non-`lloki` configs that DID complete**:
+
+| config | PCC | ST-FID |
+|---|---|---|
+| `stormlite_mome_both_paneldecoder_add` (combine_mode=add) | 0.2622 | 2.26 |
+| `stormlite_mome_mlp_paneldecoder_add` | 0.2215 | 2.11 |
+| `wae_gan_stpath_mlpresidual` | **0.3603** | 4.11 |
+
+`wae_gan_stpath_mlpresidual` completes the WAE-GAN residual-source
+ablation: plain (0.1975) < both (0.2901) < mlp (0.3603) < **novae
+(0.3453)**... wait — mlp (0.3603) actually edges out novae (0.3453) here,
+reversing what looked like a clean "Novae is WAE-GAN's optimum" read from
+the earlier single-arm result. Both are close (0.36 vs 0.35) and both
+clearly beat "both" (0.29) — the real, robust finding is still "combining
+MLP+Novae underperforms the better single source," just with the
+identity of that single source now looking closer to a toss-up between
+MLP and Novae for WAE-GAN specifically, unlike FM-OT where MLP alone
+(0.4291) beat Novae alone (0.3904) by a clearer margin.
+
+## 2026-07-17: 40k `stpath_unfrozen_bothresidual` vs. StormLite
+
+| config | PCC (best available) |
+|---|---|
+| STPath pretrained `bothresidual` | **0.4717** (40k) |
+| STPath unfrozen `bothresidual` | 0.3857 (40k) |
+| StormLite `mome_both` | 0.3461 (40k) |
+| StormLite `mome_both_paneldecoder_add` | 0.2622 (10k only) |
+| StormLite `mome_novae` | 0.2968 (plateaued by 10k) |
+| StormLite `mome_mlp_paneldecoder_add` | 0.2215 (10k only) |
+| StormLite `mome_mlp` | 0.1708 (plateaued by 10k) |
+
+The from-scratch, no-pretrained-weights STPath arm (0.3857) now beats
+**every** StormLite arm run so far, including StormLite's own best
+(`mome_both`, 0.3461). At this comparison point the gap isn't about
+pretraining anymore — STPath's underlying architecture (its real spatial
+transformer + tokenization scheme) is outperforming StormLite's from-
+scratch fusion, independent of pretrained weights. Not a fully matched
+comparison yet (the paneldecoder variants only have 10k numbers, `mome_both`
+has 40k) — worth revisiting once every arm has a 40k number.
+
+Separately: pretrained-vs-unfrozen `bothresidual`'s gap roughly HALVED
+from 10k to 40k (0.161 → 0.086) — pretraining's advantage shrinks
+substantially with more training rather than staying fixed, though it
+never fully closes.
+
+## 2026-07-17: multi-sample training extended to support images/Novae/STPath
+
+Real gap closed: `_main_multi_sample`/`load_multi_sample_data`
+(`src/training/train.py`) previously hardcoded `images=None` and never
+computed Novae features — meaning multi-sample training (`cfg.data.sample_ids`
+as a list, across INT1-INT8 rather than just INT1) could not exercise
+StormLite+MoME+Novae or STPath+bothresidual at all, only `gene_encoder_type`
+`"raw"`/`"mlp"`. Now loads images and precomputes Novae features per
+sample (own Gigapath/Novae cache path each), mirroring `main()`'s
+single-sample dispatch logic exactly. Also closed a separate real gap:
+multi-sample `n_genes` had no auto-injector at all (previously a manual,
+easy-to-get-wrong step — see `exp_hest1k_fm_ot_multisample.yaml`'s old
+header) — now auto-derived from the real shared-gene-panel intersection
+(`inject_multi_sample_n_genes`).
+
+STPath itself is still not fully multi-sample-aware: `STPathContextEncoder`
+uses one fixed `stpath_organ_type`/`stpath_tech_type` string across every
+sample (its real IDTokenizer vocabulary, not per-sample-dynamic like
+`OrganTechEmbedding`) — fine for the current all-ccRCC, all-Visium
+INT1-INT24, a real limitation only if genuinely mixed-organ/platform
+samples are used with STPath specifically.
+
+Four configs queued for the first real multi-sample run
+(`scripts/run_parallel_4gpu_multisample.sh`, INT1-INT8, 10k epochs,
+weighted toward StormLite): `fm_ot` + StormLite+MoME (both/novae gene
+branches), `fm_ot` + STPath bothresidual (comparison anchor), `wae_gan` +
+STPath novaeresidual (checks whether the single-sample result, PCC
+0.3453, holds with more data diversity). Not yet run as of this entry —
+depends on how many HEST-1k samples are actually downloaded locally.

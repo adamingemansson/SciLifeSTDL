@@ -957,6 +957,24 @@ def inject_decoder_gene_names(model_cfg: dict, adata) -> None:
         params.setdefault("full_gene_names", adata.var_names.tolist())
 
 
+def inject_multi_sample_n_genes(model_cfg: dict, adatas: list) -> None:
+    """Multi-sample training's n_genes has NO reliable manual default —
+    load_multi_sample's shared-gene-panel intersection across every
+    sample_ids entry almost always differs from any single sample's own
+    gene count (see exp_hest1k_fm_ot_multisample.yaml's own header, which
+    used to require checking real console output and hand-correcting a
+    placeholder value — a real, easy-to-get-wrong step, same class of
+    problem inject_stpath_gene_names/inject_decoder_gene_names/
+    inject_novae_dim already solve for their own params). Auto-derives it
+    from the real, already-intersected adatas[0].n_vars instead — every
+    sample in adatas shares the same panel size after load_multi_sample's
+    intersection (its own documented guarantee), so any one sample's
+    count is correct for all of them. Mutates model_cfg["params"] in
+    place; no-op if n_genes is already explicitly set."""
+    params = model_cfg.get("params", {})
+    params.setdefault("n_genes", adatas[0].n_vars)
+
+
 def _main_multi_sample(cfg) -> None:
     """Multi-sample training entry point (2026-07-16), called from main()
     when cfg.data.sample_ids is set. Mirrors main()'s single-sample flow
@@ -988,6 +1006,7 @@ def _main_multi_sample(cfg) -> None:
     context_gene_features, context_novae_features = samples[0][6], samples[0][7]
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
+    inject_multi_sample_n_genes(model_cfg, adatas)
     inject_organ_tech_vocab(model_cfg, adatas)
     inject_coord_scale(model_cfg, coord_scale)
     inject_decoder_gene_names(model_cfg, adatas[0])
@@ -1006,6 +1025,7 @@ def _main_multi_sample(cfg) -> None:
     # unresolved copy for checkpointing — same reasoning as main()'s own
     # unresolved_model_cfg (keeps ${oc.env:...} interpolations literal)
     unresolved_model_cfg = OmegaConf.to_container(cfg.model, resolve=False)
+    inject_multi_sample_n_genes(unresolved_model_cfg, adatas)
     inject_organ_tech_vocab(unresolved_model_cfg, adatas)
     inject_coord_scale(unresolved_model_cfg, coord_scale)
     inject_decoder_gene_names(unresolved_model_cfg, adatas[0])

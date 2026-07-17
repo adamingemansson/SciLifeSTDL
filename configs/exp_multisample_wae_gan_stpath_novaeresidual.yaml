@@ -1,0 +1,70 @@
+# Multi-sample run (2026-07-17), WAE-GAN's best single-sample
+# configuration (Novae-only residual on pretrained STPath, PCC 0.3453 —
+# this project's best WAE-GAN result, see docs/results_log.md). Checks
+# whether that result holds up with genuinely more/independent tissue
+# sections, not just INT1's own ~1000 spots — WAE-GAN's adversarial
+# training is exactly the kind of thing that could behave differently
+# with more data diversity (either more stable, since the discriminator
+# sees a richer real-data distribution, or less stable, since it's a
+# harder generalization target).
+#
+# See exp_multisample_fm_ot_stormlite_mome_both.yaml's header for the
+# general reasoning (sample_ids assumption, n_genes auto-injection) and
+# exp_multisample_fm_ot_stpath_bothresidual.yaml's header for the
+# STPath-specific fixed-organ/tech caveat (same applies here).
+#
+# Direct comparison target: exp_hest1k_wae_gan_stpath_novaeresidual.yaml
+# (single-sample, INT1 only, PCC 0.3453 @ 10k).
+#
+# Requires `pip install novae` (Python >=3.11).
+
+experiment_name: multisample_wae_gan_stpath_novaeresidual
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_ids: [INT1, INT2, INT3, INT4, INT5, INT6, INT7, INT8]
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: wae_gan
+  params:
+    context_encoder_type: stpath
+    stpath_gene_voc_path: ${oc.env:STPATH_GENE_VOC_PATH}
+    stpath_model_weight_path: ${oc.env:STPATH_MODEL_WEIGHT_PATH}
+    stpath_organ_type: Kidney      # all of INT1-INT8 are ccRCC — see header caveat
+    stpath_tech_type: Visium
+    stpath_new_gene_encoder_type: novae
+    # n_genes is NOT set — auto-injected, see companion config's header
+    coord_dim: 3
+    latent_dim: 32
+    hidden_dim: 256
+    cond_hidden_dim: 256
+    disc_hidden_dim: 128
+    adv_weight: 1.0
+    lr: 1.0e-3
+    lr_disc: 1.0e-3
+
+training:
+  epochs: 10000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

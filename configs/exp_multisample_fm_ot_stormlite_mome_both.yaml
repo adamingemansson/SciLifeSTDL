@@ -1,0 +1,86 @@
+# First real multi-sample run (2026-07-17) exercising StormLite+MoME's
+# full architecture (images + Novae + StormLite's own gene fusion) across
+# SEVERAL samples at once, not just INT1 — the real gap closed this
+# session (see load_multi_sample_data's own updated docstring in
+# train.py: multi-sample training previously could not use images/Novae/
+# STPath at all). StormLite is the priority context encoder for this
+# project's actual research direction, so this is the flagship config of
+# tonight's multi-sample batch.
+#
+# sample_ids below assumes INT1-INT8 are downloaded locally — check with
+# `ls data/raw/hest1k/` first and trim this list to match what's actually
+# present; a missing sample raises a clear FileNotFoundError naming it
+# (loaders.load_hest_sample), not a silent skip.
+#
+# n_genes is NOT set — auto-injected from the real shared-gene-panel
+# intersection across every sample_ids entry (inject_multi_sample_n_genes,
+# 2026-07-17 — previously a manual, easy-to-get-wrong step, see that
+# function's own docstring for the real gotcha this replaces).
+#
+# organ/tech: INT1-INT24 are documented as all-Visium, same ccRCC cohort
+# (docs/dataset_notes.md) — use_organ_tech_conditioning is left OFF here
+# deliberately (see OrganTechEmbedding's own docstring: a constant
+# organ/tech value across every sample contributes zero real signal,
+# would just be a no-op parameter). The real point of this run is
+# training on genuinely different TISSUE SECTIONS (different patients),
+# not organ/tech diversity — that's a separate, still-unavailable axis.
+#
+# Direct comparison target: exp_hest1k_fm_ot_stormlite_mome_both.yaml
+# (single-sample, INT1 only, PCC 0.2798 @ 10k / 0.3461 @ 40k) — does
+# training on more, spatially-independent tissue sections help this
+# arm generalize, or does single-sample overfitting turn out not to be
+# the actual bottleneck?
+#
+# Requires `pip install novae` (Python >=3.11).
+
+experiment_name: multisample_fm_ot_stormlite_mome_both
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_ids: [INT1, INT2, INT3, INT4, INT5, INT6, INT7, INT8]
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    storm_lite_fusion_mode: mome
+    # n_genes is NOT set — see header
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 10000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab
