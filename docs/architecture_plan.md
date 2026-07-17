@@ -228,6 +228,25 @@ baseline, not counted as one of the three comparison models below.
 4. **Normalizing flows** — deprioritized; invertibility constraints on the
    network are restrictive and there's no prior-art pull toward it here.
 
+**VQ-VAE+AR deprioritized 2026-07-17** (user decision, real-data evidence):
+consistently the weakest of the three core generator families across every
+context-encoder configuration tried, not just one. Original 4-way
+comparison already flagged it as an outlier (ST-FID ~3.7-3.8 vs. ~0.55-0.6
+for every other row); confirmed again this session with StormLite+MoME
+(`exp_hest1k_vqvae_ar_stormlite_mome_both.yaml`, PCC ≈ -0.0008, effectively
+no signal) and with STPath's real pretrained "both" residual arm — this
+project's single best-performing mechanism for the other two families
+(`exp_hest1k_vqvae_ar_stpath_bothresidual.yaml`, PCC 0.0016, again
+effectively zero). Three independent, otherwise-strong context encoders,
+three near-zero results — reads as a property of VQ-VAE+AR itself
+(discrete tokenization + Morton-order autoregressive sampling) on this
+task/scale, not a fixable context-encoder mismatch. **No new VQ-VAE+AR
+configs or experiments going forward.** The existing `VQVAEAutoregressive`
+class, its configs, and its tests stay in the repo as-is — real
+infrastructure and a documented negative result, not deleted (explicit
+user decision, 2026-07-17: keep for citability/reproducibility rather than
+remove).
+
 ## Known gaps / next steps
 - All current models (`interp_baseline`, `vae_baseline`, `wae_gan`) are
   **unconditioned placeholders** — they ignore `context`/`query['coords']`
