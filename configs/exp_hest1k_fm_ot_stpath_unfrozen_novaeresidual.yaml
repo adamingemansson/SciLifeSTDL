@@ -1,0 +1,69 @@
+# "Does a better gene encoder help even WITHOUT pretrained weights?"
+# (2026-07-17) — Novae variant. See
+# exp_hest1k_fm_ot_stpath_unfrozen_mlpresidual.yaml's header for the full
+# reasoning (identical, only stpath_new_gene_encoder_type differs).
+# Requires `pip install novae` — see src/models/conditioning.py
+# precompute_novae_features docstring for setup/verification caveats.
+#
+# Direct comparison targets: exp_hest1k_fm_ot_stpath_unfrozen.yaml
+# (isolates the encoder's own contribution) and
+# exp_hest1k_fm_ot_stpath_novaeresidual.yaml (same residual, but on the
+# PRETRAINED fusion).
+
+experiment_name: fm_ot_hest1k_pilot_stpath_unfrozen_novaeresidual
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: stpath
+    stpath_pretrained: false        # 2026-07-16: random init, fully trainable
+    stpath_gene_voc_path: ${oc.env:STPATH_GENE_VOC_PATH}
+    # stpath_model_weight_path deliberately NOT set — nothing to load
+    stpath_organ_type: Kidney      # INT1 is ccRCC (renal cell carcinoma)
+    stpath_tech_type: Visium
+    stpath_new_gene_encoder_type: novae   # 2026-07-17: Route B residual, ON TOP OF unfrozen
+    # stpath_novae_dim auto-injected from real precomputed Novae features
+    # (train.py inject_stpath_novae_dim) — do not set here
+    # stpath_gene_names auto-derived from the loaded AnnData at load time
+    # (train.py/run_comparison.py inject_stpath_gene_names) - do not set here
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_fm_ot_stpath.yaml
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 10000                  # same as exp_hest1k_fm_ot_stpath.yaml - fair comparison
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

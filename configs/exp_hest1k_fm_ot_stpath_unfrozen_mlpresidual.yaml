@@ -1,0 +1,88 @@
+# "Does a better gene encoder help even WITHOUT pretrained weights?"
+# (2026-07-17) — combines exp_hest1k_fm_ot_stpath_unfrozen.yaml's
+# stpath_pretrained: false (STPath's real architecture, trained fully
+# from random init on our pilot data — see that config's header) with
+# exp_hest1k_fm_ot_stpath_mlpresidual.yaml's Route-B MLP gene-encoder
+# residual. Both params are independent in STPathContextEncoder (see
+# src/models/stpath_encoder.py's __init__/forward — needs_grad =
+# self.new_gene_encoder is not None or not self.pretrained already
+# handles this combination correctly), just never exercised together in
+# a config until now.
+#
+# Direct scientific point (2026-07-17, user question: "wouldnt we also
+# need a run with stpath completely unfrozen and then our new GEX
+# encoder? then we could see if a more advanced encoder helps from
+# training from scratch as well, not only improves already pretrained?"):
+# every existing Route-B config (mlpresidual/novaeresidual/bothresidual)
+# tests "does a better gene encoder help ON TOP OF a strong, ALREADY
+# pretrained fusion" — task #19-followup's earlier Route-C test (a better
+# encoder in OUR OWN weak fusion) could only show a better encoder can't
+# rescue a bad fusion, not whether it matters to a good one. This tests
+# the missing THIRD cell of that 2x2: does a better gene encoder help a
+# fusion that's STRUCTURALLY the same as STPath's (frame-averaging
+# attention, tokenized gene embeddings, etc.) but has NO pretrained
+# weights to lean on — i.e. does encoder quality matter for architecture
+# quality in general, independent of whether the fusion itself started
+# pretrained.
+#
+# Direct comparison targets: exp_hest1k_fm_ot_stpath_unfrozen.yaml (same
+# unfrozen architecture, no residual — isolates the encoder's own
+# contribution) and exp_hest1k_fm_ot_stpath_mlpresidual.yaml (same
+# residual, but on the PRETRAINED fusion — isolates whether pretraining
+# changes how much the residual helps).
+
+experiment_name: fm_ot_hest1k_pilot_stpath_unfrozen_mlpresidual
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: stpath
+    stpath_pretrained: false        # 2026-07-16: random init, fully trainable (see header)
+    stpath_gene_voc_path: ${oc.env:STPATH_GENE_VOC_PATH}
+    # stpath_model_weight_path deliberately NOT set — nothing to load
+    stpath_organ_type: Kidney      # INT1 is ccRCC (renal cell carcinoma)
+    stpath_tech_type: Visium
+    stpath_new_gene_encoder_type: mlp   # 2026-07-17: Route B residual, ON TOP OF unfrozen (see header)
+    # stpath_gene_names auto-derived from the loaded AnnData at load time
+    # (train.py/run_comparison.py inject_stpath_gene_names) - do not set here
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_fm_ot_stpath.yaml
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 10000                  # same as exp_hest1k_fm_ot_stpath.yaml - fair comparison
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab
