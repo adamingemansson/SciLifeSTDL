@@ -40,15 +40,54 @@ class RandomFourierFeatures(nn.Module):
     Encodes continuous coordinates into a higher-dimensional feature basis
     (Rahimi & Recht 2007; Tancik et al. 2020 — module docstring above).
     Fixed (non-trainable) random projection, so `sigma` is the one
-    hyperparameter that matters — controls the encoding's spatial frequency.
+    hyperparameter that matters — controls the encoding's spatial frequency,
+    IN WHATEVER UNITS THE INPUT COORDINATES ALREADY ARE.
+
+    REAL BUG found 2026-07-17 (same class of bug as RelativePositionBias's
+    2026-07-17 fix — see that class's docstring for the first instance):
+    sigma=1.0 (the untouched default in every config in this project) only
+    makes sense if coordinates are already roughly unit-scale. Real
+    HEST-1k coordinates are pixel-scale (thousands — see this project's
+    masking configs' own radius_range, e.g. [250, 450]). Checked directly:
+    two spots 5 pixel-units apart (essentially the same location) got
+    cosine similarity 0.001 between their encodings — indistinguishable
+    from spots 2000 units apart (-0.093) — i.e. sin(2*pi*x@B) for
+    thousands-scale x wraps around (aliases) so many times that the
+    encoding is essentially RANDOM NOISE with respect to real spatial
+    locality, not a smooth positional signal at all. Every config using
+    "builtin" (SpatialContextEncoder) or "storm_lite"
+    (StormLiteContextEncoder) context encoders was silently getting a
+    near-useless absolute-position signal on real data (StormLite's
+    RelativePositionBias fix, above, still leaves this SEPARATE absolute-
+    position pathway broken).
+
+    Fixed via coord_scale: divides x by this BEFORE the sigma-scaled
+    projection (mathematically equivalent to sigma/coord_scale, kept as a
+    separate constructor arg since sigma still meaningfully controls
+    relative frequency in the now-normalized space, while coord_scale is
+    purely "what are this dataset's real units"). Deliberately a FIXED
+    value set at construction time, not a per-call auto-normalization
+    (the fix RelativePositionBias uses) — SpatialContextEncoder calls this
+    module SEPARATELY for context_coords and query_coords (two different
+    point sets, potentially different extents); per-call normalization
+    would give the SAME real position a DIFFERENT encoding depending on
+    which call computed it, which is a worse bug than the one being fixed.
+    coord_scale=1.0 (default) preserves the exact original (buggy at real
+    scale, but correct at small-scale/synthetic-test scale) behavior for
+    every existing caller that doesn't explicitly opt in — auto-derived
+    from real per-sample coordinate spread by inject_coord_scale in
+    src/training/train.py, the same "must be derived from real data, not
+    hardcoded" pattern as inject_novae_dim.
     """
 
-    def __init__(self, in_dim: int, num_features: int = 64, sigma: float = 1.0):
+    def __init__(self, in_dim: int, num_features: int = 64, sigma: float = 1.0,
+                 coord_scale: float = 1.0):
         super().__init__()
+        self.coord_scale = coord_scale
         self.register_buffer("B", torch.randn(in_dim, num_features) * sigma)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        proj = 2 * math.pi * x @ self.B
+        proj = 2 * math.pi * (x / self.coord_scale) @ self.B
         return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
 
 
@@ -690,7 +729,7 @@ class SpatialContextEncoder(nn.Module):
 
     def __init__(self, n_genes: int, coord_dim: int = 3, hidden_dim: int = 256,
                  n_message_layers: int = 2, k_neighbors: int = 10,
-                 rff_features: int = 64, rff_sigma: float = 1.0,
+                 rff_features: int = 64, rff_sigma: float = 1.0, coord_scale: float = 1.0,
                  image_encoder_type: str = "none", image_feat_dim: int = 64,
                  image_patch_size: int = 256,
                  gene_encoder_type: str = "raw", gene_feat_dim: int = 256,
@@ -706,7 +745,13 @@ class SpatialContextEncoder(nn.Module):
         self.k_neighbors = k_neighbors
         self.use_images = image_encoder_type != "none"
         self.gene_encoder_type = gene_encoder_type
-        self.coord_encoder = RandomFourierFeatures(coord_dim, rff_features, rff_sigma)
+        # coord_scale (2026-07-17, see RandomFourierFeatures' own docstring
+        # for the real bug this fixes): a FIXED value set once here, not
+        # per-call — this class calls coord_encoder SEPARATELY for
+        # context_coords/query_coords below, so a per-call auto-scale
+        # would give the same real position different encodings depending
+        # on which call computed it.
+        self.coord_encoder = RandomFourierFeatures(coord_dim, rff_features, rff_sigma, coord_scale)
         coord_feat_dim = 2 * rff_features  # sin + cos
 
         if gene_encoder_type == "raw":

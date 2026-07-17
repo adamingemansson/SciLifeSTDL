@@ -39,6 +39,7 @@ def _build_context_encoder(
     context_encoder_type: str = "builtin",
     image_encoder_type: str = "none", image_feat_dim: int = 64, image_patch_size: int = 256,
     gene_encoder_type: str = "raw", gene_feat_dim: int = 256, novae_dim: int | None = None,
+    coord_scale: float = 1.0,
     stpath_gene_names: list[str] | None = None, stpath_gene_voc_path: str | None = None,
     stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
     stpath_tech_type: str = "Visium",
@@ -85,14 +86,26 @@ def _build_context_encoder(
     IDTokenizer vocabulary loaded from model_weight_path, not a
     data-driven vocab we build ourselves). Passing both None (default)
     disables organ/tech conditioning entirely, same as before this
-    param existed — single-sample/single-organ training is unaffected."""
+    param existed — single-sample/single-organ training is unaffected.
+
+    coord_scale (2026-07-17, see RandomFourierFeatures' own docstring in
+    conditioning.py for the real bug this fixes: sigma=1.0's default
+    absolute-position encoding is essentially random noise on real
+    HEST-1k pixel-scale coordinates) only applies to "builtin"/
+    "storm_lite" (both construct a RandomFourierFeatures coord_encoder) —
+    NOT "stpath", which has its own real, verified geometry-aware
+    attention bias from its pretrained checkpoint, independent of this
+    mechanism entirely. 1.0 (default) preserves the original behavior for
+    any caller that doesn't explicitly opt in; auto-derived from real
+    per-sample coordinate spread by inject_coord_scale in
+    src/training/train.py."""
     if context_encoder_type == "builtin":
         return SpatialContextEncoder(
             n_genes=n_genes, coord_dim=coord_dim, hidden_dim=cond_hidden_dim,
             image_encoder_type=image_encoder_type, image_feat_dim=image_feat_dim,
             image_patch_size=image_patch_size,
             gene_encoder_type=gene_encoder_type, gene_feat_dim=gene_feat_dim,
-            novae_dim=novae_dim,
+            novae_dim=novae_dim, coord_scale=coord_scale,
             organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
     elif context_encoder_type == "stpath":
@@ -120,6 +133,7 @@ def _build_context_encoder(
         return StormLiteContextEncoder(
             n_genes=n_genes, novae_dim=novae_dim, coord_dim=coord_dim,
             hidden_dim=cond_hidden_dim, gene_encoder_type=gene_encoder_type,
+            coord_scale=coord_scale,
             n_transformer_layers=storm_lite_n_layers, n_heads=storm_lite_n_heads,
             use_relative_bias=storm_lite_use_relative_bias,
             relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
@@ -329,6 +343,7 @@ class WAEGAN(BaseGenerativeModel):
                  storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
                  storm_lite_use_relative_bias: bool = True,
                  storm_lite_relative_bias_hidden_dim: int = 32,
+                 coord_scale: float = 1.0,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
         self.save_hyperparameters()
@@ -348,7 +363,7 @@ class WAEGAN(BaseGenerativeModel):
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
             storm_lite_use_relative_bias=storm_lite_use_relative_bias,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
-            organ_vocab=organ_vocab, tech_vocab=tech_vocab,
+            coord_scale=coord_scale, organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
         self.encoder = nn.Sequential(
             nn.Linear(n_genes, hidden_dim), nn.ReLU(),
@@ -536,6 +551,7 @@ class FlowMatchingOT(BaseGenerativeModel):
                  storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
                  storm_lite_use_relative_bias: bool = True,
                  storm_lite_relative_bias_hidden_dim: int = 32,
+                 coord_scale: float = 1.0,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
         self.save_hyperparameters()
@@ -554,7 +570,7 @@ class FlowMatchingOT(BaseGenerativeModel):
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
             storm_lite_use_relative_bias=storm_lite_use_relative_bias,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
-            organ_vocab=organ_vocab, tech_vocab=tech_vocab,
+            coord_scale=coord_scale, organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
         # own autoencoder, own weights — compresses expression to a small
         # latent code the velocity net operates on instead of raw n_genes
@@ -739,6 +755,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
                  storm_lite_use_relative_bias: bool = True,
                  storm_lite_relative_bias_hidden_dim: int = 32,
+                 coord_scale: float = 1.0,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
         self.save_hyperparameters()
@@ -756,7 +773,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
             storm_lite_use_relative_bias=storm_lite_use_relative_bias,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
-            organ_vocab=organ_vocab, tech_vocab=tech_vocab,
+            coord_scale=coord_scale, organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
         self.encoder = nn.Sequential(
             nn.Linear(n_genes, ae_hidden_dim), nn.ReLU(),

@@ -84,6 +84,7 @@ from src.models.conditioning import (
 class StormLiteContextEncoder(nn.Module):
     def __init__(self, n_genes: int, novae_dim: int | None = None, coord_dim: int = 3,
                  hidden_dim: int = 256, rff_features: int = 64, rff_sigma: float = 1.0,
+                 coord_scale: float = 1.0,
                  n_transformer_layers: int = 2, n_heads: int = 4,
                  gene_encoder_type: str = "both", use_relative_bias: bool = True,
                  relative_bias_hidden_dim: int = 32,
@@ -118,9 +119,29 @@ class StormLiteContextEncoder(nn.Module):
             self.gene_encoder = NovaeGeneEncoder(novae_dim, hidden_dim)
         else:  # "both"
             assert novae_dim is not None, "gene_encoder_type='both' requires novae_dim"
-            self.gene_encoder = CombinedGeneEncoder(n_genes, novae_dim, hidden_dim)
+            # combine_mode="concat", not the default "sum" (2026-07-17,
+            # same bug already found+fixed for STPath's Route-B residual,
+            # see CombinedGeneEncoder's own docstring and commit 1a26a75:
+            # summing before a downstream Linear mathematically prevents
+            # it from independently weighting the two gene signals — was
+            # never exercised as a DISTINCT issue here since ALL THREE
+            # gene_encoder_type variants were broken by the separate
+            # RelativePositionBias/coord_scale bugs, but worth fixing on
+            # the same principle now that those are fixed). Output is
+            # 2*hidden_dim wide (output_dim_multiplier=2 for concat mode)
+            # — gene_combine_proj below brings it back to hidden_dim so it
+            # can still be summed into `tokens` alongside img_embed/
+            # coord_embed (this class's fusion tokens are additive, unlike
+            # STPath's Route-B residual which has its own dedicated
+            # residual_proj for exactly this same width mismatch).
+            self.gene_encoder = CombinedGeneEncoder(n_genes, novae_dim, hidden_dim, combine_mode="concat")
+            self.gene_combine_proj = nn.Linear(hidden_dim * self.gene_encoder.output_dim_multiplier, hidden_dim)
 
-        self.coord_encoder = RandomFourierFeatures(coord_dim, rff_features, rff_sigma)
+        # coord_scale (2026-07-17, see RandomFourierFeatures' own docstring)
+        # — safe as a per-call-shared FIXED value here since this class
+        # calls coord_encoder ONCE on context+query coords concatenated
+        # together (unlike SpatialContextEncoder's separate calls).
+        self.coord_encoder = RandomFourierFeatures(coord_dim, rff_features, rff_sigma, coord_scale)
         self.coord_proj = nn.Linear(2 * rff_features, hidden_dim)
 
         # Learned placeholder for query positions' missing gene signal —
@@ -170,7 +191,11 @@ class StormLiteContextEncoder(nn.Module):
             assert novae_features is not None, (
                 "gene_encoder_type='both' requires context_novae_features"
             )
-            return self.gene_encoder(torch.log1p(raw_expr), novae_features)
+            # CombinedGeneEncoder(combine_mode="concat") output is
+            # 2*hidden_dim wide — gene_combine_proj brings it back to
+            # hidden_dim (see __init__'s own comment)
+            combined = self.gene_encoder(torch.log1p(raw_expr), novae_features)
+            return self.gene_combine_proj(combined)
 
     def forward(self, context_coords: torch.Tensor, context_expression: torch.Tensor,
                 query_coords: torch.Tensor, context_images: torch.Tensor,

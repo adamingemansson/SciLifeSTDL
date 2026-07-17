@@ -594,6 +594,24 @@ def inject_novae_dim(model_cfg: dict, novae_dim: int) -> None:
         params["novae_dim"] = novae_dim
 
 
+def inject_coord_scale(model_cfg: dict, coord_scale: float) -> None:
+    """RandomFourierFeatures real-scale bug fix (2026-07-17 — see that
+    class's own docstring in conditioning.py): auto-derive coord_scale
+    from this sample's real coordinate spread rather than hardcoding it,
+    since different HEST-1k samples can have different physical pixel
+    resolutions — same "must be derived from real data, not guessed"
+    reasoning as inject_novae_dim/inject_stpath_gene_names. Applies to
+    context_encoder_type in ("builtin", "storm_lite") only — both
+    construct a RandomFourierFeatures coord_encoder (see registry.py's
+    _build_context_encoder); "stpath" has its own real, verified
+    geometry-aware attention bias, unaffected by this mechanism. Mutates
+    model_cfg["params"] in place; no-op for every other config."""
+    params = model_cfg.get("params", {})
+    if params.get("context_encoder_type", "builtin") in ("builtin", "storm_lite") \
+            and "coord_scale" not in params:
+        params["coord_scale"] = coord_scale
+
+
 def inject_stpath_novae_dim(model_cfg: dict, novae_dim: int) -> None:
     """Same reasoning as inject_novae_dim above, for STPathContextEncoder's
     Route-B residual (context_encoder_type: "stpath" +
@@ -808,14 +826,24 @@ def _main_multi_sample(cfg) -> None:
     samples, adatas = load_multi_sample_data(cfg)
     gene_names = adatas[0].var_names.tolist()  # shared panel, same order across samples (load_multi_sample's guarantee)
     augment = cfg.training.get("augment_coords", False)
+    # 2026-07-17: RandomFourierFeatures real-scale bug fix — see
+    # inject_coord_scale's own docstring. Derived from the FIRST sample
+    # only (same convention as gene_names above) — every sample fed
+    # through this one model instance should share a comparable physical
+    # pixel resolution for this single fixed coord_scale to make sense
+    # (same "confirm sample_ids share a platform before pooling"
+    # assumption load_multi_sample's own docstring already documents).
+    coord_scale = float(samples[0][0][:, :2].std())
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     inject_organ_tech_vocab(model_cfg, adatas)
+    inject_coord_scale(model_cfg, coord_scale)
     model = build_model(model_cfg)
     # unresolved copy for checkpointing — same reasoning as main()'s own
     # unresolved_model_cfg (keeps ${oc.env:...} interpolations literal)
     unresolved_model_cfg = OmegaConf.to_container(cfg.model, resolve=False)
     inject_organ_tech_vocab(unresolved_model_cfg, adatas)
+    inject_coord_scale(unresolved_model_cfg, coord_scale)
 
     if list(model.parameters()):
         dataset = MultiSampleMaskedContextQueryDataset(
@@ -914,8 +942,13 @@ def main(cfg_path: str, overrides: list[str] | None = None):
         # storm_lite_encoder.py's own forward()/_encode_gene.
         context_novae_features = get_novae_features(cfg, adata)
 
+    # 2026-07-17: RandomFourierFeatures real-scale bug fix — see
+    # inject_coord_scale's own docstring
+    coord_scale = float(coords3d[:, :2].std())
+
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     inject_stpath_gene_names(model_cfg, adata)
+    inject_coord_scale(model_cfg, coord_scale)
     if context_gene_features is not None:
         inject_novae_dim(model_cfg, context_gene_features.shape[1])
     if context_novae_features is not None:
@@ -937,6 +970,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     # saved config self-consistent with model_cfg above.
     unresolved_model_cfg = OmegaConf.to_container(cfg.model, resolve=False)
     inject_stpath_gene_names(unresolved_model_cfg, adata)
+    inject_coord_scale(unresolved_model_cfg, coord_scale)
     if context_gene_features is not None:
         inject_novae_dim(unresolved_model_cfg, context_gene_features.shape[1])
     if context_novae_features is not None:
