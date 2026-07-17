@@ -77,6 +77,50 @@ def test_relative_position_bias():
     print(f"[RelativePositionBias] OK — shape {tuple(bias.shape)}, self-bias consistent")
 
 
+def test_relative_position_bias_scale_invariance():
+    """Regression test for the real 2026-07-17 bug: RelativePositionBias
+    used to feed RAW coordinate differences into its MLP, producing
+    exploding bias values on real HEST-1k pixel-scale coordinates
+    (thousands, not the [0, 100) every other test in this file uses) —
+    directly responsible for StormLiteContextEncoder scoring WORSE than a
+    plain interpolation baseline on real data (PCC -0.005 to -0.015 vs.
+    interp_baseline's 0.0076, ST-FID 22-36 vs. 10.09), across every
+    gene_encoder_type variant, while STPath arms (unaffected by this
+    class) trained fine. Fixed via per-call normalization by the point
+    cloud's own max pairwise distance — this test checks BOTH properties
+    that fix is supposed to guarantee, at a REALISTIC coordinate scale."""
+    torch.manual_seed(0)
+    n, coord_dim = 10, 3
+    bias_module = RelativePositionBias(coord_dim, hidden_dim=16)
+
+    # 1. boundedness: real HEST-1k-scale coordinates (thousands, matching
+    # this project's own masking configs' radius_range, e.g. [250, 450])
+    # must NOT produce an exploding bias — before the fix, this konsistently
+    # this produced values in the hundreds-to-thousands (swamping real
+    # attention logits, which are O(1-10)); after the fix, values stay small because
+    # feat is normalized into roughly [-1, 1] before the MLP sees it.
+    pixel_scale_coords = torch.rand(n, coord_dim) * 5000.0
+    bias = bias_module(pixel_scale_coords)
+    assert torch.isfinite(bias).all()
+    assert bias.abs().max() < 50.0, (
+        f"bias exploded at real pixel-scale coordinates: max |bias| = {bias.abs().max().item():.2f} "
+        f"(this is exactly the 2026-07-17 bug — unnormalized coordinates feeding directly into the MLP)"
+    )
+
+    # 2. scale invariance: the SAME relative geometry at a 1000x different
+    # absolute scale must produce IDENTICAL bias (up to floating point
+    # tolerance) — the whole point of normalizing by this call's own max
+    # pairwise distance is that only the RELATIVE layout matters, never
+    # the caller's coordinate units.
+    small_scale_coords = pixel_scale_coords / 1000.0
+    bias_small = bias_module(small_scale_coords)
+    assert torch.allclose(bias, bias_small, atol=1e-4), (
+        "bias should be invariant to the absolute coordinate scale, only relative geometry should matter"
+    )
+    print(f"[RelativePositionBias scale invariance] OK — bounded (max |bias|={bias.abs().max().item():.3f}) "
+          f"at pixel scale, invariant to a 1000x rescale")
+
+
 def test_storm_lite_relative_bias_actually_used():
     """Real check that use_relative_bias isn't a silent no-op — output
     with the bias enabled must differ from output with it disabled, given
@@ -122,5 +166,6 @@ def test_storm_lite_relative_bias_actually_used():
 if __name__ == "__main__":
     test_storm_lite_context_encoder()
     test_relative_position_bias()
+    test_relative_position_bias_scale_invariance()
     test_storm_lite_relative_bias_actually_used()
     print("\nStormLiteContextEncoder smoke test done.")

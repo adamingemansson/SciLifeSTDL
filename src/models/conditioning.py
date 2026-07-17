@@ -88,7 +88,33 @@ class RelativePositionBias(nn.Module):
     (one masking draw at a time, see MaskedContextQueryDataset's own
     docstring), and per-head biases would need one MLP output per head
     rather than a scalar; kept simple for a first version, easy to
-    extend later if a per-head bias turns out to matter."""
+    extend later if a per-head bias turns out to matter.
+
+    REAL BUG found 2026-07-17 (this class was directly responsible for
+    StormLiteContextEncoder scoring WORSE than a plain k-NN interpolation
+    baseline on real HEST-1k data — PCC -0.005 to -0.015, ST-FID 22-36
+    vs. interp_baseline's 10.09 — across every gene_encoder_type variant,
+    while every STPath arm, unaffected by this class, trained fine): the
+    original forward() fed RAW, unnormalized coordinate differences
+    directly into self.mlp. Every smoke test in this project used
+    synthetic coordinates in [0, 100) (small enough to hide the problem),
+    but real HEST-1k spatial coordinates are pixel-scale — see this
+    project's masking configs' own radius_range (e.g. [250, 450]),
+    implying the full coordinate range is in the thousands. Feeding
+    values that large through two nn.Linear layers with standard
+    (small-weight) init produces enormous pre-activation magnitudes,
+    added directly to raw attention logits BEFORE softmax — completely
+    swamping the actual learnable Q/K attention signal with an
+    effectively-random, poorly-conditioned bias term the model has no
+    way to learn its way out of (the bias itself keeps growing during
+    training since its own gradient is dominated by this same scale
+    mismatch). Fixed by normalizing diff/dist by this forward call's OWN
+    max pairwise distance before the MLP sees them — keeps every feature
+    within roughly [-1, 1] regardless of whether the input coordinates
+    are in pixels, microns, or the small-scale values every test in this
+    file happens to use, so the bias magnitude is governed entirely by
+    the MLP's own (trainable, well-scaled) output layer instead of by
+    whatever units the caller's coordinates happen to be in."""
 
     def __init__(self, coord_dim: int = 3, hidden_dim: int = 32):
         super().__init__()
@@ -104,7 +130,11 @@ class RelativePositionBias(nn.Module):
         adjusted based on their relative position)."""
         diff = coords.unsqueeze(1) - coords.unsqueeze(0)  # [N, N, coord_dim]
         dist = diff.norm(dim=-1, keepdim=True)             # [N, N, 1]
-        feat = torch.cat([diff, dist], dim=-1)              # [N, N, coord_dim+1]
+        # per-call scale normalization (2026-07-17 fix, see class
+        # docstring) — makes this module invariant to the raw coordinate
+        # unit/magnitude instead of assuming small values
+        scale = dist.max().clamp(min=1e-6)
+        feat = torch.cat([diff / scale, dist / scale], dim=-1)  # [N, N, coord_dim+1], roughly in [-1, 1]
         return self.mlp(feat).squeeze(-1)                    # [N, N]
 
 
