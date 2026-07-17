@@ -1,0 +1,71 @@
+# Completes WAE-GAN's residual-source ablation (2026-07-17). We now have
+# plain (0.1975), both/MLP+Novae (0.2901), and Novae-only (0.3453 — this
+# project's best WAE-GAN result, see docs/results_log.md) — this is the
+# missing MLP-only arm, needed to confirm Novae is genuinely WAE-GAN's
+# best single source, not just better than MLP by default. FM-OT's own
+# ablation went the OTHER way (MLP alone, 0.4291, beat Novae alone,
+# 0.3904) — if WAE-GAN's MLP-only result also beats its Novae-only result,
+# that would mean the earlier "Novae is WAE-GAN's optimum" read was
+# premature; if MLP-only underperforms Novae-only here, it confirms the
+# per-family asymmetry (MLP favored for FM-OT, Novae favored for WAE-GAN)
+# is real, not an artifact of only testing one single-source arm.
+#
+# Direct comparison targets: exp_hest1k_wae_gan_stpath.yaml (plain),
+# exp_hest1k_wae_gan_stpath_bothresidual.yaml, and
+# exp_hest1k_wae_gan_stpath_novaeresidual.yaml.
+#
+# Prepared 2026-07-17, NOT YET RUN — queued for later, see
+# docs/results_log.md for the reasoning this follows up on.
+
+experiment_name: wae_gan_hest1k_pilot_stpath_mlpresidual
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: wae_gan
+  params:
+    context_encoder_type: stpath
+    stpath_gene_voc_path: ${oc.env:STPATH_GENE_VOC_PATH}
+    stpath_model_weight_path: ${oc.env:STPATH_MODEL_WEIGHT_PATH}
+    stpath_organ_type: Kidney      # INT1 is ccRCC (renal cell carcinoma)
+    stpath_tech_type: Visium
+    stpath_new_gene_encoder_type: mlp   # 2026-07-17: see header
+    # stpath_gene_names auto-derived from the loaded AnnData at load time
+    # (train.py/run_comparison.py inject_stpath_gene_names) - do not set here
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_wae_gan_stpath.yaml
+    coord_dim: 3
+    latent_dim: 32
+    hidden_dim: 256
+    cond_hidden_dim: 256
+    disc_hidden_dim: 128
+    adv_weight: 1.0
+    lr: 1.0e-3
+    lr_disc: 1.0e-3
+
+training:
+  epochs: 10000                  # same as exp_hest1k_wae_gan_stpath.yaml - fair comparison
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab
