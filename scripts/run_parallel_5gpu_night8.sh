@@ -28,9 +28,9 @@
 #
 # Same CUDA_VISIBLE_DEVICES-pinning / CPU-thread-capping / resumable /
 # corrected-grep pattern as every other parallel script in this directory.
-# NOTE: pins to GPUs 0-4 — check `nvidia-smi` first to confirm night6/
-# night7 have actually finished before launching, since those used
-# overlapping GPU indices.
+# NOTE: pins to GPUs 3-7 — night7 (GPUs 0-2) was still running when this
+# was queued up, so this deliberately avoids that range. Check
+# `nvidia-smi` first regardless before launching.
 #
 # Usage: bash scripts/run_parallel_5gpu_night8.sh
 # Logs: logs/parallel_run_night8/<name>.log
@@ -45,7 +45,7 @@ CONFIGS=(
     "configs/exp_hest1k_wae_gan_stpath_novaeresidual.yaml"
 )
 EPOCHS_PER_CONFIG=(40000 10000 10000 10000 10000)
-GPU_IDS=(0 1 2 3 4)
+GPU_IDS=(3 4 5 6 7)
 LOG_DIR="logs/parallel_run_night8"
 EXTRA_ARGS="--shuffle-diagnostic"
 
