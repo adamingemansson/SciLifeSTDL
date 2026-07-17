@@ -7,7 +7,7 @@
 # fusion transformer — this variant uses ONLY MLPGeneEncoder
 # (task-trained, no pretraining). Companion configs:
 # exp_hest1k_fm_ot_stormlite_novae.yaml (Novae only),
-# exp_hest1k_fm_ot_stormlite_both.yaml (MLP+Novae summed).
+# exp_hest1k_fm_ot_stormlite_both.yaml (MLP+Novae concatenated).
 #
 # Direct comparison target: exp_hest1k_fm_ot_stpath_unfrozen.yaml — same
 # "train the fusion on our own pilot data" starting point, testing

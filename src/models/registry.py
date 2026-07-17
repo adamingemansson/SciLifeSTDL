@@ -47,6 +47,7 @@ def _build_context_encoder(
     stpath_pretrained: bool = True,
     storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
     storm_lite_bias_type: str = "frame_averaging", storm_lite_relative_bias_hidden_dim: int = 32,
+    storm_lite_fusion_mode: str = "sum",
     organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
 ):
     """Shared by WAE-GAN/FM-OT/VQ-VAE+AR so each model's __init__ doesn't
@@ -137,6 +138,7 @@ def _build_context_encoder(
             n_transformer_layers=storm_lite_n_layers, n_heads=storm_lite_n_heads,
             bias_type=storm_lite_bias_type,
             relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
+            fusion_mode=storm_lite_fusion_mode,
             organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
     else:
@@ -343,6 +345,7 @@ class WAEGAN(BaseGenerativeModel):
                  storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
                  storm_lite_bias_type: str = "frame_averaging",
                  storm_lite_relative_bias_hidden_dim: int = 32,
+                 storm_lite_fusion_mode: str = "sum",
                  coord_scale: float = 1.0,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
@@ -363,6 +366,7 @@ class WAEGAN(BaseGenerativeModel):
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
             storm_lite_bias_type=storm_lite_bias_type,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
+            storm_lite_fusion_mode=storm_lite_fusion_mode,
             coord_scale=coord_scale, organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
         self.encoder = nn.Sequential(
@@ -551,6 +555,7 @@ class FlowMatchingOT(BaseGenerativeModel):
                  storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
                  storm_lite_bias_type: str = "frame_averaging",
                  storm_lite_relative_bias_hidden_dim: int = 32,
+                 storm_lite_fusion_mode: str = "sum",
                  coord_scale: float = 1.0,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
@@ -570,6 +575,7 @@ class FlowMatchingOT(BaseGenerativeModel):
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
             storm_lite_bias_type=storm_lite_bias_type,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
+            storm_lite_fusion_mode=storm_lite_fusion_mode,
             coord_scale=coord_scale, organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
         # own autoencoder, own weights — compresses expression to a small
@@ -755,6 +761,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
                  storm_lite_bias_type: str = "frame_averaging",
                  storm_lite_relative_bias_hidden_dim: int = 32,
+                 storm_lite_fusion_mode: str = "sum",
                  coord_scale: float = 1.0,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
@@ -773,6 +780,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
             storm_lite_bias_type=storm_lite_bias_type,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
+            storm_lite_fusion_mode=storm_lite_fusion_mode,
             coord_scale=coord_scale, organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
         self.encoder = nn.Sequential(

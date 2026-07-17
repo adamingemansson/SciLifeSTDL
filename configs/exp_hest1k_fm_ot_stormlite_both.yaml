@@ -1,7 +1,7 @@
 # STORM-lite fusion transformer (2026-07-16) — see
 # exp_hest1k_fm_ot_stormlite_mlp.yaml for the full header/reasoning
 # (identical here). This variant uses CombinedGeneEncoder (MLP+Novae
-# summed) on the gene side — the most direct answer to "MLP+Novae+
+# concatenated) on the gene side — the most direct answer to "MLP+Novae+
 # GigaPath+fusion transformer" (2026-07-16 discussion).
 #
 # Requires `pip install novae` (Python >=3.11) — see
@@ -28,7 +28,7 @@ model:
   name: fm_ot
   params:
     context_encoder_type: storm_lite
-    gene_encoder_type: both         # 2026-07-16: CombinedGeneEncoder (MLP+Novae summed)
+    gene_encoder_type: both         # 2026-07-16: CombinedGeneEncoder (MLP+Novae concatenated)
     # novae_dim is NOT set here — auto-injected from the real precomputed
     # Novae features' shape (see train.py inject_novae_dim / get_novae_features)
     storm_lite_n_layers: 2

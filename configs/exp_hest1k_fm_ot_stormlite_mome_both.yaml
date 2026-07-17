@@ -1,0 +1,80 @@
+# STORM-lite fusion transformer with MoME-FFN (2026-07-17) — same
+# CombinedGeneEncoder(both) gene side as exp_hest1k_fm_ot_stormlite_both.yaml,
+# but fusion_mode: mome instead of the default "sum".
+#
+# Real STORM detail (verified directly from the uploaded manuscript PDF,
+# arXiv 2604.03630, Online Methods "Spatial encoder"): "Each block
+# contains a shared multi-head self-attention (MSA) module and two
+# modality-specific feed-forward networks (modality experts). Tokens are
+# routed to the appropriate expert based on modality, while the shared
+# MSA aligns features across modalities." Requires separate image/gene
+# tokens (not summed into one, unlike fusion_mode="sum") — see
+# _MoMETransformerBlock in src/models/storm_lite_encoder.py.
+#
+# Motivation (2026-07-17): every StormLite arm so far (fusion_mode="sum",
+# all three gene_encoder_type variants, both bias_type options) scored
+# at/below interp_baseline on real HEST-1k data — PCC roughly -0.01 to
+# +0.01, ST-FID 6-14 vs. every STPath arm's ~1.5-2.5. This tests whether
+# a shared-attention-but-per-modality-FFN design (the STORM detail this
+# project had NOT yet implemented) does better than plain shared-FFN
+# fusion at actually using both modalities' signal, now that the
+# coordinate-scale bugs (RelativePositionBias, RandomFourierFeatures) are
+# independently fixed and ruled out as the cause. Direct comparison
+# target: exp_hest1k_fm_ot_stormlite_both.yaml (identical everything else,
+# only fusion_mode differs).
+#
+# Requires `pip install novae` (Python >=3.11).
+
+experiment_name: fm_ot_hest1k_pilot_stormlite_mome_both
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    storm_lite_fusion_mode: mome   # 2026-07-17: see header
+    # novae_dim is NOT set here — auto-injected from the real precomputed
+    # Novae features' shape (see train.py inject_novae_dim / get_novae_features)
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_fm_ot_stpath.yaml
+    coord_dim: 3
+    cond_hidden_dim: 256           # also StormLiteContextEncoder's internal token dim
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 10000                  # same as exp_hest1k_fm_ot_stpath.yaml - fair comparison
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

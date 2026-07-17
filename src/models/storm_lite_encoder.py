@@ -89,6 +89,62 @@ from src.models.conditioning import (
 )
 
 
+class _MoMETransformerBlock(nn.Module):
+    """One spatial-encoder block matching STORM's real design (verified
+    2026-07-17 directly from the uploaded manuscript PDF, arXiv 2604.03630
+    Online Methods, "Spatial encoder": "Each block contains a shared
+    multi-head self-attention (MSA) module and two modality-specific
+    feed-forward networks (modality experts). Tokens are routed to the
+    appropriate expert based on modality, while the shared MSA aligns
+    features across modalities.").
+
+    Requires tokens to carry their own modality identity (an image token
+    and a gene token per spot, not summed into one) — StormLiteContext-
+    Encoder's original design (fusion_mode="sum") summed img_embed +
+    gene_embed + coord_embed into ONE token per spot specifically because
+    a single shared FFN doesn't need per-token modality identity; MoME-FFN
+    is the opposite design choice, and needs it. fusion_mode="mome"
+    switches StormLiteContextEncoder's token layout accordingly (see its
+    own forward() for the doubled-sequence-length token construction)."""
+
+    def __init__(self, d_model: int, n_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(d_model)
+        hidden = int(d_model * mlp_ratio)
+        # two modality experts (image, gene) — matches STORM's own two
+        # modalities (H&E, ST); this project's "gene" expert covers
+        # whichever gene_encoder_type this run uses, same as the rest of
+        # this class already does for the shared-FFN "sum" path
+        self.ffn_experts = nn.ModuleDict({
+            "image": nn.Sequential(
+                nn.Linear(d_model, hidden), nn.GELU(), nn.Linear(hidden, d_model),
+            ),
+            "gene": nn.Sequential(
+                nn.Linear(d_model, hidden), nn.GELU(), nn.Linear(hidden, d_model),
+            ),
+        })
+
+    def forward(self, x: torch.Tensor, is_image_token: torch.Tensor,
+                attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """x: [1, 2N, d_model]. is_image_token: [2N] bool — True for image
+        tokens, False for gene tokens (routes each token to its own FFN
+        expert after the SHARED attention pass). attn_mask: same [n_heads,
+        2N, 2N] or [2N, 2N] additive bias nn.MultiheadAttention accepts."""
+        normed = self.norm1(x)
+        attn_out, _ = self.attn(normed, normed, normed, attn_mask=attn_mask)
+        x = x + attn_out
+
+        normed2 = self.norm2(x)
+        ffn_out = torch.zeros_like(normed2)
+        if is_image_token.any():
+            ffn_out[:, is_image_token] = self.ffn_experts["image"](normed2[:, is_image_token])
+        if (~is_image_token).any():
+            ffn_out[:, ~is_image_token] = self.ffn_experts["gene"](normed2[:, ~is_image_token])
+        return x + ffn_out
+
+
 class StormLiteContextEncoder(nn.Module):
     def __init__(self, n_genes: int, novae_dim: int | None = None, coord_dim: int = 3,
                  hidden_dim: int = 256, rff_features: int = 64, rff_sigma: float = 1.0,
@@ -96,6 +152,7 @@ class StormLiteContextEncoder(nn.Module):
                  n_transformer_layers: int = 2, n_heads: int = 4,
                  gene_encoder_type: str = "both",
                  bias_type: str = "frame_averaging", relative_bias_hidden_dim: int = 32,
+                 fusion_mode: str = "sum",
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
         assert gene_encoder_type in ("mlp", "novae", "both"), (
@@ -104,6 +161,8 @@ class StormLiteContextEncoder(nn.Module):
         assert bias_type in ("none", "relative_position", "frame_averaging"), (
             f"unknown bias_type {bias_type!r}"
         )
+        assert fusion_mode in ("sum", "mome"), f"unknown fusion_mode {fusion_mode!r}"
+        self.fusion_mode = fusion_mode
         self.gene_encoder_type = gene_encoder_type
         # relative-position attention bias (2026-07-16/17 — see module
         # docstring's "Coordinate handling" for the full reasoning behind
@@ -173,11 +232,42 @@ class StormLiteContextEncoder(nn.Module):
         # architecture does).
         self.mask_token = nn.Parameter(torch.randn(hidden_dim) * 0.02)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, nhead=n_heads, batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_transformer_layers)
+        # LayerNorm on each branch before combining (2026-07-17, StormLite
+        # underperformance investigation) — a fresh-init numerical check
+        # found the three branches (image/gene/coord) similarly scaled at
+        # construction time, so this ISN'T confirmed as the root cause of
+        # StormLite scoring near/below interp_baseline — but scales can
+        # still drift apart from each other during training regardless of
+        # a similar start, and normalizing each branch before it's
+        # combined is standard practice for exactly this failure mode
+        # (one branch's gradient/scale coming to dominate a sum). Applied
+        # in BOTH fusion_mode paths below.
+        self.img_norm = nn.LayerNorm(hidden_dim)
+        self.gene_norm = nn.LayerNorm(hidden_dim)
+        self.coord_norm = nn.LayerNorm(hidden_dim)
+
         self.hidden_dim = hidden_dim
+        if fusion_mode == "mome":
+            # 2026-07-17: real STORM detail (Online Methods, "Spatial
+            # encoder" — see _MoMETransformerBlock's own docstring) —
+            # needs separate image/gene tokens (not summed) to route
+            # through per-modality FFN experts after shared attention.
+            # modality_embed: STORM's own M_i term (formula
+            # H_{0,i} = H_i + M_i + P_i) — a learned per-modality offset,
+            # one row per modality (0=image, 1=gene).
+            self.modality_embed = nn.Parameter(torch.randn(2, hidden_dim) * 0.02)
+            self.mome_blocks = nn.ModuleList([
+                _MoMETransformerBlock(hidden_dim, n_heads) for _ in range(n_transformer_layers)
+            ])
+            # c must be ONE vector per query spot, not per (spot,
+            # modality) pair — combines each query spot's final image-
+            # token and gene-token representations after the MoME blocks.
+            self.mome_output_proj = nn.Linear(2 * hidden_dim, hidden_dim)
+        else:  # "sum" — original design, unchanged
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim, nhead=n_heads, batch_first=True
+            )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_transformer_layers)
 
         # 2026-07-16, multi-sample training follow-up — same additive
         # organ/tech offset as SpatialContextEncoder (see that class and
@@ -240,28 +330,63 @@ class StormLiteContextEncoder(nn.Module):
         device = context_coords.device
 
         coords = torch.cat([context_coords, query_coords], dim=0)
-        coord_embed = self.coord_proj(self.coord_encoder(coords))
+        coord_embed = self.coord_norm(self.coord_proj(self.coord_encoder(coords)))
 
-        img_embed = torch.cat([
+        img_embed = self.img_norm(torch.cat([
             self.image_encoder(context_images), self.image_encoder(query_images),
-        ], dim=0)
+        ], dim=0))
 
-        gene_embed = torch.zeros(n_total, self.hidden_dim, device=device)
-        gene_embed[:n_context] = self._encode_gene(context_expression, context_novae_features)
-        gene_embed[n_context:] = self.mask_token  # broadcasts over n_query rows
+        gene_embed_raw = torch.zeros(n_total, self.hidden_dim, device=device)
+        gene_embed_raw[:n_context] = self._encode_gene(context_expression, context_novae_features)
+        gene_embed_raw[n_context:] = self.mask_token  # broadcasts over n_query rows
+        gene_embed = self.gene_norm(gene_embed_raw)
 
-        tokens = img_embed + gene_embed + coord_embed  # [N_total, hidden_dim]
-        if self.organ_tech_embed is not None and organ is not None and tech is not None:
-            tokens = tokens + self.organ_tech_embed(organ, tech, n_total, device)
-        # additive attention bias (see bias_type in __init__) — a
-        # FloatTensor `mask` is documented PyTorch behavior for an
-        # additive bias added to raw attention logits before softmax, not
-        # a boolean keep/drop mask; accepts either a single [N, N] bias
-        # shared across heads (RelativePositionBias) or a per-head
-        # [n_heads, N, N] bias (FrameAveragingBias) — both verified
-        # directly against a real nn.TransformerEncoder call (see
-        # tests/test_frame_averaging_bias.py). None (bias_type="none")
-        # preserves plain self-attention with no relative-position term.
-        bias = self.pos_bias(coords) if self.pos_bias is not None else None
-        fused = self.transformer(tokens.unsqueeze(0), mask=bias).squeeze(0)  # self-attention over ALL spots
-        return fused[n_context:]  # query positions only
+        if self.fusion_mode == "sum":
+            tokens = img_embed + gene_embed + coord_embed  # [N_total, hidden_dim]
+            if self.organ_tech_embed is not None and organ is not None and tech is not None:
+                tokens = tokens + self.organ_tech_embed(organ, tech, n_total, device)
+            # additive attention bias (see bias_type in __init__) — a
+            # FloatTensor `mask` is documented PyTorch behavior for an
+            # additive bias added to raw attention logits before softmax,
+            # not a boolean keep/drop mask; accepts either a single
+            # [N, N] bias shared across heads (RelativePositionBias) or a
+            # per-head [n_heads, N, N] bias (FrameAveragingBias) — both
+            # verified directly against a real nn.TransformerEncoder call
+            # (see tests/test_frame_averaging_bias.py). None
+            # (bias_type="none") preserves plain self-attention with no
+            # relative-position term.
+            bias = self.pos_bias(coords) if self.pos_bias is not None else None
+            fused = self.transformer(tokens.unsqueeze(0), mask=bias).squeeze(0)  # self-attention over ALL spots
+            return fused[n_context:]  # query positions only
+        else:  # "mome" — see _MoMETransformerBlock's own docstring
+            img_tokens = img_embed + coord_embed + self.modality_embed[0]
+            gene_tokens = gene_embed + coord_embed + self.modality_embed[1]
+            if self.organ_tech_embed is not None and organ is not None and tech is not None:
+                offset = self.organ_tech_embed(organ, tech, n_total, device)
+                img_tokens = img_tokens + offset
+                gene_tokens = gene_tokens + offset
+            # [1, 2*N_total, hidden_dim] — image tokens first, then gene
+            # tokens, same order is_image_token/coords_doubled below use
+            tokens = torch.cat([img_tokens, gene_tokens], dim=0).unsqueeze(0)
+            is_image_token = torch.cat([
+                torch.ones(n_total, dtype=torch.bool, device=device),
+                torch.zeros(n_total, dtype=torch.bool, device=device),
+            ])
+            bias = None
+            if self.pos_bias is not None:
+                # coords duplicated to match the doubled token sequence —
+                # the image token and gene token for the SAME spot share
+                # the SAME coordinate, so the bias between them is
+                # exactly the "self" (zero relative-offset) case, letting
+                # a spot's own image/gene tokens attend to each other
+                # most strongly by default, same-spot cross-modality
+                # information exchange being the whole point of a shared
+                # attention pass over both modalities' tokens.
+                coords_doubled = torch.cat([coords, coords], dim=0)
+                bias = self.pos_bias(coords_doubled)
+            for block in self.mome_blocks:
+                tokens = block(tokens, is_image_token, attn_mask=bias)
+            tokens = tokens.squeeze(0)  # [2*N_total, hidden_dim]
+            img_out, gene_out = tokens[:n_total], tokens[n_total:]
+            combined = self.mome_output_proj(torch.cat([img_out, gene_out], dim=-1))  # [N_total, hidden_dim]
+            return combined[n_context:]  # query positions only

@@ -12,7 +12,7 @@ Run with:
 """
 import torch
 
-from src.models.storm_lite_encoder import StormLiteContextEncoder
+from src.models.storm_lite_encoder import StormLiteContextEncoder, _MoMETransformerBlock
 from src.models.conditioning import _GIGAPATH_FEAT_DIM, RelativePositionBias
 
 
@@ -56,6 +56,107 @@ def test_storm_lite_context_encoder():
         )
         print(f"[StormLiteContextEncoder gene_encoder_type={gene_encoder_type!r}] "
               f"OK — output shape {tuple(c.shape)}, all params received gradient")
+
+
+def test_mome_transformer_block():
+    """Direct unit test of _MoMETransformerBlock (2026-07-17, real STORM
+    detail — see its own docstring) — shape, gradient flow, and the real
+    check that matters: image tokens and gene tokens must actually route
+    through DIFFERENT FFN experts, not silently collapse to the same
+    weights (a real bug class this project has hit before with similarly-
+    named-but-distinct pathways — see CombinedGeneEncoder's sum-vs-concat
+    history)."""
+    torch.manual_seed(0)
+    d_model, n_heads, n_total = 16, 4, 6
+    block = _MoMETransformerBlock(d_model, n_heads)
+    x = torch.randn(1, 2 * n_total, d_model)
+    is_image_token = torch.cat([
+        torch.ones(n_total, dtype=torch.bool), torch.zeros(n_total, dtype=torch.bool),
+    ])
+    out = block(x, is_image_token)
+    assert out.shape == x.shape, out.shape
+    assert torch.isfinite(out).all()
+
+    loss = out.sum()
+    loss.backward()
+    no_grad = [name for name, p in block.named_parameters()
+               if p.requires_grad and (p.grad is None or not torch.isfinite(p.grad).all())]
+    assert not no_grad, f"params with no/invalid gradient: {no_grad}"
+
+    # real check the two experts are genuinely different modules, not
+    # aliased to the same weights — feed the SAME feature vector through
+    # both experts directly and confirm different output
+    torch.manual_seed(0)
+    same_input = torch.randn(1, 1, d_model)
+    image_out = block.ffn_experts["image"](same_input)
+    gene_out = block.ffn_experts["gene"](same_input)
+    assert not torch.allclose(image_out, gene_out), (
+        "image and gene FFN experts produced identical output on identical input — "
+        "they may be accidentally sharing weights instead of being independent experts"
+    )
+    print("[_MoMETransformerBlock] OK — shape correct, gradient flows, "
+          "image/gene experts are genuinely independent")
+
+
+def test_storm_lite_fusion_mode_mome():
+    """Integration test of StormLiteContextEncoder(fusion_mode='mome') —
+    every gene_encoder_type x bias_type combination, shape + gradient
+    flow (same discipline as test_storm_lite_context_encoder above)."""
+    torch.manual_seed(0)
+    n_context, n_query, n_genes, novae_dim, hidden_dim = 10, 4, 20, 64, 16
+    context_coords = torch.rand(n_context, 3) * 5000  # real pixel-scale, not the [0,100) every other check uses
+    query_coords = torch.rand(n_query, 3) * 5000
+    context_images = torch.rand(n_context, _GIGAPATH_FEAT_DIM)
+    query_images = torch.rand(n_query, _GIGAPATH_FEAT_DIM)
+    context_expression = torch.rand(n_context, n_genes)
+    context_novae_features = torch.rand(n_context, novae_dim)
+
+    for gene_encoder_type in ("mlp", "novae", "both"):
+        for bias_type in ("none", "relative_position", "frame_averaging"):
+            encoder = StormLiteContextEncoder(
+                n_genes=n_genes, novae_dim=novae_dim, hidden_dim=hidden_dim,
+                n_transformer_layers=2, n_heads=4, gene_encoder_type=gene_encoder_type,
+                fusion_mode="mome", bias_type=bias_type, coord_scale=1000.0,
+            )
+            c = encoder(context_coords, context_expression, query_coords,
+                         context_images, query_images, context_novae_features=context_novae_features)
+            assert c.shape == (n_query, hidden_dim), (gene_encoder_type, bias_type, c.shape)
+            assert torch.isfinite(c).all()
+
+            loss = c.sum()
+            loss.backward()
+            no_grad = [name for name, p in encoder.named_parameters()
+                       if p.requires_grad and (p.grad is None or not torch.isfinite(p.grad).all())]
+            assert not no_grad, (gene_encoder_type, bias_type, no_grad)
+    print("[StormLiteContextEncoder fusion_mode='mome'] OK — all 9 "
+          "gene_encoder_type x bias_type combinations pass shape/gradient checks")
+
+
+def test_storm_lite_fusion_mode_sum_vs_mome_differ():
+    torch.manual_seed(0)
+    n_context, n_query, n_genes, hidden_dim = 8, 3, 15, 16
+    context_coords = torch.rand(n_context, 3) * 5000
+    query_coords = torch.rand(n_query, 3) * 5000
+    context_images = torch.rand(n_context, _GIGAPATH_FEAT_DIM)
+    query_images = torch.rand(n_query, _GIGAPATH_FEAT_DIM)
+    context_expression = torch.rand(n_context, n_genes)
+
+    torch.manual_seed(1)
+    sum_encoder = StormLiteContextEncoder(
+        n_genes=n_genes, hidden_dim=hidden_dim, gene_encoder_type="mlp", fusion_mode="sum",
+    )
+    torch.manual_seed(1)
+    mome_encoder = StormLiteContextEncoder(
+        n_genes=n_genes, hidden_dim=hidden_dim, gene_encoder_type="mlp", fusion_mode="mome",
+    )
+    with torch.no_grad():
+        out_sum = sum_encoder(context_coords, context_expression, query_coords, context_images, query_images)
+        out_mome = mome_encoder(context_coords, context_expression, query_coords, context_images, query_images)
+    assert out_sum.shape == out_mome.shape
+    assert not torch.allclose(out_sum, out_mome), (
+        "fusion_mode='sum' and 'mome' produced identical output — 'mome' may not be wired up"
+    )
+    print("[StormLiteContextEncoder] OK — fusion_mode='sum' vs 'mome' produce genuinely different output")
 
 
 def test_relative_position_bias():
@@ -170,6 +271,9 @@ def test_storm_lite_bias_type_actually_used():
 
 if __name__ == "__main__":
     test_storm_lite_context_encoder()
+    test_mome_transformer_block()
+    test_storm_lite_fusion_mode_mome()
+    test_storm_lite_fusion_mode_sum_vs_mome_differ()
     test_relative_position_bias()
     test_relative_position_bias_scale_invariance()
     test_storm_lite_bias_type_actually_used()
