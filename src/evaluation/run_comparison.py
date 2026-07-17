@@ -64,7 +64,7 @@ from src.training.train import (
     _load_images, _images_tensor, inject_stpath_gene_names,
     get_gigapath_features, save_trained_model, make_dataloader,
     _downsample_patches, get_novae_features, inject_novae_dim, inject_stpath_novae_dim,
-    inject_coord_scale,
+    inject_coord_scale, inject_decoder_gene_names,
 )
 from src.evaluation import metrics as ev
 from src.evaluation.cell_type_classifier import cluster_pseudo_labels, CellTypePlausibilityClassifier
@@ -176,6 +176,7 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     inject_stpath_gene_names(model_cfg, adata)
+    inject_decoder_gene_names(model_cfg, adata)
     inject_coord_scale(model_cfg, coord_scale)
     if context_gene_features is not None:
         inject_novae_dim(model_cfg, context_gene_features.shape[1])
@@ -193,6 +194,7 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
     # bug this fixes (2026-07-15).
     unresolved_model_cfg = OmegaConf.to_container(cfg.model, resolve=False)
     inject_stpath_gene_names(unresolved_model_cfg, adata)
+    inject_decoder_gene_names(unresolved_model_cfg, adata)
     inject_coord_scale(unresolved_model_cfg, coord_scale)
     if context_gene_features is not None:
         inject_novae_dim(unresolved_model_cfg, context_gene_features.shape[1])
