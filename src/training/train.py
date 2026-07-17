@@ -137,7 +137,23 @@ class PeriodicCheckpointCallback(pl.Callback):
 
     Opt-in via training.checkpoint_every_n_steps in a config (unset/None
     default — every existing config's behavior is completely unchanged,
-    only saving once at the end of training as before)."""
+    only saving once at the end of training as before).
+
+    Keys off batch_idx, NOT trainer.global_step — real discrepancy found
+    2026-07-17 by an actual empirical check (see docs/results_log.md):
+    trainer.global_step increments once per optimizer.step() call, not
+    once per training batch, so it advances TWICE per batch for WAE-GAN
+    specifically (its manual-optimization training_step calls .step() on
+    two separate optimizers — opt_disc then opt_ae) but only once per
+    batch for FM-OT/VQ-VAE+AR's single-optimizer automatic optimization.
+    Using global_step would have silently checkpointed WAE-GAN twice as
+    often as every other family for the same save_every_n_steps value.
+    batch_idx is uniform across every family here (every trainer in this
+    codebase sets max_epochs=1, with n_items=cfg.training.epochs items,
+    so batch_idx directly IS the true 0-indexed count of training items
+    for the whole run, matching this codebase's own "epochs means masking
+    draws, not literal epochs" convention — see MaskedContextQueryDataset's
+    own docstring)."""
 
     def __init__(self, model_cfg: dict, gene_names: list, checkpoint_dir: str,
                  save_every_n_steps: int):
@@ -147,8 +163,8 @@ class PeriodicCheckpointCallback(pl.Callback):
         self.save_every_n_steps = save_every_n_steps
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        step = trainer.global_step
-        if step > 0 and step % self.save_every_n_steps == 0:
+        step = batch_idx + 1  # batch_idx is 0-indexed; report/key off the 1-indexed item count
+        if step % self.save_every_n_steps == 0:
             saved_path = save_trained_model(pl_module, self.model_cfg, self.gene_names, self.checkpoint_dir)
             if saved_path is not None:
                 print(f"[PeriodicCheckpointCallback] step {step}: saved checkpoint to {saved_path.parent}")
