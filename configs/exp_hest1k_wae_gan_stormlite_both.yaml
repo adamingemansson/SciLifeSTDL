@@ -1,0 +1,66 @@
+# Mode-collapse isolation test (2026-07-17) — companion to
+# exp_hest1k_wae_gan_stormlite_mome_both.yaml, which produced a real
+# ConstantInputWarning mode collapse (PCC=nan, model output the SAME
+# expression vector for every query point) on its first 10000-epoch run.
+# Identical config, only storm_lite_fusion_mode differs (default "sum"
+# instead of "mome") — isolates whether the MoME-FFN's extra architectural
+# complexity specifically destabilized WAE-GAN's adversarial training, or
+# whether StormLite+WAE-GAN collapses regardless of fusion_mode. If THIS
+# run collapses too, the issue is WAE-GAN+StormLite generally (context
+# encoder complexity vs. adversarial training stability); if it doesn't,
+# the issue is specific to mome's shared-attention/per-modality-FFN
+# design interacting badly with the discriminator loss.
+#
+# Requires `pip install novae` (Python >=3.11).
+
+experiment_name: wae_gan_hest1k_pilot_stormlite_both
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: wae_gan
+  params:
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    # storm_lite_fusion_mode NOT set -> defaults to "sum" (2026-07-17: see header)
+    # novae_dim is NOT set here — auto-injected from the real precomputed
+    # Novae features' shape (see train.py inject_novae_dim / get_novae_features)
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    n_genes: 16570
+    coord_dim: 3
+    latent_dim: 32
+    hidden_dim: 256
+    cond_hidden_dim: 256           # also StormLiteContextEncoder's internal token dim
+    disc_hidden_dim: 128
+    adv_weight: 1.0
+    lr: 1.0e-3
+    lr_disc: 1.0e-3
+
+training:
+  epochs: 10000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab
