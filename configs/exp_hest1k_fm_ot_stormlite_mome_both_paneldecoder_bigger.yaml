@@ -1,0 +1,75 @@
+# Capacity follow-up (2026-07-17) to exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder.yaml,
+# whose first real result came back at PCC 0.1308 — a real, non-trivial
+# gap vs. the dense-decoder mome_both arm's 0.2798 at the same 10k epochs.
+# Hypothesis: the gap is a CAPACITY problem, not a fundamental limitation
+# of the gene-identity-lookup mechanism — PanelInvariantGeneDecoder has to
+# learn a single shared scoring function across all 16570 genes via one
+# small MLP + embedding lookup, a harder problem than the dense decoder's
+# one-linear-column-per-gene. This quadruples decoder_gene_embed_dim
+# (64 -> 256, now matching cond_hidden_dim/ae_hidden_dim's own width)
+# to test that hypothesis directly. If this closes most of the gap,
+# capacity was the issue and it's a simple tuning knob; if it doesn't,
+# something more structural about the panel-invariant mechanism itself
+# needs attention before it's trusted for real cross-platform use.
+#
+# Direct comparison targets: exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder.yaml
+# (decoder_gene_embed_dim=64, PCC 0.1308) and exp_hest1k_fm_ot_stormlite_mome_both.yaml
+# (dense decoder, PCC 0.2798) — both at 10k epochs.
+#
+# Requires `pip install novae` (Python >=3.11).
+
+experiment_name: fm_ot_hest1k_pilot_stormlite_mome_both_paneldecoder_bigger
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    storm_lite_fusion_mode: mome
+    decoder_type: panel_invariant   # 2026-07-17: see header
+    # decoder_gene_names is NOT set here — auto-injected from adata.var_names
+    # (see train.py inject_decoder_gene_names), same panel as context/training
+    decoder_gene_embed_dim: 256     # 2026-07-17: bumped from 64 — see header
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_fm_ot_stpath.yaml
+    coord_dim: 3
+    cond_hidden_dim: 256           # also StormLiteContextEncoder's internal token dim
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 10000                  # same as exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder.yaml - fair comparison
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

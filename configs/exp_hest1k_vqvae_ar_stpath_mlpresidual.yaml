@@ -1,0 +1,70 @@
+# Cross-model-family test (2026-07-17): does STPath's Route-B MLP-only
+# residual (MLPGeneEncoder, trainable from scratch) help VQ-VAE+AR the way
+# it helped FM-OT (exp_hest1k_fm_ot_stpath_mlpresidual.yaml, PCC 0.4291 —
+# beat both the plain STPath baseline and the Novae-only residual there)?
+# Only "both" (MLP+Novae combined) has been tested on VQ-VAE+AR so far
+# (exp_hest1k_vqvae_ar_stpath_bothresidual.yaml) — this isolates the
+# MLP-only contribution the same way it was isolated for FM-OT.
+# Direct comparison target: exp_hest1k_vqvae_ar_stpath.yaml (plain, no
+# residual) and exp_hest1k_vqvae_ar_stpath_novaeresidual.yaml (companion).
+#
+# Requires `pip install novae` (Python >=3.11).
+
+experiment_name: vqvae_ar_hest1k_pilot_stpath_mlpresidual
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: vqvae_ar
+  params:
+    context_encoder_type: stpath
+    stpath_gene_voc_path: ${oc.env:STPATH_GENE_VOC_PATH}
+    stpath_model_weight_path: ${oc.env:STPATH_MODEL_WEIGHT_PATH}
+    stpath_organ_type: Kidney      # INT1 is ccRCC (renal cell carcinoma)
+    stpath_tech_type: Visium
+    stpath_new_gene_encoder_type: mlp   # 2026-07-17: see header
+    # stpath_gene_names auto-derived from the loaded AnnData at load time
+    # (train.py/run_comparison.py inject_stpath_gene_names) - do not set here
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_vqvae_ar_stpath.yaml
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    codebook_size: 64
+    commitment_weight: 0.25
+    transformer_dim: 128
+    n_transformer_layers: 4
+    n_heads: 4
+    max_seq_len: 2048
+    recon_weight: 1.0
+    ar_weight: 1.0
+    sample_temperature: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 10000                  # same as exp_hest1k_vqvae_ar_stpath.yaml - fair comparison
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab
