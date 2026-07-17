@@ -1,6 +1,7 @@
 #!/bin/bash
 # Ninth batch (2026-07-17) — last run before the overnight gap. 7 configs,
-# 10000 epochs each, GPUs 0-6. Weighted toward StormLite (the priority
+# 10000 epochs each, GPUs 0,1,2,4,5,6,7 (skips GPU 3 -- still busy with
+# the 40k stpath_unfrozen_bothresidual run from night8). Weighted toward StormLite (the priority
 # context encoder for this project's actual research direction — GigaPath
 # + Novae, STPath-inspired fusion, built from scratch rather than relying
 # on STPath's external pretrained weights) rather than an even split:
@@ -58,6 +59,8 @@ CONFIGS=(
     "configs/exp_hest1k_fm_ot_stpath_bothresidual_lloki.yaml"
     "configs/exp_hest1k_wae_gan_stormlite_mome_both_lloki.yaml"
 )
+GPU_IDS=(0 1 2 4 5 6 7)  # skips GPU 3 -- still busy with the 40k
+                          # stpath_unfrozen_bothresidual run (night8)
 EPOCHS=10000
 LOG_DIR="logs/parallel_run_night9_${EPOCHS}ep"
 EXTRA_ARGS="--shuffle-diagnostic"
@@ -67,24 +70,31 @@ N_CORES=$(nproc)
 THREADS_PER_JOB=$((N_CORES / ${#CONFIGS[@]}))
 [ "$THREADS_PER_JOB" -lt 1 ] && THREADS_PER_JOB=1
 
-if [ "${#CONFIGS[@]}" -gt "$N_GPUS" ]; then
-    echo "ERROR: ${#CONFIGS[@]} configs but only $N_GPUS GPUs visible — trim CONFIGS or this will double up on a GPU."
+if [ "${#CONFIGS[@]}" -ne "${#GPU_IDS[@]}" ]; then
+    echo "ERROR: ${#CONFIGS[@]} configs but ${#GPU_IDS[@]} GPU_IDS entries — these must match 1:1."
     exit 1
 fi
+for gid in "${GPU_IDS[@]}"; do
+    if [ "$gid" -ge "$N_GPUS" ]; then
+        echo "ERROR: GPU index $gid requested but only $N_GPUS GPUs visible."
+        exit 1
+    fi
+done
 
 mkdir -p "$LOG_DIR"
-echo "Launching ${#CONFIGS[@]} jobs across GPUs 0-$((${#CONFIGS[@]}-1)), ${THREADS_PER_JOB} CPU threads each, logs in $LOG_DIR..."
+echo "Launching ${#CONFIGS[@]} jobs on GPUs ${GPU_IDS[*]}, ${THREADS_PER_JOB} CPU threads each, logs in $LOG_DIR..."
 
 for i in "${!CONFIGS[@]}"; do
     cfg="${CONFIGS[$i]}"
+    gid="${GPU_IDS[$i]}"
     name=$(basename "$cfg" .yaml)
     logfile="$LOG_DIR/${name}.log"
     if [ -f "$logfile" ] && grep -q "^model " "$logfile"; then
-        echo "  GPU $i: $cfg -> SKIPPING, already completed (see $logfile)"
+        echo "  GPU $gid: $cfg -> SKIPPING, already completed (see $logfile)"
         continue
     fi
-    echo "  GPU $i: $cfg -> $logfile"
-    CUDA_VISIBLE_DEVICES=$i \
+    echo "  GPU $gid: $cfg -> $logfile"
+    CUDA_VISIBLE_DEVICES=$gid \
     OMP_NUM_THREADS=$THREADS_PER_JOB \
     MKL_NUM_THREADS=$THREADS_PER_JOB \
     python -m src.evaluation.run_comparison "$cfg" \
