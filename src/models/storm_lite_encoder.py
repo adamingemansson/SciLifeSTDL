@@ -54,15 +54,22 @@ Simplifications, explicit:
     much higher-density data (Visium HD), not fundamental to the
     question this class tests.
   - Coordinate handling: RandomFourierFeatures (absolute, concatenated
-    into each token) PLUS, as of 2026-07-16, RelativePositionBias (a
-    Swin-V2-style continuous position bias — an MLP over pairwise
-    relative coordinates, added directly to attention logits, see
-    conditioning.py). Still not STPath's own geometry-aware
-    frame-averaging attention bias (verified via STPath's real source),
-    which STORM may or may not also use — unconfirmed either way — but
-    now at least gives this class a genuine relative-geometry signal
-    rather than only absolute position, closing what was previously a
-    real gap versus STPath.
+    into each token) PLUS a relative-position attention bias, selectable
+    via bias_type. As of 2026-07-17 the DEFAULT is "frame_averaging" —
+    STPath's OWN real mechanism, directly verified by cloning
+    github.com/Graph-and-Geometric-Learning/STPath and reading
+    stpath/model/nn_utils/fa.py + stpath/model/encoder/spatial_transformer.py
+    (see FrameAveragingBias's own docstring in conditioning.py for the
+    full mechanism and its provable rotation/reflection invariance).
+    "relative_position" (the 2026-07-16 Swin-V2-style CPB MLP, added when
+    STORM's own mechanism was still unverifiable behind the arxiv block)
+    is kept as a still-tested, still-usable alternative for comparison —
+    not deleted, since it's a real, working, if less principled, design.
+    STORM's own attention/positional mechanism (arXiv 2604.03630) remains
+    genuinely unverified (that domain stays blocked by this sandbox's
+    network proxy, confirmed repeatedly) — frame_averaging is STPath's
+    real mechanism, used here on the reasoning that a directly-verified
+    real architecture is preferable to continuing to guess at STORM's.
   - STORM's own image encoder is H0-mini, not GigaPath — kept GigaPath
     here for consistency with every other arm in this project's
     comparisons (isolates the fusion-architecture question from a
@@ -76,7 +83,8 @@ import torch.nn as nn
 
 from src.models.conditioning import (
     RandomFourierFeatures, GigapathPatchEncoder,
-    MLPGeneEncoder, NovaeGeneEncoder, CombinedGeneEncoder, RelativePositionBias,
+    MLPGeneEncoder, NovaeGeneEncoder, CombinedGeneEncoder,
+    RelativePositionBias, FrameAveragingBias,
     OrganTechEmbedding,
 )
 
@@ -86,22 +94,33 @@ class StormLiteContextEncoder(nn.Module):
                  hidden_dim: int = 256, rff_features: int = 64, rff_sigma: float = 1.0,
                  coord_scale: float = 1.0,
                  n_transformer_layers: int = 2, n_heads: int = 4,
-                 gene_encoder_type: str = "both", use_relative_bias: bool = True,
-                 relative_bias_hidden_dim: int = 32,
+                 gene_encoder_type: str = "both",
+                 bias_type: str = "frame_averaging", relative_bias_hidden_dim: int = 32,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
         assert gene_encoder_type in ("mlp", "novae", "both"), (
             f"unknown gene_encoder_type {gene_encoder_type!r}"
         )
+        assert bias_type in ("none", "relative_position", "frame_averaging"), (
+            f"unknown bias_type {bias_type!r}"
+        )
         self.gene_encoder_type = gene_encoder_type
-        # 2026-07-16: Swin-V2-style continuous position bias (see
-        # RelativePositionBias's own docstring in conditioning.py) — closes
-        # the gap versus STPath's verified geometry-aware attention bias,
-        # which this class previously had no counterpart for (only
-        # absolute RandomFourierFeatures baked into each token below).
-        self.use_relative_bias = use_relative_bias
-        self.rel_pos_bias = RelativePositionBias(coord_dim, relative_bias_hidden_dim) \
-            if use_relative_bias else None
+        # relative-position attention bias (2026-07-16/17 — see module
+        # docstring's "Coordinate handling" for the full reasoning behind
+        # each option). "frame_averaging" (default, 2026-07-17): STPath's
+        # own real, verified mechanism (FrameAveragingBias, produces a
+        # PER-HEAD [n_heads, N, N] bias). "relative_position" (2026-07-16):
+        # the earlier ad hoc Swin-V2-style CPB MLP (RelativePositionBias,
+        # a single SHARED [N, N] bias across all heads), kept as a
+        # comparison arm. "none": no relative bias at all (only absolute
+        # RandomFourierFeatures baked into each token below).
+        self.bias_type = bias_type
+        if bias_type == "frame_averaging":
+            self.pos_bias = FrameAveragingBias(n_heads, coord_scale)
+        elif bias_type == "relative_position":
+            self.pos_bias = RelativePositionBias(coord_dim, relative_bias_hidden_dim)
+        else:
+            self.pos_bias = None
 
         # Per-modality encoders, each projecting to hidden_dim so they can
         # be summed into one token — same additive-fusion pattern STPath's
@@ -234,11 +253,15 @@ class StormLiteContextEncoder(nn.Module):
         tokens = img_embed + gene_embed + coord_embed  # [N_total, hidden_dim]
         if self.organ_tech_embed is not None and organ is not None and tech is not None:
             tokens = tokens + self.organ_tech_embed(organ, tech, n_total, device)
-        # additive attention bias (Swin-V2-style CPB, see RelativePositionBias)
-        # — a FloatTensor `mask` is documented PyTorch behavior for an
+        # additive attention bias (see bias_type in __init__) — a
+        # FloatTensor `mask` is documented PyTorch behavior for an
         # additive bias added to raw attention logits before softmax, not
-        # a boolean keep/drop mask; None (use_relative_bias=False)
-        # preserves the original plain-self-attention behavior exactly.
-        bias = self.rel_pos_bias(coords) if self.use_relative_bias else None
+        # a boolean keep/drop mask; accepts either a single [N, N] bias
+        # shared across heads (RelativePositionBias) or a per-head
+        # [n_heads, N, N] bias (FrameAveragingBias) — both verified
+        # directly against a real nn.TransformerEncoder call (see
+        # tests/test_frame_averaging_bias.py). None (bias_type="none")
+        # preserves plain self-attention with no relative-position term.
+        bias = self.pos_bias(coords) if self.pos_bias is not None else None
         fused = self.transformer(tokens.unsqueeze(0), mask=bias).squeeze(0)  # self-attention over ALL spots
         return fused[n_context:]  # query positions only

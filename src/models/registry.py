@@ -46,7 +46,7 @@ def _build_context_encoder(
     stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None,
     stpath_pretrained: bool = True,
     storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
-    storm_lite_use_relative_bias: bool = True, storm_lite_relative_bias_hidden_dim: int = 32,
+    storm_lite_bias_type: str = "frame_averaging", storm_lite_relative_bias_hidden_dim: int = 32,
     organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
 ):
     """Shared by WAE-GAN/FM-OT/VQ-VAE+AR so each model's __init__ doesn't
@@ -135,7 +135,7 @@ def _build_context_encoder(
             hidden_dim=cond_hidden_dim, gene_encoder_type=gene_encoder_type,
             coord_scale=coord_scale,
             n_transformer_layers=storm_lite_n_layers, n_heads=storm_lite_n_heads,
-            use_relative_bias=storm_lite_use_relative_bias,
+            bias_type=storm_lite_bias_type,
             relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
             organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
@@ -341,7 +341,7 @@ class WAEGAN(BaseGenerativeModel):
                  stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None,
                  stpath_pretrained: bool = True,
                  storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
-                 storm_lite_use_relative_bias: bool = True,
+                 storm_lite_bias_type: str = "frame_averaging",
                  storm_lite_relative_bias_hidden_dim: int = 32,
                  coord_scale: float = 1.0,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
@@ -361,7 +361,7 @@ class WAEGAN(BaseGenerativeModel):
             stpath_new_gene_encoder_type=stpath_new_gene_encoder_type, stpath_novae_dim=stpath_novae_dim,
             stpath_pretrained=stpath_pretrained,
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
-            storm_lite_use_relative_bias=storm_lite_use_relative_bias,
+            storm_lite_bias_type=storm_lite_bias_type,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
             coord_scale=coord_scale, organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
@@ -549,7 +549,7 @@ class FlowMatchingOT(BaseGenerativeModel):
                  stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None,
                  stpath_pretrained: bool = True,
                  storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
-                 storm_lite_use_relative_bias: bool = True,
+                 storm_lite_bias_type: str = "frame_averaging",
                  storm_lite_relative_bias_hidden_dim: int = 32,
                  coord_scale: float = 1.0,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
@@ -568,7 +568,7 @@ class FlowMatchingOT(BaseGenerativeModel):
             stpath_new_gene_encoder_type=stpath_new_gene_encoder_type, stpath_novae_dim=stpath_novae_dim,
             stpath_pretrained=stpath_pretrained,
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
-            storm_lite_use_relative_bias=storm_lite_use_relative_bias,
+            storm_lite_bias_type=storm_lite_bias_type,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
             coord_scale=coord_scale, organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
@@ -753,7 +753,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None,
                  stpath_pretrained: bool = True,
                  storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
-                 storm_lite_use_relative_bias: bool = True,
+                 storm_lite_bias_type: str = "frame_averaging",
                  storm_lite_relative_bias_hidden_dim: int = 32,
                  coord_scale: float = 1.0,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
@@ -771,7 +771,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
             stpath_new_gene_encoder_type=stpath_new_gene_encoder_type, stpath_novae_dim=stpath_novae_dim,
             stpath_pretrained=stpath_pretrained,
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
-            storm_lite_use_relative_bias=storm_lite_use_relative_bias,
+            storm_lite_bias_type=storm_lite_bias_type,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
             coord_scale=coord_scale, organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )

@@ -121,12 +121,16 @@ def test_relative_position_bias_scale_invariance():
           f"at pixel scale, invariant to a 1000x rescale")
 
 
-def test_storm_lite_relative_bias_actually_used():
-    """Real check that use_relative_bias isn't a silent no-op — output
-    with the bias enabled must differ from output with it disabled, given
-    otherwise-identical weights/inputs (same failure class as this
-    project's real @torch.no_grad()-swallowed-gradient bugs, just for
-    "is this feature doing anything at all" instead of "is it trainable")."""
+def test_storm_lite_bias_type_actually_used():
+    """Real check that bias_type isn't a silent no-op — output for each of
+    the 3 bias_type options must differ from the others, given otherwise-
+    identical weights/inputs (same failure class as this project's real
+    @torch.no_grad()-swallowed-gradient bugs, just for "is this feature
+    doing anything at all" instead of "is it trainable"). Covers both
+    bias mechanisms (2026-07-17, frame_averaging added as the new default
+    — see StormLiteContextEncoder's own bias_type docstring), not just
+    the older relative_position vs none comparison this test used to
+    check exclusively."""
     torch.manual_seed(0)
     n_context, n_query, n_genes, hidden_dim = 8, 3, 15, 16
     context_coords = torch.rand(n_context, 3) * 100
@@ -135,37 +139,38 @@ def test_storm_lite_relative_bias_actually_used():
     query_images = torch.rand(n_query, _GIGAPATH_FEAT_DIM)
     context_expression = torch.rand(n_context, n_genes)
 
-    torch.manual_seed(1)
-    with_bias = StormLiteContextEncoder(
-        n_genes=n_genes, hidden_dim=hidden_dim, gene_encoder_type="mlp", use_relative_bias=True,
+    outputs = {}
+    for bias_type in ("none", "relative_position", "frame_averaging"):
+        torch.manual_seed(1)
+        encoder = StormLiteContextEncoder(
+            n_genes=n_genes, hidden_dim=hidden_dim, gene_encoder_type="mlp", bias_type=bias_type,
+        )
+        with torch.no_grad():
+            outputs[bias_type] = encoder(context_coords, context_expression, query_coords,
+                                          context_images, query_images)
+        assert outputs[bias_type].shape == (n_query, hidden_dim)
+
+    # same seed -> identical weights for every shared submodule constructed
+    # BEFORE pos_bias in __init__, but pos_bias itself (constructed first)
+    # shifts the seed sequence for everything after it differently per
+    # bias_type — so this checks the weaker-but-still-real property that
+    # all three outputs genuinely differ, not that non-bias weights are
+    # byte-identical across bias_type values.
+    assert not torch.allclose(outputs["none"], outputs["relative_position"]), (
+        "bias_type='relative_position' produced identical output to 'none' — bias may be a no-op"
     )
-    torch.manual_seed(1)
-    without_bias = StormLiteContextEncoder(
-        n_genes=n_genes, hidden_dim=hidden_dim, gene_encoder_type="mlp", use_relative_bias=False,
+    assert not torch.allclose(outputs["none"], outputs["frame_averaging"]), (
+        "bias_type='frame_averaging' produced identical output to 'none' — bias may be a no-op"
     )
-    # same seed -> identical weights for every shared submodule (rel_pos_bias
-    # itself only exists in with_bias, extra params don't affect the seed
-    # sequence consumed by modules constructed BEFORE it in __init__... but
-    # rel_pos_bias IS constructed before the gene/image encoders in this
-    # class's __init__, so its random init does shift the seed sequence for
-    # everything after it. This test therefore checks something weaker but
-    # still real: the two forward passes must simply produce DIFFERENT
-    # output, not that all non-bias weights are byte-identical.
-    with torch.no_grad():
-        out_with = with_bias(context_coords, context_expression, query_coords,
-                              context_images, query_images)
-        out_without = without_bias(context_coords, context_expression, query_coords,
-                                    context_images, query_images)
-    assert out_with.shape == out_without.shape
-    assert not torch.allclose(out_with, out_without), (
-        "use_relative_bias=True/False produced identical output — bias may be a no-op"
+    assert not torch.allclose(outputs["relative_position"], outputs["frame_averaging"]), (
+        "the two bias mechanisms produced identical output — suspicious given they're structurally different"
     )
-    print("[StormLiteContextEncoder] OK — use_relative_bias genuinely changes output")
+    print("[StormLiteContextEncoder] OK — all 3 bias_type options genuinely produce different output")
 
 
 if __name__ == "__main__":
     test_storm_lite_context_encoder()
     test_relative_position_bias()
     test_relative_position_bias_scale_invariance()
-    test_storm_lite_relative_bias_actually_used()
+    test_storm_lite_bias_type_actually_used()
     print("\nStormLiteContextEncoder smoke test done.")

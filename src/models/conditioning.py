@@ -177,6 +177,118 @@ class RelativePositionBias(nn.Module):
         return self.mlp(feat).squeeze(-1)                    # [N, N]
 
 
+class FrameAveragingBias(nn.Module):
+    """Real, VERIFIED relative-position attention bias, reproducing
+    STPath's OWN actual mechanism — added 2026-07-17 after directly
+    cloning and reading github.com/Graph-and-Geometric-Learning/STPath
+    (stpath/model/nn_utils/fa.py's FrameAveraging class +
+    stpath/model/encoder/spatial_transformer.py's Attention class),
+    resolving what was previously only described secondhand in this
+    project's own comments. Supersedes RelativePositionBias (above,
+    2026-07-16) as StormLiteContextEncoder's default bias mechanism —
+    that class was an ad hoc Swin-V2-style CPB MLP, invented because
+    STORM's own real mechanism was unverifiable (arXiv 2604.03630 blocked
+    by this sandbox's network proxy, confirmed repeatedly). STPath's real
+    mechanism turned out to be independently accessible and is used here
+    instead, on the reasoning that reproducing a VERIFIED real
+    architecture beats reproducing an invented one when direct evidence
+    is available. RelativePositionBias is kept (not deleted) as a
+    still-usable, still-tested alternative.
+
+    Frame averaging (Puny et al. 2022, "Frame Averaging for Invariant and
+    Equivariant Network Design") is a technique for exact invariance to a
+    symmetry group by averaging a function's output over a small, FINITE
+    "frame" of group elements, rather than the whole continuous group
+    (which would need e.g. numerical integration over all rotation
+    angles). STPath applies it to build a relative-position attention
+    bias that is PROVABLY invariant to any rotation/reflection of the
+    whole coordinate system — a strictly stronger geometric guarantee
+    than RelativePositionBias's plain MLP-over-raw-offset, which has no
+    such property (rotating the same tissue 90 degrees would, in
+    general, change RelativePositionBias's output, but cannot change
+    this class's, by construction — verified numerically in this
+    project's own tests via a real random rotation+reflection+translation
+    applied to the input coordinates).
+
+    Mechanism, per this forward call's whole point set (STPath's own
+    version computes this PER QUERY ROW's own N neighbor offsets — same
+    idea, done here in one batched pass over every row at once, which
+    this project's small point clouds make cheap): for query row i, its N
+    relative offsets to every other point are centered, their covariance
+    matrix eigendecomposed for a principal-axis basis (eigenvectors),
+    then combined with all 2^dim=4 sign-flip operations
+    ((-1,-1),(-1,1),(1,-1),(1,1)) to produce 4 canonical reorientations of
+    row i's offsets. edge_bias (a small Linear, one output per attention
+    head — this class produces a genuinely PER-HEAD bias, unlike
+    RelativePositionBias's single shared scalar, since
+    nn.TransformerEncoder's `mask` accepts a [n_heads, N, N] tensor
+    exactly as needed for batch_size=1) is applied to each of the 4
+    reoriented-offset-plus-norm feature vectors, then averaged over the 4
+    frames — averaging over a group's frame is exactly what makes the
+    result provably invariant to that group's action on the input.
+
+    dim=2 (not this project's usual coord_dim=3): matches STPath's own
+    real Attention class, `super(Attention, self).__init__(dim=2)` — only
+    the xy plane, verified directly in its source. STPath itself only
+    ever applies this bias to 2D coordinates even though 3D positions
+    exist elsewhere in its pipeline; this class does the same (coords[:,
+    :2] only), regardless of what coord_dim the caller's coordinates
+    actually carry.
+
+    coord_scale (2026-07-17, NOT part of STPath's own real code — see
+    RandomFourierFeatures' own docstring for the coordinate-scale bug
+    this avoids REINTRODUCING): STPath's real edge_bias weights were
+    trained end-to-end on STPath's own real pretraining data's coordinate
+    convention. This class is a FRESH, randomly-initialized copy trained
+    on OUR data instead, so reusing STPath's implicit raw-coordinate
+    convention here would just reintroduce the identical exploding-bias
+    failure this project already found and fixed once (see
+    RelativePositionBias's own 2026-07-17 docstring) — radial offsets and
+    their norm are divided by coord_scale before edge_bias sees them,
+    same fixed-at-construction-time approach as RandomFourierFeatures
+    (this class is also called ONCE on the full concatenated coord set in
+    StormLiteContextEncoder, the same safe usage pattern)."""
+
+    def __init__(self, n_heads: int, coord_scale: float = 1.0):
+        super().__init__()
+        self.dim = 2
+        self.n_frames = 2 ** self.dim  # 4
+        self.coord_scale = coord_scale
+        # the 4 fixed sign-flip combinations — not learned, matches
+        # STPath's own real create_ops (verified via its source)
+        self.register_buffer("ops", torch.tensor(
+            [[sx, sy] for sx in (-1.0, 1.0) for sy in (-1.0, 1.0)]
+        ))  # [4, 2]
+        self.edge_bias = nn.Linear(self.dim + 1, n_heads, bias=False)
+
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        """coords: [N, coord_dim] (only the first 2 columns are used — see
+        class docstring). Returns [n_heads, N, N] additive per-head
+        attention bias, directly usable as nn.TransformerEncoder's `mask`
+        argument for a batch_size=1 model."""
+        coords = coords[:, :2] / self.coord_scale
+        n = coords.shape[0]
+        radial = coords.unsqueeze(1) - coords.unsqueeze(0)          # [N, N, 2] radial[i,j] = coords[i]-coords[j]
+        radial_norm = radial.norm(dim=-1, keepdim=True)              # [N, N, 1]
+
+        # per-query-row (i) frame: center row i's N offsets, eigendecompose
+        # their covariance for a principal-axis basis, combine with the 4
+        # sign-flip ops (see class docstring / STPath's real create_frame)
+        center = radial.mean(dim=1, keepdim=True)                    # [N, 1, 2]
+        centered = radial - center                                    # [N, N, 2]
+        cov = torch.einsum("nmi,nmj->nij", centered, centered) / n   # [N, 2, 2]
+        _, eigvecs = torch.linalg.eigh(cov)                           # eigvecs: [N, 2, 2]
+
+        f_ops = self.ops.view(1, self.n_frames, 1, self.dim) * eigvecs.unsqueeze(1)  # [N, 4, 2, 2]
+        # reorient row i's offsets into each of its 4 canonical frames
+        frame_feats = torch.einsum("nojk,nmk->nomj", f_ops, radial)  # [N, 4, N, 2]
+
+        radial_norm_exp = radial_norm.unsqueeze(1).expand(n, self.n_frames, n, 1)  # [N, 4, N, 1]
+        feat = torch.cat([frame_feats, radial_norm_exp], dim=-1)     # [N, 4, N, 3]
+        bias = self.edge_bias(feat).mean(dim=1)                       # [N, N, n_heads] — frame AVERAGING
+        return bias.permute(2, 0, 1)                                   # [n_heads, N, N]
+
+
 class _KNNMessageLayer(nn.Module):
     """One round of message passing: each context node attends to its own
     k nearest neighbours. Stacking a few of these lets information from a
