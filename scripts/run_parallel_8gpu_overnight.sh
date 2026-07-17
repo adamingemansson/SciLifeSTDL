@@ -50,8 +50,17 @@
 #
 # Usage: bash scripts/run_parallel_8gpu_overnight.sh
 # Logs: logs/parallel_run_overnight/<name>.log
+#
+# Smoke test: SMOKETEST=1 bash scripts/run_parallel_8gpu_overnight.sh
+# Runs all 8 jobs with tiny epoch/checkpoint counts to catch config/crash
+# issues (missing samples, decoder shape mismatches, tech_vocab bugs, etc.)
+# before committing real GPU-hours. Writes to a SEPARATE log dir
+# (logs/parallel_run_overnight_smoketest/) so a smoke-test log can never be
+# mistaken by the resumable skip-logic for a completed real overnight run.
 
 set -u
+
+SMOKETEST="${SMOKETEST:-0}"
 
 SINGLE_CONFIGS=(
     "configs/exp_hest1k_fm_ot_stormlite_mome_both.yaml"
@@ -73,6 +82,13 @@ MULTI_CONFIGS=(
 
 LOG_DIR="logs/parallel_run_overnight"
 EXTRA_ARGS="--shuffle-diagnostic"
+SMOKE_OVERRIDE=""
+
+if [ "$SMOKETEST" = "1" ]; then
+    LOG_DIR="logs/parallel_run_overnight_smoketest"
+    SMOKE_OVERRIDE="training.epochs=10 training.checkpoint_every_n_steps=5"
+    echo "*** SMOKETEST=1 -- running tiny versions of all 8 jobs (epochs=10) to catch config/crash issues before the real run. Logs: $LOG_DIR ***"
+fi
 
 N_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 TOTAL_JOBS=$((${#SINGLE_CONFIGS[@]} + ${#MULTI_CONFIGS[@]}))
@@ -104,7 +120,7 @@ for i in "${!SINGLE_CONFIGS[@]}"; do
     OMP_NUM_THREADS=$THREADS_PER_JOB \
     MKL_NUM_THREADS=$THREADS_PER_JOB \
     python -m src.evaluation.run_comparison "$cfg" \
-        --override ${extra} \
+        --override ${extra} ${SMOKE_OVERRIDE} \
         ${EXTRA_ARGS} \
         > "$logfile" 2>&1 &
     gpu=$((gpu + 1))
@@ -123,6 +139,7 @@ for cfg in "${MULTI_CONFIGS[@]}"; do
     OMP_NUM_THREADS=$THREADS_PER_JOB \
     MKL_NUM_THREADS=$THREADS_PER_JOB \
     python -m src.training.train --config "$cfg" \
+        --override ${SMOKE_OVERRIDE} \
         > "$logfile" 2>&1 &
     gpu=$((gpu + 1))
 done
