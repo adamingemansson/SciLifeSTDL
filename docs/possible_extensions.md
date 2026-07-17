@@ -51,6 +51,31 @@ fact-checked**, treat as leads to check before citing:
 verified and documented in `docs/literature_review.md`'s imputation
 section — no duplicate entry needed.)
 
+## Cross-platform decoder ("target platform space" conditioning)
+
+Surfaced 2026-07-17 from a user-drafted architecture roadmap (informally
+compared against STPath/STORM/Novae's real architectures, all
+independently verified this session — see conditioning.py/
+storm_lite_encoder.py docstrings). The roadmap's proposed model
+conditions its decoder on sequencing technology so it can output
+expression for a *different* gene panel than the one the context data
+came from (e.g. context from Visium, predict for Xenium's panel).
+
+Not something this project currently has: every generator here
+(WAE-GAN/FM-OT/VQ-VAE+AR) uses a dense, fixed-width `Linear(hidden_dim,
+n_genes)` decoder tied to one specific gene panel at construction time —
+unlike STPath's real tokenized gene output head (verified via its source,
+stpath_encoder.py), which is panel-agnostic by construction. Adding this
+would be a genuine decoder redesign (token-based/panel-invariant output),
+not a small addition — deferred until the current architecture-selection
+work (StormLite bias_type/fusion_mode/gene_encoder_type comparisons) is
+settled, and until training data spans more than one platform (currently
+INT1-24, all-Visium — see load_multi_sample's own docstring in
+src/data/loaders.py). Revisit once genuinely multi-platform training data
+is in hand; the multi-sample training infrastructure (organ_vocab/
+tech_vocab, src/models/conditioning.py OrganTechEmbedding) is already
+built and would need extending in the same spirit.
+
 ## Deprioritized architecture options
 
 Already noted in `docs/architecture_plan.md`'s prioritization, repeated
