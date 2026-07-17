@@ -961,6 +961,179 @@ class PanelInvariantGeneDecoder(nn.Module):
         return out
 
 
+class GeneAttentionDecoder(nn.Module):
+    """Geneformer-inspired gene decoder (Theodoris et al. 2023, Nature —
+    "Transfer learning enables predictions in network biology"): genes are
+    literal self-attended sequence positions, decoded via a SHARED
+    per-position output head, rather than PanelInvariantGeneDecoder's
+    independent-per-gene scoring (every gene predicted in isolation, no
+    way for gene co-expression structure to influence the prediction).
+    Real, considered-and-initially-rejected design (see
+    docs/results_log.md's 2026-07-17 decoder research entry) — rejected
+    only because full self-attention over our ~16570-gene FULL training
+    vocabulary is O(n_panel^2) per query location, genuinely too
+    expensive. Implemented here WITH a hard safety guard instead
+    (MAX_SAFE_PANEL_SIZE) rather than dropped entirely: for the actual
+    target use case this decoder exists for — a genuinely smaller
+    cross-platform panel (Xenium's is typically ~300-500 genes, not the
+    full transcriptome) — full attention is completely tractable
+    (300^2 = 90k, trivial), and lets gene predictions influence each
+    other, which the independent-scoring design fundamentally cannot do.
+    NOT a literal port of Geneformer's own architecture (rank-based input
+    encoding, its own masked-pretraining objective) — this borrows only
+    the structural idea (genes as attended tokens, shared output head),
+    grounded in real published precedent rather than invented from
+    scratch, same "structural echo, not a full port" relationship
+    PanelInvariantGeneDecoder itself has to STPath's real per-gene-token
+    classification head.
+
+    Token construction: additive (see PanelInvariantGeneDecoder's own
+    combine_mode="add" docstring for why — scGPT's real, verified
+    mechanism, and cheaper than concatenation), not a second design
+    decision made independently here.
+
+    NOT validated on genuine cross-platform data (none available — see
+    docs/possible_extensions.md). On today's all-Visium data this can
+    only be exercised with gene_names restricted to a SUBSET smaller than
+    MAX_SAFE_PANEL_SIZE (see tests/test_panel_invariant_decoder.py) —
+    querying the full training vocabulary raises loudly rather than
+    silently attempting an O(n_panel^2) computation that would OOM."""
+
+    MAX_SAFE_PANEL_SIZE = 4096  # O(n_panel^2) attention guard, see class docstring
+
+    def __init__(self, gene_names: list[str], gene_embed_dim: int, in_dim: int,
+                 hidden_dim: int = 128, n_heads: int = 4, n_layers: int = 1,
+                 tech_vocab: list[str] | None = None):
+        super().__init__()
+        self.gene_names = list(gene_names)
+        self._gene_to_idx = {name: i for i, name in enumerate(self.gene_names)}
+        assert len(self._gene_to_idx) == len(self.gene_names), (
+            "gene_names contains duplicates — decoder vocabulary must be unique"
+        )
+        self.gene_embed = nn.Embedding(len(self.gene_names), gene_embed_dim)
+        self.tech_vocab = list(tech_vocab) if tech_vocab else None
+        if self.tech_vocab:
+            self.tech_to_id = {name: i for i, name in enumerate(self.tech_vocab)}
+            self.tech_embed = nn.Embedding(len(self.tech_vocab), gene_embed_dim)
+        self.in_proj = nn.Linear(in_dim, hidden_dim)
+        self.gene_proj = nn.Linear(gene_embed_dim, hidden_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=n_heads, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.output_head = nn.Linear(hidden_dim, 1)  # SHARED across every gene position
+
+    def gene_indices(self, gene_names: list[str], device) -> torch.Tensor:
+        missing = [g for g in gene_names if g not in self._gene_to_idx]
+        assert not missing, (
+            f"{len(missing)} gene(s) not in decoder vocabulary "
+            f"(e.g. {missing[:5]}) — this decoder can only predict genes "
+            f"it was constructed with, see class docstring"
+        )
+        return torch.tensor(
+            [self._gene_to_idx[g] for g in gene_names], device=device, dtype=torch.long
+        )
+
+    def forward(self, h: torch.Tensor, gene_names: list[str] | None = None,
+                tech: str | None = None) -> torch.Tensor:
+        """h: [N, in_dim]. gene_names: target panel — unlike
+        PanelInvariantGeneDecoder, does NOT default to the full training
+        vocabulary, since that would silently trigger the O(n_panel^2)
+        blowup this class exists to guard against; always pass an
+        explicit, reasonably-sized panel. Returns [N, len(gene_names)]."""
+        assert gene_names is not None, (
+            "GeneAttentionDecoder requires an explicit gene_names panel "
+            "(no full-vocabulary default — see class docstring, "
+            "MAX_SAFE_PANEL_SIZE guard)"
+        )
+        n_panel = len(gene_names)
+        assert n_panel <= self.MAX_SAFE_PANEL_SIZE, (
+            f"gene_names has {n_panel} genes, exceeding MAX_SAFE_PANEL_SIZE="
+            f"{self.MAX_SAFE_PANEL_SIZE} — full self-attention over a panel "
+            f"this large is O(n_panel^2) and will exhaust GPU memory. This "
+            f"decoder is designed for realistic target-platform panel sizes "
+            f"(e.g. Xenium's ~300-500 genes), not a full transcriptome — use "
+            f"PanelInvariantGeneDecoder (decoder_type='panel_invariant') "
+            f"instead for full-vocabulary decoding."
+        )
+        device = h.device
+        idx = self.gene_indices(gene_names, device)
+        g = self.gene_embed(idx)                       # [n_panel, gene_embed_dim]
+        if tech is not None and self.tech_vocab:
+            assert tech in self.tech_to_id, (
+                f"tech {tech!r} not in decoder tech_vocab {sorted(self.tech_to_id)}"
+            )
+            tech_t = torch.tensor(self.tech_to_id[tech], device=device)
+            g = g + self.tech_embed(tech_t)
+        g_proj = self.gene_proj(g)                      # [n_panel, hidden_dim]
+        h_proj = self.in_proj(h)                        # [N, hidden_dim]
+        n = h_proj.shape[0]
+        tokens = g_proj.unsqueeze(0).expand(n, n_panel, -1) + h_proj.unsqueeze(1)  # [N, n_panel, hidden_dim]
+        contextualized = self.transformer(tokens)       # self-attention among gene tokens, per query location
+        return self.output_head(contextualized).squeeze(-1)  # [N, n_panel]
+
+
+class LLOKIStyleDecoder(nn.Module):
+    """Faithfully ports LLOKI-CAE's real, verified conditional-autoencoder
+    mechanism (Levy et al. 2025, Genome Research — source verified
+    directly: github.com/ma-compbio/LLOKI, lloki/cae/conditional_autoencoder.py,
+    2026-07-17). Real architecture, confirmed from source: encoder input =
+    concat(features, technology_embedding), decoder input =
+    concat(latent, technology_embedding), multi-layer stack of Linear+ReLU
+    (final layer has no activation), technology embedding is a learned
+    nn.Embedding looked up by a discrete batch/technology index and
+    concatenated ONCE at the input (not injected at every layer).
+
+    IMPORTANT — this is deliberately NOT a claim of full LLOKI parity, and
+    NOT panel-invariant the way PanelInvariantGeneDecoder is (fixed
+    n_genes width, tied at construction, same limitation as the original
+    "dense" decoder): LLOKI's real panel-invariance comes from a SEPARATE,
+    heavier component (LLOKI-FP), which uses an external pretrained
+    single-cell foundation model (scGPT) to impute/embed arbitrary gene
+    panels into a shared space BEFORE LLOKI-CAE ever sees them — LLOKI-CAE
+    itself only does cross-technology batch integration within that
+    already-shared space. Standing up an FP-equivalent here would mean
+    integrating a full external single-cell foundation model, out of
+    scope for a decoder swap. What's ported here is the one directly
+    transferable, verified piece: technology-conditioned decoding via
+    input concatenation, useful for a DIFFERENT real problem than panel
+    mismatch — adapting the output distribution to the source
+    technology's detection biases/dropout patterns within the SAME gene
+    panel. `tech` is therefore REQUIRED here (not optional, unlike
+    PanelInvariantGeneDecoder/GeneAttentionDecoder), since the whole
+    mechanism depends on it.
+
+    hidden_dims defaults to (512, 256, 128), the real shape LLOKI-CAE's
+    paper/repo describes for its own encoder/decoder stacks — kept as the
+    default for fidelity to the source, not re-tuned for this project's
+    much smaller pilot scale."""
+
+    def __init__(self, in_dim: int, n_genes: int, tech_vocab: list[str],
+                 tech_embed_dim: int = 10, hidden_dims: tuple[int, ...] = (512, 256, 128)):
+        super().__init__()
+        assert tech_vocab, "LLOKIStyleDecoder requires a non-empty tech_vocab"
+        self.tech_to_id = {name: i for i, name in enumerate(tech_vocab)}
+        self.tech_embed = nn.Embedding(len(tech_vocab), tech_embed_dim)
+        dims = [in_dim + tech_embed_dim] + list(hidden_dims) + [n_genes]
+        layers: list[nn.Module] = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            if i < len(dims) - 2:  # ReLU on every layer except the final output layer
+                layers.append(nn.ReLU())
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, h: torch.Tensor, tech: str) -> torch.Tensor:
+        """h: [N, in_dim]. tech: REQUIRED (see class docstring). Returns
+        [N, n_genes] — fixed width, not panel-invariant."""
+        assert tech in self.tech_to_id, (
+            f"tech {tech!r} not in decoder tech_vocab {sorted(self.tech_to_id)}"
+        )
+        device = h.device
+        tech_t = torch.tensor(self.tech_to_id[tech], device=device)
+        tech_vec = self.tech_embed(tech_t).unsqueeze(0).expand(h.shape[0], -1)
+        return self.net(torch.cat([h, tech_vec], dim=-1))
+
+
 class SpatialContextEncoder(nn.Module):
     """
     context (coords [N_obs, D], expression [N_obs, G]) + query coords

@@ -28,7 +28,10 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 
-from src.models.conditioning import SpatialContextEncoder, PanelInvariantGeneDecoder
+from src.models.conditioning import (
+    SpatialContextEncoder, PanelInvariantGeneDecoder,
+    GeneAttentionDecoder, LLOKIStyleDecoder,
+)
 from src.models.vqvae import VectorQuantizer, morton_order
 
 _MODEL_REGISTRY: dict[str, type["BaseGenerativeModel"]] = {}
@@ -151,6 +154,9 @@ def _build_decoder(
     decoder_gene_embed_dim: int = 64, tech_vocab: list[str] | None = None,
     decoder_hidden_dim: int | None = None, decoder_mlp_depth: int = 1,
     decoder_combine_mode: str = "concat",
+    decoder_attn_n_heads: int = 4, decoder_attn_n_layers: int = 1,
+    decoder_lloki_tech_embed_dim: int = 10,
+    decoder_lloki_hidden_dims: list[int] | None = None,
 ) -> nn.Module:
     """Shared by WAE-GAN/FM-OT/VQ-VAE+AR (2026-07-17, diagram-5 gap
     analysis follow-up — see PanelInvariantGeneDecoder's own docstring in
@@ -180,9 +186,25 @@ def _build_decoder(
     "add" — scGPT's real gene-token combination rule, see
     PanelInvariantGeneDecoder's own docstring) roughly halves this
     decoder's training memory footprint (no more [N, n_panel, 2*hidden_dim]
-    tensor) and is literature-grounded rather than an ad hoc default. All
-    three are only meaningful for decoder_type="panel_invariant" — silently
-    unused for "dense"."""
+    tensor) and is literature-grounded rather than an ad hoc default.
+    These four are only meaningful for decoder_type="panel_invariant" —
+    silently unused for other types.
+
+    decoder_attn_n_heads/decoder_attn_n_layers configure "gene_attention"
+    (GeneAttentionDecoder — Geneformer-inspired, see its own docstring for
+    the real precedent and why it has a hard MAX_SAFE_PANEL_SIZE guard
+    instead of silently attempting O(n_panel^2) attention over the full
+    training vocabulary).
+
+    decoder_lloki_tech_embed_dim/decoder_lloki_hidden_dims configure
+    "lloki" (LLOKIStyleDecoder — faithfully ports LLOKI-CAE's real,
+    verified conditional-autoencoder mechanism, see its own docstring for
+    the important caveat: fixed n_genes width, NOT panel-invariant, since
+    LLOKI's real panel-invariance comes from a separate component
+    [LLOKI-FP] not ported here). Requires tech_vocab (reused as-is, same
+    vocabulary as the context encoder's own organ_vocab/tech_vocab, or set
+    independently if this decoder is used without organ/tech conditioning
+    on the context encoder itself)."""
     if decoder_type == "dense":
         return nn.Sequential(
             nn.Linear(in_dim, dense_hidden_dim), nn.ReLU(),
@@ -197,6 +219,35 @@ def _build_decoder(
             in_dim=in_dim, tech_vocab=tech_vocab,
             hidden_dim=decoder_hidden_dim or dense_hidden_dim,
             mlp_depth=decoder_mlp_depth, combine_mode=decoder_combine_mode,
+        )
+    elif decoder_type == "gene_attention":
+        assert decoder_gene_names, (
+            "decoder_type='gene_attention' requires decoder_gene_names"
+        )
+        assert len(decoder_gene_names) <= GeneAttentionDecoder.MAX_SAFE_PANEL_SIZE, (
+            f"decoder_gene_names has {len(decoder_gene_names)} genes, exceeding "
+            f"GeneAttentionDecoder.MAX_SAFE_PANEL_SIZE={GeneAttentionDecoder.MAX_SAFE_PANEL_SIZE} "
+            f"— restrict decoder_gene_names to a realistic target panel size "
+            f"(see GeneAttentionDecoder's own docstring); this is NOT meant "
+            f"for full-vocabulary decoding, use decoder_type='panel_invariant' "
+            f"for that."
+        )
+        return GeneAttentionDecoder(
+            gene_names=decoder_gene_names, gene_embed_dim=decoder_gene_embed_dim,
+            in_dim=in_dim, hidden_dim=decoder_hidden_dim or dense_hidden_dim,
+            n_heads=decoder_attn_n_heads, n_layers=decoder_attn_n_layers,
+            tech_vocab=tech_vocab,
+        )
+    elif decoder_type == "lloki":
+        assert tech_vocab, (
+            "decoder_type='lloki' requires tech_vocab (see LLOKIStyleDecoder's "
+            "own docstring — its real, verified mechanism is technology-"
+            "conditioned, not panel-invariant)"
+        )
+        return LLOKIStyleDecoder(
+            in_dim=in_dim, n_genes=n_genes, tech_vocab=tech_vocab,
+            tech_embed_dim=decoder_lloki_tech_embed_dim,
+            hidden_dims=tuple(decoder_lloki_hidden_dims or (512, 256, 128)),
         )
     else:
         raise ValueError(f"unknown decoder_type {decoder_type!r}")
@@ -259,6 +310,30 @@ class BaseGenerativeModel(pl.LightningModule, abc.ABC):
             context_novae_features=context.get("novae_features"),
             organ=context.get("organ"), tech=context.get("tech"),
         )
+
+    def _slice_target_for_decoder(self, target_expression: torch.Tensor) -> torch.Tensor:
+        """decoder_type="gene_attention" (GeneAttentionDecoder) outputs a
+        DELIBERATELY restricted gene panel (its self-attention is
+        O(n_panel^2), see its MAX_SAFE_PANEL_SIZE guard) — narrower than
+        target_expression's full training-panel width. This slices
+        target_expression down to the SAME columns, via an index buffer
+        registered at construction time (see each model's __init__,
+        "gene_attention" branch), so training_step's loss computation
+        compares like-for-like widths. No-op (returns target_expression
+        unchanged) for every other decoder_type, including "panel_invariant"
+        (whose default gene_names=None already covers the full training
+        panel in the same column order, so no slicing is needed there).
+
+        KNOWN GAP (2026-07-17, not yet fixed): this only covers the
+        TRAINING loss path. Evaluation (run_comparison.py's shared FID/MMD
+        machinery, PCA-fit on the full training-panel width) does NOT yet
+        slice consistently — decoder_type="gene_attention" is not yet
+        safe to run through the normal evaluation pipeline. Not fixed here
+        due to time constraints; flagged clearly rather than silently
+        producing wrong FID/MMD numbers. decoder_type="lloki" has no such
+        gap (fixed n_genes width, same as "dense")."""
+        idx = getattr(self, "_decoder_target_col_idx", None)
+        return target_expression if idx is None else target_expression[:, idx]
 
     @abc.abstractmethod
     def sample(self, context: dict[str, torch.Tensor], query: dict[str, Any]
@@ -408,7 +483,11 @@ class WAEGAN(BaseGenerativeModel):
                  decoder_type: str = "dense", decoder_gene_names: list[str] | None = None,
                  decoder_gene_embed_dim: int = 64,
                  decoder_hidden_dim: int | None = None, decoder_mlp_depth: int = 1,
-                 decoder_combine_mode: str = "concat"):
+                 decoder_combine_mode: str = "concat",
+                 decoder_attn_n_heads: int = 4, decoder_attn_n_layers: int = 1,
+                 decoder_lloki_tech_embed_dim: int = 10,
+                 decoder_lloki_hidden_dims: list[int] | None = None,
+                 full_gene_names: list[str] | None = None):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False  # we alternate encoder/decoder vs. discriminator ourselves
@@ -440,7 +519,28 @@ class WAEGAN(BaseGenerativeModel):
             decoder_gene_embed_dim=decoder_gene_embed_dim, tech_vocab=tech_vocab,
             decoder_hidden_dim=decoder_hidden_dim, decoder_mlp_depth=decoder_mlp_depth,
             decoder_combine_mode=decoder_combine_mode,
+            decoder_attn_n_heads=decoder_attn_n_heads, decoder_attn_n_layers=decoder_attn_n_layers,
+            decoder_lloki_tech_embed_dim=decoder_lloki_tech_embed_dim,
+            decoder_lloki_hidden_dims=decoder_lloki_hidden_dims,
         )
+        self._decoder_gene_names = decoder_gene_names
+        if decoder_type == "gene_attention":
+            assert full_gene_names is not None, (
+                "decoder_type='gene_attention' requires full_gene_names (auto-injected "
+                "by inject_decoder_gene_names) -- needed to align this decoder's "
+                "restricted output panel with target_expression's full-width columns, "
+                "see BaseGenerativeModel._slice_target_for_decoder"
+            )
+            name_to_idx = {g: i for i, g in enumerate(full_gene_names)}
+            missing = [g for g in decoder_gene_names if g not in name_to_idx]
+            assert not missing, (
+                f"decoder_gene_names contains {len(missing)} gene(s) not in "
+                f"full_gene_names (e.g. {missing[:5]})"
+            )
+            self.register_buffer(
+                "_decoder_target_col_idx",
+                torch.tensor([name_to_idx[g] for g in decoder_gene_names], dtype=torch.long),
+            )
         self.decoder_type = decoder_type
         self.discriminator = nn.Sequential(
             nn.Linear(latent_dim, disc_hidden_dim), nn.ReLU(),
@@ -453,9 +553,16 @@ class WAEGAN(BaseGenerativeModel):
 
     def _decode(self, h: torch.Tensor, tech: str | None = None) -> torch.Tensor:
         """Dispatches on decoder_type (2026-07-17, see PanelInvariantGeneDecoder
-        docstring) so sample()/training_step() don't need their own branching."""
+        docstring) so sample()/training_step() don't need their own branching.
+        "gene_attention" (GeneAttentionDecoder) needs gene_names passed
+        explicitly every call — unlike PanelInvariantGeneDecoder, it does
+        NOT default to the full training vocabulary (see its own docstring:
+        that default would silently trigger the O(n_panel^2) blowup it
+        exists to guard against)."""
         if self.decoder_type == "dense":
             return self.decoder(h)
+        elif self.decoder_type == "gene_attention":
+            return self.decoder(h, gene_names=self._decoder_gene_names, tech=tech)
         return self.decoder(h, tech=tech)
 
     def sample(self, context, query):
@@ -503,8 +610,8 @@ class WAEGAN(BaseGenerativeModel):
         opt_disc.step()
 
         # --- 2. encoder/decoder step: reconstruction + fool the discriminator ---
-        recon = self.decoder(torch.cat([z_fake, c], dim=-1))
-        recon_loss = nn.functional.mse_loss(recon, target_expression)
+        recon = self._decode(torch.cat([z_fake, c], dim=-1), tech=query.get("tech"))
+        recon_loss = nn.functional.mse_loss(recon, self._slice_target_for_decoder(target_expression))
         logits_fake_for_ae = self.discriminator(z_fake)
         adv_loss = nn.functional.binary_cross_entropy_with_logits(
             logits_fake_for_ae, torch.ones_like(logits_fake_for_ae)  # fool disc: look like prior
@@ -633,7 +740,11 @@ class FlowMatchingOT(BaseGenerativeModel):
                  decoder_type: str = "dense", decoder_gene_names: list[str] | None = None,
                  decoder_gene_embed_dim: int = 64,
                  decoder_hidden_dim: int | None = None, decoder_mlp_depth: int = 1,
-                 decoder_combine_mode: str = "concat"):
+                 decoder_combine_mode: str = "concat",
+                 decoder_attn_n_heads: int = 4, decoder_attn_n_layers: int = 1,
+                 decoder_lloki_tech_embed_dim: int = 10,
+                 decoder_lloki_hidden_dims: list[int] | None = None,
+                 full_gene_names: list[str] | None = None):
         super().__init__()
         self.save_hyperparameters()
         assert path_type in ("ot", "edm"), f"unknown path_type {path_type!r}"
@@ -666,7 +777,28 @@ class FlowMatchingOT(BaseGenerativeModel):
             decoder_gene_embed_dim=decoder_gene_embed_dim, tech_vocab=tech_vocab,
             decoder_hidden_dim=decoder_hidden_dim, decoder_mlp_depth=decoder_mlp_depth,
             decoder_combine_mode=decoder_combine_mode,
+            decoder_attn_n_heads=decoder_attn_n_heads, decoder_attn_n_layers=decoder_attn_n_layers,
+            decoder_lloki_tech_embed_dim=decoder_lloki_tech_embed_dim,
+            decoder_lloki_hidden_dims=decoder_lloki_hidden_dims,
         )
+        self._decoder_gene_names = decoder_gene_names
+        if decoder_type == "gene_attention":
+            assert full_gene_names is not None, (
+                "decoder_type='gene_attention' requires full_gene_names (auto-injected "
+                "by inject_decoder_gene_names) -- needed to align this decoder's "
+                "restricted output panel with target_expression's full-width columns, "
+                "see BaseGenerativeModel._slice_target_for_decoder"
+            )
+            name_to_idx = {g: i for i, g in enumerate(full_gene_names)}
+            missing = [g for g in decoder_gene_names if g not in name_to_idx]
+            assert not missing, (
+                f"decoder_gene_names contains {len(missing)} gene(s) not in "
+                f"full_gene_names (e.g. {missing[:5]})"
+            )
+            self.register_buffer(
+                "_decoder_target_col_idx",
+                torch.tensor([name_to_idx[g] for g in decoder_gene_names], dtype=torch.long),
+            )
         self.decoder_type = decoder_type
         self.time_embed = _SinusoidalTimeEmbedding(time_embed_dim)
         self.velocity_net = nn.Sequential(
@@ -708,9 +840,16 @@ class FlowMatchingOT(BaseGenerativeModel):
 
     def _decode(self, h: torch.Tensor, tech: str | None = None) -> torch.Tensor:
         """Dispatches on decoder_type (2026-07-17, see PanelInvariantGeneDecoder
-        docstring) so sample()/training_step() don't need their own branching."""
+        docstring) so sample()/training_step() don't need their own branching.
+        "gene_attention" (GeneAttentionDecoder) needs gene_names passed
+        explicitly every call — unlike PanelInvariantGeneDecoder, it does
+        NOT default to the full training vocabulary (see its own docstring:
+        that default would silently trigger the O(n_panel^2) blowup it
+        exists to guard against)."""
         if self.decoder_type == "dense":
             return self.decoder(h)
+        elif self.decoder_type == "gene_attention":
+            return self.decoder(h, gene_names=self._decoder_gene_names, tech=tech)
         return self.decoder(h, tech=tech)
 
     def sample(self, context, query):
@@ -748,7 +887,7 @@ class FlowMatchingOT(BaseGenerativeModel):
 
         z_1 = self.encoder(x_1)
         recon = self._decode(torch.cat([z_1, c], dim=-1), tech=query.get("tech"))
-        recon_loss = nn.functional.mse_loss(recon, x_1)
+        recon_loss = nn.functional.mse_loss(recon, self._slice_target_for_decoder(x_1))
 
         # flow-matching/diffusion target sees a frozen (detached) latent
         # code, so the encoder/decoder are trained only by recon_loss —
@@ -854,7 +993,11 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  decoder_type: str = "dense", decoder_gene_names: list[str] | None = None,
                  decoder_gene_embed_dim: int = 64,
                  decoder_hidden_dim: int | None = None, decoder_mlp_depth: int = 1,
-                 decoder_combine_mode: str = "concat"):
+                 decoder_combine_mode: str = "concat",
+                 decoder_attn_n_heads: int = 4, decoder_attn_n_layers: int = 1,
+                 decoder_lloki_tech_embed_dim: int = 10,
+                 decoder_lloki_hidden_dims: list[int] | None = None,
+                 full_gene_names: list[str] | None = None):
         super().__init__()
         self.save_hyperparameters()
         self.context_encoder = _build_context_encoder(
@@ -884,7 +1027,28 @@ class VQVAEAutoregressive(BaseGenerativeModel):
             decoder_gene_embed_dim=decoder_gene_embed_dim, tech_vocab=tech_vocab,
             decoder_hidden_dim=decoder_hidden_dim, decoder_mlp_depth=decoder_mlp_depth,
             decoder_combine_mode=decoder_combine_mode,
+            decoder_attn_n_heads=decoder_attn_n_heads, decoder_attn_n_layers=decoder_attn_n_layers,
+            decoder_lloki_tech_embed_dim=decoder_lloki_tech_embed_dim,
+            decoder_lloki_hidden_dims=decoder_lloki_hidden_dims,
         )
+        self._decoder_gene_names = decoder_gene_names
+        if decoder_type == "gene_attention":
+            assert full_gene_names is not None, (
+                "decoder_type='gene_attention' requires full_gene_names (auto-injected "
+                "by inject_decoder_gene_names) -- needed to align this decoder's "
+                "restricted output panel with target_expression's full-width columns, "
+                "see BaseGenerativeModel._slice_target_for_decoder"
+            )
+            name_to_idx = {g: i for i, g in enumerate(full_gene_names)}
+            missing = [g for g in decoder_gene_names if g not in name_to_idx]
+            assert not missing, (
+                f"decoder_gene_names contains {len(missing)} gene(s) not in "
+                f"full_gene_names (e.g. {missing[:5]})"
+            )
+            self.register_buffer(
+                "_decoder_target_col_idx",
+                torch.tensor([name_to_idx[g] for g in decoder_gene_names], dtype=torch.long),
+            )
         self.decoder_type = decoder_type
         self.vq = VectorQuantizer(codebook_size, latent_dim, commitment_weight)
 
@@ -920,9 +1084,16 @@ class VQVAEAutoregressive(BaseGenerativeModel):
 
     def _decode(self, h: torch.Tensor, tech: str | None = None) -> torch.Tensor:
         """Dispatches on decoder_type (2026-07-17, see PanelInvariantGeneDecoder
-        docstring) so sample()/training_step() don't need their own branching."""
+        docstring) so sample()/training_step() don't need their own branching.
+        "gene_attention" (GeneAttentionDecoder) needs gene_names passed
+        explicitly every call — unlike PanelInvariantGeneDecoder, it does
+        NOT default to the full training vocabulary (see its own docstring:
+        that default would silently trigger the O(n_panel^2) blowup it
+        exists to guard against)."""
         if self.decoder_type == "dense":
             return self.decoder(h)
+        elif self.decoder_type == "gene_attention":
+            return self.decoder(h, gene_names=self._decoder_gene_names, tech=tech)
         return self.decoder(h, tech=tech)
 
     def sample(self, context, query):
@@ -970,7 +1141,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
         z_e = self.encoder(x_1)
         z_q, idx, vq_loss = self.vq(z_e)
         recon = self._decode(z_q, tech=query.get("tech"))
-        recon_loss = nn.functional.mse_loss(recon, x_1)
+        recon_loss = nn.functional.mse_loss(recon, self._slice_target_for_decoder(x_1))
 
         idx_detached = idx.detach()
         bos = torch.full((1,), self.bos_token, dtype=torch.long, device=self.device)

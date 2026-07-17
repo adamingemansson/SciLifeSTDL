@@ -107,3 +107,68 @@ happened to use — an accidental coupling, not a deliberate choice).
 `exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder_add.yaml` combines all
 three (gene_embed_dim=256, combine_mode=add, mlp_depth=2) — queued, not
 yet run as of this entry.
+
+## 2026-07-17: GeneAttentionDecoder and LLOKIStyleDecoder implemented
+
+Follow-up to the research above — both candidate designs that were
+initially only *discussed* got implemented (`src/models/conditioning.py`),
+not left as documentation:
+
+**`LLOKIStyleDecoder`** faithfully ports LLOKI-CAE's real mechanism,
+verified directly from source (`github.com/ma-compbio/LLOKI/lloki/cae/
+conditional_autoencoder.py`, 2026-07-17) rather than from search-snippet
+descriptions alone: encoder input = `concat(features, tech_embedding)`,
+decoder input = `concat(latent, tech_embedding)`, multi-layer ReLU stack
+(final layer unactivated), tech token concatenated once at input. Real
+nuance found only by reading the source: LLOKI-CAE is only *half* of
+LLOKI — its panel-invariance comes from a separate component (LLOKI-FP,
+an external pretrained single-cell foundation model doing imputation
+upstream) that isn't ported here, so `LLOKIStyleDecoder` is fixed-width
+(same limitation as the original dense decoder), not panel-invariant.
+What's genuinely useful and ported: technology-conditioned decoding
+within a fixed panel — a different, complementary capability to
+`PanelInvariantGeneDecoder`'s gene-identity lookup, not a competing
+"better" version of it.
+
+**`GeneAttentionDecoder`** implements the Geneformer-inspired design
+(genes as self-attended tokens, shared per-position output head) that was
+initially rejected for being too expensive over the full ~16570-gene
+panel. Not dropped — implemented WITH a hard `MAX_SAFE_PANEL_SIZE=4096`
+guard, since the design is completely tractable (and more expressive than
+independent per-gene scoring, since attention lets gene predictions
+depend on each other) for the actual realistic use case: a genuinely
+smaller target panel (e.g. Xenium's ~300-500 genes), auto-derived here via
+`sc.pp.highly_variable_genes` (scanpy's standard HVG selection, `n_top_genes=512`)
+rather than the full training vocabulary.
+
+**A real integration gap found and partially fixed while wiring this
+in**: the training/eval pipeline assumed a decoder's output always covers
+the FULL training panel (true for "dense" and "panel_invariant"'s default
+use) — `GeneAttentionDecoder`'s deliberately restricted panel broke that
+assumption. Fixed the TRAINING-loss path (`BaseGenerativeModel.
+_slice_target_for_decoder`, an index buffer computed at construction from
+`full_gene_names`, aligning the restricted output with the correct
+columns of `target_expression`). **Not yet fixed**: `run_comparison.py`'s
+shared FID/MMD machinery fits a PCA model on the full training-panel
+width once per comparison run — incompatible with a restricted-panel
+prediction. `decoder_type="gene_attention"` is therefore excluded from
+real training runs until that's addressed; `decoder_type="lloki"` has no
+such gap (fixed-width, drops straight into the existing pipeline).
+
+**A real pre-existing bug found (unrelated to either new decoder, but
+found while adding the second one)**: `WAEGAN.training_step` called
+`self.decoder(...)` directly instead of through the `self._decode(...)`
+dispatcher every other call site (including WAEGAN's own `sample()`)
+already used — silently skipped `tech` conditioning during WAE-GAN
+training for every `decoder_type`, and would have crashed outright for
+`decoder_type="lloki"` specifically (its `forward()` requires `tech` as a
+non-optional argument, no default). Fixed; regression-tested in
+`tests/test_alternative_decoders.py::test_wae_gan_lloki_end_to_end`.
+
+Queued for the 2026-07-17 night9 batch (`scripts/run_parallel_7gpu_night9.sh`,
+10k epochs, weighted toward StormLite per current research priority):
+`lloki` on StormLite (both/novae gene branches) and pretrained STPath
+bothresidual; `panel_invariant` with `combine_mode="add"` on StormLite's
+mlp branch; `lloki` on WAE-GAN+StormLite (diagnostic — does a different
+decoder change the confirmed mode collapse, or is it entirely upstream).
+Results not yet available as of this entry.

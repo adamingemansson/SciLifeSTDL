@@ -817,12 +817,44 @@ def inject_decoder_gene_names(model_cfg: dict, adata) -> None:
     docstring in conditioning.py), auto-derive decoder_gene_names from the
     loaded AnnData's var_names, same "vocabulary fixed at construction
     time, derived from real data rather than hardcoded into a YAML file"
-    reasoning as inject_stpath_gene_names above. Mutates
-    model_cfg["params"] in place; no-op for every other config (the
-    default decoder_type="dense" doesn't use this param at all)."""
+    reasoning as inject_stpath_gene_names above.
+
+    decoder_type: "gene_attention" (2026-07-17, GeneAttentionDecoder —
+    Geneformer-inspired, see its own docstring) gets a DIFFERENT
+    treatment: it CANNOT safely use the full ~16570-gene training
+    vocabulary (its self-attention is O(n_panel^2) per query location,
+    guarded by MAX_SAFE_PANEL_SIZE) — the full-vocabulary default that's
+    correct for "panel_invariant" would just immediately fail its
+    construction-time size check. Instead auto-derives a realistic
+    SMALLER target panel via scanpy's standard highly-variable-genes
+    selection (Seurat/scanpy's default `sc.pp.highly_variable_genes`
+    method — the same real technique actual targeted panels, e.g.
+    Xenium's ~300-500 genes, are designed around, not an arbitrary or
+    random truncation). n_top_genes=512 is a deliberately realistic
+    target-panel-like size (well under the 4096 safety guard), not tuned
+    for accuracy.
+
+    Mutates model_cfg["params"] in place; no-op for every other config
+    (the default decoder_type="dense", and "lloki", don't use this param
+    at all — "lloki" is fixed-width, not panel-based, see
+    LLOKIStyleDecoder's own docstring)."""
     params = model_cfg.get("params", {})
-    if params.get("decoder_type") == "panel_invariant" and "decoder_gene_names" not in params:
+    decoder_type = params.get("decoder_type")
+    if decoder_type == "panel_invariant" and "decoder_gene_names" not in params:
         params["decoder_gene_names"] = adata.var_names.tolist()
+    elif decoder_type == "gene_attention" and "decoder_gene_names" not in params:
+        import scanpy as sc
+        n_target = min(512, adata.n_vars)
+        hvg_adata = adata.copy()
+        sc.pp.highly_variable_genes(hvg_adata, n_top_genes=n_target)
+        params["decoder_gene_names"] = (
+            hvg_adata.var_names[hvg_adata.var["highly_variable"]].tolist()
+        )
+        # full_gene_names (2026-07-17): the FULL training-panel gene order,
+        # needed so the model can align this decoder's restricted output
+        # columns with target_expression's full-width columns for loss
+        # computation — see BaseGenerativeModel._slice_target_for_decoder.
+        params.setdefault("full_gene_names", adata.var_names.tolist())
 
 
 def _main_multi_sample(cfg) -> None:

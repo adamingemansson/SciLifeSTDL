@@ -1,0 +1,70 @@
+# LLOKI-style decoder test (2026-07-17) on WAE-GAN + plain pretrained
+# STPath (no residual). See exp_hest1k_fm_ot_stormlite_mome_both_lloki.yaml's
+# header for the full LLOKI-CAE mechanism/source verification. Also the
+# regression test target for a real bug found while wiring this decoder
+# in: WAEGAN.training_step was calling self.decoder(...) directly instead
+# of through the self._decode(...) dispatcher every other call site used —
+# would have crashed outright for decoder_type="lloki" specifically
+# (fixed in registry.py, see tests/test_alternative_decoders.py's
+# test_wae_gan_lloki_end_to_end).
+#
+# Direct comparison target: exp_hest1k_wae_gan_stpath.yaml (dense decoder,
+# PCC 0.1975).
+#
+# Requires `pip install novae` (Python >=3.11) — not actually used here
+# (new_gene_encoder_type unset), but STPathContextEncoder's own import
+# chain still needs it installed.
+
+experiment_name: wae_gan_hest1k_pilot_stpath_lloki
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: wae_gan
+  params:
+    context_encoder_type: stpath
+    stpath_gene_voc_path: ${oc.env:STPATH_GENE_VOC_PATH}
+    stpath_model_weight_path: ${oc.env:STPATH_MODEL_WEIGHT_PATH}
+    stpath_organ_type: Kidney      # INT1 is ccRCC (renal cell carcinoma)
+    stpath_tech_type: Visium
+    decoder_type: lloki             # 2026-07-17: see header
+    tech_vocab: ["Visium"]          # required by LLOKIStyleDecoder
+    decoder_lloki_tech_embed_dim: 10
+    decoder_lloki_hidden_dims: [512, 256, 128]  # LLOKI-CAE's real published shape
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_wae_gan_stpath.yaml
+    coord_dim: 3
+    latent_dim: 32
+    hidden_dim: 256
+    cond_hidden_dim: 256
+    disc_hidden_dim: 128
+    adv_weight: 1.0
+    lr: 1.0e-3
+    lr_disc: 1.0e-3
+
+training:
+  epochs: 10000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

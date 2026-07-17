@@ -1,0 +1,71 @@
+# LLOKI-style decoder test (2026-07-17) on WAE-GAN + StormLite+MoME — the
+# combination confirmed to reproducibly mode-collapse with a dense decoder
+# (PCC=nan, constant output, across 2 seeds — see docs/results_log.md).
+# Real, curious question: does swapping in a technology-conditioned
+# decoder (a genuinely different decoder architecture, not a
+# hyperparameter tweak) change that collapse behavior at all, or is the
+# instability entirely upstream in the context-encoder/adversarial-loss
+# interaction, unaffected by which decoder sits on top? Not expected to
+# "fix" WAE-GAN+StormLite (that investigation already concluded it's a
+# StormLite-complexity issue, not decoder-related) — this is a diagnostic
+# data point, not a fix attempt.
+#
+# Direct comparison target: exp_hest1k_wae_gan_stormlite_mome_both.yaml
+# (dense decoder, PCC=nan) and exp_hest1k_wae_gan_stormlite_both.yaml
+# (sum mode, PCC -0.007).
+#
+# Requires `pip install novae` (Python >=3.11).
+
+experiment_name: wae_gan_hest1k_pilot_stormlite_mome_both_lloki
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: wae_gan
+  params:
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    storm_lite_fusion_mode: mome
+    decoder_type: lloki             # 2026-07-17: see header
+    tech_vocab: ["Visium"]          # required by LLOKIStyleDecoder
+    decoder_lloki_tech_embed_dim: 10
+    decoder_lloki_hidden_dims: [512, 256, 128]  # LLOKI-CAE's real published shape
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    n_genes: 16570
+    coord_dim: 3
+    latent_dim: 32
+    hidden_dim: 256
+    cond_hidden_dim: 256
+    disc_hidden_dim: 128
+    adv_weight: 1.0
+    lr: 1.0e-3
+    lr_disc: 1.0e-3
+
+training:
+  epochs: 10000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab
