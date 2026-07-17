@@ -88,6 +88,24 @@ exactly, missing-gene assertion, tech conditioning) and
 `configs/exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder.yaml` for a
 runnable sanity-check config.
 
+**Capacity + literature follow-up (2026-07-17)**: the first real run
+underperformed the dense decoder (PCC 0.13 vs. 0.28 at matched epochs) and
+had a real ~20GB memory footprint. A literature pass (see
+`docs/results_log.md`'s dedicated entry for the full writeup) grounded two
+follow-up changes rather than guessing: `combine_mode="add"` (scGPT's real
+gene-token combination rule — element-wise addition instead of
+concatenation, roughly halving memory) and independent
+`decoder_hidden_dim`/`decoder_mlp_depth` knobs (previously accidentally
+tied to the caller's own `ae_hidden_dim`/`cond_hidden_dim`). Geneformer's
+genes-as-self-attended-tokens design was considered and explicitly not
+adopted (too expensive at this panel's size). **LLOKI** (Levy et al. 2025,
+*Genome Research*) is a real, directly relevant 2025 paper solving this
+exact stated problem via a different architecture (a conditional
+autoencoder conditioned on technology + gene panel) — a genuine
+alternative worth revisiting if the gene-identity-lookup approach
+continues to underperform once real cross-platform data exists, not
+adopted here.
+
 **Still not validated end-to-end on genuinely cross-platform data** — no
 multi-platform training set is currently available (INT1-24, this
 project's only confirmed-available HEST-1k samples, are all-Visium — see

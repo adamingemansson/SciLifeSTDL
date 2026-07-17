@@ -856,13 +856,52 @@ class PanelInvariantGeneDecoder(nn.Module):
     regime — not a workaround."""
 
     def __init__(self, gene_names: list[str], gene_embed_dim: int, in_dim: int,
-                 tech_vocab: list[str] | None = None, hidden_dim: int = 128):
+                 tech_vocab: list[str] | None = None, hidden_dim: int = 128,
+                 mlp_depth: int = 1, combine_mode: str = "concat"):
+        """hidden_dim/mlp_depth (2026-07-17, capacity follow-up — see
+        docs/results_log.md): the first real result (gene_embed_dim=64,
+        hidden_dim implicitly tied to whatever the caller's dense decoder
+        width was) scored PCC 0.1308 vs. the dense decoder's 0.2798 at the
+        same epochs; bumping gene_embed_dim alone (64->256) closed about
+        half that gap (0.2039) but made ST-FID slightly worse — capacity
+        was a real factor but not the whole story. hidden_dim now defaults
+        to 128 rather than silently inheriting the caller's dense-decoder
+        width, and is a genuinely independent knob (see _build_decoder's
+        decoder_hidden_dim in registry.py) rather than reusing
+        ae_hidden_dim/cond_hidden_dim. mlp_depth (default 1, matching the
+        original 2-layer Linear->GELU->Linear structure exactly) adds
+        capacity along a second, different axis — depth, not just width —
+        each extra unit inserts one more Linear(hidden_dim,
+        hidden_dim)->GELU block before the final Linear(hidden_dim, 1).
+
+        combine_mode (2026-07-17, literature-grounded follow-up): "concat"
+        (default, preserves original behavior) concatenates the projected
+        query features and gene embedding before the MLP — a [N, n_panel,
+        2*hidden_dim] tensor, the real source of this decoder's ~20GB
+        training memory footprint. "add" instead combines them via
+        element-wise addition, halving that tensor's width — and isn't
+        just a cheaper hack: it's scGPT's actual verified mechanism for
+        combining gene-identity and expression/context embeddings (Cui
+        et al. 2024, Nature Methods — gene identity embedding + expression
+        value embedding combined via element-wise addition, not
+        concatenation, to form each gene token). Geneformer's real
+        architecture (Theodoris et al. 2023, Nature) was also checked as a
+        candidate design (genes as literal self-attended sequence
+        positions, decoded via a shared per-position head) but full
+        self-attention over a ~16570-gene panel is O(n_panel^2) per query
+        location — not adopted here, too expensive at this panel size
+        without truncation/sparsity machinery this project doesn't have.
+        "add" is the practical middle ground: a real, published multi-modal
+        gene-token combination rule, not concat's ad hoc default."""
         super().__init__()
+        assert combine_mode in ("concat", "add"), f"unknown combine_mode {combine_mode!r}"
         self.gene_names = list(gene_names)
         self._gene_to_idx = {name: i for i, name in enumerate(self.gene_names)}
         assert len(self._gene_to_idx) == len(self.gene_names), (
             "gene_names contains duplicates — decoder vocabulary must be unique"
         )
+        assert mlp_depth >= 1, f"mlp_depth must be >= 1, got {mlp_depth}"
+        self.combine_mode = combine_mode
         self.gene_embed = nn.Embedding(len(self.gene_names), gene_embed_dim)
         self.tech_vocab = list(tech_vocab) if tech_vocab else None
         if self.tech_vocab:
@@ -870,10 +909,12 @@ class PanelInvariantGeneDecoder(nn.Module):
             self.tech_embed = nn.Embedding(len(self.tech_vocab), gene_embed_dim)
         self.in_proj = nn.Linear(in_dim, hidden_dim)
         self.gene_proj = nn.Linear(gene_embed_dim, hidden_dim)
-        self.out_mlp = nn.Sequential(
-            nn.Linear(2 * hidden_dim, hidden_dim), nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
+        first_in = hidden_dim if combine_mode == "add" else 2 * hidden_dim
+        layers = [nn.Linear(first_in, hidden_dim), nn.GELU()]
+        for _ in range(mlp_depth - 1):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.GELU()]
+        layers.append(nn.Linear(hidden_dim, 1))
+        self.out_mlp = nn.Sequential(*layers)
 
     def gene_indices(self, gene_names: list[str], device) -> torch.Tensor:
         missing = [g for g in gene_names if g not in self._gene_to_idx]
@@ -906,10 +947,17 @@ class PanelInvariantGeneDecoder(nn.Module):
             g = g + self.tech_embed(tech_t)            # broadcast over all panel genes
         h_proj = self.in_proj(h)                       # [N, hidden_dim]
         g_proj = self.gene_proj(g)                     # [n_panel, hidden_dim]
-        n, n_panel = h_proj.shape[0], g_proj.shape[0]
-        h_exp = h_proj.unsqueeze(1).expand(n, n_panel, -1)
-        g_exp = g_proj.unsqueeze(0).expand(n, n_panel, -1)
-        out = self.out_mlp(torch.cat([h_exp, g_exp], dim=-1)).squeeze(-1)  # [N, n_panel]
+        if self.combine_mode == "add":
+            # scGPT's real combination rule (see __init__ docstring) — half
+            # the memory of "concat" below, [N, n_panel, hidden_dim] not
+            # [N, n_panel, 2*hidden_dim].
+            combined = h_proj.unsqueeze(1) + g_proj.unsqueeze(0)  # [N, n_panel, hidden_dim]
+        else:
+            n, n_panel = h_proj.shape[0], g_proj.shape[0]
+            h_exp = h_proj.unsqueeze(1).expand(n, n_panel, -1)
+            g_exp = g_proj.unsqueeze(0).expand(n, n_panel, -1)
+            combined = torch.cat([h_exp, g_exp], dim=-1)          # [N, n_panel, 2*hidden_dim]
+        out = self.out_mlp(combined).squeeze(-1)        # [N, n_panel]
         return out
 
 

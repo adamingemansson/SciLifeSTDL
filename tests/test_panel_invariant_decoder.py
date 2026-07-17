@@ -189,6 +189,72 @@ def test_vqvae_ar_panel_invariant_end_to_end():
     print("[VQVAEAutoregressive] OK — decoder_type='panel_invariant' runs sample()/training_step() end-to-end")
 
 
+def test_combine_mode_add_shape_and_finiteness():
+    torch.manual_seed(0)
+    dec = PanelInvariantGeneDecoder(gene_names=_GENES, gene_embed_dim=8, in_dim=16,
+                                     hidden_dim=24, combine_mode="add")
+    h = torch.randn(5, 16)
+    out = dec(h, gene_names=["gene_3", "gene_0", "gene_17"])
+    assert out.shape == (5, 3), out.shape
+    assert torch.isfinite(out).all()
+    print("[combine_mode=add] OK — correct shape, finite output")
+
+
+def test_combine_mode_add_vs_concat_differ():
+    """Not just a smaller tensor -- combine_mode should genuinely change
+    what the decoder computes, not produce the same numbers via a
+    different path."""
+    torch.manual_seed(0)
+    dec_concat = PanelInvariantGeneDecoder(gene_names=_GENES, gene_embed_dim=8, in_dim=16,
+                                            hidden_dim=24, combine_mode="concat")
+    torch.manual_seed(0)
+    dec_add = PanelInvariantGeneDecoder(gene_names=_GENES, gene_embed_dim=8, in_dim=16,
+                                         hidden_dim=24, combine_mode="add")
+    dec_concat.eval()
+    dec_add.eval()
+    h = torch.randn(4, 16)
+    with torch.no_grad():
+        out_concat = dec_concat(h, gene_names=["gene_1", "gene_2"])
+        out_add = dec_add(h, gene_names=["gene_1", "gene_2"])
+    assert not torch.allclose(out_concat, out_add), (
+        "combine_mode='add' produced identical output to 'concat' — combine_mode may be a no-op"
+    )
+    print("[combine_mode] OK — 'add' and 'concat' produce genuinely different output")
+
+
+def test_combine_mode_add_gradient_flow():
+    torch.manual_seed(0)
+    dec = PanelInvariantGeneDecoder(gene_names=_GENES, gene_embed_dim=8, in_dim=16,
+                                     hidden_dim=24, combine_mode="add")
+    h = torch.randn(4, 16, requires_grad=True)
+    out = dec(h, gene_names=["gene_1", "gene_2"])
+    out.sum().backward()
+    assert h.grad is not None and torch.isfinite(h.grad).all()
+    assert dec.gene_embed.weight.grad is not None and torch.isfinite(dec.gene_embed.weight.grad).all()
+    print("[combine_mode=add] OK — gradients flow correctly")
+
+
+def test_hidden_dim_and_mlp_depth_override():
+    """decoder_hidden_dim/decoder_mlp_depth (registry.py's _build_decoder)
+    give the panel-invariant decoder capacity independent of whatever the
+    caller's own dense-decoder width happens to be."""
+    torch.manual_seed(0)
+    dec = PanelInvariantGeneDecoder(gene_names=_GENES, gene_embed_dim=8, in_dim=16,
+                                     hidden_dim=64, mlp_depth=3)
+    # mlp_depth=3 -> 3 hidden Linear+GELU blocks then the final Linear(hidden_dim, 1)
+    linear_layers = [m for m in dec.out_mlp if isinstance(m, torch.nn.Linear)]
+    assert len(linear_layers) == 4, (
+        f"mlp_depth=3 should produce 4 Linear layers total (3 hidden + 1 output), "
+        f"got {len(linear_layers)}"
+    )
+    h = torch.randn(4, 16, requires_grad=True)
+    out = dec(h, gene_names=["gene_1", "gene_2"])
+    assert out.shape == (4, 2)
+    out.sum().backward()
+    assert h.grad is not None and torch.isfinite(h.grad).all()
+    print("[hidden_dim/mlp_depth] OK — independent width/depth knobs work correctly")
+
+
 def test_target_gene_subset_smaller_than_training_panel():
     """The actual cross-platform use case (not yet exercised on real data,
     but the mechanism should work today): querying FEWER genes than the
@@ -204,6 +270,36 @@ def test_target_gene_subset_smaller_than_training_panel():
     print("[cross-panel] OK — querying a smaller target gene panel than the training vocabulary works")
 
 
+def test_fm_ot_panel_invariant_add_combine_mode_end_to_end():
+    """Registry-level wiring check for decoder_combine_mode (2026-07-17,
+    scGPT-grounded memory-efficiency follow-up — see PanelInvariantGeneDecoder's
+    own docstring)."""
+    torch.manual_seed(0)
+    gene_names = _GENES[:20]
+    model = FlowMatchingOT(n_genes=20, coord_dim=3, cond_hidden_dim=32,
+                            hidden_dim=64, time_embed_dim=16, n_ode_steps=5,
+                            decoder_type="panel_invariant", decoder_gene_names=gene_names,
+                            decoder_combine_mode="add", decoder_hidden_dim=48,
+                            decoder_mlp_depth=2)
+    assert model.decoder.combine_mode == "add"
+    batch = _make_batch(n_context=40, n_query=10, n_genes=20, coord_dim=3)
+
+    out = model.sample(batch["context"], batch["query"])
+    assert out["expression"].shape == (10, 20), out["expression"].shape
+    assert torch.isfinite(out["expression"]).all()
+
+    opt = model.configure_optimizers()
+    model.optimizers = lambda: opt
+    model.manual_backward = lambda loss: loss.backward()
+    model.log_dict = lambda *a, **k: None
+    loss = model.training_step(batch, batch_idx=0)
+    opt.zero_grad()
+    loss.backward()
+    assert torch.isfinite(loss)
+    print("[FlowMatchingOT] OK — decoder_combine_mode='add' + decoder_hidden_dim/mlp_depth "
+          "override run end-to-end")
+
+
 if __name__ == "__main__":
     test_shape_default_matches_full_vocab()
     test_shape_gene_subset()
@@ -215,4 +311,9 @@ if __name__ == "__main__":
     test_fm_ot_panel_invariant_end_to_end()
     test_vqvae_ar_panel_invariant_end_to_end()
     test_target_gene_subset_smaller_than_training_panel()
+    test_combine_mode_add_shape_and_finiteness()
+    test_combine_mode_add_vs_concat_differ()
+    test_combine_mode_add_gradient_flow()
+    test_hidden_dim_and_mlp_depth_override()
+    test_fm_ot_panel_invariant_add_combine_mode_end_to_end()
     print("\nAll PanelInvariantGeneDecoder tests passed.")

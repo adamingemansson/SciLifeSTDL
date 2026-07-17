@@ -50,3 +50,60 @@ not learning anything useful either). Confirmed via the plain
 to be StormLite-specific instability, not a general WAE-GAN-family issue —
 WAE-GAN is fine with a well-behaved context encoder, it's StormLite's added
 complexity that destabilizes its adversarial training specifically.
+
+## 2026-07-17: PanelInvariantGeneDecoder capacity + literature research
+
+**Setup**: the panel-invariant decoder (`PanelInvariantGeneDecoder`,
+`src/models/conditioning.py` — see its own docstring for the mechanism)
+scored PCC 0.1308 on its first real run vs. the dense decoder's 0.2798 at
+matched epochs (`exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder.yaml`
+vs. `exp_hest1k_fm_ot_stormlite_mome_both.yaml`, both 10k epochs). Also
+flagged separately: this decoder's real ~20GB training memory footprint
+(vs. ~2GB for the dense decoder on the same run), traced to materializing
+a `[N_query, n_genes, 2*hidden_dim]` tensor every forward pass (query
+features concatenated with every gene's embedding, before the MLP).
+
+**Capacity test**: bumping `decoder_gene_embed_dim` 64->256
+(`..._paneldecoder_bigger.yaml`) improved PCC to 0.2039 — closes roughly
+half the gap to the dense decoder, but ST-FID got slightly worse (3.30 ->
+3.91). Capacity is a real, partial factor, not the whole story.
+
+**Literature research** (2026-07-17, before assuming "just add more
+capacity" was the right lever): checked how published single-cell/spatial
+foundation models actually combine gene-identity signal with
+expression/context signal, rather than guessing.
+- **scGPT** (Cui et al. 2024, *Nature Methods*): combines a trainable
+  per-gene identity embedding with an expression-value embedding via
+  **element-wise addition**, not concatenation, to form each gene token.
+  Directly actionable: our decoder used concatenation, which is both an
+  arbitrary choice (not grounded in precedent) and the actual source of
+  the ~20GB memory footprint (the `2*hidden_dim` channel doubling).
+- **Geneformer** (Theodoris et al. 2023, *Nature*): genes are literal
+  sequence positions, self-attended together, decoded via a shared
+  per-position output head. Considered as a design for this decoder but
+  **not adopted** — self-attention over our full ~16570-gene panel is
+  `O(n_panel^2)` per query location, too expensive without the
+  truncation/sparsity machinery Geneformer itself relies on (it typically
+  processes ~2048 genes/cell, not the full panel).
+- **LLOKI** (Levy et al. 2025, *Genome Research*) — directly relevant,
+  not just structurally similar: a 2025 paper solving the exact stated
+  problem this decoder targets ("integrating spatial transcriptomics
+  across platforms without requiring shared gene panels"), via a
+  conditional autoencoder conditioned on technology + gene panel (a
+  learnable batch/panel token appended at both encoder and decoder
+  input). A real, published alternative architecture for the same
+  problem — noted here as a design point we're aware of and chose not to
+  take, not adopted in this codebase. Worth revisiting if the
+  gene-identity-lookup approach continues to underperform once real
+  cross-platform data exists.
+
+**Implemented**: `combine_mode` param on `PanelInvariantGeneDecoder`
+(`"concat"` default, unchanged behavior for every existing config;
+`"add"` — scGPT's real mechanism, roughly halves the decoder's memory
+footprint) — plus `decoder_hidden_dim`/`decoder_mlp_depth`, which were
+previously NOT independent knobs (the decoder's internal width silently
+inherited whatever `ae_hidden_dim`/`cond_hidden_dim` the rest of the model
+happened to use — an accidental coupling, not a deliberate choice).
+`exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder_add.yaml` combines all
+three (gene_embed_dim=256, combine_mode=add, mlp_depth=2) — queued, not
+yet run as of this entry.

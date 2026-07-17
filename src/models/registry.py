@@ -149,6 +149,8 @@ def _build_decoder(
     in_dim: int, n_genes: int, dense_hidden_dim: int,
     decoder_type: str = "dense", decoder_gene_names: list[str] | None = None,
     decoder_gene_embed_dim: int = 64, tech_vocab: list[str] | None = None,
+    decoder_hidden_dim: int | None = None, decoder_mlp_depth: int = 1,
+    decoder_combine_mode: str = "concat",
 ) -> nn.Module:
     """Shared by WAE-GAN/FM-OT/VQ-VAE+AR (2026-07-17, diagram-5 gap
     analysis follow-up — see PanelInvariantGeneDecoder's own docstring in
@@ -163,7 +165,24 @@ def _build_decoder(
     tech_vocab reused as-is from the context-encoder's own
     organ_vocab/tech_vocab params (2026-07-16) — same vocabulary, allowed
     to be queried with a different (target-platform) tech string at decode
-    time than the context encoder was conditioned on."""
+    time than the context encoder was conditioned on.
+
+    decoder_hidden_dim/decoder_mlp_depth (2026-07-17, capacity follow-up —
+    see docs/results_log.md and PanelInvariantGeneDecoder's own docstring):
+    PREVIOUSLY the panel-invariant decoder's internal width silently
+    reused dense_hidden_dim (whatever ae_hidden_dim/cond_hidden_dim the
+    rest of that model happened to use) — an accidental coupling, not a
+    deliberate choice. decoder_hidden_dim now gives it a genuinely
+    independent width (defaults to dense_hidden_dim if unset, so every
+    existing config's behavior is unchanged); decoder_mlp_depth adds
+    capacity along depth instead of width (default 1 == the original
+    2-layer structure exactly). decoder_combine_mode ("concat" default,
+    "add" — scGPT's real gene-token combination rule, see
+    PanelInvariantGeneDecoder's own docstring) roughly halves this
+    decoder's training memory footprint (no more [N, n_panel, 2*hidden_dim]
+    tensor) and is literature-grounded rather than an ad hoc default. All
+    three are only meaningful for decoder_type="panel_invariant" — silently
+    unused for "dense"."""
     if decoder_type == "dense":
         return nn.Sequential(
             nn.Linear(in_dim, dense_hidden_dim), nn.ReLU(),
@@ -175,7 +194,9 @@ def _build_decoder(
         )
         return PanelInvariantGeneDecoder(
             gene_names=decoder_gene_names, gene_embed_dim=decoder_gene_embed_dim,
-            in_dim=in_dim, tech_vocab=tech_vocab, hidden_dim=dense_hidden_dim,
+            in_dim=in_dim, tech_vocab=tech_vocab,
+            hidden_dim=decoder_hidden_dim or dense_hidden_dim,
+            mlp_depth=decoder_mlp_depth, combine_mode=decoder_combine_mode,
         )
     else:
         raise ValueError(f"unknown decoder_type {decoder_type!r}")
@@ -385,7 +406,9 @@ class WAEGAN(BaseGenerativeModel):
                  coord_scale: float = 1.0,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
                  decoder_type: str = "dense", decoder_gene_names: list[str] | None = None,
-                 decoder_gene_embed_dim: int = 64):
+                 decoder_gene_embed_dim: int = 64,
+                 decoder_hidden_dim: int | None = None, decoder_mlp_depth: int = 1,
+                 decoder_combine_mode: str = "concat"):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False  # we alternate encoder/decoder vs. discriminator ourselves
@@ -415,6 +438,8 @@ class WAEGAN(BaseGenerativeModel):
             in_dim=latent_dim + cond_hidden_dim, n_genes=n_genes, dense_hidden_dim=hidden_dim,
             decoder_type=decoder_type, decoder_gene_names=decoder_gene_names,
             decoder_gene_embed_dim=decoder_gene_embed_dim, tech_vocab=tech_vocab,
+            decoder_hidden_dim=decoder_hidden_dim, decoder_mlp_depth=decoder_mlp_depth,
+            decoder_combine_mode=decoder_combine_mode,
         )
         self.decoder_type = decoder_type
         self.discriminator = nn.Sequential(
@@ -606,7 +631,9 @@ class FlowMatchingOT(BaseGenerativeModel):
                  coord_scale: float = 1.0,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
                  decoder_type: str = "dense", decoder_gene_names: list[str] | None = None,
-                 decoder_gene_embed_dim: int = 64):
+                 decoder_gene_embed_dim: int = 64,
+                 decoder_hidden_dim: int | None = None, decoder_mlp_depth: int = 1,
+                 decoder_combine_mode: str = "concat"):
         super().__init__()
         self.save_hyperparameters()
         assert path_type in ("ot", "edm"), f"unknown path_type {path_type!r}"
@@ -637,6 +664,8 @@ class FlowMatchingOT(BaseGenerativeModel):
             in_dim=latent_dim + cond_hidden_dim, n_genes=n_genes, dense_hidden_dim=ae_hidden_dim,
             decoder_type=decoder_type, decoder_gene_names=decoder_gene_names,
             decoder_gene_embed_dim=decoder_gene_embed_dim, tech_vocab=tech_vocab,
+            decoder_hidden_dim=decoder_hidden_dim, decoder_mlp_depth=decoder_mlp_depth,
+            decoder_combine_mode=decoder_combine_mode,
         )
         self.decoder_type = decoder_type
         self.time_embed = _SinusoidalTimeEmbedding(time_embed_dim)
@@ -823,7 +852,9 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  coord_scale: float = 1.0,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
                  decoder_type: str = "dense", decoder_gene_names: list[str] | None = None,
-                 decoder_gene_embed_dim: int = 64):
+                 decoder_gene_embed_dim: int = 64,
+                 decoder_hidden_dim: int | None = None, decoder_mlp_depth: int = 1,
+                 decoder_combine_mode: str = "concat"):
         super().__init__()
         self.save_hyperparameters()
         self.context_encoder = _build_context_encoder(
@@ -851,6 +882,8 @@ class VQVAEAutoregressive(BaseGenerativeModel):
             in_dim=latent_dim, n_genes=n_genes, dense_hidden_dim=ae_hidden_dim,
             decoder_type=decoder_type, decoder_gene_names=decoder_gene_names,
             decoder_gene_embed_dim=decoder_gene_embed_dim, tech_vocab=tech_vocab,
+            decoder_hidden_dim=decoder_hidden_dim, decoder_mlp_depth=decoder_mlp_depth,
+            decoder_combine_mode=decoder_combine_mode,
         )
         self.decoder_type = decoder_type
         self.vq = VectorQuantizer(codebook_size, latent_dim, commitment_weight)

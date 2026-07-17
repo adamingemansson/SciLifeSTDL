@@ -1,0 +1,94 @@
+# Literature-grounded decoder follow-up (2026-07-17) to
+# exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder_bigger.yaml. That run
+# tested pure capacity (decoder_gene_embed_dim 64->256, PCC 0.1308->0.2039,
+# still trailing the dense decoder's 0.2798, and ST-FID actually got
+# slightly worse) — capacity alone didn't close the gap. Real research
+# pass (2026-07-17) into how published foundation models combine gene
+# identity with expression/context signal found scGPT (Cui et al. 2024,
+# Nature Methods) uses ELEMENT-WISE ADDITION, not concatenation, to
+# combine gene-identity embeddings with expression-value embeddings —
+# our original design concatenated instead (a real, avoidable memory cost:
+# concat's [N, n_panel, 2*hidden_dim] tensor is what drove this decoder's
+# ~20GB training footprint). This switches to combine_mode="add"
+# (roughly half the memory of concat), keeps the capacity win from the
+# bigger run (gene_embed_dim=256), and adds a second hidden layer
+# (decoder_mlp_depth=2) as a further, independent capacity axis.
+# Geneformer's real architecture (Theodoris et al. 2023, Nature — genes as
+# self-attended sequence positions, shared per-position output head) was
+# also checked as a candidate design but ruled out: full self-attention
+# over a ~16570-gene panel is O(n_panel^2) per query location, too
+# expensive at this panel size without truncation/sparsity machinery this
+# project doesn't have.
+#
+# LLOKI (Levy et al. 2025, Genome Research) is a directly relevant
+# published paper solving the SAME stated problem this decoder targets
+# ("integrating spatial transcriptomics across platforms without requiring
+# shared gene panels") via a different architecture (a conditional
+# autoencoder, technology+panel embedding appended at both encoder and
+# decoder) — noted as a real alternative design point, not adopted here,
+# see docs/results_log.md for the fuller writeup.
+#
+# Direct comparison targets: exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder_bigger.yaml
+# (concat, gene_embed_dim=256, PCC 0.2039) and
+# exp_hest1k_fm_ot_stormlite_mome_both.yaml (dense decoder, PCC 0.2798) —
+# all at 10k epochs.
+#
+# Requires `pip install novae` (Python >=3.11).
+
+experiment_name: fm_ot_hest1k_pilot_stormlite_mome_both_paneldecoder_add
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    storm_lite_fusion_mode: mome
+    decoder_type: panel_invariant   # 2026-07-17: see header
+    # decoder_gene_names is NOT set here — auto-injected from adata.var_names
+    # (see train.py inject_decoder_gene_names), same panel as context/training
+    decoder_gene_embed_dim: 256     # keeps the capacity win from _bigger.yaml
+    decoder_combine_mode: add       # 2026-07-17: scGPT's real combination rule — see header
+    decoder_mlp_depth: 2            # 2026-07-17: capacity along depth too
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_fm_ot_stpath.yaml
+    coord_dim: 3
+    cond_hidden_dim: 256           # also StormLiteContextEncoder's internal token dim
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 10000                  # same as exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder.yaml - fair comparison
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab
