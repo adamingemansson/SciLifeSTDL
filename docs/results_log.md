@@ -255,9 +255,82 @@ INT1-INT24, a real limitation only if genuinely mixed-organ/platform
 samples are used with STPath specifically.
 
 Four configs queued for the first real multi-sample run
-(`scripts/run_parallel_4gpu_multisample.sh`, INT1-INT8, 10k epochs,
-weighted toward StormLite): `fm_ot` + StormLite+MoME (both/novae gene
-branches), `fm_ot` + STPath bothresidual (comparison anchor), `wae_gan` +
-STPath novaeresidual (checks whether the single-sample result, PCC
-0.3453, holds with more data diversity). Not yet run as of this entry —
-depends on how many HEST-1k samples are actually downloaded locally.
+(`scripts/run_parallel_4gpu_multisample.sh`, INT1-INT8, weighted toward
+StormLite): `fm_ot` + StormLite+MoME (both/novae gene branches), `fm_ot` +
+STPath bothresidual (comparison anchor), `wae_gan` + STPath novaeresidual
+(checks whether the single-sample result, PCC 0.3453, holds with more
+data diversity). Bumped to 40k epochs and folded into the overnight batch
+below rather than run standalone — see that entry.
+
+## 2026-07-17: second lloki bug — tech_vocab assumed "Visium", real value is "unknown"
+
+The `tech`/`organ` fix above unblocked the crash, but all 4 `lloki`
+configs still failed with a different error: `AssertionError: tech
+'unknown' not in decoder tech_vocab ['Visium']`. Real bug in my own
+config assumption, not the pipeline: `load_adata()` never passes
+`organ=`/`tech=` into `load_hest_sample()` for single-sample configs, so
+`adata.obs["tech"]` is always the literal string `"unknown"` (that
+function's own documented default), not `"Visium"` — the biological fact
+that INT samples ARE Visium-sequenced was never true of what flows
+through this specific pipeline path. Fixed all 5 `lloki` configs'
+`tech_vocab` to `["unknown"]`. Since this is the only value that ever
+appears for single-sample configs, `lloki`'s technology-conditioning is
+exercised but not meaningfully differentiated (same "constant value,
+contributes nothing but doesn't break" situation `OrganTechEmbedding`
+already documents on single-organ data) — real technology conditioning
+would need either genuinely multi-platform data, or `organ=`/`tech=`
+wired from the config into `load_adata()` (a real, small follow-up,
+not done here).
+
+**One real, unexplained finding from the corrected run**:
+`stormlite_mome_both_lloki` and `wae_gan_stormlite_mome_both_lloki` both
+came back `PCC=nan` — but `stormlite_mome_novae_lloki` (0.2166) and
+`stpath_bothresidual_lloki` (0.2240) both work fine. Looks specific to
+StormLite's `gene_encoder_type="both"` (CombinedGeneEncoder) interacting
+badly with `lloki` specifically, across both generator families tried —
+not yet investigated further, flagged for follow-up.
+
+## 2026-07-17: PeriodicCheckpointCallback
+
+User request, motivated by tonight's overnight batch (several 40k-80k
+epoch runs with no interactive supervision): a new opt-in
+`training.checkpoint_every_n_steps` config field saves trainable weights
++ config + gene names every N steps, overwriting the same checkpoint path
+each time (not versioned) — so a killed/crashed/disconnected job still
+leaves a recent, loadable checkpoint behind instead of only ever saving
+once at the very end. Reuses `save_trained_model` exactly (only trainable
+params, not frozen backbones — see `save_trainable_state_dict`'s own
+docstring on why: a STPath-conditioned model's full `state_dict()` is
+~4.7GB, saving that every 10k steps for hours would be real, avoidable
+cost). Wired into all 3 trainer-construction sites
+(`run_comparison.py`'s `_train_model`, `train.py`'s `main()` and
+`_main_multi_sample`). Unset by default — zero behavior change for every
+existing config.
+
+## 2026-07-17: overnight batch — 4 real levers to close the StormLite/STPath gap
+
+The open question from the two entries above: STPath's from-scratch
+(unfrozen) `bothresidual` (0.3857 @ 40k) beats StormLite's best arm
+(`mome_both`, 0.3461 @ 40k) even with no pretraining advantage on either
+side — the gap is architectural, not about pretraining. Since StormLite
+is this project's priority architecture (GigaPath + Novae, built from
+scratch rather than relying on STPath's external weights), tonight tests
+the four most likely real causes, `scripts/run_parallel_8gpu_overnight.sh`:
+
+1. **Training length**: `mome_both` pushed to 80k epochs (was still
+   climbing at 40k, never plateaued — does it catch up?).
+2. **Capacity**: `mome_both_bigger` — 4 transformer layers/8 heads/512-dim
+   tokens instead of 2/4/256 (StormLite's current config is much smaller
+   than STPath's real architecture).
+3. **Position-bias choice**: `mome_both_relpos` — `relative_position`
+   instead of the default `frame_averaging`, the first direct comparison
+   at MoME scale (every earlier bias_type sweep predates the MoME-FFN
+   fix, commit 00a188a).
+4. **Data diversity**: the 4 multi-sample configs (INT1-INT8, now 40k
+   epochs) plus a flagship 5th combining capacity + data diversity
+   together (`multisample_fm_ot_stormlite_mome_both_bigger`) — the actual
+   best shot at beating STPath tonight, since it addresses both
+   hypotheses (architecture bottleneck, single-sample overfitting)
+   simultaneously.
+
+Not yet run as of this entry.

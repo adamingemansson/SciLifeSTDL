@@ -109,6 +109,51 @@ def save_trained_model(model, model_cfg: dict, gene_names: list, checkpoint_dir:
     return weights_path
 
 
+class PeriodicCheckpointCallback(pl.Callback):
+    """Saves trainable weights + config + gene names every
+    save_every_n_steps training steps, OVERWRITING the same checkpoint_dir
+    each time (not versioned/accumulated — save_trained_model/
+    save_trainable_state_dict already write to a fixed filename via an
+    atomic os.replace, see that function's own docstring) — so a
+    long-running job that gets killed, disconnected, or crashes partway
+    through still leaves a recent, loadable checkpoint behind (via
+    load_trained_model / run_comparison.py's --skip-training), rather
+    than only ever saving once at the very end of training.
+
+    2026-07-17, user request ("save and overwrite each 10K steps, so
+    worst case I can just stop things and compare as is") — motivated by
+    tonight's overnight batch including multiple long (40k-80k epoch)
+    runs with no interactive supervision.
+
+    Reuses save_trained_model exactly, not a separate/cheaper mechanism —
+    deliberately NOT Lightning's own built-in ModelCheckpoint callback
+    (why every trainer in this codebase already sets
+    enable_checkpointing=False): that would serialize the FULL
+    state_dict, including frozen backbones (Gigapath/STPath) — see
+    save_trainable_state_dict's own docstring on why a STPath-conditioned
+    model's full state_dict is ~4.7GB vs. a few tens of MB for just the
+    trainable params. Doing that every 10k steps for an 80k-epoch run
+    would be real, avoidable disk/time cost.
+
+    Opt-in via training.checkpoint_every_n_steps in a config (unset/None
+    default — every existing config's behavior is completely unchanged,
+    only saving once at the end of training as before)."""
+
+    def __init__(self, model_cfg: dict, gene_names: list, checkpoint_dir: str,
+                 save_every_n_steps: int):
+        self.model_cfg = model_cfg
+        self.gene_names = gene_names
+        self.checkpoint_dir = checkpoint_dir
+        self.save_every_n_steps = save_every_n_steps
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        step = trainer.global_step
+        if step > 0 and step % self.save_every_n_steps == 0:
+            saved_path = save_trained_model(pl_module, self.model_cfg, self.gene_names, self.checkpoint_dir)
+            if saved_path is not None:
+                print(f"[PeriodicCheckpointCallback] step {step}: saved checkpoint to {saved_path.parent}")
+
+
 def load_trained_model(checkpoint_dir: str):
     """Reconstruct a model saved by save_trained_model: rebuild an
     architecturally-identical, freshly-initialized model from the saved
@@ -1038,21 +1083,32 @@ def _main_multi_sample(cfg) -> None:
         else:
             inject_stpath_novae_dim(unresolved_model_cfg, context_novae_features.shape[1])
 
+    checkpoint_dir = cfg.training.get("checkpoint_dir", f"results/checkpoints/{cfg.experiment_name}")
     if list(model.parameters()):
         dataset = MultiSampleMaskedContextQueryDataset(
             samples, cfg.masking, n_items=cfg.training.epochs, base_seed=cfg.training.seed,
             augment=augment,
         )
         dataloader = make_dataloader(dataset, cfg)
+        # PeriodicCheckpointCallback (2026-07-17): opt-in via
+        # training.checkpoint_every_n_steps, unset by default — see that
+        # class's own docstring.
+        callbacks = []
+        checkpoint_every_n_steps = cfg.training.get("checkpoint_every_n_steps")
+        if checkpoint_every_n_steps:
+            callbacks.append(PeriodicCheckpointCallback(
+                unresolved_model_cfg, gene_names, checkpoint_dir,
+                save_every_n_steps=checkpoint_every_n_steps,
+            ))
         trainer = pl.Trainer(
             max_epochs=1,
             accelerator="auto",
             log_every_n_steps=cfg.training.log_every_n_steps,
             enable_checkpointing=False,
             logger=False,
+            callbacks=callbacks,
         )
         trainer.fit(model, dataloader)
-        checkpoint_dir = cfg.training.get("checkpoint_dir", f"results/checkpoints/{cfg.experiment_name}")
         saved_path = save_trained_model(model, unresolved_model_cfg, gene_names, checkpoint_dir)
         if saved_path is not None:
             print(f"Saved trained model (weights + config + gene names) to {saved_path.parent}")
@@ -1094,11 +1150,13 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     # Multi-sample training (2026-07-16, cfg.data.sample_ids as a LIST in
     # place of the single-sample configs' cfg.data.sample_id) — a genuinely
     # separate, simpler code path rather than threading a branch through
-    # every line below, since load_multi_sample_data/
-    # MultiSampleMaskedContextQueryDataset deliberately don't support
-    # images/Novae/STPath yet (see those classes' own docstrings on why
-    # that's scoped separately) — trying to share one code path would just
-    # mean asserting those features are off throughout, no real benefit.
+    # every line below. UPDATED 2026-07-17: load_multi_sample_data/
+    # MultiSampleMaskedContextQueryDataset now DO support images/Novae/
+    # STPath (see load_multi_sample_data's own updated docstring for the
+    # real gap this closed) — kept as a separate function regardless,
+    # since sharing one code path would still mean threading extra
+    # branching through every line below for no real benefit now that
+    # both paths already work correctly independently.
     if cfg.data.get("sample_ids") is not None:
         _main_multi_sample(cfg)
         return
@@ -1193,19 +1251,30 @@ def main(cfg_path: str, overrides: list[str] | None = None):
             augment=augment,
         )
         dataloader = make_dataloader(dataset, cfg)
+        # .get() with the same default every real config's own YAML comment
+        # documents, not a bare attribute access — configs that don't
+        # declare checkpoint_dir (e.g. tests/test_run_comparison.py's
+        # synthetic configs) must still work, not crash on a missing key
+        checkpoint_dir = cfg.training.get("checkpoint_dir", f"results/checkpoints/{cfg.experiment_name}")
+        # PeriodicCheckpointCallback (2026-07-17): opt-in via
+        # training.checkpoint_every_n_steps, unset by default — see that
+        # class's own docstring.
+        callbacks = []
+        checkpoint_every_n_steps = cfg.training.get("checkpoint_every_n_steps")
+        if checkpoint_every_n_steps:
+            callbacks.append(PeriodicCheckpointCallback(
+                unresolved_model_cfg, adata.var_names.tolist(), checkpoint_dir,
+                save_every_n_steps=checkpoint_every_n_steps,
+            ))
         trainer = pl.Trainer(
             max_epochs=1,  # one pass over `n_items` fresh masking draws == old epoch count
             accelerator="auto",
             log_every_n_steps=cfg.training.log_every_n_steps,
             enable_checkpointing=False,
             logger=False,
+            callbacks=callbacks,
         )
         trainer.fit(model, dataloader)
-        # .get() with the same default every real config's own YAML comment
-        # documents, not a bare attribute access — configs that don't
-        # declare checkpoint_dir (e.g. tests/test_run_comparison.py's
-        # synthetic configs) must still work, not crash on a missing key
-        checkpoint_dir = cfg.training.get("checkpoint_dir", f"results/checkpoints/{cfg.experiment_name}")
         saved_path = save_trained_model(model, unresolved_model_cfg, adata.var_names.tolist(), checkpoint_dir)
         if saved_path is not None:
             print(f"Saved trained model (weights + config + gene names) to {saved_path.parent}")

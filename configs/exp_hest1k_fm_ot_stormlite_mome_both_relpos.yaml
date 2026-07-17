@@ -1,0 +1,74 @@
+# bias_type systematic comparison at MoME scale (2026-07-17) — every
+# bias_type sweep so far (none/relative_position/frame_averaging)
+# predates the MoME-FFN fix (commit 00a188a), so we've never directly
+# checked whether the position-bias choice matters once MoME fusion is
+# actually working. frame_averaging (STPath's real, verified mechanism)
+# is StormLiteContextEncoder's current default; this tests
+# relative_position instead — a real, structurally different mechanism
+# (an MLP over raw coordinate differences, not a frame-averaged PCA
+# eigenbasis), to see whether it changes anything now that the fusion
+# itself isn't the bottleneck it used to be.
+#
+# Direct comparison target: exp_hest1k_fm_ot_stormlite_mome_both.yaml
+# (identical everything else — bias_type defaults to "frame_averaging").
+#
+# checkpoint_every_n_steps: see exp_hest1k_fm_ot_stormlite_mome_both_bigger.yaml's
+# own header for the reasoning (same overnight-run motivation).
+#
+# Requires `pip install novae` (Python >=3.11).
+
+experiment_name: fm_ot_hest1k_pilot_stormlite_mome_both_relpos
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    storm_lite_fusion_mode: mome
+    storm_lite_bias_type: relative_position   # 2026-07-17: see header (default is frame_averaging)
+    # novae_dim is NOT set here — auto-injected from the real precomputed
+    # Novae features' shape (see train.py inject_novae_dim / get_novae_features)
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_fm_ot_stpath.yaml
+    coord_dim: 3
+    cond_hidden_dim: 256           # also StormLiteContextEncoder's internal token dim
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 40000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+  checkpoint_every_n_steps: 10000
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

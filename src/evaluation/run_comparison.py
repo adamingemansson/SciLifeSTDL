@@ -64,7 +64,7 @@ from src.training.train import (
     _load_images, _images_tensor, inject_stpath_gene_names,
     get_gigapath_features, save_trained_model, make_dataloader,
     _downsample_patches, get_novae_features, inject_novae_dim, inject_stpath_novae_dim,
-    inject_coord_scale, inject_decoder_gene_names,
+    inject_coord_scale, inject_decoder_gene_names, PeriodicCheckpointCallback,
 )
 from src.evaluation import metrics as ev
 from src.evaluation.cell_type_classifier import cluster_pseudo_labels, CellTypePlausibilityClassifier
@@ -227,10 +227,21 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
             augment=cfg.training.get("augment_coords", False),
         )
         dataloader = make_dataloader(dataset, cfg)
+        # PeriodicCheckpointCallback (2026-07-17): opt-in via
+        # training.checkpoint_every_n_steps, unset by default — see that
+        # class's own docstring.
+        callbacks = []
+        checkpoint_every_n_steps = cfg.training.get("checkpoint_every_n_steps")
+        if checkpoint_every_n_steps:
+            callbacks.append(PeriodicCheckpointCallback(
+                unresolved_model_cfg, adata.var_names.tolist(), checkpoint_dir,
+                save_every_n_steps=checkpoint_every_n_steps,
+            ))
         trainer = pl.Trainer(
             max_epochs=1, accelerator="auto",
             log_every_n_steps=cfg.training.log_every_n_steps,
             enable_checkpointing=False, logger=False,
+            callbacks=callbacks,
         )
         trainer.fit(model, dataloader)
         saved_path = save_trained_model(model, unresolved_model_cfg, adata.var_names.tolist(), checkpoint_dir)
