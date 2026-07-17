@@ -51,7 +51,7 @@ fact-checked**, treat as leads to check before citing:
 verified and documented in `docs/literature_review.md`'s imputation
 section — no duplicate entry needed.)
 
-## Cross-platform decoder ("target platform space" conditioning)
+## Cross-platform decoder ("target platform space" conditioning) — IMPLEMENTED 2026-07-17
 
 Surfaced 2026-07-17 from a user-drafted architecture roadmap (informally
 compared against STPath/STORM/Novae's real architectures, all
@@ -61,20 +61,44 @@ conditions its decoder on sequencing technology so it can output
 expression for a *different* gene panel than the one the context data
 came from (e.g. context from Visium, predict for Xenium's panel).
 
-Not something this project currently has: every generator here
-(WAE-GAN/FM-OT/VQ-VAE+AR) uses a dense, fixed-width `Linear(hidden_dim,
-n_genes)` decoder tied to one specific gene panel at construction time —
-unlike STPath's real tokenized gene output head (verified via its source,
-stpath_encoder.py), which is panel-agnostic by construction. Adding this
-would be a genuine decoder redesign (token-based/panel-invariant output),
-not a small addition — deferred until the current architecture-selection
-work (StormLite bias_type/fusion_mode/gene_encoder_type comparisons) is
-settled, and until training data spans more than one platform (currently
-INT1-24, all-Visium — see load_multi_sample's own docstring in
-src/data/loaders.py). Revisit once genuinely multi-platform training data
-is in hand; the multi-sample training infrastructure (organ_vocab/
-tech_vocab, src/models/conditioning.py OrganTechEmbedding) is already
-built and would need extending in the same spirit.
+Every generator here (WAE-GAN/FM-OT/VQ-VAE+AR) originally used a dense,
+fixed-width `Linear(hidden_dim, n_genes)` decoder tied to one specific
+gene panel at construction time — unlike STPath's real tokenized gene
+output head (verified via its source, stpath_encoder.py), which is
+panel-agnostic by construction. This gap is now closed:
+`PanelInvariantGeneDecoder` (src/models/conditioning.py) predicts
+expression via a learned per-gene identity embedding looked up by name,
+not a fixed output column, so the same trained decoder can be queried
+against a different gene subset at inference time than it was trained on
+— a continuous-regression simplification of STPath's real per-gene-token
+classification head, not a literal port of its tokenizer/binning
+machinery. Also takes an optional target-platform `tech` string (separate
+from the context encoder's own source-platform tech conditioning),
+matching the roadmap's "GEX decoder ... also fed by tech embedding"
+arrow.
+
+Opt-in via `decoder_type: "panel_invariant"` (default remains `"dense"`,
+zero behavior change for every existing config) on any of the three
+generator families; `decoder_gene_names` is auto-derived from the loaded
+AnnData's `var_names` the same way `stpath_gene_names` already is (see
+`inject_decoder_gene_names`, src/training/train.py) unless set explicitly.
+See `tests/test_panel_invariant_decoder.py` for the mechanism-level checks
+(shape, gradient flow, panel-subset scoring matches full-panel slicing
+exactly, missing-gene assertion, tech conditioning) and
+`configs/exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder.yaml` for a
+runnable sanity-check config.
+
+**Still not validated end-to-end on genuinely cross-platform data** — no
+multi-platform training set is currently available (INT1-24, this
+project's only confirmed-available HEST-1k samples, are all-Visium — see
+load_multi_sample's own docstring in src/data/loaders.py). On today's
+data, `decoder_gene_names` is always auto-injected as the SAME panel used
+for context/training, so every run so far exercises the mechanism at
+`gene_names=None` (full-vocab default) rather than the actual
+smaller/different-panel case the roadmap describes. Revisit the real
+cross-platform test once genuinely multi-platform training data is in
+hand; the multi-sample training infrastructure (organ_vocab/tech_vocab,
+`OrganTechEmbedding`) is already built and generalizes the same way.
 
 ## Deprioritized architecture options
 

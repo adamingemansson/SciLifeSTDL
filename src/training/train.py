@@ -811,6 +811,20 @@ def inject_stpath_gene_names(model_cfg: dict, adata) -> None:
         params["stpath_gene_names"] = adata.var_names.tolist()
 
 
+def inject_decoder_gene_names(model_cfg: dict, adata) -> None:
+    """If a config sets decoder_type: "panel_invariant" (2026-07-17,
+    diagram-5 gap analysis follow-up — see PanelInvariantGeneDecoder's own
+    docstring in conditioning.py), auto-derive decoder_gene_names from the
+    loaded AnnData's var_names, same "vocabulary fixed at construction
+    time, derived from real data rather than hardcoded into a YAML file"
+    reasoning as inject_stpath_gene_names above. Mutates
+    model_cfg["params"] in place; no-op for every other config (the
+    default decoder_type="dense" doesn't use this param at all)."""
+    params = model_cfg.get("params", {})
+    if params.get("decoder_type") == "panel_invariant" and "decoder_gene_names" not in params:
+        params["decoder_gene_names"] = adata.var_names.tolist()
+
+
 def _main_multi_sample(cfg) -> None:
     """Multi-sample training entry point (2026-07-16), called from main()
     when cfg.data.sample_ids is set. Mirrors main()'s single-sample flow
@@ -838,12 +852,14 @@ def _main_multi_sample(cfg) -> None:
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     inject_organ_tech_vocab(model_cfg, adatas)
     inject_coord_scale(model_cfg, coord_scale)
+    inject_decoder_gene_names(model_cfg, adatas[0])
     model = build_model(model_cfg)
     # unresolved copy for checkpointing — same reasoning as main()'s own
     # unresolved_model_cfg (keeps ${oc.env:...} interpolations literal)
     unresolved_model_cfg = OmegaConf.to_container(cfg.model, resolve=False)
     inject_organ_tech_vocab(unresolved_model_cfg, adatas)
     inject_coord_scale(unresolved_model_cfg, coord_scale)
+    inject_decoder_gene_names(unresolved_model_cfg, adatas[0])
 
     if list(model.parameters()):
         dataset = MultiSampleMaskedContextQueryDataset(
@@ -948,6 +964,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     inject_stpath_gene_names(model_cfg, adata)
+    inject_decoder_gene_names(model_cfg, adata)
     inject_coord_scale(model_cfg, coord_scale)
     if context_gene_features is not None:
         inject_novae_dim(model_cfg, context_gene_features.shape[1])
@@ -970,6 +987,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     # saved config self-consistent with model_cfg above.
     unresolved_model_cfg = OmegaConf.to_container(cfg.model, resolve=False)
     inject_stpath_gene_names(unresolved_model_cfg, adata)
+    inject_decoder_gene_names(unresolved_model_cfg, adata)
     inject_coord_scale(unresolved_model_cfg, coord_scale)
     if context_gene_features is not None:
         inject_novae_dim(unresolved_model_cfg, context_gene_features.shape[1])

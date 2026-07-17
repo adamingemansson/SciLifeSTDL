@@ -1,0 +1,81 @@
+# Panel-invariant decoder sanity check (2026-07-17) — diagram-5 gap
+# analysis follow-up. Swaps this project's best current StormLite arm's
+# (mome_both, see exp_hest1k_fm_ot_stormlite_mome_both.yaml) fixed-width
+# nn.Linear(hidden_dim, n_genes) decoder for PanelInvariantGeneDecoder
+# (src/models/conditioning.py) — the last unbuilt box in the user's
+# proposed-model roadmap, "GEX decoder ... predicted expression in target
+# platform space". See PanelInvariantGeneDecoder's own docstring for the
+# full mechanism (gene identity looked up by name, not a fixed output
+# column) and its real caveat: NOT validated on genuine cross-platform
+# data (none available — see docs/possible_extensions.md). On this
+# all-Visium data, decoder_gene_names is auto-injected as the SAME panel
+# used for context/training (inject_decoder_gene_names, train.py), so
+# this run is the sanity check that the mechanism reproduces normal
+# training behavior with an identity-lookup decoder instead of a fixed
+# one — not a claim of any accuracy improvement, and not yet the
+# cross-platform test itself.
+#
+# Direct comparison target: exp_hest1k_fm_ot_stormlite_mome_both.yaml
+# (identical everything else, only decoder_type differs). If this scores
+# meaningfully worse, the identity-lookup decoder itself needs more
+# capacity/tuning before it's trusted for a real cross-platform run; if
+# comparable, it's ready to point at genuinely multi-platform data
+# whenever that exists.
+#
+# Requires `pip install novae` (Python >=3.11).
+
+experiment_name: fm_ot_hest1k_pilot_stormlite_mome_both_paneldecoder
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    storm_lite_fusion_mode: mome
+    decoder_type: panel_invariant   # 2026-07-17: see header
+    # decoder_gene_names is NOT set here — auto-injected from adata.var_names
+    # (see train.py inject_decoder_gene_names), same panel as context/training
+    decoder_gene_embed_dim: 64
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_fm_ot_stpath.yaml
+    coord_dim: 3
+    cond_hidden_dim: 256           # also StormLiteContextEncoder's internal token dim
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 10000                  # same as exp_hest1k_fm_ot_stormlite_mome_both.yaml - fair comparison
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

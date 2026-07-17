@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 
-from src.models.conditioning import SpatialContextEncoder
+from src.models.conditioning import SpatialContextEncoder, PanelInvariantGeneDecoder
 from src.models.vqvae import VectorQuantizer, morton_order
 
 _MODEL_REGISTRY: dict[str, type["BaseGenerativeModel"]] = {}
@@ -143,6 +143,42 @@ def _build_context_encoder(
         )
     else:
         raise ValueError(f"unknown context_encoder_type {context_encoder_type!r}")
+
+
+def _build_decoder(
+    in_dim: int, n_genes: int, dense_hidden_dim: int,
+    decoder_type: str = "dense", decoder_gene_names: list[str] | None = None,
+    decoder_gene_embed_dim: int = 64, tech_vocab: list[str] | None = None,
+) -> nn.Module:
+    """Shared by WAE-GAN/FM-OT/VQ-VAE+AR (2026-07-17, diagram-5 gap
+    analysis follow-up — see PanelInvariantGeneDecoder's own docstring in
+    conditioning.py for the full reasoning). "dense" (default) is the
+    original fixed-width nn.Linear(in_dim, n_genes) — unchanged behavior
+    for every existing config. "panel_invariant" swaps in
+    PanelInvariantGeneDecoder, which looks up genes by name instead of a
+    fixed output column, and requires decoder_gene_names (same
+    "vocabulary fixed at construction time" requirement as
+    stpath_gene_names — see inject_decoder_gene_names in
+    src/training/train.py for how it's auto-populated from real data).
+    tech_vocab reused as-is from the context-encoder's own
+    organ_vocab/tech_vocab params (2026-07-16) — same vocabulary, allowed
+    to be queried with a different (target-platform) tech string at decode
+    time than the context encoder was conditioned on."""
+    if decoder_type == "dense":
+        return nn.Sequential(
+            nn.Linear(in_dim, dense_hidden_dim), nn.ReLU(),
+            nn.Linear(dense_hidden_dim, n_genes),
+        )
+    elif decoder_type == "panel_invariant":
+        assert decoder_gene_names, (
+            "decoder_type='panel_invariant' requires decoder_gene_names"
+        )
+        return PanelInvariantGeneDecoder(
+            gene_names=decoder_gene_names, gene_embed_dim=decoder_gene_embed_dim,
+            in_dim=in_dim, tech_vocab=tech_vocab, hidden_dim=dense_hidden_dim,
+        )
+    else:
+        raise ValueError(f"unknown decoder_type {decoder_type!r}")
 
 
 def register_model(name: str):
@@ -347,7 +383,9 @@ class WAEGAN(BaseGenerativeModel):
                  storm_lite_relative_bias_hidden_dim: int = 32,
                  storm_lite_fusion_mode: str = "sum",
                  coord_scale: float = 1.0,
-                 organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
+                 organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
+                 decoder_type: str = "dense", decoder_gene_names: list[str] | None = None,
+                 decoder_gene_embed_dim: int = 64):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False  # we alternate encoder/decoder vs. discriminator ourselves
@@ -373,10 +411,12 @@ class WAEGAN(BaseGenerativeModel):
             nn.Linear(n_genes, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, latent_dim),   # deterministic encoder, no logvar
         )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim + cond_hidden_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, n_genes),
+        self.decoder = _build_decoder(
+            in_dim=latent_dim + cond_hidden_dim, n_genes=n_genes, dense_hidden_dim=hidden_dim,
+            decoder_type=decoder_type, decoder_gene_names=decoder_gene_names,
+            decoder_gene_embed_dim=decoder_gene_embed_dim, tech_vocab=tech_vocab,
         )
+        self.decoder_type = decoder_type
         self.discriminator = nn.Sequential(
             nn.Linear(latent_dim, disc_hidden_dim), nn.ReLU(),
             nn.Linear(disc_hidden_dim, 1),   # logit: real-prior-sample vs. encoder output
@@ -385,6 +425,13 @@ class WAEGAN(BaseGenerativeModel):
         self.adv_weight = adv_weight
         self.lr = lr
         self.lr_disc = lr_disc
+
+    def _decode(self, h: torch.Tensor, tech: str | None = None) -> torch.Tensor:
+        """Dispatches on decoder_type (2026-07-17, see PanelInvariantGeneDecoder
+        docstring) so sample()/training_step() don't need their own branching."""
+        if self.decoder_type == "dense":
+            return self.decoder(h)
+        return self.decoder(h, tech=tech)
 
     def sample(self, context, query):
         # No real target expression at generation time, so z ~ prior (as
@@ -397,7 +444,7 @@ class WAEGAN(BaseGenerativeModel):
         n = query["coords"].shape[0]
         c = self._encode_context(context, query)
         z = torch.randn(n, self.latent_dim, device=self.device)
-        expr_gen = self.decoder(torch.cat([z, c], dim=-1))
+        expr_gen = self._decode(torch.cat([z, c], dim=-1), tech=query.get("tech"))
         return {"coords": query["coords"], "expression": expr_gen}
 
     def training_step(self, batch, batch_idx):
@@ -557,7 +604,9 @@ class FlowMatchingOT(BaseGenerativeModel):
                  storm_lite_relative_bias_hidden_dim: int = 32,
                  storm_lite_fusion_mode: str = "sum",
                  coord_scale: float = 1.0,
-                 organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
+                 organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
+                 decoder_type: str = "dense", decoder_gene_names: list[str] | None = None,
+                 decoder_gene_embed_dim: int = 64):
         super().__init__()
         self.save_hyperparameters()
         assert path_type in ("ot", "edm"), f"unknown path_type {path_type!r}"
@@ -584,10 +633,12 @@ class FlowMatchingOT(BaseGenerativeModel):
             nn.Linear(n_genes, ae_hidden_dim), nn.ReLU(),
             nn.Linear(ae_hidden_dim, latent_dim),
         )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim + cond_hidden_dim, ae_hidden_dim), nn.ReLU(),
-            nn.Linear(ae_hidden_dim, n_genes),
+        self.decoder = _build_decoder(
+            in_dim=latent_dim + cond_hidden_dim, n_genes=n_genes, dense_hidden_dim=ae_hidden_dim,
+            decoder_type=decoder_type, decoder_gene_names=decoder_gene_names,
+            decoder_gene_embed_dim=decoder_gene_embed_dim, tech_vocab=tech_vocab,
         )
+        self.decoder_type = decoder_type
         self.time_embed = _SinusoidalTimeEmbedding(time_embed_dim)
         self.velocity_net = nn.Sequential(
             nn.Linear(latent_dim + time_embed_dim + cond_hidden_dim, hidden_dim), nn.ReLU(),
@@ -626,6 +677,13 @@ class FlowMatchingOT(BaseGenerativeModel):
         f = self.velocity_net(torch.cat([c_in * z_sigma, t_embed, c], dim=-1))
         return c_skip * z_sigma + c_out * f
 
+    def _decode(self, h: torch.Tensor, tech: str | None = None) -> torch.Tensor:
+        """Dispatches on decoder_type (2026-07-17, see PanelInvariantGeneDecoder
+        docstring) so sample()/training_step() don't need their own branching."""
+        if self.decoder_type == "dense":
+            return self.decoder(h)
+        return self.decoder(h, tech=tech)
+
     def sample(self, context, query):
         n = query["coords"].shape[0]
         c = self._encode_context(context, query)
@@ -650,7 +708,7 @@ class FlowMatchingOT(BaseGenerativeModel):
                 d_over_sigma = (z - d) / sigma_cur          # probability-flow ODE: dz/dsigma
                 z = z + (sigmas[step + 1] - sigma_cur) * d_over_sigma  # Euler step
 
-        expr_gen = self.decoder(torch.cat([z, c], dim=-1))
+        expr_gen = self._decode(torch.cat([z, c], dim=-1), tech=query.get("tech"))
         return {"coords": query["coords"], "expression": expr_gen}
 
     def training_step(self, batch, batch_idx):
@@ -660,7 +718,7 @@ class FlowMatchingOT(BaseGenerativeModel):
         c = self._encode_context(context, query)
 
         z_1 = self.encoder(x_1)
-        recon = self.decoder(torch.cat([z_1, c], dim=-1))
+        recon = self._decode(torch.cat([z_1, c], dim=-1), tech=query.get("tech"))
         recon_loss = nn.functional.mse_loss(recon, x_1)
 
         # flow-matching/diffusion target sees a frozen (detached) latent
@@ -763,7 +821,9 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  storm_lite_relative_bias_hidden_dim: int = 32,
                  storm_lite_fusion_mode: str = "sum",
                  coord_scale: float = 1.0,
-                 organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
+                 organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
+                 decoder_type: str = "dense", decoder_gene_names: list[str] | None = None,
+                 decoder_gene_embed_dim: int = 64):
         super().__init__()
         self.save_hyperparameters()
         self.context_encoder = _build_context_encoder(
@@ -787,10 +847,12 @@ class VQVAEAutoregressive(BaseGenerativeModel):
             nn.Linear(n_genes, ae_hidden_dim), nn.ReLU(),
             nn.Linear(ae_hidden_dim, latent_dim),
         )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, ae_hidden_dim), nn.ReLU(),
-            nn.Linear(ae_hidden_dim, n_genes),
+        self.decoder = _build_decoder(
+            in_dim=latent_dim, n_genes=n_genes, dense_hidden_dim=ae_hidden_dim,
+            decoder_type=decoder_type, decoder_gene_names=decoder_gene_names,
+            decoder_gene_embed_dim=decoder_gene_embed_dim, tech_vocab=tech_vocab,
         )
+        self.decoder_type = decoder_type
         self.vq = VectorQuantizer(codebook_size, latent_dim, commitment_weight)
 
         self.bos_token = codebook_size  # one extra embedding slot for BOS
@@ -823,6 +885,13 @@ class VQVAEAutoregressive(BaseGenerativeModel):
         h_out = self.transformer(h_in.unsqueeze(0), mask=mask)
         return h_out.squeeze(0)
 
+    def _decode(self, h: torch.Tensor, tech: str | None = None) -> torch.Tensor:
+        """Dispatches on decoder_type (2026-07-17, see PanelInvariantGeneDecoder
+        docstring) so sample()/training_step() don't need their own branching."""
+        if self.decoder_type == "dense":
+            return self.decoder(h)
+        return self.decoder(h, tech=tech)
+
     def sample(self, context, query):
         n = query["coords"].shape[0]
         c = self._encode_context(context, query)
@@ -850,7 +919,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
         idx = torch.cat(generated)  # [n], in Morton order
 
         z_q = self.vq.embed[idx]
-        expr_gen_ordered = self.decoder(z_q)
+        expr_gen_ordered = self._decode(z_q, tech=query.get("tech"))
 
         expr_gen = torch.empty_like(expr_gen_ordered)
         expr_gen[order] = expr_gen_ordered
@@ -867,7 +936,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
 
         z_e = self.encoder(x_1)
         z_q, idx, vq_loss = self.vq(z_e)
-        recon = self.decoder(z_q)
+        recon = self._decode(z_q, tech=query.get("tech"))
         recon_loss = nn.functional.mse_loss(recon, x_1)
 
         idx_detached = idx.detach()

@@ -800,6 +800,119 @@ def build_organ_tech_vocab(organs: list[str], techs: list[str]) -> tuple[list[st
     return sorted(set(organs)), sorted(set(techs))
 
 
+class PanelInvariantGeneDecoder(nn.Module):
+    """Gene-identity-lookup decoder — the "GEX decoder ... predicted
+    expression in target platform space" box from the user's 2026-07-17
+    architecture roadmap (diagram 5), and the real gap flagged in
+    docs/possible_extensions.md's "Cross-platform decoder" section: every
+    generator's decoder up to now (WAE-GAN/FM-OT/VQ-VAE+AR, registry.py)
+    is `nn.Linear(hidden_dim, n_genes)`, tied to exactly one fixed-width
+    gene panel at construction time — it has no notion of gene IDENTITY,
+    only gene POSITION (output column i is "whatever gene was at index i
+    in the training panel"). This class predicts expression by looking up
+    each target gene's identity in a learned embedding table instead, so
+    the same trained decoder can be queried against a DIFFERENT gene
+    subset than it was trained on (e.g. context/training from Visium's
+    ~16.5k-gene panel, query for Xenium's ~300-gene panel) — provided the
+    queried genes are within the known vocabulary.
+
+    Structurally a simplification of STPath's real per-gene-token output
+    head (verified via its source, see stpath_encoder.py's GeneExpTokenizer
+    usage): STPath predicts a discretized expression BIN per gene token
+    via a classification head; this predicts continuous expression
+    directly via a small MLP over (decoder_input, gene_embedding) pairs —
+    same "gene identity is a lookup, not a fixed output column" structure,
+    simpler regression head rather than porting STPath's tokenizer/binning
+    machinery wholesale.
+
+    gene_names is the FIXED vocabulary set at construction time (same
+    "vocabulary size must be fixed at construction time" reasoning as
+    OrganTechEmbedding/inject_stpath_gene_names) — querying a gene outside
+    it raises loudly (see gene_indices) rather than silently degrading.
+    Calling forward() with gene_names=None (the default) queries the FULL
+    training vocabulary in its original order, making this a drop-in
+    replacement for a dense decoder: same output shape [N, n_genes], same
+    loss code, no changes needed anywhere else in a training loop that
+    doesn't explicitly opt into querying a different panel.
+
+    tech_vocab (optional) adds a per-target-technology offset to every
+    gene embedding, letting the same decoder shift its predictions for
+    "the same gene, but on a different sequencing technology" (diagram 5's
+    "GEX decoder ... also fed by tech embedding" arrow) — NOT the same
+    tech_vocab conditioning as OrganTechEmbedding/context_encoder (which
+    conditions on the SOURCE data's tech), this one is meant to be called
+    with the TARGET/query platform's tech, so the two are allowed to
+    diverge once genuine cross-platform training pairs exist. On today's
+    data context["tech"] == query["tech"] always (single tech per sample —
+    see train.py), so this mechanism is exercised but not yet validated
+    against a real source != target case.
+
+    NOT validated end-to-end on genuinely cross-platform data (no
+    multi-platform training set currently available — see
+    possible_extensions.md's own caveat). Built so the architecture is
+    ready the moment such data exists; on today's all-Visium data it only
+    ever gets queried with gene_names=None (== the training panel), which
+    is the correct, expected, non-degenerate use of this class in that
+    regime — not a workaround."""
+
+    def __init__(self, gene_names: list[str], gene_embed_dim: int, in_dim: int,
+                 tech_vocab: list[str] | None = None, hidden_dim: int = 128):
+        super().__init__()
+        self.gene_names = list(gene_names)
+        self._gene_to_idx = {name: i for i, name in enumerate(self.gene_names)}
+        assert len(self._gene_to_idx) == len(self.gene_names), (
+            "gene_names contains duplicates — decoder vocabulary must be unique"
+        )
+        self.gene_embed = nn.Embedding(len(self.gene_names), gene_embed_dim)
+        self.tech_vocab = list(tech_vocab) if tech_vocab else None
+        if self.tech_vocab:
+            self.tech_to_id = {name: i for i, name in enumerate(self.tech_vocab)}
+            self.tech_embed = nn.Embedding(len(self.tech_vocab), gene_embed_dim)
+        self.in_proj = nn.Linear(in_dim, hidden_dim)
+        self.gene_proj = nn.Linear(gene_embed_dim, hidden_dim)
+        self.out_mlp = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def gene_indices(self, gene_names: list[str], device) -> torch.Tensor:
+        missing = [g for g in gene_names if g not in self._gene_to_idx]
+        assert not missing, (
+            f"{len(missing)} gene(s) not in decoder vocabulary "
+            f"(e.g. {missing[:5]}) — this decoder can only predict genes "
+            f"it was constructed with, see class docstring"
+        )
+        return torch.tensor(
+            [self._gene_to_idx[g] for g in gene_names], device=device, dtype=torch.long
+        )
+
+    def forward(self, h: torch.Tensor, gene_names: list[str] | None = None,
+                tech: str | None = None) -> torch.Tensor:
+        """h: [N, in_dim] per-location decoder input (the same tensor a
+        dense decoder would receive, e.g. cat([z, c])). gene_names: target
+        panel, defaults to the full training vocabulary in its original
+        order (drop-in shape parity with a dense decoder). tech: optional
+        target-platform lookup into tech_vocab, ignored if tech_vocab
+        wasn't set at construction. Returns [N, len(gene_names)]."""
+        device = h.device
+        names = gene_names if gene_names is not None else self.gene_names
+        idx = self.gene_indices(names, device)
+        g = self.gene_embed(idx)                      # [n_panel, gene_embed_dim]
+        if tech is not None and self.tech_vocab:
+            assert tech in self.tech_to_id, (
+                f"tech {tech!r} not in decoder tech_vocab {sorted(self.tech_to_id)}"
+            )
+            tech_t = torch.tensor(self.tech_to_id[tech], device=device)
+            g = g + self.tech_embed(tech_t)            # broadcast over all panel genes
+        h_proj = self.in_proj(h)                       # [N, hidden_dim]
+        g_proj = self.gene_proj(g)                     # [n_panel, hidden_dim]
+        n, n_panel = h_proj.shape[0], g_proj.shape[0]
+        h_exp = h_proj.unsqueeze(1).expand(n, n_panel, -1)
+        g_exp = g_proj.unsqueeze(0).expand(n, n_panel, -1)
+        out = self.out_mlp(torch.cat([h_exp, g_exp], dim=-1)).squeeze(-1)  # [N, n_panel]
+        return out
+
+
 class SpatialContextEncoder(nn.Module):
     """
     context (coords [N_obs, D], expression [N_obs, G]) + query coords
