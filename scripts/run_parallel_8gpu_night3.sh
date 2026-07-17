@@ -44,7 +44,7 @@ CONFIGS=(
     "configs/exp_hest1k_fm_ot_stormlite_both.yaml"
     "configs/exp_hest1k_fm_ot_stpath_bothresidual.yaml"   # PRETRAINED reference anchor (current best result, PCC 0.4717 at 40000 epochs) — direct comparison point for every unfrozen/StormLite arm above in the same run
 )
-EPOCHS=40000
+EPOCHS=20000
 EXTRA_ARGS="--shuffle-diagnostic"
 
 N_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
