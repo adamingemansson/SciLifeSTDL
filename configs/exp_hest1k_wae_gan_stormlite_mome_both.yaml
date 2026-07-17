@@ -1,0 +1,66 @@
+# Cross-model-family generalization test (2026-07-17): does the MoME-FFN
+# fix that rescued StormLite for FM-OT (see exp_hest1k_fm_ot_stormlite_mome_both.yaml
+# and storm_lite_encoder.py's _MoMETransformerBlock) also work for a
+# structurally different training paradigm — WAE-GAN's adversarial
+# encoder/decoder-vs-discriminator loop, not flow matching? If MoME-FFN
+# only helps FM-OT specifically, that's a much weaker claim than if it
+# helps regardless of which generator family sits on top of the same
+# context encoder — this is the real test of that.
+#
+# Direct comparison target: exp_hest1k_wae_gan_stpath.yaml (this
+# project's WAE-GAN reference point) and exp_hest1k_fm_ot_stormlite_mome_both.yaml
+# (same context encoder, different generator family).
+#
+# Requires `pip install novae` (Python >=3.11).
+
+experiment_name: wae_gan_hest1k_pilot_stormlite_mome_both
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: wae_gan
+  params:
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    storm_lite_fusion_mode: mome   # 2026-07-17: see header
+    # novae_dim is NOT set here — auto-injected from the real precomputed
+    # Novae features' shape (see train.py inject_novae_dim / get_novae_features)
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    n_genes: 16570
+    coord_dim: 3
+    latent_dim: 32
+    hidden_dim: 256
+    cond_hidden_dim: 256           # also StormLiteContextEncoder's internal token dim
+    disc_hidden_dim: 128
+    adv_weight: 1.0
+    lr: 1.0e-3
+    lr_disc: 1.0e-3
+
+training:
+  epochs: 10000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab
