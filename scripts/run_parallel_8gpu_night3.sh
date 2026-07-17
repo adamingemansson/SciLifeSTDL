@@ -12,13 +12,22 @@
 #    exp_hest1k_fm_ot_stpath_unfrozen_mlpresidual.yaml's header for the
 #    full reasoning.
 #
-# 2. A re-run of all three StormLite arms, now that two real bugs found
-#    from yesterday's actual results are fixed (RelativePositionBias and
+# 2. A re-run of all three StormLite arms, now that three real bugs found
+#    from yesterday's actual results are fixed: RelativePositionBias and
 #    RandomFourierFeatures both silently produced near-random output on
-#    real HEST-1k pixel-scale coordinates — see conditioning.py's own
-#    docstrings on each, commits 32c3e2b/1727b32). Yesterday's run scored
+#    real HEST-1k pixel-scale coordinates, AND CombinedGeneEncoder's
+#    "both" mode had the same sum-vs-concat bug already fixed once for
+#    STPath's residual (see conditioning.py/storm_lite_encoder.py's own
+#    docstrings, commits 32c3e2b/1727b32/45ec5b7 — the last of those also
+#    added FrameAveragingBias, STPath's real verified relative-position
+#    mechanism, as StormLite's new default bias). Yesterday's run scored
 #    every StormLite arm WORSE than a trivial interp_baseline; this checks
-#    whether the fix actually restores competitive performance.
+#    whether the fixes actually restore competitive performance.
+#
+# 3. The pretrained bothresidual config (this project's current best
+#    result, PCC 0.4717 at 40000 epochs) as an 8th reference-anchor slot
+#    — every unfrozen/StormLite arm above can be compared against it
+#    directly within the same run's output.
 #
 # Usage: bash scripts/run_parallel_8gpu_night3.sh
 # Logs: logs/parallel_run_night3/<name>.log
@@ -33,6 +42,7 @@ CONFIGS=(
     "configs/exp_hest1k_fm_ot_stormlite_mlp.yaml"
     "configs/exp_hest1k_fm_ot_stormlite_novae.yaml"
     "configs/exp_hest1k_fm_ot_stormlite_both.yaml"
+    "configs/exp_hest1k_fm_ot_stpath_bothresidual.yaml"   # PRETRAINED reference anchor (current best result, PCC 0.4717 at 40000 epochs) — direct comparison point for every unfrozen/StormLite arm above in the same run
 )
 EPOCHS=40000
 EXTRA_ARGS="--shuffle-diagnostic"
