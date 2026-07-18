@@ -367,3 +367,26 @@ Results from the batch above (all real runs, `logs/parallel_run_overnight/`):
 6. Multi-sample STPath `bothresidual` re-run with gradient clipping — control: is STPath's multi-sample degradation (0.12 vs. 0.47) partly an optimization-instability issue too, or purely architectural/data-heterogeneity?
 7. Winning config with `gene_encoder_type="novae"` (no `"both"`) — isolates whether the decoder swap is the dominant lever regardless of gene-encoder choice.
 8. Winning config re-run with a different seed — is PCC 0.4933 reproducible, or a lucky draw?
+
+## 2026-07-19: day1 batch results — "bigger" StormLite capacity confirmed dead (clipping made it WORSE), decoder swap holds up but needs a seed average
+
+Full results from `scripts/run_parallel_8gpu_day1.sh` (`logs/parallel_run_day1/`):
+
+| job | PCC | RMSE | AUC | ST-FID | note |
+|---|---|---|---|---|---|
+| `mome_both_bigger` (single, +clip) | nan | 0.4254 | 0.8608 | **377.87** | collapse got WORSE with clipping (was RMSE 0.3492/ST-FID 9.05 overnight, unclipped) |
+| `mome_both_bigger_paneldecoder_add` (single, new combo) | nan | 0.5214 | **0.5000** | **689.69** | AUC=exact chance — total collapse to one universal constant, worse than the "predict-the-mean-per-gene" pattern seen before |
+| `mome_both_paneldecoder_add` @ 80k (single) | 0.4681 | 0.3040 | 0.9211 | 1.06 | landed just below STPath's 0.4717 |
+| `mome_novae_paneldecoder_add` (single, no "both") | 0.4557 | 0.3015 | 0.9183 | 1.73 | decoder swap still wins big even without the "both" gene encoder |
+| `mome_both_paneldecoder_add_seed1` (single) | 0.4501 | 0.3030 | 0.9190 | 2.26 | below STPath's 0.4717 |
+| `multisample mome_both_bigger` (flagship, +clip) | nan | **0.5247** | — | — | still collapsed; RMSE got worse than overnight's 0.2745 too |
+| `multisample mome_both_paneldecoder_add` | **0.1361** | 0.2024 | — | — | **no longer nan** — decoder swap rescues the multi-sample collapse (was nan overnight with the dense decoder) |
+| `multisample stpath_bothresidual` (+clip, control) | 0.1887 | 0.2005 | — | — | up from 0.1244 overnight — clipping DID help here |
+
+**"Bigger" StormLite capacity (4L/8H/512d) is now a confirmed dead end, not investigated further**: `gradient_clip_val=1.0` didn't just fail to fix it — it made the single-sample collapse measurably worse (ST-FID 9.05 → 377.87), and stacking it with the winning decoder produced the most degenerate result seen in this project (AUC exactly 0.5000 — every prediction has converged to essentially one value, losing even the loose across-gene signal earlier collapsed runs still had). Multi-sample "bigger" also stayed collapsed with worse RMSE than before. Dropped entirely from `scripts/run_parallel_8gpu_day2.sh` — not worth more GPU-time chasing without a real root-cause diagnosis (LR warmup, different init, etc. — none attempted yet).
+
+**Decoder swap (`panel_invariant`/`add`) confirmed as the one real, reliable lever** — but four data points (0.4933 seed0/40k, 0.4681 @80k, 0.4557 novae-only, 0.4501 seed1) all land in PCC 0.45-0.49, a massive win over StormLite's own dense-decoder baseline (~0.28-0.35), but **only the original seed0/40k run clearly beats STPath's 0.4717** — the others land at-or-below it. Not yet a statistically confident "StormLite beats STPath" claim on a single seed; needs averaging over more seeds.
+
+**Gradient clipping partially validated as useful, independent of the "bigger"-capacity failure**: multi-sample STPath's own control run improved with clipping (0.1244 → 0.1887), and the decoder swap separately rescued multi-sample StormLite's dense-decoder collapse (nan → 0.1361) — two genuinely different fixes for two genuinely different problems, both real.
+
+**day2 batch** (`scripts/run_parallel_8gpu_day2.sh`, launched — results pending): built entirely around the decoder swap, since it's the only proven lever. 3 more StormLite seeds (2/3/4) + 1 more STPath-with-decoder seed (toward a real seed-averaged StormLite-vs-STPath comparison, not single-run noise vs. single-run noise), the decoder swap extended to multi-sample STPath and multi-sample novae-only StormLite (does it rescue/improve those the way it did `mome_both`?), and the working multi-sample `mome_both_paneldecoder_add` pushed to 80k epochs (does more training help now that it's no longer collapsed?). Also queued but not yet run: `exp_hest1k_fm_ot_stpath_bothresidual_paneldecoder_add.yaml` @ 40k, the direct decoder-held-constant STPath comparison.
