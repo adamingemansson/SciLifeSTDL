@@ -1,0 +1,93 @@
+# Real attempt to FIX the "bigger" StormLite collapse (2026-07-19), not
+# just re-test it — see docs/results_log.md's day1 entry:
+# exp_hest1k_fm_ot_stormlite_mome_both_bigger_paneldecoder_add.yaml
+# mode-collapsed to PCC=nan TWICE (overnight unclipped, and again today
+# WITH gradient_clip_val=1.0 — clipping made it worse, ST-FID going from
+# 9.05 to 377.87/689.69). Confirmed via grep: no trainer in this codebase
+# scheduled LR at all before today — every model trained at a flat rate
+# for the whole run, and bigger/deeper transformers reliably needing a
+# LOWER LR and/or warmup at the same LR a smaller model tolerates fine is
+# extremely well-established (the standard explanation for exactly this
+# "deeper transformer diverges" failure pattern). Two real, targeted
+# changes here, not more of the same (clipping again):
+#   1. lr reduced 1.0e-3 -> 3.0e-4 (standard "bigger model needs smaller
+#      LR" adjustment)
+#   2. warmup_steps: 1000 (model.params) — linear LR ramp over the first
+#      1000 steps, src/models/registry.py's _linear_warmup_lr_lambda
+#   3. training.ema_decay: 0.999 (src/training/train.py's EMACallback) —
+#      separate fix for a SEPARATE problem (run-to-run seed noise, 5
+#      identical StormLite+decoder seeds spanned PCC 0.366-0.493) added
+#      here too since it's a safe, standard, zero-cost-if-unneeded
+#      addition, not because it's expected to fix the collapse itself.
+#
+# gradient_clip_val=1.0 is still active too (it's now unconditional in
+# every Trainer() in this codebase, not a per-config opt-in) — this
+# config tests whether clipping PLUS a properly-scheduled LR together
+# succeed where clipping alone failed.
+#
+# Direct comparison target:
+# exp_hest1k_fm_ot_stormlite_mome_both_bigger_paneldecoder_add.yaml
+# (identical architecture, flat lr=1.0e-3, no warmup, no EMA — PCC=nan
+# both times it's been run).
+#
+# Requires `pip install novae` (Python >=3.11).
+
+experiment_name: fm_ot_hest1k_pilot_stormlite_mome_both_bigger_paneldecoder_add_warmupema
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    storm_lite_fusion_mode: mome
+    decoder_type: panel_invariant
+    decoder_gene_embed_dim: 256
+    decoder_combine_mode: add
+    decoder_mlp_depth: 2
+    storm_lite_n_layers: 4
+    storm_lite_n_heads: 8
+    n_genes: 16570
+    coord_dim: 3
+    cond_hidden_dim: 512
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 3.0e-4              # 2026-07-19: reduced from 1.0e-3 — standard "bigger model needs smaller LR"
+    warmup_steps: 1000      # 2026-07-19: linear LR ramp over the first 1000 steps
+
+training:
+  epochs: 40000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+  checkpoint_every_n_steps: 10000
+  log_print_every_n_steps: 1000
+  ema_decay: 0.999         # 2026-07-19: separate fix for run-to-run seed noise, see header
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

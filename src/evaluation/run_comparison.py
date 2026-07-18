@@ -65,7 +65,7 @@ from src.training.train import (
     get_gigapath_features, save_trained_model, make_dataloader,
     _downsample_patches, get_novae_features, inject_novae_dim, inject_stpath_novae_dim,
     inject_coord_scale, inject_decoder_gene_names, PeriodicCheckpointCallback,
-    PeriodicPrintCallback,
+    PeriodicPrintCallback, EMACallback,
 )
 from src.evaluation import metrics as ev
 from src.evaluation.cell_type_classifier import cluster_pseudo_labels, CellTypePlausibilityClassifier
@@ -246,6 +246,14 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
         log_print_every_n_steps = cfg.training.get("log_print_every_n_steps")
         if log_print_every_n_steps:
             callbacks.append(PeriodicPrintCallback(log_print_every_n_steps))
+        # EMACallback (2026-07-19): opt-in via training.ema_decay — see its
+        # own docstring (train.py) for the full reasoning (found via 5
+        # identically-configured seeds landing anywhere from PCC 0.366 to
+        # 0.493 — EMA is the standard fix for run-to-run noise this large).
+        ema_decay = cfg.training.get("ema_decay")
+        ema_callback = EMACallback(ema_decay) if ema_decay else None
+        if ema_callback is not None:
+            callbacks.append(ema_callback)
         trainer = pl.Trainer(
             max_epochs=1, accelerator="auto",
             log_every_n_steps=cfg.training.log_every_n_steps,
@@ -254,6 +262,8 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
             gradient_clip_val=1.0,
         )
         trainer.fit(model, dataloader)
+        if ema_callback is not None:
+            ema_callback.apply_to_model(model)
         saved_path = save_trained_model(model, unresolved_model_cfg, adata.var_names.tolist(), checkpoint_dir)
         if saved_path is not None:
             print(f"Saved trained model (weights + config + gene names) to {saved_path.parent}")

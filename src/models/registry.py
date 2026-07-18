@@ -37,6 +37,24 @@ from src.models.vqvae import VectorQuantizer, morton_order
 _MODEL_REGISTRY: dict[str, type["BaseGenerativeModel"]] = {}
 
 
+def _linear_warmup_lr_lambda(warmup_steps: int):
+    """Linear LR warmup from 0 to full LR over warmup_steps, then constant
+    at full LR afterward — standard fix for deeper/wider transformer
+    training instability at a flat LR (2026-07-19, see docs/results_log.md
+    "bigger" StormLite collapse investigation: no trainer in this codebase
+    scheduled LR at all before this, and gradient_clip_val=1.0 alone made
+    that collapse WORSE, not better — clipping treats the symptom, large
+    gradient norms, without addressing why the optimization trajectory is
+    unstable at a flat LR from step 0, which warmup directly targets).
+
+    warmup_steps=0 (default for every model, unless a config explicitly
+    sets warmup_steps > 0) means the caller should NOT attach a scheduler
+    at all (see each model's own configure_optimizers) — zero behavior
+    change for every existing config, not merely a no-op multiplier
+    wrapping the optimizer."""
+    return lambda step: min(1.0, (step + 1) / warmup_steps)
+
+
 def _build_context_encoder(
     n_genes: int, coord_dim: int, cond_hidden_dim: int,
     context_encoder_type: str = "builtin",
@@ -487,7 +505,8 @@ class WAEGAN(BaseGenerativeModel):
                  decoder_attn_n_heads: int = 4, decoder_attn_n_layers: int = 1,
                  decoder_lloki_tech_embed_dim: int = 10,
                  decoder_lloki_hidden_dims: list[int] | None = None,
-                 full_gene_names: list[str] | None = None):
+                 full_gene_names: list[str] | None = None,
+                 warmup_steps: int = 0):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False  # we alternate encoder/decoder vs. discriminator ourselves
@@ -550,6 +569,7 @@ class WAEGAN(BaseGenerativeModel):
         self.adv_weight = adv_weight
         self.lr = lr
         self.lr_disc = lr_disc
+        self.warmup_steps = warmup_steps
 
     def _decode(self, h: torch.Tensor, tech: str | None = None) -> torch.Tensor:
         """Dispatches on decoder_type (2026-07-17, see PanelInvariantGeneDecoder
@@ -591,6 +611,14 @@ class WAEGAN(BaseGenerativeModel):
         context, query = batch["context"], batch["query"]
         target_expression = batch["target_expression"]
         opt_ae, opt_disc = self.optimizers()
+        # only touch lr_schedulers() when warmup is actually enabled — it
+        # requires an attached Trainer (raises RuntimeError otherwise),
+        # which several existing tests deliberately don't set up (they
+        # call training_step() directly against a bare model, monkey-
+        # patching just optimizers()/manual_backward()/log_dict() — see
+        # tests/test_wae_gan.py's own comment). warmup_steps=0 (default)
+        # must stay a genuine no-op, not merely "no scheduler stepped."
+        schedulers = self.lr_schedulers() if self.warmup_steps > 0 else None
         batch_size = target_expression.shape[0]
 
         c = self._encode_context(context, query)
@@ -621,6 +649,18 @@ class WAEGAN(BaseGenerativeModel):
         self.manual_backward(ae_loss)
         opt_ae.step()
 
+        # LR warmup (2026-07-19, opt-in via warmup_steps): manual
+        # optimization means Lightning does NOT step schedulers
+        # automatically (unlike automatic-optimization models' "interval":
+        # "step" config) — must be stepped explicitly here, once per
+        # optimizer, every training step. self.lr_schedulers() returns
+        # None when warmup_steps=0 (configure_optimizers attaches no
+        # scheduler at all in that case — see its own comment).
+        if schedulers is not None:
+            sched_ae, sched_disc = schedulers
+            sched_ae.step()
+            sched_disc.step()
+
         self.log_dict({
             "train/recon": recon_loss, "train/adv": adv_loss,
             "train/disc": disc_loss, "train/ae_loss": ae_loss,
@@ -634,6 +674,17 @@ class WAEGAN(BaseGenerativeModel):
             lr=self.lr,
         )
         opt_disc = torch.optim.Adam(self.discriminator.parameters(), lr=self.lr_disc)
+        if self.warmup_steps > 0:
+            # warmup_steps=0 (default) returns [opt_ae, opt_disc] exactly as
+            # before this feature existed — zero behavior change unless a
+            # config explicitly opts in. See _linear_warmup_lr_lambda's own
+            # docstring and training_step's manual .step() calls above
+            # (manual optimization means Lightning won't step these itself).
+            sched_ae = torch.optim.lr_scheduler.LambdaLR(
+                opt_ae, lr_lambda=_linear_warmup_lr_lambda(self.warmup_steps))
+            sched_disc = torch.optim.lr_scheduler.LambdaLR(
+                opt_disc, lr_lambda=_linear_warmup_lr_lambda(self.warmup_steps))
+            return [opt_ae, opt_disc], [sched_ae, sched_disc]
         return [opt_ae, opt_disc]
 
 
@@ -744,7 +795,8 @@ class FlowMatchingOT(BaseGenerativeModel):
                  decoder_attn_n_heads: int = 4, decoder_attn_n_layers: int = 1,
                  decoder_lloki_tech_embed_dim: int = 10,
                  decoder_lloki_hidden_dims: list[int] | None = None,
-                 full_gene_names: list[str] | None = None):
+                 full_gene_names: list[str] | None = None,
+                 warmup_steps: int = 0):
         super().__init__()
         self.save_hyperparameters()
         assert path_type in ("ot", "edm"), f"unknown path_type {path_type!r}"
@@ -819,6 +871,7 @@ class FlowMatchingOT(BaseGenerativeModel):
         self.rho = rho
         self.edm_p_mean = edm_p_mean
         self.edm_p_std = edm_p_std
+        self.warmup_steps = warmup_steps
 
     def _velocity(self, z_t, t, c):
         t_embed = self.time_embed(t)
@@ -919,7 +972,18 @@ class FlowMatchingOT(BaseGenerativeModel):
         # AdamW (decoupled weight decay) over plain Adam: standard choice in
         # the flow-matching/diffusion literature (Lipman et al. 2022 and
         # essentially all follow-ups use AdamW, not Adam).
-        return torch.optim.AdamW(self.parameters(), lr=self.lr)
+        opt = torch.optim.AdamW(self.parameters(), lr=self.lr)
+        if self.warmup_steps > 0:
+            # 2026-07-19, opt-in LR warmup (see _linear_warmup_lr_lambda's
+            # own docstring) — "interval": "step" means Lightning steps
+            # this itself every training batch under AUTOMATIC optimization
+            # (unlike WAEGAN's manual .step() calls). warmup_steps=0
+            # (default) returns the bare optimizer exactly as before this
+            # feature existed.
+            sched = torch.optim.lr_scheduler.LambdaLR(
+                opt, lr_lambda=_linear_warmup_lr_lambda(self.warmup_steps))
+            return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+        return opt
 
 
 # ---------------------------------------------------------------------------
@@ -997,7 +1061,8 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  decoder_attn_n_heads: int = 4, decoder_attn_n_layers: int = 1,
                  decoder_lloki_tech_embed_dim: int = 10,
                  decoder_lloki_hidden_dims: list[int] | None = None,
-                 full_gene_names: list[str] | None = None):
+                 full_gene_names: list[str] | None = None,
+                 warmup_steps: int = 0):
         super().__init__()
         self.save_hyperparameters()
         self.context_encoder = _build_context_encoder(
@@ -1068,6 +1133,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
         self.ar_weight = ar_weight
         self.sample_temperature = sample_temperature
         self.lr = lr
+        self.warmup_steps = warmup_steps
 
     def _transformer_forward(self, input_tokens: torch.Tensor, c_ordered: torch.Tensor):
         """input_tokens, c_ordered: [N]/[N, cond_hidden_dim]. Returns
@@ -1158,4 +1224,12 @@ class VQVAEAutoregressive(BaseGenerativeModel):
         return loss
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.lr)
+        opt = torch.optim.AdamW(self.parameters(), lr=self.lr)
+        if self.warmup_steps > 0:
+            # 2026-07-19, opt-in LR warmup — see FlowMatchingOT's own
+            # configure_optimizers comment for the full reasoning
+            # (identical pattern, automatic optimization).
+            sched = torch.optim.lr_scheduler.LambdaLR(
+                opt, lr_lambda=_linear_warmup_lr_lambda(self.warmup_steps))
+            return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+        return opt

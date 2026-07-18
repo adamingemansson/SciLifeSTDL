@@ -265,6 +265,74 @@ class PeriodicPrintCallback(pl.Callback):
             print(f"[step {step}] {metrics}", flush=True)
 
 
+class EMACallback(pl.Callback):
+    """Exponential moving average of trainable parameters (Polyak
+    averaging) — after every training step, each tracked parameter's
+    shadow value is updated as shadow = decay*shadow + (1-decay)*param.
+    apply_to_model() (called once, right after trainer.fit() returns —
+    see main()/_main_multi_sample()/_train_model()'s own call sites)
+    copies the shadow values into the live model IN PLACE, so the final
+    eval/save_trained_model() call sees the EMA-smoothed weights, not
+    whatever noisy state the raw optimizer trajectory happened to land on
+    at the very last training step.
+
+    2026-07-19, motivated by a real, measured problem (see
+    docs/results_log.md's day2 entry): 5 identically-configured StormLite+
+    decoder runs, differing only in random seed, landed anywhere from PCC
+    0.366 to 0.493 — a huge spread for "the same config." EMA is the
+    standard, well-established fix for exactly this kind of run-to-run
+    noise (used throughout modern generative-model training: diffusion
+    models, GANs, and increasingly standard transformer training) — it
+    is NOT a fix for the SEPARATE "bigger StormLite mode-collapses"
+    problem (see warmup_steps/_linear_warmup_lr_lambda in registry.py for
+    that one); the two address different failure modes found the same day
+    and are independent, composable opt-ins.
+
+    Only tracks PARAMETERS (model.named_parameters(), same set
+    save_trainable_state_dict already saves), not buffers — buffers in
+    this codebase are either fixed-random-at-construction
+    (RandomFourierFeatures.B — never updated by training at all, nothing
+    to average) or already EMA-updated by their own internal mechanism
+    (VectorQuantizer's codebook — averaging an average would just distort
+    its own, already-correct EMA dynamics). Excludes frozen backbone
+    parameters (requires_grad=False, e.g. Gigapath/STPath when pretrained)
+    the same way save_trainable_state_dict does — nothing to average
+    there either, they never change.
+
+    Opt-in via training.ema_decay (unset/None default — every existing
+    config's behavior is completely unchanged unless a config explicitly
+    turns this on). decay=0.999 (a config's typical choice, not hardcoded
+    here) gives an effective averaging window of roughly 1/(1-decay) =
+    1000 steps — sized for this project's typical 10k-80k step runs, not
+    the whole run and not just the last few steps."""
+
+    def __init__(self, decay: float):
+        self.decay = decay
+        self.shadow: dict[str, torch.Tensor] = {}
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        with torch.no_grad():
+            for name, param in pl_module.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if name not in self.shadow:
+                    self.shadow[name] = param.data.clone()
+                else:
+                    self.shadow[name].mul_(self.decay).add_(param.data, alpha=1 - self.decay)
+
+    def apply_to_model(self, model) -> None:
+        """Copies the EMA shadow weights into the live model's parameters,
+        IN PLACE and PERMANENTLY (no raw-weights backup kept — this
+        codebase's established pattern is "the trained model" means
+        exactly one thing per run, not two variants to choose between at
+        eval time, matching save_trained_model's own single-checkpoint
+        design). Call ONCE, after trainer.fit() returns, before eval/save."""
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in self.shadow:
+                    param.data.copy_(self.shadow[name])
+
+
 def load_trained_model(checkpoint_dir: str):
     """Reconstruct a model saved by save_trained_model: rebuild an
     architecturally-identical, freshly-initialized model from the saved
@@ -1227,6 +1295,15 @@ def _main_multi_sample(cfg) -> None:
         log_print_every_n_steps = cfg.training.get("log_print_every_n_steps")
         if log_print_every_n_steps:
             callbacks.append(PeriodicPrintCallback(log_print_every_n_steps))
+        # EMACallback (2026-07-19): opt-in via training.ema_decay, unset by
+        # default — see that class's own docstring (found via 5 identically
+        # -configured StormLite+decoder seeds landing anywhere from PCC
+        # 0.366 to 0.493 — EMA is the standard fix for run-to-run noise
+        # this large).
+        ema_decay = cfg.training.get("ema_decay")
+        ema_callback = EMACallback(ema_decay) if ema_decay else None
+        if ema_callback is not None:
+            callbacks.append(ema_callback)
         trainer = pl.Trainer(
             max_epochs=1,
             accelerator="auto",
@@ -1247,6 +1324,11 @@ def _main_multi_sample(cfg) -> None:
             gradient_clip_val=1.0,
         )
         trainer.fit(model, dataloader)
+        if ema_callback is not None:
+            # apply EMA weights BEFORE the final eval/save below, so both
+            # see the smoothed weights, not the raw last-step state — see
+            # EMACallback.apply_to_model's own docstring.
+            ema_callback.apply_to_model(model)
         saved_path = save_trained_model(model, unresolved_model_cfg, gene_names, checkpoint_dir)
         if saved_path is not None:
             print(f"Saved trained model (weights + config + gene names) to {saved_path.parent}")
@@ -1410,6 +1492,12 @@ def main(cfg_path: str, overrides: list[str] | None = None):
         log_print_every_n_steps = cfg.training.get("log_print_every_n_steps")
         if log_print_every_n_steps:
             callbacks.append(PeriodicPrintCallback(log_print_every_n_steps))
+        # EMACallback (2026-07-19): opt-in via training.ema_decay — see
+        # _main_multi_sample's identical block above for the full reasoning.
+        ema_decay = cfg.training.get("ema_decay")
+        ema_callback = EMACallback(ema_decay) if ema_decay else None
+        if ema_callback is not None:
+            callbacks.append(ema_callback)
         trainer = pl.Trainer(
             max_epochs=1,  # one pass over `n_items` fresh masking draws == old epoch count
             accelerator="auto",
@@ -1420,6 +1508,8 @@ def main(cfg_path: str, overrides: list[str] | None = None):
             gradient_clip_val=1.0,
         )
         trainer.fit(model, dataloader)
+        if ema_callback is not None:
+            ema_callback.apply_to_model(model)
         saved_path = save_trained_model(model, unresolved_model_cfg, adata.var_names.tolist(), checkpoint_dir)
         if saved_path is not None:
             print(f"Saved trained model (weights + config + gene names) to {saved_path.parent}")
