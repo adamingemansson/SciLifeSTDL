@@ -63,6 +63,8 @@ training:
   log_every_n_steps: 10
   checkpoint_dir: results/checkpoints/${experiment_name}
   checkpoint_every_n_steps: 10000
+  log_print_every_n_steps: 1000   # 2026-07-19: real loss telemetry — see PeriodicPrintCallback,
+                                   # this is the config that collapsed to PCC=nan overnight
 
 evaluation:
   metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]

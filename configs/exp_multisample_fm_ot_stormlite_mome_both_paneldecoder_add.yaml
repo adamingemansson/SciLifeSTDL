@@ -1,0 +1,78 @@
+# Weekend daytime batch (2026-07-19) — does the winning decoder
+# (panel_invariant/add, PCC 0.4933 single-sample, beat STPath's 0.4717)
+# also rescue multi-sample StormLite, which collapsed to a constant
+# output (PCC=nan) on every gene_encoder_type variant in the overnight
+# batch (see docs/results_log.md's 2026-07-18/19 entry)? Base config is
+# exp_multisample_fm_ot_stormlite_mome_both.yaml (INT1-INT8) with the
+# decoder swap from exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder_add.yaml
+# — everything else unchanged, including gradient_clip_val=1.0 (added
+# today, applies process-wide, not per-config).
+#
+# decoder_gene_names is NOT set — auto-injected from adatas[0].var_names
+# (inject_decoder_gene_names, called on the shared multi-sample panel —
+# see train.py's _main_multi_sample). n_genes is also NOT set — same
+# shared-panel auto-injection as the base multisample config.
+#
+# sample_ids below assumes INT1-INT8 are downloaded locally — see
+# exp_multisample_fm_ot_stormlite_mome_both.yaml's own header for the
+# same caveat.
+#
+# Requires `pip install novae` (Python >=3.11).
+
+experiment_name: multisample_fm_ot_stormlite_mome_both_paneldecoder_add
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_ids: [INT1, INT2, INT3, INT4, INT5, INT6, INT7, INT8]
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    storm_lite_fusion_mode: mome
+    decoder_type: panel_invariant   # 2026-07-19: winning arm from the overnight single-sample batch
+    decoder_gene_embed_dim: 256
+    decoder_combine_mode: add
+    decoder_mlp_depth: 2
+    # n_genes is NOT set — auto-injected from the shared multi-sample panel
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 40000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+  checkpoint_every_n_steps: 10000
+  log_print_every_n_steps: 1000
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

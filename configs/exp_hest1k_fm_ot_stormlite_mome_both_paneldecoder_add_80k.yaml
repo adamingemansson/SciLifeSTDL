@@ -1,0 +1,64 @@
+# Weekend daytime batch (2026-07-19) — the overnight winner
+# (exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder_add.yaml, PCC 0.4933
+# @ 40k, beat STPath's 0.4717) pushed to 80k epochs: does it keep
+# climbing the way plain mome_both did NOT (that arm actually regressed
+# from 0.3461 @ 40k to 0.3329 @ 80k — see docs/results_log.md's
+# 2026-07-18/19 entry)? Identical to the 40k config in every other way.
+
+experiment_name: fm_ot_hest1k_pilot_stormlite_mome_both_paneldecoder_add_80k
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    storm_lite_fusion_mode: mome
+    decoder_type: panel_invariant
+    decoder_gene_embed_dim: 256
+    decoder_combine_mode: add
+    decoder_mlp_depth: 2
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    n_genes: 16570
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 80000   # 2026-07-19: bumped from 10000 — see header
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+  checkpoint_every_n_steps: 10000
+  log_print_every_n_steps: 1000
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

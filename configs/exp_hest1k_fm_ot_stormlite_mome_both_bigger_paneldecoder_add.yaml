@@ -1,0 +1,75 @@
+# Weekend daytime batch (2026-07-19) — combines the two real wins found
+# in the overnight batch instead of testing them in isolation:
+#   1. Bigger StormLite capacity (n_layers=4, n_heads=8, cond_hidden_dim=512
+#      — exp_hest1k_fm_ot_stormlite_mome_both_bigger.yaml)
+#   2. The panel_invariant/add decoder that beat STPath outright
+#      (PCC 0.4933 vs STPath's 0.4717 — exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder_add.yaml)
+#
+# Only meaningful once gradient_clip_val=1.0 (added today, src/training/
+# train.py) is confirmed to fix the bigger-capacity mode collapse
+# (mome_both_bigger, overnight batch: PCC=nan, ConstantInputWarning from
+# pearsonr — see docs/results_log.md's 2026-07-18/19 entry) — queued
+# regardless since the fix is a safe default either way, and this
+# combination is the actual best shot at further improving on tonight's
+# new best result.
+#
+# Requires `pip install novae` (Python >=3.11).
+
+experiment_name: fm_ot_hest1k_pilot_stormlite_mome_both_bigger_paneldecoder_add
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    storm_lite_fusion_mode: mome
+    decoder_type: panel_invariant   # 2026-07-17: see exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder_add.yaml
+    # decoder_gene_names is NOT set here — auto-injected from adata.var_names
+    decoder_gene_embed_dim: 256
+    decoder_combine_mode: add       # scGPT's real combination rule
+    decoder_mlp_depth: 2
+    storm_lite_n_layers: 4          # 2026-07-17: bumped from 2 — see exp_hest1k_fm_ot_stormlite_mome_both_bigger.yaml
+    storm_lite_n_heads: 8           # 2026-07-17: bumped from 4
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_fm_ot_stpath.yaml
+    coord_dim: 3
+    cond_hidden_dim: 512           # 2026-07-17: bumped from 256 — also StormLiteContextEncoder's internal token dim
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 40000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+  checkpoint_every_n_steps: 10000
+  log_print_every_n_steps: 1000   # 2026-07-19: real loss telemetry, see PeriodicPrintCallback
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab
