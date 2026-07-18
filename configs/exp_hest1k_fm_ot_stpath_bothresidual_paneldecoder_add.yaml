@@ -9,7 +9,15 @@
 # StormLite's from-scratch fusion.
 #
 # Direct comparison target: exp_hest1k_fm_ot_stpath_bothresidual.yaml
-# (dense decoder, PCC 0.4154 @ 10k).
+# (dense decoder, PCC 0.4154 @ 10k; STPath's own best-ever result,
+# pretrained bothresidual @ 40k, was PCC 0.4717 — see docs/results_log.md).
+#
+# 2026-07-19: bumped 10k -> 40k to match the scale StormLite's
+# panel_invariant/add win (PCC 0.4933 @ 40k) was measured at — the
+# question this config actually answers ("does the SAME decoder swap that
+# helped StormLite also help STPath, holding the decoder constant to
+# isolate the encoder-choice question") needs an apples-to-apples epoch
+# count, not the original 10k quick-check scale.
 #
 # Requires `pip install novae` (Python >=3.11).
 
@@ -61,10 +69,12 @@ model:
     lr: 1.0e-3
 
 training:
-  epochs: 10000
+  epochs: 40000
   seed: 0
   log_every_n_steps: 10
   checkpoint_dir: results/checkpoints/${experiment_name}
+  checkpoint_every_n_steps: 10000
+  log_print_every_n_steps: 1000
 
 evaluation:
   metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
