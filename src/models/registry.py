@@ -68,7 +68,8 @@ def _build_context_encoder(
     stpath_pretrained: bool = True,
     storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
     storm_lite_bias_type: str = "frame_averaging", storm_lite_relative_bias_hidden_dim: int = 32,
-    storm_lite_fusion_mode: str = "sum",
+    storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
+    storm_lite_input_already_log1p: bool = False,
     organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
 ):
     """Shared by WAE-GAN/FM-OT/VQ-VAE+AR so each model's __init__ doesn't
@@ -159,7 +160,8 @@ def _build_context_encoder(
             n_transformer_layers=storm_lite_n_layers, n_heads=storm_lite_n_heads,
             bias_type=storm_lite_bias_type,
             relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
-            fusion_mode=storm_lite_fusion_mode,
+            fusion_mode=storm_lite_fusion_mode, qk_norm=storm_lite_qk_norm,
+            input_already_log1p=storm_lite_input_already_log1p,
             organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
     else:
@@ -495,7 +497,8 @@ class WAEGAN(BaseGenerativeModel):
                  storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
                  storm_lite_bias_type: str = "frame_averaging",
                  storm_lite_relative_bias_hidden_dim: int = 32,
-                 storm_lite_fusion_mode: str = "sum",
+                 storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
+                 storm_lite_input_already_log1p: bool = False,
                  coord_scale: float = 1.0,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
                  decoder_type: str = "dense", decoder_gene_names: list[str] | None = None,
@@ -525,7 +528,8 @@ class WAEGAN(BaseGenerativeModel):
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
             storm_lite_bias_type=storm_lite_bias_type,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
-            storm_lite_fusion_mode=storm_lite_fusion_mode,
+            storm_lite_fusion_mode=storm_lite_fusion_mode, storm_lite_qk_norm=storm_lite_qk_norm,
+            storm_lite_input_already_log1p=storm_lite_input_already_log1p,
             coord_scale=coord_scale, organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
         self.encoder = nn.Sequential(
@@ -770,6 +774,8 @@ class FlowMatchingOT(BaseGenerativeModel):
                  hidden_dim: int = 512, time_embed_dim: int = 64,
                  n_ode_steps: int = 50, recon_weight: float = 1.0,
                  fm_weight: float = 1.0, lr: float = 1e-3,
+                 fm_time_sampling: str = "uniform",
+                 fm_logit_normal_m: float = 0.0, fm_logit_normal_s: float = 1.0,
                  path_type: str = "ot", sigma_min: float = 0.002,
                  sigma_max: float = 80.0, sigma_data: float = 0.5, rho: float = 7.0,
                  edm_p_mean: float = -1.2, edm_p_std: float = 1.2,
@@ -785,7 +791,8 @@ class FlowMatchingOT(BaseGenerativeModel):
                  storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
                  storm_lite_bias_type: str = "frame_averaging",
                  storm_lite_relative_bias_hidden_dim: int = 32,
-                 storm_lite_fusion_mode: str = "sum",
+                 storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
+                 storm_lite_input_already_log1p: bool = False,
                  coord_scale: float = 1.0,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
                  decoder_type: str = "dense", decoder_gene_names: list[str] | None = None,
@@ -814,7 +821,8 @@ class FlowMatchingOT(BaseGenerativeModel):
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
             storm_lite_bias_type=storm_lite_bias_type,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
-            storm_lite_fusion_mode=storm_lite_fusion_mode,
+            storm_lite_fusion_mode=storm_lite_fusion_mode, storm_lite_qk_norm=storm_lite_qk_norm,
+            storm_lite_input_already_log1p=storm_lite_input_already_log1p,
             coord_scale=coord_scale, organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
         # own autoencoder, own weights — compresses expression to a small
@@ -872,6 +880,32 @@ class FlowMatchingOT(BaseGenerativeModel):
         self.edm_p_mean = edm_p_mean
         self.edm_p_std = edm_p_std
         self.warmup_steps = warmup_steps
+        assert fm_time_sampling in ("uniform", "logit_normal"), (
+            f"unknown fm_time_sampling {fm_time_sampling!r}"
+        )
+        self.fm_time_sampling = fm_time_sampling
+        self.fm_logit_normal_m = fm_logit_normal_m
+        self.fm_logit_normal_s = fm_logit_normal_s
+
+    def _sample_flow_time(self, n: int) -> torch.Tensor:
+        """Timestep sampling for the OT flow-matching loss. "uniform"
+        (default) draws t ~ U[0,1] — the original, unchanged behavior for
+        every existing config. "logit_normal" (2026-07-19, verified
+        improvement from Stable Diffusion 3 / Esser et al. 2024, "Scaling
+        Rectified Flow Transformers for High-Resolution Image Synthesis",
+        arXiv 2403.03206) instead draws t = sigmoid(m + s*eps), eps ~
+        N(0,1), concentrating probability mass around the informative
+        MIDDLE of the noise->data trajectory (t~0.5) rather than spending
+        equal supervision on the near-noise (t~0, weak structure) and
+        near-data (t~1, redundant) ends. SD3 showed this outperforms plain
+        uniform rectified-flow sampling and EDM/LDM-linear baselines on
+        training efficiency; m=0/s=1 (defaults) is SD3's own default,
+        symmetric around t=0.5. Only affects the "ot" path (edm has its
+        own separate P_mean/P_std log-normal sigma sampling already)."""
+        if self.fm_time_sampling == "logit_normal":
+            eps = torch.randn(n, device=self.device)
+            return torch.sigmoid(self.fm_logit_normal_m + self.fm_logit_normal_s * eps)
+        return torch.rand(n, device=self.device)
 
     def _velocity(self, z_t, t, c):
         t_embed = self.time_embed(t)
@@ -950,7 +984,7 @@ class FlowMatchingOT(BaseGenerativeModel):
 
         if self.path_type == "ot":
             z_0 = torch.randn_like(z_1_target)
-            t = torch.rand(n, device=self.device)
+            t = self._sample_flow_time(n)   # uniform (default) or logit-normal (SD3, see _sample_flow_time)
             z_t = (1 - t[:, None]) * z_0 + t[:, None] * z_1_target   # OT straight-line path
             target_velocity = z_1_target - z_0                        # constant along a straight line
             pred_velocity = self._velocity(z_t, t, c)
@@ -1051,7 +1085,8 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
                  storm_lite_bias_type: str = "frame_averaging",
                  storm_lite_relative_bias_hidden_dim: int = 32,
-                 storm_lite_fusion_mode: str = "sum",
+                 storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
+                 storm_lite_input_already_log1p: bool = False,
                  coord_scale: float = 1.0,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
                  decoder_type: str = "dense", decoder_gene_names: list[str] | None = None,
@@ -1079,7 +1114,8 @@ class VQVAEAutoregressive(BaseGenerativeModel):
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
             storm_lite_bias_type=storm_lite_bias_type,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
-            storm_lite_fusion_mode=storm_lite_fusion_mode,
+            storm_lite_fusion_mode=storm_lite_fusion_mode, storm_lite_qk_norm=storm_lite_qk_norm,
+            storm_lite_input_already_log1p=storm_lite_input_already_log1p,
             coord_scale=coord_scale, organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
         self.encoder = nn.Sequential(
