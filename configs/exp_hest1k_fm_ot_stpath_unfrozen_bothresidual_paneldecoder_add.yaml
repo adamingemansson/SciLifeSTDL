@@ -1,0 +1,89 @@
+# Flagship StormLite vs. flagship UNFROZEN STPath (2026-07-19) — the real,
+# no-pretraining-advantage architecture comparison the user asked for
+# directly. Every other StormLite-vs-STPath comparison so far has either
+# compared against STPath's PRETRAINED weights (a genuine external-data
+# advantage StormLite doesn't have — see docs/results_log.md's day2 entry:
+# pretrained STPath+decoder averaged ~0.497 vs StormLite+decoder's ~0.435)
+# or compared different decoders entirely. This config holds BOTH
+# confounds constant: same decoder (panel_invariant, combine_mode="add",
+# exactly matching exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder_add.yaml
+# and exp_hest1k_fm_ot_stpath_bothresidual_paneldecoder_add.yaml) AND no
+# pretraining on either side (stpath_pretrained: false, same as
+# exp_hest1k_fm_ot_stpath_unfrozen_bothresidual.yaml, which scored PCC
+# 0.3857 with the DENSE decoder at 40k) — isolating the one question that
+# actually matters for "is our own from-scratch architecture better":
+# StormLite's from-scratch fusion vs. STPath's from-scratch fusion, same
+# decoder, same epochs, neither side borrowing external pretrained weights.
+#
+# Direct comparison targets:
+#   - exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder_add.yaml (StormLite
+#     flagship, same decoder, mean PCC ~0.435 across 5 seeds, best 0.4933)
+#   - exp_hest1k_fm_ot_stpath_unfrozen_bothresidual.yaml (same unfrozen
+#     STPath, but the OLD dense decoder — PCC 0.3857 @ 40k)
+#
+# Requires `pip install novae`.
+
+experiment_name: fm_ot_hest1k_pilot_stpath_unfrozen_bothresidual_paneldecoder_add
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: stpath
+    stpath_pretrained: false        # 2026-07-16: random init, fully trainable — no pretraining advantage
+    stpath_gene_voc_path: ${oc.env:STPATH_GENE_VOC_PATH}
+    # stpath_model_weight_path deliberately NOT set — nothing to load
+    stpath_organ_type: Kidney      # INT1 is ccRCC (renal cell carcinoma)
+    stpath_tech_type: Visium
+    stpath_new_gene_encoder_type: both   # Route B residual, ON TOP OF unfrozen
+    # stpath_novae_dim auto-injected from real precomputed Novae features
+    # (train.py inject_stpath_novae_dim) — do not set here
+    # stpath_gene_names auto-derived from the loaded AnnData at load time
+    # (train.py/run_comparison.py inject_stpath_gene_names) - do not set here
+    decoder_type: panel_invariant   # 2026-07-19: held constant vs. StormLite's flagship
+    # decoder_gene_names is NOT set here — auto-injected from adata.var_names
+    decoder_gene_embed_dim: 256
+    decoder_combine_mode: add       # scGPT's real combination rule
+    decoder_mlp_depth: 2
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_fm_ot_stpath.yaml
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 40000                  # matches StormLite flagship's scale, not the old 10k unfrozen baseline
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+  checkpoint_every_n_steps: 10000
+  log_print_every_n_steps: 1000
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab
