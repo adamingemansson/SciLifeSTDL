@@ -65,6 +65,7 @@ from src.training.train import (
     get_gigapath_features, save_trained_model, make_dataloader,
     _downsample_patches, get_novae_features, inject_novae_dim, inject_stpath_novae_dim,
     inject_coord_scale, inject_decoder_gene_names, PeriodicCheckpointCallback,
+    PeriodicPrintCallback,
 )
 from src.evaluation import metrics as ev
 from src.evaluation.cell_type_classifier import cluster_pseudo_labels, CellTypePlausibilityClassifier
@@ -237,11 +238,20 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
                 unresolved_model_cfg, adata.var_names.tolist(), checkpoint_dir,
                 save_every_n_steps=checkpoint_every_n_steps,
             ))
+        # PeriodicPrintCallback / gradient_clip_val (2026-07-19): see
+        # PeriodicPrintCallback's own docstring (train.py) for the real
+        # collapsed run (mome_both_bigger) this was found investigating —
+        # no per-step loss survives into a redirected log file without it,
+        # and no trainer anywhere in this codebase clipped gradients before.
+        log_print_every_n_steps = cfg.training.get("log_print_every_n_steps")
+        if log_print_every_n_steps:
+            callbacks.append(PeriodicPrintCallback(log_print_every_n_steps))
         trainer = pl.Trainer(
             max_epochs=1, accelerator="auto",
             log_every_n_steps=cfg.training.log_every_n_steps,
             enable_checkpointing=False, logger=False,
             callbacks=callbacks,
+            gradient_clip_val=1.0,
         )
         trainer.fit(model, dataloader)
         saved_path = save_trained_model(model, unresolved_model_cfg, adata.var_names.tolist(), checkpoint_dir)

@@ -334,3 +334,36 @@ the four most likely real causes, `scripts/run_parallel_8gpu_overnight.sh`:
    simultaneously.
 
 Not yet run as of this entry.
+
+## 2026-07-18/19: overnight batch results — StormLite beats STPath (decoder lever), a real capacity collapse, and two real infra bugs
+
+Results from the batch above (all real runs, `logs/parallel_run_overnight/`):
+
+| job | PCC | RMSE | ST-FID | note |
+|---|---|---|---|---|
+| `mome_both` @ 80k (single) | 0.3329 | 0.3209 | 5.32 | **regressed** vs. 0.3461 @ 40k — training length is not the lever |
+| `mome_both_bigger` (single, 4L/8H/512d) | **nan** | 0.3492 | 9.05 | mode-collapsed to a constant output (see below) |
+| `mome_both_paneldecoder_add` (single) | **0.4933** | 0.2971 | 2.90 | **new best result of the project — beats STPath's 0.4717** |
+| `multisample mome_both` | nan | 0.2745 | — | collapsed |
+| `multisample mome_novae` | nan | 0.2745 | — | collapsed (identical RMSE to mome_both — see below) |
+| `multisample mome_both_bigger` (flagship) | nan | 0.2745 | — | collapsed |
+| `multisample stpath bothresidual` | 0.1244 | 0.2026 | — | far below single-sample STPath's 0.4717 |
+| `multisample wae_gan stpath novaeresidual` | 0.1219 | 0.2096 | — | same multi-sample degradation |
+
+**Headline: StormLite + `decoder_type="panel_invariant"` (`combine_mode="add"`) now beats STPath's best-ever result on every metric** (PCC 0.4933 vs. 0.4717, RMSE 0.2971 vs. 0.3053, ST-FID 2.90 vs. 1.95 — actually the one metric STPath still wins; PCC/RMSE/AUC all favor StormLite). The decoder swap is doing real work; training length (job 0) and raw capacity (job 1) are not the levers that close the gap.
+
+**The `mome_both_bigger` collapse, root-caused**: `grep -i nan` on the raw log showed only `ConstantInputWarning: An input array is constant` from `pearsonr` — i.e. the model's predicted expression has ZERO variance per gene across the whole held-out set, for every gene. Not a literal NaN-weight divergence (RMSE stayed finite) — the decoder collapsed to predicting a constant (effectively the dataset mean), a classic MSE-only degenerate local minimum. This hit BOTH the single-sample and all 3 multi-sample "bigger" StormLite configs identically (the 3 multi-sample jobs even landed on the exact same RMSE, 0.2745 — strong evidence they all output the same constant against the same held-out draw), while the smaller default StormLite (2L/4H/256d) trained fine. The only architectural difference is capacity; no trainer in this codebase clipped gradients before this, and a deeper/wider fusion transformer (plus `FrameAveragingBias`'s attention bias) is meaningfully more prone to gradient-explosion-driven collapse early in training than the smaller default.
+
+**Fix applied** (`src/training/train.py`, all 3 `pl.Trainer(...)` sites): `gradient_clip_val=1.0` added everywhere (safe, zero-cost if unneeded — standard default in the flow-matching/diffusion literature). Also added `PeriodicPrintCallback` (opt-in via `training.log_print_every_n_steps`, same `batch_idx`-based cadence as `PeriodicCheckpointCallback`) — found while investigating this that **none of these background/redirected runs left any per-step loss telemetry behind at all**: `logger=False` disables Lightning's own logger, and tqdm's progress bar auto-disables when stdout isn't a real terminal (true for every one of this project's `> logfile 2>&1` parallel launch scripts). The collapsed run's entire log had zero `train/loss` values — impossible to tell *when* it degenerated. `PeriodicPrintCallback` uses a plain `print()`, which always survives redirection.
+
+**Separate, real infra bug found and fixed while re-running the test suite** (`tests/test_model_save_load.py` failed — not caused by the above changes, confirmed via `git stash`): `save_trainable_state_dict` filtered purely on `requires_grad` (`model.named_parameters()`), which silently drops every BUFFER. `RandomFourierFeatures.B` (the fixed random coordinate-encoding projection) is a buffer, not a parameter — on reload, `build_model()` reconstructs it with a *different* random value, so a reloaded model's positional encoding never matched what it was actually trained with. Same root cause would have silently reset `VectorQuantizer`'s entire EMA-updated codebook (`embed`/`ema_cluster_size`/`ema_embed_sum`) to random init on every VQ-VAE+AR checkpoint reload. This didn't affect any PCC number reported above (train+eval happen in the same in-memory process, same buffers) — but it would have silently corrupted any future `--skip-training` re-evaluation, exactly the safety net this week's `checkpoint_every_n_steps` work was built around. Fixed via `_is_frozen_backbone_module` (`train.py`): saves every non-frozen buffer alongside trainable params, while still correctly excluding genuine frozen pretrained backbones (Gigapath's `tile_encoder`, STPath's `self.model` when `pretrained=True`) by checking "owns >=1 parameter AND all are `requires_grad=False`" — this correctly distinguishes those from buffer-only modules (`RandomFourierFeatures`) and EMA-only modules (`VectorQuantizer`), neither of which have any `nn.Parameter` at all. 3 new regression tests added (`tests/test_model_save_load.py`).
+
+**Still unresolved / next steps (today's batch, weekend daytime run)**:
+1. Re-run `mome_both_bigger` (single-sample) with the gradient-clip fix — does it actually resolve the collapse?
+2. Re-run the multi-sample flagship (`mome_both_bigger`) with the same fix, at scale.
+3. Bigger capacity + the winning decoder (`panel_invariant`/`add`) combined — do the two real wins stack?
+4. Winning decoder pushed to 80k epochs — does it keep climbing, unlike plain `mome_both`?
+5. Multi-sample `mome_both` with the winning decoder swapped in — does it rescue multi-sample StormLite the way it helped single-sample?
+6. Multi-sample STPath `bothresidual` re-run with gradient clipping — control: is STPath's multi-sample degradation (0.12 vs. 0.47) partly an optimization-instability issue too, or purely architectural/data-heterogeneity?
+7. Winning config with `gene_encoder_type="novae"` (no `"both"`) — isolates whether the decoder swap is the dominant lever regardless of gene-encoder choice.
+8. Winning config re-run with a different seed — is PCC 0.4933 reproducible, or a lucky draw?

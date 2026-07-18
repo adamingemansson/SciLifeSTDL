@@ -38,25 +38,77 @@ from src.models.registry import build_model
 from src.evaluation import metrics as ev
 
 
+def _is_frozen_backbone_module(module: torch.nn.Module) -> bool:
+    """True iff every parameter this module owns (recursively) is frozen
+    (requires_grad=False) AND it owns at least one parameter at all — the
+    real structural signature of this codebase's two genuine frozen-
+    pretrained-backbone cases (GigapathPatchEncoder's tile_encoder,
+    STPathContextEncoder's self.model when pretrained=True), which are
+    deliberately reconstructed fresh from their own external pretrained
+    source every time build_model() runs, rather than saved here (see
+    save_trainable_state_dict's own docstring on the ~4.7GB redundancy
+    this avoids).
+
+    Requiring >=1 owned parameter is deliberate: it excludes parameter-
+    free-but-buffer-only modules — RandomFourierFeatures (a FIXED RANDOM
+    buffer, not reconstructible from model_cfg, not reloadable from any
+    external source) and VectorQuantizer (an EMA-updated codebook buffer,
+    genuinely LEARNED training state, updated by training but not via
+    gradient descent so it's never in named_parameters() at all) — from
+    ever being misclassified as "frozen" just because they happen to have
+    zero nn.Parameter objects. Both would otherwise be silently dropped by
+    a plain requires_grad-based filter — see save_trainable_state_dict's
+    own docstring for the real, confirmed bug this fixes (2026-07-19,
+    found via test_model_save_load.py failing: a reloaded model produced
+    different output than the original because RandomFourierFeatures.B
+    was never saved, so build_model() gave the reloaded model a
+    DIFFERENT random coordinate-encoding basis than the one it was
+    actually trained with)."""
+    params = list(module.parameters(recurse=True))
+    return bool(params) and all(not p.requires_grad for p in params)
+
+
 def save_trainable_state_dict(model, checkpoint_dir: str, filename: str = "trainable_weights.pt") -> Path | None:
-    """Save only trainable parameters, not frozen backbones (Gigapath/
-    STPath). Those are identical to the public pretrained weights and get
-    reloaded fresh from HuggingFace/the local weight file every time a
-    model is rebuilt (see conditioning.py/stpath_encoder.py __init__) —
-    saving them again here would be pure redundancy: a STPath-conditioned
-    model's full state_dict() is ~4.7GB (1.2B frozen params) vs a few
-    tens of MB for just the trainable ones. No-op (returns None) for
-    parameter-free models like interp_baseline.
+    """Save trainable parameters AND non-frozen buffers — NOT frozen
+    backbones (Gigapath/STPath). Frozen backbones are identical to the
+    public pretrained weights and get reloaded fresh from HuggingFace/the
+    local weight file every time a model is rebuilt (see conditioning.py/
+    stpath_encoder.py __init__) — saving them again here would be pure
+    redundancy: a STPath-conditioned model's full state_dict() is ~4.7GB
+    (1.2B frozen params) vs a few tens of MB for just the trainable ones.
+    No-op (returns None) for parameter-free models like interp_baseline.
 
     Added 2026-07-15 after a real question: training runs weren't saving
     ANYTHING before this, meaning a completed 10000-step run's weights
     were gone the moment run_comparison.py's _free() deleted the model
     object — any later use (e.g. testing on a newly downloaded sample)
-    would have required retraining from scratch."""
+    would have required retraining from scratch.
+
+    Real bug fixed 2026-07-19 (see _is_frozen_backbone_module's own
+    docstring for the full mechanism): originally filtered purely by
+    requires_grad on model.named_parameters(), which misses every BUFFER
+    entirely (RandomFourierFeatures.B, VectorQuantizer's EMA codebook) —
+    these are genuinely part of a trained model's state (either fixed-
+    random-at-construction or EMA-updated during training) and are NOT
+    reconstructible identically by simply rebuilding the architecture from
+    model_cfg. Every non-frozen buffer is now saved alongside the
+    trainable parameters; only buffers belonging to a genuine frozen
+    pretrained backbone are still excluded (correctly redundant to save,
+    since those get reloaded from their own real external source)."""
     trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
-    if not trainable_names:
+    frozen_module_names = {name for name, m in model.named_modules() if _is_frozen_backbone_module(m)}
+
+    def _under_frozen_module(buf_name: str) -> bool:
+        parts = buf_name.split(".")
+        return any(".".join(parts[:i]) in frozen_module_names for i in range(1, len(parts)))
+
+    save_names = set(trainable_names)
+    for buf_name, _ in model.named_buffers():
+        if not _under_frozen_module(buf_name):
+            save_names.add(buf_name)
+    if not save_names:
         return None
-    state = {k: v for k, v in model.state_dict().items() if k in trainable_names}
+    state = {k: v for k, v in model.state_dict().items() if k in save_names}
     path = Path(checkpoint_dir) / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     # atomic write (same reasoning/bug as _atomic_savez above) — under
@@ -168,6 +220,49 @@ class PeriodicCheckpointCallback(pl.Callback):
             saved_path = save_trained_model(pl_module, self.model_cfg, self.gene_names, self.checkpoint_dir)
             if saved_path is not None:
                 print(f"[PeriodicCheckpointCallback] step {step}: saved checkpoint to {saved_path.parent}")
+
+
+class PeriodicPrintCallback(pl.Callback):
+    """Prints trainer.callback_metrics (populated by every model's own
+    self.log_dict() call regardless of logger=False — Lightning tracks
+    logged metrics internally for the progress bar even when no external
+    Logger is attached) via plain print() every print_every_n_steps steps.
+
+    Real gap found 2026-07-19 while investigating a real collapsed run
+    (exp_hest1k_fm_ot_stormlite_mome_both_bigger, overnight batch —
+    PCC=nan, ConstantInputWarning from pearsonr: the model had collapsed
+    to predicting a constant output regardless of context, see
+    docs/results_log.md): every trainer in this codebase sets logger=False
+    (see PeriodicCheckpointCallback's own docstring for why — avoiding
+    Lightning's default ModelCheckpoint's full-state-dict cost), and
+    relies on Lightning's own TQDMProgressBar for loss visibility instead
+    — but tqdm auto-disables its progress bar when stdout isn't a real
+    terminal, which is exactly the case for every one of this project's
+    parallel launch scripts (`> logfile 2>&1`). Checked directly: the
+    collapsed run's full log contained ZERO train/loss values anywhere,
+    only the final eval result — making it impossible to tell WHEN during
+    an 40000-step run training actually degenerated. This callback is
+    independent of both the disabled Logger and the disabled progress bar
+    — a plain print() always reaches a redirected log file — so future
+    collapses/instabilities leave an actual loss trajectory behind.
+
+    Opt-in via training.log_print_every_n_steps (unset/None default —
+    every existing config's behavior, and its log file's size/content, is
+    completely unchanged unless a config explicitly turns this on) — same
+    convention as training.checkpoint_every_n_steps. Keys off batch_idx,
+    not trainer.global_step (same reasoning as PeriodicCheckpointCallback's
+    own docstring — uniform cadence across manual- and automatic-
+    optimization model families)."""
+
+    def __init__(self, print_every_n_steps: int):
+        self.print_every_n_steps = print_every_n_steps
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        step = batch_idx + 1
+        if step % self.print_every_n_steps == 0:
+            metrics = {k: (round(v.item(), 6) if hasattr(v, "item") else v)
+                       for k, v in trainer.callback_metrics.items()}
+            print(f"[step {step}] {metrics}", flush=True)
 
 
 def load_trained_model(checkpoint_dir: str):
@@ -1124,6 +1219,14 @@ def _main_multi_sample(cfg) -> None:
                 unresolved_model_cfg, gene_names, checkpoint_dir,
                 save_every_n_steps=checkpoint_every_n_steps,
             ))
+        # PeriodicPrintCallback (2026-07-19): opt-in via
+        # training.log_print_every_n_steps, unset by default — see that
+        # class's own docstring (found via the mome_both_bigger collapse
+        # investigation: no per-step loss survives into a redirected log
+        # file otherwise).
+        log_print_every_n_steps = cfg.training.get("log_print_every_n_steps")
+        if log_print_every_n_steps:
+            callbacks.append(PeriodicPrintCallback(log_print_every_n_steps))
         trainer = pl.Trainer(
             max_epochs=1,
             accelerator="auto",
@@ -1131,6 +1234,17 @@ def _main_multi_sample(cfg) -> None:
             enable_checkpointing=False,
             logger=False,
             callbacks=callbacks,
+            # gradient_clip_val (2026-07-19, real fix — see PeriodicPrintCallback's
+            # own docstring for the collapsed run this was found investigating):
+            # no trainer in this codebase clipped gradients before this. 1.0 is the
+            # standard default value in the flow-matching/diffusion/transformer
+            # literature (e.g. used throughout Lipman et al. 2022 follow-ups) —
+            # a safe, zero-cost-if-unneeded guard against the exact kind of
+            # gradient-explosion-driven collapse-to-constant-output failure mode
+            # a bigger/deeper StormLite (mome_both_bigger) hit, in both single-
+            # and multi-sample settings, while the smaller default StormLite
+            # trained fine under the identical (unclipped) optimizer setup.
+            gradient_clip_val=1.0,
         )
         trainer.fit(model, dataloader)
         saved_path = save_trained_model(model, unresolved_model_cfg, gene_names, checkpoint_dir)
@@ -1290,6 +1404,12 @@ def main(cfg_path: str, overrides: list[str] | None = None):
                 unresolved_model_cfg, adata.var_names.tolist(), checkpoint_dir,
                 save_every_n_steps=checkpoint_every_n_steps,
             ))
+        # PeriodicPrintCallback / gradient_clip_val (2026-07-19): see
+        # _main_multi_sample's identical block above for the real
+        # collapsed-run investigation these came from.
+        log_print_every_n_steps = cfg.training.get("log_print_every_n_steps")
+        if log_print_every_n_steps:
+            callbacks.append(PeriodicPrintCallback(log_print_every_n_steps))
         trainer = pl.Trainer(
             max_epochs=1,  # one pass over `n_items` fresh masking draws == old epoch count
             accelerator="auto",
@@ -1297,6 +1417,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
             enable_checkpointing=False,
             logger=False,
             callbacks=callbacks,
+            gradient_clip_val=1.0,
         )
         trainer.fit(model, dataloader)
         saved_path = save_trained_model(model, unresolved_model_cfg, adata.var_names.tolist(), checkpoint_dir)
