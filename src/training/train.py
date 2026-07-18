@@ -386,6 +386,75 @@ def load_trained_model(checkpoint_dir: str):
     return model, gene_names
 
 
+def load_pretrained_weights_into(model, checkpoint_dir: str) -> dict:
+    """Warm-start `model` (already built by build_model — NOT necessarily
+    architecturally identical to the checkpoint's own saved config) from a
+    prior run's saved trainable weights. Unlike load_trained_model (which
+    reconstructs a FRESH model from the checkpoint's own config, for eval,
+    and asserts every trainable param must be present), this loads INTO
+    an already-constructed model, matching by (name, shape) pair —
+    tolerant of architectural drift between the two configs (e.g. a
+    different sample's post-QC gene panel changing a decoder's width),
+    which load_trained_model's strict check would reject outright.
+
+    Real motivation (2026-07-19, see docs/results_log.md): STPath's own
+    pretrained-vs-unfrozen ablation showed pretraining alone is worth
+    ~0.086 PCC, architecture held constant — StormLite never had an
+    actual pretraining stage before this; it always trained directly on
+    the target task. This is the mechanism for a genuine two-stage
+    recipe: pretrain (e.g. multi-sample across many INT samples, longer
+    schedule) -> save via save_trained_model -> finetune (build a fresh
+    model for the target task/sample, call this function, THEN
+    trainer.fit() as normal — see training.init_checkpoint_dir in
+    main()/_main_multi_sample()/run_comparison.py's _train_model()).
+
+    CAVEAT worth understanding, not just accepting: a (name, shape) match
+    does NOT by itself guarantee SEMANTIC correctness for name-keyed
+    lookup tables — e.g. decoder_type="panel_invariant"'s gene_embed
+    table is indexed by decoder_gene_names' ORDER, not just its count.
+    This is safe specifically because decoder_gene_names is always
+    derived from a SORTED gene set (load_multi_sample's shared_genes /
+    inject_decoder_gene_names' adata.var_names — both alphabetically
+    sorted): identical gene SETS always produce identical embedding
+    ORDER regardless of which run computed it. Mismatched-SHAPE rows are
+    correctly skipped below, but same-shape rows built from a genuinely
+    DIFFERENT gene set would silently load semantically wrong
+    embeddings — verify gene-panel consistency between pretrain/finetune
+    configs yourself before relying on this across genuinely different
+    sample sets.
+
+    Prints (and returns) exactly what loaded / was skipped and why —
+    every finetune run's log shows this explicitly rather than silently
+    guessing whether warm-starting actually did anything."""
+    in_dir = Path(checkpoint_dir)
+    state = torch.load(in_dir / "trainable_weights.pt", map_location="cpu")
+    model_state = dict(model.named_parameters())
+    loaded, skipped_shape, skipped_missing = [], [], []
+    with torch.no_grad():
+        for name, param in model_state.items():
+            if name not in state:
+                skipped_missing.append(name)
+                continue
+            src = state[name]
+            if src.shape != param.shape:
+                skipped_shape.append(f"{name} (checkpoint {tuple(src.shape)} vs model {tuple(param.shape)})")
+                continue
+            param.copy_(src)
+            loaded.append(name)
+    print(f"load_pretrained_weights_into({checkpoint_dir}): "
+          f"loaded {len(loaded)}/{len(model_state)} trainable params, "
+          f"{len(skipped_shape)} skipped (shape mismatch), "
+          f"{len(skipped_missing)} skipped (not in checkpoint)")
+    if skipped_shape:
+        preview = skipped_shape[:5]
+        print(f"  shape-mismatched (kept fresh init): {preview}{'...' if len(skipped_shape) > 5 else ''}")
+    if skipped_missing:
+        preview = skipped_missing[:5]
+        print(f"  missing from checkpoint (kept fresh init): {preview}{'...' if len(skipped_missing) > 5 else ''}")
+    return {"loaded": loaded, "skipped_shape_mismatch": skipped_shape,
+            "skipped_missing_from_checkpoint": skipped_missing}
+
+
 def make_context_query_split(coords3d: np.ndarray, slice_ids: np.ndarray, masking_cfg, seed: int):
     """One random context/query mask draw. Factored out of
     MaskedContextQueryDataset so anything that needs the raw boolean masks
@@ -1254,6 +1323,14 @@ def _main_multi_sample(cfg) -> None:
         else:
             inject_stpath_novae_dim(model_cfg, context_novae_features.shape[1])
     model = build_model(model_cfg)
+    # init_checkpoint_dir (2026-07-19): opt-in pretrain->finetune warm
+    # start, unset by default — see load_pretrained_weights_into's own
+    # docstring for the full reasoning (motivated by STPath's own
+    # pretrained-vs-unfrozen ablation showing pretraining alone is worth
+    # ~0.086 PCC, architecture held constant).
+    init_checkpoint_dir = cfg.training.get("init_checkpoint_dir")
+    if init_checkpoint_dir:
+        load_pretrained_weights_into(model, init_checkpoint_dir)
     # unresolved copy for checkpointing — same reasoning as main()'s own
     # unresolved_model_cfg (keeps ${oc.env:...} interpolations literal)
     unresolved_model_cfg = OmegaConf.to_container(cfg.model, resolve=False)
@@ -1432,6 +1509,12 @@ def main(cfg_path: str, overrides: list[str] | None = None):
         else:
             inject_stpath_novae_dim(model_cfg, context_novae_features.shape[1])
     model = build_model(model_cfg)
+    # init_checkpoint_dir (2026-07-19): opt-in pretrain->finetune warm
+    # start — see _main_multi_sample's identical block / load_pretrained_
+    # weights_into's own docstring for the full reasoning.
+    init_checkpoint_dir = cfg.training.get("init_checkpoint_dir")
+    if init_checkpoint_dir:
+        load_pretrained_weights_into(model, init_checkpoint_dir)
     # UNRESOLVED copy, saved (not model_cfg above) so a STPath config's
     # ${oc.env:STPATH_GENE_VOC_PATH}/${oc.env:STPATH_MODEL_WEIGHT_PATH}
     # interpolations stay literal in the checkpoint rather than getting

@@ -65,7 +65,7 @@ from src.training.train import (
     get_gigapath_features, save_trained_model, make_dataloader,
     _downsample_patches, get_novae_features, inject_novae_dim, inject_stpath_novae_dim,
     inject_coord_scale, inject_decoder_gene_names, PeriodicCheckpointCallback,
-    PeriodicPrintCallback, EMACallback,
+    PeriodicPrintCallback, EMACallback, load_pretrained_weights_into,
 )
 from src.evaluation import metrics as ev
 from src.evaluation.cell_type_classifier import cluster_pseudo_labels, CellTypePlausibilityClassifier
@@ -187,6 +187,14 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
         else:
             inject_stpath_novae_dim(model_cfg, context_novae_features.shape[1])
     model = build_model(model_cfg)
+    # init_checkpoint_dir (2026-07-19): opt-in pretrain->finetune warm
+    # start — see train.py's load_pretrained_weights_into for the full
+    # reasoning (motivated by STPath's own pretrained-vs-unfrozen ablation
+    # showing pretraining alone is worth ~0.086 PCC, architecture held
+    # constant; StormLite never had a pretraining stage before this).
+    init_checkpoint_dir = cfg.training.get("init_checkpoint_dir")
+    if init_checkpoint_dir:
+        load_pretrained_weights_into(model, init_checkpoint_dir)
     # UNRESOLVED copy, saved (not model_cfg above) so a STPath config's
     # ${oc.env:STPATH_GENE_VOC_PATH}/${oc.env:STPATH_MODEL_WEIGHT_PATH}
     # interpolations stay literal in the checkpoint rather than getting

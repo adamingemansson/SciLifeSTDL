@@ -1,0 +1,107 @@
+# PRETRAIN stage (2026-07-19) of a genuine two-stage pretrain->finetune
+# recipe — the first time this codebase has one. Motivated directly by a
+# real finding: STPath's own pretrained-vs-unfrozen ablation shows
+# pretraining alone is worth ~0.086 PCC, architecture held constant (see
+# docs/results_log.md) — StormLite has always trained directly on the
+# target task, no pretraining stage at all. This is the fix.
+#
+# Trains StormLite's context encoder (fusion transformer + coord/image
+# encoders) across all 8 currently-downloaded samples (INT1-INT8) for a
+# long schedule, saving periodic checkpoints. The FINETUNE stage
+# (exp_finetune_hest1k_stormlite_mome_both_paneldecoder_add.yaml) then
+# warm-starts from this checkpoint via training.init_checkpoint_dir
+# (train.py's load_pretrained_weights_into) before training on the
+# single-sample target task.
+#
+# REALISTIC EXPECTATION, not oversold: n_genes here is INT1-INT8's SHARED
+# gene panel (the intersection, see loaders.py load_multi_sample), which
+# will almost certainly differ in SIZE from INT1's own single-sample
+# post-QC panel the finetune run uses — so the gene-panel-DEPENDENT
+# layers (MLPGeneEncoder's first Linear, the encoder/decoder mapping
+# to/from raw expression space, panel_invariant's gene_embed table) will
+# have MISMATCHED SHAPES and get correctly skipped (fresh init) at
+# finetune time — see load_pretrained_weights_into's own docstring. What
+# DOES transfer, and is the actual point of this pretrain stage: the
+# fusion transformer itself (MoME blocks — the real spatial+multimodal
+# reasoning backbone, sized only by hidden_dim, never by n_genes), the
+# coordinate encoder, the image encoder's projection head, and the
+# flow-matching velocity_net (operates on latent_dim, not gene space).
+# Pretraining the SHARED spatial-reasoning machinery across diverse
+# samples while leaving gene-panel-specific layers to finetune fresh on
+# the target task is a real, coherent recipe, not a full-weight-copy
+# best-case assumption.
+#
+# QK-norm enabled: this run trains far longer (80k epochs) than anything
+# tested with the un-normed attention path — the structural stability fix
+# is the safer default at this scale, not just for the "bigger" config.
+#
+# UNIQUE checkpoint_dir/experiment_name (2026-07-19 audit fix — see
+# docs/results_log.md's checkpoint-collision entry): deliberately does
+# NOT reuse exp_multisample_fm_ot_stormlite_mome_both_paneldecoder_add's
+# own experiment_name/checkpoint_dir, since several jobs in tonight's
+# batches already share that path concurrently (a real bug, documented,
+# not yet fixed in those already-launched scripts) — this pretrain run
+# needs an on-disk checkpoint that's actually reliable to warm-start from.
+#
+# Requires `pip install novae` (Python >=3.11). sample_ids assumes
+# INT1-INT8 are downloaded locally.
+
+experiment_name: pretrain_multisample_stormlite_mome_both_paneldecoder_add
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_ids: [INT1, INT2, INT3, INT4, INT5, INT6, INT7, INT8]
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    storm_lite_fusion_mode: mome
+    storm_lite_qk_norm: true        # 2026-07-19: stability at this training length
+    decoder_type: panel_invariant
+    decoder_gene_embed_dim: 256
+    decoder_combine_mode: add
+    decoder_mlp_depth: 2
+    # n_genes is NOT set — auto-injected from the shared multi-sample panel
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 80000               # long schedule — this IS the pretraining budget
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}   # UNIQUE, see header
+  checkpoint_every_n_steps: 10000
+  log_print_every_n_steps: 1000
+  ema_decay: 0.999
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

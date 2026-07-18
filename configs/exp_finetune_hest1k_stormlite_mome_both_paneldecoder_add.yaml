@@ -1,0 +1,90 @@
+# FINETUNE stage (2026-07-19) of the pretrain->finetune pair — see
+# exp_pretrain_multisample_stormlite_mome_both_paneldecoder_add.yaml's
+# own header for the full recipe/reasoning and the realistic expectation
+# of what actually warm-starts (the fusion transformer / coord encoder /
+# image projection / velocity_net — NOT the gene-panel-dependent layers,
+# which will have mismatched shapes against the pretrain run's different
+# multi-sample panel size and correctly stay at fresh init — see
+# load_pretrained_weights_into's own docstring in train.py).
+#
+# Otherwise IDENTICAL architecture to the single-sample flagship
+# (exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder_add.yaml, PCC 0.4933
+# best seed / ~0.435 average without pretraining) except:
+#   - storm_lite_qk_norm: true (must match the pretrain run's architecture
+#     for the fusion transformer's attention weights to actually transfer
+#     — a shape mismatch there would silently skip the exact backbone
+#     this whole recipe exists to warm-start)
+#   - training.init_checkpoint_dir points at the pretrain run's checkpoint
+#   - training.epochs is LOWER (10000, not 40000) — finetuning from a
+#     warm start should need less task-specific training than from-scratch,
+#     that's the entire point; also directly testable by comparing against
+#     exp_hest1k_fm_ot_stormlite_mome_both_paneldecoder_add.yaml's own
+#     40k-epoch from-scratch numbers at a much cheaper epoch budget
+#
+# RUN ORDER: exp_pretrain_multisample_stormlite_mome_both_paneldecoder_add.yaml
+# must complete (or at least reach one checkpoint_every_n_steps save)
+# BEFORE this config is run — load_pretrained_weights_into raises a clear
+# FileNotFoundError naming the missing checkpoint file if it hasn't.
+#
+# Requires `pip install novae` (Python >=3.11).
+
+experiment_name: finetune_hest1k_stormlite_mome_both_paneldecoder_add
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    storm_lite_fusion_mode: mome
+    storm_lite_qk_norm: true        # MUST match the pretrain run's architecture, see header
+    decoder_type: panel_invariant
+    decoder_gene_embed_dim: 256
+    decoder_combine_mode: add
+    decoder_mlp_depth: 2
+    n_genes: 16570                # INT1 after QC, same as exp_hest1k_fm_ot_stpath.yaml
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 10000                # lower than the 40k from-scratch baseline — see header
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+  checkpoint_every_n_steps: 5000
+  log_print_every_n_steps: 500
+  ema_decay: 0.999
+  init_checkpoint_dir: results/checkpoints/pretrain_multisample_stormlite_mome_both_paneldecoder_add
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

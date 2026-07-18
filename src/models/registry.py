@@ -776,6 +776,8 @@ class FlowMatchingOT(BaseGenerativeModel):
                  fm_weight: float = 1.0, lr: float = 1e-3,
                  fm_time_sampling: str = "uniform",
                  fm_logit_normal_m: float = 0.0, fm_logit_normal_s: float = 1.0,
+                 fm_coupling: str = "independent",
+                 ode_solver: str = "euler",
                  path_type: str = "ot", sigma_min: float = 0.002,
                  sigma_max: float = 80.0, sigma_data: float = 0.5, rho: float = 7.0,
                  edm_p_mean: float = -1.2, edm_p_std: float = 1.2,
@@ -886,6 +888,12 @@ class FlowMatchingOT(BaseGenerativeModel):
         self.fm_time_sampling = fm_time_sampling
         self.fm_logit_normal_m = fm_logit_normal_m
         self.fm_logit_normal_s = fm_logit_normal_s
+        assert fm_coupling in ("independent", "minibatch_ot"), (
+            f"unknown fm_coupling {fm_coupling!r}"
+        )
+        self.fm_coupling = fm_coupling
+        assert ode_solver in ("euler", "heun"), f"unknown ode_solver {ode_solver!r}"
+        self.ode_solver = ode_solver
 
     def _sample_flow_time(self, n: int) -> torch.Tensor:
         """Timestep sampling for the OT flow-matching loss. "uniform"
@@ -906,6 +914,51 @@ class FlowMatchingOT(BaseGenerativeModel):
             eps = torch.randn(n, device=self.device)
             return torch.sigmoid(self.fm_logit_normal_m + self.fm_logit_normal_s * eps)
         return torch.rand(n, device=self.device)
+
+    def _couple_noise(self, z_1_target: torch.Tensor) -> torch.Tensor:
+        """Sample z_0 (the OT path's noise endpoint) either "independent"
+        (default — z_0 = torch.randn_like(z_1_target), i.i.d., the ORIGINAL
+        behavior for every existing config) or "minibatch_ot" (2026-07-19,
+        Tong et al. 2023, "Improving and Generalizing Flow-Based Generative
+        Models with Minibatch Optimal Transport"; Pooladian et al. 2023,
+        "Multisample Flow Matching: Straightening Flows with Minibatch
+        Couplings", ICML — same technique).
+
+        Real gap this closes: this class is NAMED "FlowMatchingOT" for its
+        straight-line OT-style PATH formulation, but its actual z_0<->z_1
+        PAIRING was never OT-coupled — z_0 was just an independent i.i.d.
+        draw, no different from plain (non-OT) conditional flow matching.
+        Real minibatch OT solves the assignment between a POOL of n noise
+        samples and the n real targets in THIS training step (this
+        project's own natural "minibatch": every query point in one
+        masking draw, processed together in one training_step call) via
+        the Hungarian algorithm on squared-Euclidean cost — the exact
+        discrete optimal-transport plan for that cost, not an
+        approximation. Pairing each target with the closest-in-latent-
+        space noise sample (rather than a random one) gives straighter,
+        less-crossing paths, which both papers show improves sample
+        quality and reduces the variance of the training gradient.
+
+        scipy.optimize.linear_sum_assignment (Hungarian/Kuhn-Munkres) is
+        exact and already available (scipy is an existing dependency, see
+        src/evaluation/metrics.py's own scipy.linalg usage) — no new
+        dependency. O(n^3) in the worst case, negligible at this
+        project's query-set sizes (~15-45 points per masking draw).
+        "independent" (default) never touches scipy at all — zero
+        behavior/dependency change unless a config opts in."""
+        z_0 = torch.randn_like(z_1_target)
+        if self.fm_coupling == "independent":
+            return z_0
+        from scipy.optimize import linear_sum_assignment
+        with torch.no_grad():
+            cost = torch.cdist(z_0, z_1_target, p=2).pow(2).cpu().numpy()
+            row_idx, col_idx = linear_sum_assignment(cost)
+            # row_idx is already 0..n-1 in order for a square cost matrix;
+            # col_idx[i] is the target index z_0[i] gets assigned to —
+            # invert so z_0_reordered[j] is the noise paired with z_1[j]
+            perm = torch.empty(z_1_target.shape[0], dtype=torch.long, device=z_0.device)
+            perm[torch.as_tensor(col_idx, device=z_0.device)] = torch.as_tensor(row_idx, device=z_0.device)
+        return z_0[perm]
 
     def _velocity(self, z_t, t, c):
         t_embed = self.time_embed(t)
@@ -946,9 +999,29 @@ class FlowMatchingOT(BaseGenerativeModel):
         if self.path_type == "ot":
             z = torch.randn(n, self.latent_dim, device=self.device)
             dt = 1.0 / self.n_ode_steps
-            for step in range(self.n_ode_steps):
-                t = torch.full((n,), step * dt, device=self.device)
-                z = z + dt * self._velocity(z, t, c)  # manual Euler ODE integration, in latent space
+            if self.ode_solver == "euler":
+                for step in range(self.n_ode_steps):
+                    t = torch.full((n,), step * dt, device=self.device)
+                    z = z + dt * self._velocity(z, t, c)  # manual Euler ODE integration, in latent space
+            else:  # heun — 2nd-order predictor-corrector (Karras et al. 2022,
+                   # "Elucidating the Design Space of Diffusion-Based
+                   # Generative Models", NeurIPS — the EDM paper this
+                   # project's own path_type="edm" already cites for its
+                   # preconditioning; its OWN recommended sampler is Heun's
+                   # method, not plain Euler, which is what "ot" used until
+                   # now — a documented simplification, see this class's
+                   # module docstring "Simplifications flagged explicitly"
+                   # note. Two velocity evaluations per step (predictor +
+                   # corrector) instead of one, for O(dt^3) local error
+                   # instead of Euler's O(dt^2) — same n_ode_steps, better
+                   # accuracy, or equivalent accuracy at fewer steps.
+                for step in range(self.n_ode_steps):
+                    t_cur = torch.full((n,), step * dt, device=self.device)
+                    v_cur = self._velocity(z, t_cur, c)
+                    z_pred = z + dt * v_cur                       # Euler predictor
+                    t_next = torch.full((n,), (step + 1) * dt, device=self.device)
+                    v_next = self._velocity(z_pred, t_next, c)
+                    z = z + dt * 0.5 * (v_cur + v_next)           # trapezoidal corrector
         else:  # edm
             steps = self.n_ode_steps
             i = torch.arange(steps, device=self.device, dtype=torch.float32)
@@ -983,7 +1056,7 @@ class FlowMatchingOT(BaseGenerativeModel):
         z_1_target = z_1.detach()
 
         if self.path_type == "ot":
-            z_0 = torch.randn_like(z_1_target)
+            z_0 = self._couple_noise(z_1_target)   # independent (default) or minibatch OT, see _couple_noise
             t = self._sample_flow_time(n)   # uniform (default) or logit-normal (SD3, see _sample_flow_time)
             z_t = (1 - t[:, None]) * z_0 + t[:, None] * z_1_target   # OT straight-line path
             target_velocity = z_1_target - z_0                        # constant along a straight line
