@@ -819,11 +819,25 @@ def _atomic_savez(cache_path: Path, **arrays) -> None:
     os.replace(tmp_path, cache_path)  # atomic on POSIX — no reader ever sees a partial file
 
 
+def _cache_root(cfg) -> Path:
+    """Where cache subfolders (gigapath_cache/, novae_cache/) get created.
+    Defaults to cfg.data.hest_data_dir (original, unchanged behavior) —
+    but that breaks when hest_data_dir is a READ-ONLY shared dataset (a
+    real setup found 2026-07-19, st-a100: a labmate's already-downloaded
+    HEST-1k copy, reused via symlink specifically to avoid re-downloading
+    it, but not writable by anyone else — caching next to it then fails
+    with PermissionError). cfg.data.hest_cache_dir, if set, overrides this
+    to any writable path instead, independent of where the read-only data
+    itself lives."""
+    cache_dir = cfg.data.get("hest_cache_dir") if hasattr(cfg.data, "get") else None
+    return Path(cache_dir) if cache_dir else Path(cfg.data.hest_data_dir)
+
+
 def _gigapath_cache_path(cfg, sample_id: str | None = None) -> Path:
     """Where precomputed Gigapath features for this sample get cached
-    across runs (see _load_images) — next to the HEST-1k data itself so
-    it's obvious it belongs to that sample, not somewhere in /tmp that
-    would silently vanish between sessions.
+    across runs (see _load_images) — next to the HEST-1k data itself by
+    default (see _cache_root) so it's obvious it belongs to that sample,
+    not somewhere in /tmp that would silently vanish between sessions.
 
     sample_id (2026-07-17, multi-sample image/Novae support — see
     load_multi_sample_data's own docstring for the real gap this closes):
@@ -831,7 +845,7 @@ def _gigapath_cache_path(cfg, sample_id: str | None = None) -> Path:
     cfg.data.sample_ids. Defaults to cfg.data.sample_id, so every
     single-sample call site's behavior is completely unchanged."""
     sid = sample_id if sample_id is not None else cfg.data.sample_id
-    return Path(cfg.data.hest_data_dir) / "gigapath_cache" / f"{sid}.npz"
+    return _cache_root(cfg) / "gigapath_cache" / f"{sid}.npz"
 
 
 def get_gigapath_features(cfg, patches: np.ndarray, barcodes: np.ndarray,
@@ -875,9 +889,10 @@ def _novae_cache_path(cfg, sample_id: str | None = None) -> Path:
     every `python -m src.training.train` invocation).
 
     sample_id: see _gigapath_cache_path's own docstring (same 2026-07-17
-    multi-sample follow-up, same "defaults to cfg.data.sample_id" contract)."""
+    multi-sample follow-up, same "defaults to cfg.data.sample_id" contract).
+    Root directory: see _cache_root (cfg.data.hest_cache_dir override)."""
     sid = sample_id if sample_id is not None else cfg.data.sample_id
-    return Path(cfg.data.hest_data_dir) / "novae_cache" / f"{sid}.npz"
+    return _cache_root(cfg) / "novae_cache" / f"{sid}.npz"
 
 
 def get_novae_features(cfg, adata, sample_id: str | None = None) -> np.ndarray:
