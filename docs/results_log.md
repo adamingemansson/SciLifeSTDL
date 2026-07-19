@@ -486,4 +486,37 @@ All three confirmed fixed via a full 14-job `SMOKETEST=1` run of `scripts/run_2g
 
 **Investigated but not implemented**: organ/technology conditioning (`OrganTechEmbedding`). Its own docstring already documents the real constraint — every sample actually available (INT1-INT28) is the same organ (ccRCC) and platform (Visium), so it currently contributes a constant offset any model trivially folds into its bias terms. Improving its architecture right now would be unverifiable (nothing to distinguish on single-organ/single-platform data) — a data availability gap, not an architecture one. Left as-is, ready to revisit once genuinely multi-organ/multi-platform HEST-1k samples are downloaded.
 
+## 2026-07-19 (continued): st-a100 abandoned mid-run (shared node, Markus + a second labmate both landed jobs on our GPUs), pivoted to tkdgx1 — real results that correct two earlier narratives
+
+**st-a100 salvage, before killing the run**: 2 of 14 jobs completed for real before the node got too contended to keep waiting on — `bigger_qknorm_warmup_ema_seed11` (real, not collapsed: PCC 0.1877, RMSE 0.2258, AUC 0.8947, ST-FID 0.7956, plausible 0.6190 — weaker than the earlier confounded estimates suggested, exactly why a real seed-averaged mean matters) and `pretrain_finetune_stormlite` (a genuine, real negative result: PCC **nan**, AUC exactly **0.5000**, ST-FID 835.5, plausible **0.0000** — the classic "collapsed to a constant" signature, same as the pre-QK-norm bigger-capacity failures. This is the first actual end-to-end run of the pretrain→finetune mechanism — the weight-transfer *mechanics* were unit-tested and correct, but the resulting model didn't train well. Most likely explanation, not yet confirmed: multi-sample pretraining has been the weakest/least stable setting in this whole project (mean PCC ~0.10-0.19 even before this), so the pretrain checkpoint itself may already have been in a bad region; a second, structurally real risk is that only panel-agnostic layers transfer (gene-panel-dependent layers stay fresh-init, since the multi-sample shared panel differs in width from INT1's own panel) — the transferred layers were co-adapted with pretrain's own gene encoder, which suddenly gets replaced with a fresh one at finetune time. Not chased further given the pivot away from this mechanism for now; flagged as an open question, not silently dropped.
+
+**8-config batch on tkdgx1** (`scripts/run_parallel_8gpu_tkdgx1_confirm.sh`, all 8 jobs parallel, real full-epoch runs) — full results:
+
+| job | PCC | RMSE | AUC | ST-FID | plausible |
+|---|---|---|---|---|---|
+| `bigger_qknorm_warmup_seed10` | 0.5079 | 0.2832 | 0.9270 | 0.3463 | 0.3333 |
+| `bigger_qknorm_warmup_seed12` | 0.5019 | 0.2838 | 0.9243 | 0.7094 | 0.3810 |
+| `stpath_unfrozen_seed10` | 0.4125 | 0.3142 | 0.9139 | 1.0413 | 0.2381 |
+| `stpath_unfrozen_seed11` | 0.5160 | 0.2920 | 0.9307 | 0.8518 | 0.2857 |
+| `bigger_qknormonly_flatlr_seed10` | **nan** | 0.5214 | **0.5000** | 689.4 | 0.0476 |
+| `bigger_warmuponly_noqknorm_seed10` | 0.3892 | 0.3066 | 0.9070 | 0.8532 | 0.2857 |
+| `adalnvelocity_seed10` | 0.2086 | 0.3393 | 0.8767 | 8.4637 | 0.3333 |
+| `adalnvelocity_seed11` | 0.3704 | 0.3206 | 0.9051 | 0.8345 | 0.2857 |
+
+**Correction #1 — QK-norm was NOT the fix for the "bigger" capacity collapse; the LR/warmup change was.** The 2×2 factorial is now resolved: QK-norm alone (flat lr=1e-3, no warmup) **still collapses** (PCC nan, AUC exactly 0.5000 — identical signature to every pre-fix "bigger" failure). Warmup+lower-LR alone (no QK-norm) **works fine** (PCC 0.3892, healthy AUC/ST-FID). Both together also work (0.19-0.51 across seeds). This flips the mechanism attribution this project has been documenting since day1 — QK-norm isn't harmful and may still be worth keeping (no observed downside combined with warmup), but it was never the load-bearing fix. The lowered learning rate + linear warmup schedule was the actual fix the whole time.
+
+**Correction #2 — STPath's real "full retrain" number is much stronger than previously measured, once the decoder is held constant properly.** 2-seed mean for `stpath_unfrozen` (decoder swap applied, same as every other current arm): **(0.4125 + 0.5160) / 2 = 0.464**. The old single data point (0.3857) predates the decoder swap entirely — it was never a fair comparison. This closes most of the previously-reported "pretraining advantage" gap: STPath pretrained's 4-seed mean is 0.503, so the real pretrained-vs-unfrozen gap (decoder held constant) is now only ~0.039, not the ~0.117 implied by the old numbers. Most of STPath's edge over from-scratch StormLite is architecture, not pretrained weights — a materially different conclusion than what was documented earlier this week.
+
+**Where this leaves "bigger capacity"**: `bigger_qknorm_warmup`'s 3-seed mean (0.1877, 0.5079, 0.5019) = **0.399** — actually *below* the small flagship StormLite's own 8-seed mean (~0.462), despite the collapse being genuinely fixed. Bigger capacity is not currently showing a real win over the small flagship on average, once seed variance is accounted for — the earlier "bigger + QK-norm reaches flagship-level PCC" framing was true for individual lucky seeds (0.50-0.51) but not for the mean. Not a dead end (0.50+ is achievable), but not yet a confirmed upgrade either.
+
+**Full StormLite-vs-STPath scoreboard, best current numbers**:
+- StormLite small (flagship): 8-seed mean ~0.462
+- StormLite bigger+QK-norm+warmup: 3-seed mean ~0.399
+- STPath unfrozen (full retrain, decoder held constant): 2-seed mean ~0.464
+- STPath pretrained (decoder held constant): 4-seed mean ~0.503
+
+Honest read: StormLite (small) and STPath (unfrozen) are now statistically indistinguishable (~0.462 vs ~0.464), and STPath pretrained still leads. The flagship priority — StormLite reliably beating STPath — is not yet achieved on a fair, seed-averaged, decoder-controlled comparison. This is a genuine, if less exciting, finding, and worth having rather than continuing to build on the earlier (partly wrong) narrative.
+
+**AdaLN velocity net, 2 seeds**: mean 0.2895 (0.2086, 0.3704) — below both StormLite baselines so far, and seed10's ST-FID (8.46) is notably elevated versus every other healthy run's ~0.3-1.0 range, suggesting some instability. Two seeds is nowhere near enough to conclude the architecture change doesn't help, but it isn't showing an early win either — not adopting as a default without more seeds.
+
 **Prepared, not yet run**: `scripts/run_parallel_3gpu_adaln_velocity_confirm.sh` — 3 seeds of `velocity_net_type="adaln_residual"` on the flagship StormLite config, everything else identical (same decoder, same capacity, same EMA), isolated cleanly against the already-known 8-seed flagship baseline mean (~0.462) rather than stacked with any other untested lever — deliberate, given the "all3" stacking collapse already taught this project not to bundle multiple untested changes. Waiting on GPU 0/6 to free up from the current 14-job batch.
