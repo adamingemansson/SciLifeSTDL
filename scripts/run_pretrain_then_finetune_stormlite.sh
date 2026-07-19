@@ -20,12 +20,13 @@
 set -u
 
 SMOKETEST="${SMOKETEST:-0}"
+SMOKETEST_EPOCHS="${SMOKETEST_EPOCHS:-10}"
 LOG_DIR="logs/pretrain_finetune"
 SMOKE_OVERRIDE=""
 if [ "$SMOKETEST" = "1" ]; then
     LOG_DIR="logs/pretrain_finetune_smoketest"
-    SMOKE_OVERRIDE="training.epochs=10 training.checkpoint_every_n_steps=5 training.log_print_every_n_steps=3"
-    echo "*** SMOKETEST=1 -- tiny pretrain (epochs=10) then tiny finetune. Logs: $LOG_DIR ***"
+    SMOKE_OVERRIDE="training.epochs=${SMOKETEST_EPOCHS} training.checkpoint_every_n_steps=1 training.log_print_every_n_steps=1"
+    echo "*** SMOKETEST=1 -- tiny pretrain (epochs=${SMOKETEST_EPOCHS}) then tiny finetune. Logs: $LOG_DIR ***"
 fi
 mkdir -p "$LOG_DIR"
 
@@ -44,9 +45,13 @@ else
 fi
 
 echo ""
-echo "=== Stage 2/2: FINETUNE (single-sample INT1, warm-started) -> $FINETUNE_LOG ==="
-python -m src.evaluation.run_comparison "$FINETUNE_CFG" --override ${SMOKE_OVERRIDE} --shuffle-diagnostic > "$FINETUNE_LOG" 2>&1
-echo "Finetune stage finished."
+if [ -f "$FINETUNE_LOG" ] && grep -q "^model " "$FINETUNE_LOG"; then
+    echo "Finetune stage already completed (see $FINETUNE_LOG), skipping."
+else
+    echo "=== Stage 2/2: FINETUNE (single-sample INT1, warm-started) -> $FINETUNE_LOG ==="
+    python -m src.evaluation.run_comparison "$FINETUNE_CFG" --override ${SMOKE_OVERRIDE} --shuffle-diagnostic > "$FINETUNE_LOG" 2>&1
+    echo "Finetune stage finished."
+fi
 echo ""
 echo "=== Warm-start summary (what actually transferred) ==="
 grep "load_pretrained_weights_into" "$FINETUNE_LOG"
