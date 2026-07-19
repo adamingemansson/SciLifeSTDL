@@ -1273,6 +1273,24 @@ def inject_decoder_gene_names(model_cfg: dict, adata) -> None:
         params.setdefault("full_gene_names", adata.var_names.tolist())
 
 
+def inject_single_sample_n_genes(model_cfg: dict, adata) -> None:
+    """Single-sample n_genes has always been a MANUALLY hardcoded config
+    value (e.g. "n_genes: 16570  # INT1 after QC"), unlike every other
+    injected param — a real gap found 2026-07-19 when a shared, reused
+    HEST-1k download (a labmate's copy, different from whoever originally
+    computed 16570) produced a genuinely different post-QC gene count
+    (19179) for the same sample_id, crashing with a matmul shape error
+    deep in MLPGeneEncoder's first Linear layer. There is no legitimate
+    reason for n_genes to differ from adata.n_vars post-QC — nothing
+    downstream subsets genes to hit a target count, so any stored value
+    is only ever right by coincidence with whatever data happened to
+    produce it. UNCONDITIONAL overwrite (not setdefault, unlike every
+    other inject_* here) — deliberately corrects a stale/wrong hardcoded
+    value rather than trusting it. Mutates model_cfg["params"] in place."""
+    params = model_cfg.get("params", {})
+    params["n_genes"] = adata.n_vars
+
+
 def inject_multi_sample_n_genes(model_cfg: dict, adatas: list) -> None:
     """Multi-sample training's n_genes has NO reliable manual default —
     load_multi_sample's shared-gene-panel intersection across every
@@ -1510,6 +1528,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     coord_scale = float(coords3d[:, :2].std())
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
+    inject_single_sample_n_genes(model_cfg, adata)
     inject_stpath_gene_names(model_cfg, adata)
     inject_decoder_gene_names(model_cfg, adata)
     inject_coord_scale(model_cfg, coord_scale)
@@ -1539,6 +1558,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     # machine-specific to resolve — injecting it here too just keeps the
     # saved config self-consistent with model_cfg above.
     unresolved_model_cfg = OmegaConf.to_container(cfg.model, resolve=False)
+    inject_single_sample_n_genes(unresolved_model_cfg, adata)
     inject_stpath_gene_names(unresolved_model_cfg, adata)
     inject_decoder_gene_names(unresolved_model_cfg, adata)
     inject_coord_scale(unresolved_model_cfg, coord_scale)
