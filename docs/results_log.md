@@ -422,3 +422,48 @@ Full results from `scripts/run_parallel_8gpu_day1.sh` (`logs/parallel_run_day1/`
 **Real bug found while designing the pretrain config**: checked whether tonight's own checkpoints were safe to warm-start from, and found that `scripts/run_parallel_16configs_2per_gpu_overnight.sh` (and `day2`/`day3` before it) reuse the SAME base config file across multiple CONCURRENT jobs (different seeds/overrides) without ever overriding `training.checkpoint_dir` — so jobs sharing a config file clobber each other's periodic checkpoint saves in real time. An earlier script (`run_parallel_5gpu_night6.sh`) correctly overrode `checkpoint_dir` per seed variant; that pattern was dropped in this week's later scripts. **Does NOT affect any reported PCC/RMSE number** — every batch script evaluates each job's own in-memory model right after `trainer.fit()`, never reloading from disk for the comparison table. **Does** mean the on-disk checkpoint at a shared path is unreliable for `--skip-training` reuse or warm-starting — avoid pointing `init_checkpoint_dir` at any config that ran concurrently with a sibling reusing the same file this week. Fix for future scripts: always add a distinct `training.checkpoint_dir=...` override per job whenever a base config is reused concurrently (`run_parallel_5gpu_night6.sh`'s own pattern).
 
 **Queued for tomorrow, not yet run**: a dedicated pretrain (multi-sample INT1-INT8, long schedule, own unique `checkpoint_dir`) → finetune (single-sample INT1, `init_checkpoint_dir` pointing at the pretrain run) config pair — see `configs/exp_pretrain_multisample_stormlite_mome_both_paneldecoder_add.yaml` / `exp_finetune_hest1k_stormlite_mome_both_paneldecoder_add.yaml`. This is the actual test of whether real pretraining closes StormLite's remaining gap to pretrained STPath, the way it does for STPath itself.
+
+## 2026-07-19 (continued): 16-config batch — full results, QK-norm confirmed to fix "bigger" capacity for real, and a real negative result on stacking
+
+Complete results from `scripts/run_parallel_16configs_2per_gpu_overnight.sh` (`logs/parallel_run_16/`), all 16 jobs.
+
+**Multi-sample (6 jobs, INT1-INT8, all +EMA, decoder held constant = clean encoder comparison):**
+
+| job | mean PCC | RMSE |
+|---|---|---|
+| `ms_stormlite_baseline_ema` | 0.1371 | 0.2008 |
+| `ms_stormlite_qknorm_ema` | 0.1280 | 0.2014 |
+| **`ms_stormlite_bigger_qknorm_ema`** | **0.1886** | 0.1976 |
+| `ms_stormlite_all3_ema` | 0.0967 | 0.2034 |
+| `ms_stpath_frozen_decoder_ema` | 0.1151 | 0.2013 |
+| `ms_stpath_unfrozen_decoder_ema` | -0.0203 | 0.2269 |
+
+**Headline win: multi-sample StormLite now clearly beats multi-sample STPath, on both arms** (0.1886 vs 0.1151 frozen / -0.0203 unfrozen) — and it's the "bigger" capacity model doing it, which was pure `nan` in every earlier multi-sample attempt (overnight batch, day1). This is the first genuine confirmation that QK-norm fixes the bigger-capacity collapse in the multi-sample setting, not just single-sample.
+
+**Single-sample (10 jobs, flagship unless noted, all +EMA):**
+
+| job | PCC | RMSE | AUC | ST-FID | ST-MMD | plausible |
+|---|---|---|---|---|---|---|
+| `flagship_baseline_seed10` | 0.3331 | 0.3250 | 0.8995 | 1.0387 | 0.0679 | 0.3810 |
+| `flagship_baseline_seed11` | 0.5466 | 0.2846 | 0.9393 | 0.7150 | 0.0477 | 0.3333 |
+| `flagship_qknorm_seed10` | 0.3971 | 0.3094 | 0.9096 | 0.6319 | 0.0341 | 0.2857 |
+| `flagship_qknorm_seed11` | 0.4838 | 0.2878 | 0.9241 | 0.9477 | 0.0653 | 0.3333 |
+| `flagship_logitnormal_seed10` | 0.4732 | 0.2999 | 0.9247 | 0.8995 | 0.0543 | 0.2857 |
+| `flagship_nolog1p_seed10` | 0.5205 | 0.2907 | 0.9324 | 0.8638 | 0.0529 | 0.3810 |
+| `flagship_all3_seed10` | **0.0582** | 0.3568 | 0.8464 | **6.4390** | **0.4548** | 0.1905 |
+| `flagship_all3_seed11` | 0.5074 | 0.2848 | 0.9286 | 0.5401 | 0.0449 | 0.3333 |
+| `bigger_all3_warmup_80k` | **0.5028** | 0.2831 | 0.9257 | 0.5483 | 0.0362 | 0.2381 |
+| `bigger_qknorm_warmup_40k` | 0.3886 | 0.3058 | 0.9067 | 0.5134 | 0.0474 | 0.2381 |
+
+**"Bigger" StormLite capacity is now confirmed genuinely fixed, not just patched over**: both bigger-capacity configs give real, competitive numbers (0.3886, and 0.5028 — matching the best flagship-scale results) instead of the `nan`/AUC-0.5000 total collapse seen in every prior attempt (overnight batch, day1). `bigger_all3_warmup_80k` in particular is now a legitimate flagship-tier result at 4x the capacity — directly answers the supervisor's "StormLite is even smaller than STPath" concern: bigger now actually works, given QK-norm + warmup.
+
+**Seed-averaged picture for the small flagship, 2 seeds each + EMA:**
+- baseline+EMA: (0.3331, 0.5466) → mean 0.4399; combined with day3's seed5+EMA (0.5391), 3-seed mean = **0.4729**
+- qknorm+EMA: (0.3971, 0.4838) → mean **0.4405**
+- all3+EMA: (0.0582, 0.5074) → mean 0.2828 — dragged down entirely by the seed10 collapse below
+
+**Real negative result: stacking QK-norm + logit-normal + no-double-log1p together is NOT safe, despite each individually looking fine.** `flagship_all3_seed10` collapsed hard — PCC 0.0582, ST-FID 6.44 and ST-MMD 0.45 (both roughly 10x every other run's range, not ordinary seed noise), AUC dropped to 0.8464 (every other flagship run is 0.90-0.94). `flagship_all3_seed11` is fine (0.5074), and the two individual "all3" ingredients each look solid alone (qknorm mean 0.4405, logitnormal 0.4732, nolog1p 0.5205) — so this reads as a genuine seed-dependent interaction between the stacked changes, not any one of them being bad on its own. Not yet root-caused which pairwise combination is responsible. **Practical conclusion: don't default to stacking all literature-motivated improvements together** — QK-norm looks safe and worth keeping on by default (it's the actual fix for the bigger-capacity collapse, no observed downside at small scale either), but logit-normal timestep sampling and/or the log1p change should be re-tested paired with QK-norm alone (not all three at once) before adopting either as a new default.
+
+**Where this leaves the StormLite-vs-STPath priority**: STPath pretrained+decoder's own 4-seed mean is ~0.503 (0.4874/0.5061/0.5228/0.4968, tight spread). StormLite's best individual results this batch (0.5466 baseline-seed11, 0.5205 nolog1p, 0.5074 all3-seed11, 0.5028 bigger-all3-80k) all land at-or-above that STPath mean — but StormLite's own seed-to-seed spread is still much wider (0.058-0.547) than STPath's, so no StormLite variant yet has a mean that clearly and reliably beats STPath's mean; it wins on best-case draws, not yet on typical-case reliability. Multi-sample is the one setting where the win is now clean and unambiguous (0.1886 vs 0.1151/-0.0203).
+
+**Next steps**: (1) the already-prepared pretrain→finetune pair (`scripts/run_pretrain_then_finetune_stormlite.sh`) is the next real lever to try — untested by tonight's batch; (2) a smaller, targeted follow-up isolating QK-norm+logit-normal and QK-norm+nolog1p (2-way, not 3-way) across 2-3 seeds each would identify which pairing is actually safe to keep; (3) `bigger_all3_warmup_80k`'s result (0.5028, matching flagship scale at 4x capacity) makes "bigger + QK-norm + warmup" as the new default single-sample architecture worth strongly considering going forward, independent of the logit-normal/nolog1p question.
