@@ -767,6 +767,67 @@ class _SinusoidalTimeEmbedding(nn.Module):
         return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
 
 
+class _AdaLNResidualBlock(nn.Module):
+    """DiT-style AdaLN-Zero residual block (Peebles & Xie 2023, "Scalable
+    Diffusion Models with Transformers") — LayerNorm modulated by a
+    (shift, scale) pair derived from the conditioning vector, output
+    gated by a third derived value before the residual add. AdaLN-Zero's
+    trick (the modulation projection's weight AND bias zero-initialized)
+    makes every block the identity function at initialization, so a deep
+    stack is trainable from scratch with no separate warmup schedule —
+    each block only gradually learns to contribute as training proceeds."""
+
+    def __init__(self, dim: int, cond_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False)
+        self.mlp = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, dim))
+        self.ada = nn.Linear(cond_dim, 3 * dim)
+        nn.init.zeros_(self.ada.weight)
+        nn.init.zeros_(self.ada.bias)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        shift, scale, gate = self.ada(cond).chunk(3, dim=-1)
+        h = self.norm(x) * (1 + scale) + shift
+        h = self.mlp(h)
+        return x + gate * h
+
+
+class _AdaLNVelocityNet(nn.Module):
+    """Residual, per-layer-conditioned replacement for the plain concat-MLP
+    velocity_net (2026-07-19 architecture audit, see docs/results_log.md):
+    the original velocity_net is a 2-hidden-layer feedforward MLP with NO
+    residual connections, injecting the context vector c (derived from a
+    context_encoder that can be 60-100M+ params) via one-time
+    concatenation at the input layer only — deeper layers see it purely
+    secondhand. Every comparable published flow-matching/diffusion
+    architecture (DiT, SiT, SD3's MM-DiT) uses residual blocks with
+    conditioning re-injected at EVERY layer via AdaLN specifically because
+    a plain deep feedforward net without either is hard to optimize and
+    dilutes the conditioning signal with depth. Opt-in via
+    velocity_net_type="adaln_residual" (default "mlp" = old behavior,
+    byte-for-byte unchanged).
+
+    Accepts the SAME single concatenated [z_t, t_embed, c] tensor as the
+    plain MLP (splits it back apart internally) so _velocity/_edm_denoise
+    call sites need zero changes regardless of which type is active."""
+
+    def __init__(self, latent_dim: int, time_embed_dim: int, cond_hidden_dim: int,
+                 hidden_dim: int, n_layers: int = 3):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.in_proj = nn.Linear(latent_dim, hidden_dim)
+        cond_dim = time_embed_dim + cond_hidden_dim
+        self.blocks = nn.ModuleList([_AdaLNResidualBlock(hidden_dim, cond_dim) for _ in range(n_layers)])
+        self.out_proj = nn.Linear(hidden_dim, latent_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z_t, cond = x[..., :self.latent_dim], x[..., self.latent_dim:]
+        h = self.in_proj(z_t)
+        for block in self.blocks:
+            h = block(h, cond)
+        return self.out_proj(h)
+
+
 @register_model("fm_ot")
 class FlowMatchingOT(BaseGenerativeModel):
     def __init__(self, n_genes: int, coord_dim: int = 3, cond_hidden_dim: int = 256,
@@ -805,7 +866,8 @@ class FlowMatchingOT(BaseGenerativeModel):
                  decoder_lloki_tech_embed_dim: int = 10,
                  decoder_lloki_hidden_dims: list[int] | None = None,
                  full_gene_names: list[str] | None = None,
-                 warmup_steps: int = 0):
+                 warmup_steps: int = 0,
+                 velocity_net_type: str = "mlp", velocity_net_n_layers: int = 3):
         super().__init__()
         self.save_hyperparameters()
         assert path_type in ("ot", "edm"), f"unknown path_type {path_type!r}"
@@ -863,11 +925,21 @@ class FlowMatchingOT(BaseGenerativeModel):
             )
         self.decoder_type = decoder_type
         self.time_embed = _SinusoidalTimeEmbedding(time_embed_dim)
-        self.velocity_net = nn.Sequential(
-            nn.Linear(latent_dim + time_embed_dim + cond_hidden_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, latent_dim),
+        assert velocity_net_type in ("mlp", "adaln_residual"), (
+            f"unknown velocity_net_type {velocity_net_type!r}"
         )
+        if velocity_net_type == "mlp":
+            self.velocity_net = nn.Sequential(
+                nn.Linear(latent_dim + time_embed_dim + cond_hidden_dim, hidden_dim), nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+                nn.Linear(hidden_dim, latent_dim),
+            )
+        else:
+            self.velocity_net = _AdaLNVelocityNet(
+                latent_dim=latent_dim, time_embed_dim=time_embed_dim,
+                cond_hidden_dim=cond_hidden_dim, hidden_dim=hidden_dim,
+                n_layers=velocity_net_n_layers,
+            )
         self.n_genes = n_genes
         self.latent_dim = latent_dim
         self.n_ode_steps = n_ode_steps
