@@ -509,14 +509,25 @@ All three confirmed fixed via a full 14-job `SMOKETEST=1` run of `scripts/run_2g
 
 **Where this leaves "bigger capacity"**: `bigger_qknorm_warmup`'s 3-seed mean (0.1877, 0.5079, 0.5019) = **0.399** — actually *below* the small flagship StormLite's own 8-seed mean (~0.462), despite the collapse being genuinely fixed. Bigger capacity is not currently showing a real win over the small flagship on average, once seed variance is accounted for — the earlier "bigger + QK-norm reaches flagship-level PCC" framing was true for individual lucky seeds (0.50-0.51) but not for the mean. Not a dead end (0.50+ is achievable), but not yet a confirmed upgrade either.
 
-**Full StormLite-vs-STPath scoreboard, best current numbers**:
-- StormLite small (flagship): 8-seed mean ~0.462
-- StormLite bigger+QK-norm+warmup: 3-seed mean ~0.399
-- STPath unfrozen (full retrain, decoder held constant): 2-seed mean ~0.464
-- STPath pretrained (decoder held constant): 4-seed mean ~0.503
+## 2026-07-19 (continued): matched-seed batch — the STPath-unfrozen "tie" doesn't hold up with more data
 
-Honest read: StormLite (small) and STPath (unfrozen) are now statistically indistinguishable (~0.462 vs ~0.464), and STPath pretrained still leads. The flagship priority — StormLite reliably beating STPath — is not yet achieved on a fair, seed-averaged, decoder-controlled comparison. This is a genuine, if less exciting, finding, and worth having rather than continuing to build on the earlier (partly wrong) narrative.
+`scripts/run_parallel_8gpu_matched_seeds.sh` (3 more STPath-unfrozen seeds, 3 more StormLite-small seeds, 2 more StormLite-bigger seeds — all plain, non-stacked configs, all real full-epoch runs on tkdgx1). Note: this batch's own `SMOKETEST=1` sanity-check output was initially mistaken for real results (uniformly near-chance PCC/AUC across all 8 jobs) — that was correctly just the 2-epoch smoke test behaving as expected, not a bug; the real run below is what actually counts.
 
-**AdaLN velocity net, 2 seeds**: mean 0.2895 (0.2086, 0.3704) — below both StormLite baselines so far, and seed10's ST-FID (8.46) is notably elevated versus every other healthy run's ~0.3-1.0 range, suggesting some instability. Two seeds is nowhere near enough to conclude the architecture change doesn't help, but it isn't showing an early win either — not adopting as a default without more seeds.
+**Updated seed-averaged means (n = sample count, range = max-min spread across seeds)**:
+
+| arm | n | mean | range |
+|---|---|---|---|
+| STPath unfrozen (full retrain, decoder held constant) | 5 | **0.4706** | 0.1041 (0.412–0.516) |
+| StormLite small (flagship) | 11 | 0.4546 | 0.2135 (0.333–0.547) |
+| StormLite bigger+QK-norm+warmup | 5 | 0.4388 | 0.3202 (0.188–0.508) |
+| STPath pretrained | 4 | 0.503 | — |
+
+**The earlier "tie" doesn't hold up with a fairer seed count.** With STPath-unfrozen's sample tripled (2→5 seeds) and StormLite-small's grown too (8→11), STPath-unfrozen now clearly leads StormLite-small (0.4706 vs 0.4546) rather than sitting at parity — a modest but real architectural edge even with zero pretraining advantage. STPath pretrained still leads further (0.503).
+
+**A second, distinct finding worth noting**: STPath-unfrozen's seed-to-seed spread (0.104) is roughly HALF of StormLite-small's (0.214) and a THIRD of StormLite-bigger's (0.320) — STPath's architecture isn't just scoring slightly higher on average, it's also considerably more consistent run-to-run. StormLite-bigger in particular remains highly seed-variable (0.188 to 0.508) even with the collapse fixed and 5 seeds behind it.
+
+**Honest read, now on firmer statistical footing than before**: StormLite does not currently beat STPath, with or without pretraining, on a fair decoder-controlled comparison — and STPath is also more reliable seed-to-seed. Bigger StormLite capacity still isn't earning its cost (mean below the small flagship, worst variance of any arm). This corrects and firms up the earlier "statistically indistinguishable" read from the thinner-sample comparison — worth taking as the current honest state of the project rather than continuing to look for the next tweak that closes the gap.
+
+**AdaLN velocity net, 2 seeds**: mean 0.2895 (0.2086, 0.3704) — below every StormLite baseline so far, and seed10's ST-FID (8.46) is notably elevated versus every other healthy run's ~0.3-1.0 range, suggesting some instability. Two seeds is nowhere near enough to conclude the architecture change doesn't help, but it isn't showing an early win either — not adopting as a default without more seeds.
 
 **Prepared, not yet run**: `scripts/run_parallel_3gpu_adaln_velocity_confirm.sh` — 3 seeds of `velocity_net_type="adaln_residual"` on the flagship StormLite config, everything else identical (same decoder, same capacity, same EMA), isolated cleanly against the already-known 8-seed flagship baseline mean (~0.462) rather than stacked with any other untested lever — deliberate, given the "all3" stacking collapse already taught this project not to bundle multiple untested changes. Waiting on GPU 0/6 to free up from the current 14-job batch.
