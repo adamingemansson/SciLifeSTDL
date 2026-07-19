@@ -515,6 +515,25 @@ def _any_config_uses_novae(model_config_paths: list[str], overrides: list[str] |
     return False
 
 
+def _fid_n_components(pca_components: int, context_n: int, context_d: int, query_n: int) -> int:
+    """How many PCA components st_fid/st_mmd's embedding can safely use
+    (2026-07-19 audit fix, see docs/results_log.md). n_components was
+    previously capped by CONTEXT size only (context_n-1, context_d) — but
+    st_fid/st_mmd's covariance is estimated over the QUERY-sized
+    embedding (real_embed/gen_embed in _evaluate both have query_n rows),
+    which is almost always much smaller than context. np.cov on an
+    [query_n, n_components] array is mathematically rank-deficient
+    whenever query_n < n_components (rank <= query_n-1) —
+    frechet_distance's sqrtm fallback keeps that from crashing, but a
+    Fréchet distance from a covariance matrix with many exact-zero
+    eigenvalues is numerically unstable, not just imprecise. Capping by
+    query_n-1 too (same "can't estimate more components than you have
+    degrees of freedom" rule already applied to the context side) fixes
+    it at the source instead of masking the symptom. Floored at 1 (PCA
+    needs at least one component) for a degenerate 0-1-point query set."""
+    return min(pca_components, context_n - 1, context_d, max(1, query_n - 1))
+
+
 def _build_shared_eval(cfg, adata, coords3d, expr, slice_ids, images,
                         k_neighborhood: int, pca_components: int,
                         cnn_patch_size: int | None = None,
@@ -565,9 +584,15 @@ def _build_shared_eval(cfg, adata, coords3d, expr, slice_ids, images,
     # ST-FID (task #14): patch-pooled PCA fit on real context data only
     from sklearn.decomposition import PCA
     context_patches = ev.pool_knn_neighborhood(coords3d[context_mask], expr[context_mask], k=k_neighborhood)
-    n_components = min(pca_components, context_patches.shape[0] - 1, context_patches.shape[1])
+    n_query = int(query_mask.sum())
+    n_components = _fid_n_components(pca_components, context_patches.shape[0], context_patches.shape[1], n_query)
+    if n_components < pca_components:
+        print(f"_build_shared_eval: query set has only {n_query} points -- ST-FID/ST-MMD's "
+              f"PCA embedding capped to {n_components} components (requested {pca_components}) "
+              f"to keep the covariance estimate full-rank. ST-FID/ST-MMD values are not "
+              f"directly comparable across runs with different effective n_components.")
     pca = PCA(n_components=n_components).fit(context_patches)
-    query_k = min(k_neighborhood, int(query_mask.sum()))
+    query_k = min(k_neighborhood, n_query)
     real_patches = ev.pool_knn_neighborhood(coords3d[query_mask], target_expression, k=query_k)
     real_embed = pca.transform(real_patches)
 
