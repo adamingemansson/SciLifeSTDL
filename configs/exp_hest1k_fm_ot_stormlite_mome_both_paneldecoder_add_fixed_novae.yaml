@@ -1,0 +1,85 @@
+# Leak-free Novae training base for the 8-GPU confirmation batch.
+#
+# Historical StormLite "both" runs precomputed Novae on the full intact
+# spatial graph before masking. This config must be launched through
+# src.evaluation.run_comparison_fixed_novae, which cycles through a fixed bank
+# of masks and pairs every mask with Novae embeddings computed on that mask's
+# context-only graph. The ordinary run_comparison entry point does NOT provide
+# leak-free training and must not be used for this config.
+#
+# The companion script precomputes the 64-mask bank across all 8 GPUs first,
+# then launches eight architecture variants against the exact same bank.
+
+experiment_name: fm_ot_hest1k_stormlite_mome_both_paneldecoder_add_fixed_novae
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  hest_cache_dir: data/cache/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  max_context_points: 3000
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    storm_lite_fusion_mode: mome
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    storm_lite_bias_type: frame_averaging
+
+    decoder_type: panel_invariant
+    decoder_gene_embed_dim: 256
+    decoder_combine_mode: add
+    decoder_mlp_depth: 2
+
+    # n_genes, novae_dim, decoder_gene_names and coord_scale are injected from
+    # the actual image-aligned AnnData at runtime.
+    n_genes: 16570
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    path_type: ot
+    fm_time_sampling: uniform
+    fm_coupling: independent
+    ode_solver: euler
+    velocity_net_type: mlp
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+    warmup_steps: 0
+
+training:
+  epochs: 40000
+  seed: 10
+  novae_mask_bank_size: 64
+  novae_mask_bank_seed: 700000
+  ema_decay: 0.999
+  log_every_n_steps: 10
+  log_print_every_n_steps: 1000
+  checkpoint_every_n_steps: 10000
+  checkpoint_dir: results/checkpoints/${experiment_name}
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab
