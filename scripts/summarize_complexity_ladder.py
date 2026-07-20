@@ -52,13 +52,16 @@ def main() -> None:
         writer.writerows(rows)
     print(f"wrote {args.output} ({len(rows)} completed experiments)")
     print("\nTop completed runs by full-image RMSE:")
+    def fmt(value):
+        return "NA" if value is None else f"{value:.4f}"
+
     for row in rows[:10]:
         print(
             f"{row['experiment_name']:<48} "
-            f"PCC={row.get('full_pcc', float('nan')):.4f} "
-            f"RMSE={row.get('full_rmse', float('nan')):.4f} "
-            f"target0={row.get('target_zero_rmse', float('nan')):.4f} "
-            f"all0={row.get('all_zero_rmse', float('nan')):.4f}"
+            f"PCC={fmt(row.get('full_pcc'))} "
+            f"RMSE={fmt(row.get('full_rmse'))} "
+            f"target0={fmt(row.get('target_zero_rmse'))} "
+            f"all0={fmt(row.get('all_zero_rmse'))}"
         )
 
 
