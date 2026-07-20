@@ -23,7 +23,8 @@
 #   STPath pretrained (the actual ceiling): 5-seed mean 0.5060
 #
 # Usage: bash scripts/run_parallel_4gpu_gene_tokenizer_confirm.sh
-# Smoke test: SMOKETEST=1 bash scripts/run_parallel_4gpu_gene_tokenizer_confirm.sh
+# Smoke test (always fresh, never skips on stale logs): SMOKETEST=1 bash scripts/run_parallel_4gpu_gene_tokenizer_confirm.sh
+# Force a full rerun of the real batch too, ignoring any stale/partial logs: FRESH=1 bash scripts/run_parallel_4gpu_gene_tokenizer_confirm.sh
 # Logs: logs/parallel_run_gene_tokenizer_confirm/<name>.log
 #
 # 2026-07-20 OOM fix, first real run on tkdgx1 (40GB cards): job on GPU5
@@ -99,6 +100,7 @@ EXTRA_OVERRIDE=(
     "model.params.gene_encoder_type=tokenizer_novae model.params.storm_lite_qk_norm=true"
 )
 
+FRESH="${FRESH:-0}"
 LOG_DIR="logs/parallel_run_gene_tokenizer_confirm"
 EXTRA_ARGS="--shuffle-diagnostic"
 SMOKE_OVERRIDE=""
@@ -106,6 +108,18 @@ if [ "$SMOKETEST" = "1" ]; then
     LOG_DIR="logs/parallel_run_gene_tokenizer_confirm_smoketest"
     SMOKE_OVERRIDE="training.epochs=${SMOKETEST_EPOCHS} training.checkpoint_every_n_steps=1 training.log_print_every_n_steps=1"
     echo "*** SMOKETEST=1 -- tiny versions of all 8 jobs (epochs=${SMOKETEST_EPOCHS}). Logs: $LOG_DIR ***"
+    # 2026-07-20: smoke tests are seconds-cheap and exist to sanity-check
+    # the CURRENT code -- the "skip if already completed" resumability
+    # check below (meant for expensive real overnight batches surviving a
+    # crash) was silently reusing a stale smoke-test log from a PRIOR code
+    # version and just re-printing its old numbers instead of re-running.
+    # Always wipe smoketest logs so every smoke test reflects the code as
+    # it is right now.
+    rm -rf "$LOG_DIR"
+fi
+if [ "$FRESH" = "1" ]; then
+    echo "*** FRESH=1 -- wiping $LOG_DIR for a guaranteed complete rerun (ignoring any stale/partial logs) ***"
+    rm -rf "$LOG_DIR"
 fi
 mkdir -p "$LOG_DIR"
 
