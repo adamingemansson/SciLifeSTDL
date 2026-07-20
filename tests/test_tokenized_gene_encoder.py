@@ -17,11 +17,15 @@ testing together per direct instruction, not just each alone.
 
 Run with: python -m tests.test_tokenized_gene_encoder
 """
+import tempfile
+import os
+
 import torch
 
 from src.models.conditioning import TokenizedGeneEncoder, _GIGAPATH_FEAT_DIM
 from src.models.storm_lite_encoder import StormLiteContextEncoder
 from src.models.registry import build_model
+from src.training.train import inject_novae_dim
 
 
 def _gene_setup(n_full=20, n_selected=8):
@@ -171,6 +175,48 @@ def test_build_model_end_to_end_with_tokenizer():
     print("[tokenized_gene_encoder] OK — build_model() wires gene_encoder_type='tokenizer' end-to-end")
 
 
+def test_inject_novae_dim_recognizes_tokenizer_novae():
+    """Real bug found 2026-07-19 on a real training run: gene_encoder_type=
+    'tokenizer_novae' crashed with 'requires novae_dim' because
+    inject_novae_dim's own gating check only recognized ('novae', 'both'),
+    not the new combined option -- Novae features were never even computed
+    in the first place, so novae_dim was never auto-derived. Every original
+    test in this file constructed the encoder directly with novae_dim
+    passed manually, so none of them exercised this auto-detection path at
+    all -- a real test-coverage gap, not just a code gap."""
+    params = {"gene_encoder_type": "tokenizer_novae"}
+    model_cfg = {"params": params}
+    inject_novae_dim(model_cfg, novae_dim=64)
+    assert params.get("novae_dim") == 64, (
+        "inject_novae_dim must recognize gene_encoder_type='tokenizer_novae', same as 'novae'/'both'"
+    )
+    print("[tokenized_gene_encoder] OK — inject_novae_dim recognizes gene_encoder_type='tokenizer_novae'")
+
+
+def test_any_config_uses_novae_recognizes_tokenizer_novae():
+    """Same bug class as inject_novae_dim above, but in the shared-eval
+    Novae-detection path (run_comparison.py's _any_config_uses_novae) --
+    if this doesn't recognize 'tokenizer_novae' either, Novae features
+    never get computed for the shared held-out evaluation draw, breaking
+    eval even if training somehow worked."""
+    from src.evaluation.run_comparison import _any_config_uses_novae
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_path = os.path.join(tmp, "test_tokenizer_novae.yaml")
+        with open(cfg_path, "w") as f:
+            f.write(
+                "model:\n"
+                "  name: fm_ot\n"
+                "  params:\n"
+                "    context_encoder_type: storm_lite\n"
+                "    gene_encoder_type: tokenizer_novae\n"
+            )
+        assert _any_config_uses_novae([cfg_path], overrides=None), (
+            "_any_config_uses_novae must recognize gene_encoder_type='tokenizer_novae', same as 'novae'/'both'"
+        )
+    print("[tokenized_gene_encoder] OK — _any_config_uses_novae recognizes gene_encoder_type='tokenizer_novae'")
+
+
 if __name__ == "__main__":
     test_tokenized_gene_encoder_output_shape()
     test_tokenized_gene_encoder_only_uses_selected_gene_columns()
@@ -180,4 +226,6 @@ if __name__ == "__main__":
     test_storm_lite_context_encoder_tokenizer_and_tokenizer_novae()
     test_default_gene_encoder_types_unaffected()
     test_build_model_end_to_end_with_tokenizer()
+    test_inject_novae_dim_recognizes_tokenizer_novae()
+    test_any_config_uses_novae_recognizes_tokenizer_novae()
     print("\nAll TokenizedGeneEncoder tests passed.")

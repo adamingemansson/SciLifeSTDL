@@ -941,7 +941,7 @@ def inject_novae_dim(model_cfg: dict, novae_dim: int) -> None:
     exclusive per model so there's no risk of conflating them. Mutates
     model_cfg["params"] in place; no-op for every other config."""
     params = model_cfg.get("params", {})
-    if params.get("gene_encoder_type") in ("novae", "both") and "novae_dim" not in params:
+    if params.get("gene_encoder_type") in ("novae", "both", "tokenizer_novae") and "novae_dim" not in params:
         params["novae_dim"] = novae_dim
 
 
@@ -1182,7 +1182,7 @@ def load_multi_sample_data(cfg) -> tuple[list[tuple], list]:
               and model_params.get("stpath_new_gene_encoder_type") in ("novae", "both")):
             context_novae_features = get_novae_features(cfg, adata, sample_id=sample_id)
         elif (context_encoder_type == "storm_lite"
-              and model_params.get("gene_encoder_type") in ("novae", "both")):
+              and model_params.get("gene_encoder_type") in ("novae", "both", "tokenizer_novae")):
             context_novae_features = get_novae_features(cfg, adata, sample_id=sample_id)
 
         samples.append((coords3d, expr, slice_ids, images, organ, tech,
@@ -1544,7 +1544,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
         # ADDITIVE context["novae_features"] — STPath's Route-B residual
         context_novae_features = get_novae_features(cfg, adata)
     elif (context_encoder_type == "storm_lite"
-          and model_params.get("gene_encoder_type") in ("novae", "both")):
+          and model_params.get("gene_encoder_type") in ("novae", "both", "tokenizer_novae")):
         # ADDITIVE context["novae_features"] too — StormLiteContextEncoder
         # reuses the gene_encoder_type param name but, like STPath, needs
         # this as a separate channel from raw context["expression"], never

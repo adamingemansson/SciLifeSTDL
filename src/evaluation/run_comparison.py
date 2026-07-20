@@ -148,7 +148,7 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
           and train_model_params.get("stpath_new_gene_encoder_type") in ("novae", "both")):
         context_novae_features = get_novae_features(cfg, adata)
     elif (train_context_encoder_type == "storm_lite"
-          and train_model_params.get("gene_encoder_type") in ("novae", "both")):
+          and train_model_params.get("gene_encoder_type") in ("novae", "both", "tokenizer_novae")):
         context_novae_features = get_novae_features(cfg, adata)
 
     # .get() with the same default every real config's own YAML comment
@@ -365,7 +365,7 @@ def _stpath_novae_features_for_model(model_params: dict, shared_eval: dict):
             and model_params.get("stpath_new_gene_encoder_type") in ("novae", "both")):
         return shared_eval["novae_features"]
     if (model_params.get("context_encoder_type") == "storm_lite"
-            and model_params.get("gene_encoder_type") in ("novae", "both")):
+            and model_params.get("gene_encoder_type") in ("novae", "both", "tokenizer_novae")):
         return shared_eval["novae_features"]
     return None
 
@@ -513,7 +513,7 @@ def _any_config_uses_novae(model_config_paths: list[str], overrides: list[str] |
                 and params.get("stpath_new_gene_encoder_type") in ("novae", "both")):
             return True
         if (params_context_encoder_type == "storm_lite"
-                and params.get("gene_encoder_type") in ("novae", "both")):
+                and params.get("gene_encoder_type") in ("novae", "both", "tokenizer_novae")):
             return True
     return False
 
