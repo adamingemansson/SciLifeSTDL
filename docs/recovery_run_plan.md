@@ -86,7 +86,8 @@ results. Preserve failed logs; do not launch later stages after a failure.
 
 ## Step 4 — Wave 1: FM-OT and STPath controls
 
-Only after Wave 0 prints `RECOVERY GATE: PASS`:
+After the clean FM flagship passes its independent sanity gate (the rejected
+direct harmonic-residual branch does not block FM component ablations):
 
 ```bash
 STAGE=controls bash scripts/run_recovery_suite_8gpu.sh

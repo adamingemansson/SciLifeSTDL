@@ -85,7 +85,10 @@ case "$STAGE" in
 esac
 
 if [[ "$STAGE" == "controls" && "$SMOKETEST" != "1" ]]; then
-  "$PYTHON_BIN" scripts/check_recovery_gate.py
+  # The direct harmonic-residual branch is an independent rejected
+  # diagnostic. Wave 1 tests the historically working FM family and only
+  # depends on the clean FM flagship being finite/noncollapsed.
+  "$PYTHON_BIN" scripts/check_recovery_gate.py --mode flagship
 fi
 
 # All context-only Novae jobs consume the same immutable 64-mask schedule.
@@ -142,6 +145,7 @@ for slot in "${!CONFIGS[@]}"; do
       "training.epochs=20"
       "training.unique_mask_count=20"
       "training.checkpoint_every_n_steps=0"
+      "training.checkpoint_dir=results/checkpoints/recovery_suite/smoke/${RUN_ID}/$name"
       "training.log_print_every_n_steps=1"
       "validation.every_n_steps=10"
       "validation.early_stopping_min_steps=20"

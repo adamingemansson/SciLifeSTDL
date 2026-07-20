@@ -172,7 +172,11 @@ def evaluate_model_on_mask_bank(
             with torch.inference_mode():
                 samples = predictive_samples(
                     model, item_device["context"], item_device["query"], n_samples,
-                    seed=sampling_seed + mode_index * 100_000 + i,
+                    # Common random numbers across image modes: changing
+                    # full/zero/shuffled H&E must not also change the FM
+                    # noise draws, otherwise apparent image sensitivity is
+                    # confounded by Monte-Carlo variation.
+                    seed=sampling_seed + i,
                 )
             target_t = _target_for_model(model, item_device["target_expression"])
             pred_t = samples.mean(dim=0)
