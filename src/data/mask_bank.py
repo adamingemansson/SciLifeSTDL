@@ -234,7 +234,8 @@ def ensure_mask_bank(
 
 
 def build_training_seed_bank(
-    obs_names: Iterable[str], n_items: int, base_seed: int, masking_cfg=None
+    obs_names: Iterable[str], n_items: int, base_seed: int, masking_cfg=None,
+    unique_mask_count: int | None = None,
 ) -> dict:
     """Persist the exact training-mask seed schedule for one observation set.
 
@@ -248,19 +249,27 @@ def build_training_seed_bank(
     base_seed = int(base_seed)
     if n_items < 1:
         raise ValueError("training seed bank requires at least one item")
+    unique_mask_count = n_items if unique_mask_count is None else int(unique_mask_count)
+    if unique_mask_count < 1 or unique_mask_count > n_items:
+        raise ValueError(
+            f"unique_mask_count must be in [1, n_items], got {unique_mask_count} for n_items={n_items}"
+        )
+    unique_seeds = list(range(base_seed, base_seed + unique_mask_count))
+    seeds = [unique_seeds[i % unique_mask_count] for i in range(n_items)]
     names = [str(x) for x in obs_names]
     return {
-        "version": 1,
+        "version": 2,
         "kind": "training_seed_schedule",
         "dataset_fingerprint": dataset_fingerprint(names),
         "n_obs": len(names),
         "n_items": n_items,
         "base_seed": base_seed,
+        "unique_mask_count": unique_mask_count,
         "masking_fingerprint": (
             sha256(json.dumps(_jsonable(masking_cfg), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
             if masking_cfg is not None else None
         ),
-        "seeds": list(range(base_seed, base_seed + n_items)),
+        "seeds": seeds,
     }
 
 
@@ -270,13 +279,20 @@ def ensure_training_seed_bank(
     n_items: int,
     base_seed: int,
     masking_cfg=None,
+    unique_mask_count: int | None = None,
 ) -> tuple[dict, Path]:
     """Load or atomically create an immutable training seed schedule."""
     path = Path(path)
-    expected = build_training_seed_bank(obs_names, n_items, base_seed, masking_cfg)
+    expected = build_training_seed_bank(
+        obs_names, n_items, base_seed, masking_cfg,
+        unique_mask_count=unique_mask_count,
+    )
     if path.exists():
         bank = json.loads(path.read_text())
         keys = ["kind", "dataset_fingerprint", "n_obs", "n_items", "base_seed"]
+        legacy_unique_count = bank.get("unique_mask_count") is None
+        if not legacy_unique_count or expected["unique_mask_count"] != expected["n_items"]:
+            keys.append("unique_mask_count")
         # Version-1 training banks contained the same lossless seed list but
         # no masking fingerprint. They can be upgraded safely after validating
         # all original fields and the exact schedule; explicit but different
@@ -293,7 +309,7 @@ def ensure_training_seed_bank(
         seeds = [int(x) for x in bank.get("seeds", [])]
         if seeds != expected["seeds"]:
             raise ValueError(f"training seed bank {path} contains an altered seed schedule")
-        if legacy_without_masking:
+        if legacy_without_masking or legacy_unique_count:
             save_mask_bank(expected, path)
             return expected, path
         bank["seeds"] = seeds

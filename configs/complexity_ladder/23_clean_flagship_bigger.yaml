@@ -1,0 +1,94 @@
+experiment_name: screen_clean_flagship_bigger
+data:
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+  expression_transform: normalize_log1p
+  expression_target_sum: 10000.0
+  novae_mode: context_only
+  require_image_coverage: true
+  use_images: true
+masking:
+  strategy: random_dropout_patches
+  max_context_points: 768
+  params:
+    n_patches: 3
+    radius_range:
+    - 250
+    - 450
+model:
+  name: fm_ot
+  params:
+    coord_dim: 3
+    cond_hidden_dim: 512
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 0.0003
+    fm_time_sampling: logit_normal
+    fm_coupling: minibatch_ot
+    ode_solver: heun
+    velocity_net_type: adaln_residual
+    velocity_net_n_layers: 3
+    decoder_type: gene_conditioned_vocabulary
+    warmup_steps: 1000
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    storm_lite_fusion_mode: mome
+    storm_lite_n_layers: 4
+    storm_lite_n_heads: 8
+    storm_lite_qk_norm: true
+    storm_lite_bias_type: frame_averaging
+    decoder_gene_embed_dim: 256
+    decoder_combine_mode: add
+    decoder_mlp_depth: 2
+training:
+  epochs: 10000
+  seed: 0
+  log_every_n_steps: 10
+  log_print_every_n_steps: 250
+  checkpoint_every_n_steps: 2500
+  num_workers: 0
+  augment_coords: true
+  image_mode: full
+  query_image_dropout_p: 0.0
+  all_image_dropout_p: 0.0
+  gradient_clip_val: 1.0
+  checkpoint_dir: results/checkpoints/complexity_ladder/screen_clean_flagship_bigger
+  unique_mask_count: 256
+  ema_decay: 0.999
+validation:
+  enabled: true
+  every_n_steps: 500
+  patience_checks: 8
+  min_delta: 0.0001
+  metric: rmse
+  n_samples: 4
+  sampling_seed: 800000
+evaluation:
+  mask_bank_path: results/mask_banks/INT1_image_coverage.json
+  n_validation_masks: 4
+  n_test_masks: 8
+  validation_seed: 700000
+  test_seed: 900000
+  sampling_seed: 1200000
+  n_samples: 8
+  image_modes:
+  - full
+  - target_zero
+  - all_zero
+  - shuffled
+  validation_image_mode: full
+  k_neighborhood: 8
+  pca_n_components: 50
+  training_mask_bank_path: results/mask_banks/training/complexity_ladder/clean_novae_screen_10k_u256.json
+logging:
+  backend: csv
+  project: st3d-lundeberg-lab

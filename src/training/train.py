@@ -1172,6 +1172,7 @@ def _training_seed_bank_for_config(cfg, obs_names) -> tuple[dict, Path]:
         n_items=int(cfg.training.epochs),
         base_seed=int(cfg.training.seed),
         masking_cfg=cfg.masking,
+        unique_mask_count=int(cfg.training.get("unique_mask_count", cfg.training.epochs)),
     )
 
 

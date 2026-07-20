@@ -309,8 +309,10 @@ def _evaluate(model, x: torch.Tensor, batch_size: int, device: torch.device):
     return float(np.sqrt(sq_error / max(1, count))), float(pcc)
 
 
-def main(config_path: str):
+def main(config_path: str, overrides: list[str] | None = None):
     cfg = OmegaConf.load(config_path)
+    if overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
     torch.manual_seed(int(cfg.training.get("seed", 0)))
     train_np, val_np, gene_names, target_metadata = _load_arrays(cfg)
     print(
@@ -442,5 +444,9 @@ def main(config_path: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
+    parser.add_argument(
+        "--override", nargs="*", default=[],
+        help="dotlist config overrides, e.g. --override training.steps=300",
+    )
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, args.override)

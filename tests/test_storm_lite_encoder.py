@@ -409,3 +409,64 @@ if __name__ == "__main__":
     test_storm_lite_fusion_mode_gnn_end_to_end()
     test_storm_lite_fusion_mode_gnn_differs_from_sum_and_mome()
     print("\nStormLiteContextEncoder smoke test done.")
+
+
+def test_storm_lite_concat_fusion_is_wired_and_trainable():
+    torch.manual_seed(3)
+    n_context, n_query, n_genes, hidden_dim = 7, 3, 12, 16
+    context_coords = torch.rand(n_context, 3) * 100
+    query_coords = torch.rand(n_query, 3) * 100
+    context_images = torch.rand(n_context, _GIGAPATH_FEAT_DIM)
+    query_images = torch.rand(n_query, _GIGAPATH_FEAT_DIM)
+    context_expression = torch.rand(n_context, n_genes)
+
+    encoder = StormLiteContextEncoder(
+        n_genes=n_genes,
+        hidden_dim=hidden_dim,
+        gene_encoder_type="mlp",
+        fusion_mode="concat",
+        bias_type="none",
+        n_transformer_layers=1,
+        n_heads=4,
+    )
+    out = encoder(
+        context_coords, context_expression, query_coords,
+        context_images, query_images,
+    )
+    assert out.shape == (n_query, hidden_dim)
+    assert torch.isfinite(out).all()
+    out.sum().backward()
+    assert encoder.concat_proj.weight.grad is not None
+    assert torch.isfinite(encoder.concat_proj.weight.grad).all()
+
+
+def test_storm_lite_sum_concat_and_mome_are_distinct():
+    torch.manual_seed(4)
+    n_context, n_query, n_genes, hidden_dim = 7, 3, 12, 16
+    context_coords = torch.rand(n_context, 3) * 100
+    query_coords = torch.rand(n_query, 3) * 100
+    context_images = torch.rand(n_context, _GIGAPATH_FEAT_DIM)
+    query_images = torch.rand(n_query, _GIGAPATH_FEAT_DIM)
+    context_expression = torch.rand(n_context, n_genes)
+
+    outputs = {}
+    for mode in ("sum", "concat", "mome"):
+        torch.manual_seed(11)
+        encoder = StormLiteContextEncoder(
+            n_genes=n_genes,
+            hidden_dim=hidden_dim,
+            gene_encoder_type="mlp",
+            fusion_mode=mode,
+            bias_type="none",
+            n_transformer_layers=1,
+            n_heads=4,
+        )
+        encoder.eval()
+        with torch.no_grad():
+            outputs[mode] = encoder(
+                context_coords, context_expression, query_coords,
+                context_images, query_images,
+            )
+    assert not torch.allclose(outputs["sum"], outputs["concat"])
+    assert not torch.allclose(outputs["sum"], outputs["mome"])
+    assert not torch.allclose(outputs["concat"], outputs["mome"])

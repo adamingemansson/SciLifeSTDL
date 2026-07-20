@@ -76,3 +76,24 @@ def test_mask_bank_rejects_stale_masking_or_coordinates(tmp_path: Path):
     with pytest.raises(ValueError, match="different coordinates"):
         ensure_mask_bank(path, shifted, slices, names, cfg,
                          {"validation": 1, "test": 1}, {"validation": 10, "test": 20})
+
+
+def test_training_seed_bank_can_cycle_a_fixed_unique_mask_set(tmp_path: Path):
+    from src.data.mask_bank import ensure_training_seed_bank
+
+    names = ["a", "b", "c"]
+    path = tmp_path / "cycled-training.json"
+    bank, _ = ensure_training_seed_bank(
+        path, names, n_items=10, base_seed=50, unique_mask_count=3,
+    )
+    assert bank["unique_mask_count"] == 3
+    assert bank["seeds"] == [50, 51, 52, 50, 51, 52, 50, 51, 52, 50]
+
+    loaded, _ = ensure_training_seed_bank(
+        path, names, n_items=10, base_seed=50, unique_mask_count=3,
+    )
+    assert loaded == bank
+    with pytest.raises(ValueError, match="unique_mask_count"):
+        ensure_training_seed_bank(
+            path, names, n_items=10, base_seed=50, unique_mask_count=4,
+        )

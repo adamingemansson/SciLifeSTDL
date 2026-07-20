@@ -241,7 +241,7 @@ def _build_decoder(
             nn.Linear(in_dim, dense_hidden_dim), nn.ReLU(),
             nn.Linear(dense_hidden_dim, n_genes),
         )
-    elif decoder_type == "panel_invariant":
+    elif decoder_type in ("panel_invariant", "gene_conditioned_vocabulary"):
         assert decoder_gene_names, (
             "decoder_type='panel_invariant' requires decoder_gene_names"
         )

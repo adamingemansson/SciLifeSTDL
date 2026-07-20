@@ -104,3 +104,11 @@ residual flow matching, matched seeds and held-out-slide experiments.
 See `docs/literature_review.md` and `docs/dataset_notes.md` for a first pass
 already filled in from initial literature scoping (July 2026) — treat it as a
 starting point, not the final word.
+
+## Post-audit complexity ladder
+
+After the fixed-Novae historical batch, use the staged model-selection plan in
+[`docs/complexity_ladder_plan.md`](docs/complexity_ladder_plan.md). It adds a
+simple StormLite concat fusion baseline, finite reusable training-mask schedules
+for clean context-only Novae, staged four-GPU launch commands and winner
+promotion to matched 40k three-seed confirmation configs.

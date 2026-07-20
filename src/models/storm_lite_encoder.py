@@ -381,7 +381,7 @@ class StormLiteContextEncoder(nn.Module):
         assert bias_type in ("none", "relative_position", "frame_averaging"), (
             f"unknown bias_type {bias_type!r}"
         )
-        assert fusion_mode in ("sum", "mome", "gnn"), f"unknown fusion_mode {fusion_mode!r}"
+        assert fusion_mode in ("sum", "concat", "mome", "gnn"), f"unknown fusion_mode {fusion_mode!r}"
         self.gnn_k = gnn_k
         assert knn_k is None or knn_k >= 1, f"knn_k must be >= 1 or None, got {knn_k!r}"
         self.knn_k = knn_k
@@ -555,7 +555,15 @@ class StormLiteContextEncoder(nn.Module):
             self.gnn_blocks = nn.ModuleList([
                 _GNNBlock(hidden_dim) for _ in range(n_transformer_layers)
             ])
-        else:  # "sum" — original design, unchanged
+        else:  # "sum" or the simple matched "concat" baseline
+            if fusion_mode == "concat":
+                # Keep this ablation deliberately simple: concatenate the
+                # independently normalized image/gene/coordinate branches,
+                # then use one learned linear projection before the exact same
+                # transformer used by the additive baseline. This isolates the
+                # information-preserving effect of concat from MoME's doubled
+                # token sequence and expert FFNs.
+                self.concat_proj = nn.Linear(3 * hidden_dim, hidden_dim)
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=hidden_dim, nhead=n_heads, batch_first=True
             )
@@ -664,8 +672,11 @@ class StormLiteContextEncoder(nn.Module):
         gene_embed_raw[n_context:] = self.mask_token  # broadcasts over n_query rows
         gene_embed = self.gene_norm(gene_embed_raw)
 
-        if self.fusion_mode == "sum":
-            tokens = img_embed + gene_embed + coord_embed  # [N_total, hidden_dim]
+        if self.fusion_mode in {"sum", "concat"}:
+            if self.fusion_mode == "sum":
+                tokens = img_embed + gene_embed + coord_embed
+            else:
+                tokens = self.concat_proj(torch.cat([img_embed, gene_embed, coord_embed], dim=-1))
             if self.organ_tech_embed is not None and organ is not None and tech is not None:
                 tokens = tokens + self.organ_tech_embed(organ, tech, n_total, device)
             # additive attention bias (see bias_type in __init__) — a
