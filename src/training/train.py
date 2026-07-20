@@ -13,6 +13,7 @@ Run with: python -m src.training.train --config configs/base_config.yaml
 """
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -950,6 +951,84 @@ def get_novae_features(cfg, adata, sample_id: str | None = None) -> np.ndarray:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_savez(cache_path, features=features, obs_names=obs_names)
     return features
+
+
+def _novae_context_only_cache_path(cfg, context_obs_names: np.ndarray,
+                                    sample_id: str | None = None) -> Path:
+    """Cache path for get_novae_features_context_only below. Keyed by a
+    hash of the EXACT context spot set, not just sample_id -- unlike
+    get_novae_features's per-sample-only cache, a different masking draw
+    changes which spots are even in the graph, so it must invalidate this
+    cache (two different masks over the same sample must never share an
+    entry)."""
+    sid = sample_id if sample_id is not None else cfg.data.sample_id
+    key_hash = hashlib.sha256("|".join(sorted(context_obs_names)).encode()).hexdigest()[:16]
+    return _cache_root(cfg) / "novae_context_only_cache" / f"{sid}_{key_hash}.npz"
+
+
+def get_novae_features_context_only(cfg, adata, context_mask: np.ndarray,
+                                     sample_id: str | None = None) -> np.ndarray:
+    """LEAK-FREE Novae features for one specific masking draw's context
+    set (2026-07-20 fix for a real leakage bug -- see docs/results_log.md's
+    2026-07-20 entry, "CRITICAL -- Novae features leak masked query
+    information"). get_novae_features (above) computes Novae over the
+    FULL intact sample BEFORE any masking exists -- since Novae's
+    representations are graph-propagated (novae.spatial_neighbors), a
+    context spot's embedding can carry graph-diffused information from
+    its masked/query neighbors' real expression, leaking exactly what the
+    task is supposed to hide.
+
+    This function instead builds an AnnData containing ONLY the context
+    spots (adata[context_mask].copy()) and runs Novae's spatial_neighbors
+    + compute_representations on THAT context-only graph -- query spots
+    never exist in the graph at all, so no leakage is structurally
+    possible.
+
+    Returns a FULL-LENGTH [n_total, novae_dim] array to match every
+    current consumer's "full array, sliced by context_mask at use time"
+    contract (see _gene_features_for_model/_stpath_novae_features_for_model
+    in run_comparison.py): context-only-computed values at the
+    context_mask positions, ZEROS elsewhere. Non-context rows are never
+    read by any current caller (every consumer indexes with
+    [context_mask], never [query_mask] or unmasked) -- if that ever
+    changes, this must be revisited.
+
+    Real cost: unlike get_novae_features's ONE-TIME per-sample
+    precomputation, this runs a fresh Novae forward pass PER masking draw
+    (a different context set = a different graph = genuinely different
+    representations, not just a subset of the old ones) -- deliberately
+    scoped to the single FIXED evaluation draw (EVAL_SEED) for now, not
+    every random training-time draw, which would be prohibitively
+    expensive without a fixed mask-bank (see the results_log.md entry's
+    "Status" note for the full training-time fix, not yet implemented)."""
+    context_obs_names = adata.obs_names.to_numpy()[context_mask]
+    cache_path = _novae_context_only_cache_path(cfg, context_obs_names, sample_id=sample_id)
+    context_features = None
+    if cache_path.exists():
+        cached = np.load(cache_path, allow_pickle=True)
+        if np.array_equal(cached["context_obs_names"], context_obs_names):
+            print(f"get_novae_features_context_only: loaded cached LEAK-FREE features for "
+                  f"{cached['context_features'].shape[0]} context spots from {cache_path} "
+                  f"(delete this file to force a recompute).")
+            context_features = cached["context_features"]
+        else:
+            print(f"get_novae_features_context_only: cache at {cache_path} covers a "
+                  f"different context set (hash collision or stale entry) -- recomputing.")
+    if context_features is None:
+        from src.models.conditioning import precompute_novae_features
+        print(f"Precomputing LEAK-FREE (context-only) Novae features for "
+              f"{int(context_mask.sum())} context spots (one-time cost for this masking "
+              f"draw, cached to {cache_path})...")
+        context_only_adata = adata[context_mask].copy()
+        context_features = precompute_novae_features(context_only_adata)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_savez(cache_path, context_obs_names=context_obs_names, context_features=context_features)
+
+    n_total = adata.n_obs
+    novae_dim = context_features.shape[1]
+    full = np.zeros((n_total, novae_dim), dtype=context_features.dtype)
+    full[context_mask] = context_features
+    return full
 
 
 def inject_novae_dim(model_cfg: dict, novae_dim: int) -> None:

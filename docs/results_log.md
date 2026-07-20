@@ -551,3 +551,24 @@ All three confirmed fixed via a full 14-job `SMOKETEST=1` run of `scripts/run_2g
 **STPath pretrained, now 5 seeds**: mean 0.5060, range only 0.035 — the tightest, most reliable arm in the whole project. This is the real target StormLite needs to match: not just beat the mean, but do so with comparable consistency.
 
 **Next step**: more `bigger_qknorm_warmup` seeds specifically, to determine whether the tight ~0.50 cluster is real or seed11 was simply an unlucky draw within genuine wider variance. This is now the single most information-dense thing to run — it directly tests whether the flagship priority (StormLite beating STPath) is achievable with the current architecture.
+
+## 2026-07-20: CRITICAL — Novae features leak masked query information into every Novae-involving config's context
+
+**Independent audit** (external review pass, verified against the real code before accepting — this project's own established practice, same as every prior "corrected" narrative above) surfaced a real, structural leakage bug: **Novae's precomputed embeddings are graph-propagated over the WHOLE sample, computed BEFORE any masking draw exists.**
+
+**Verified directly in code** (2026-07-20):
+- `precompute_novae_features` (`src/models/conditioning.py:591-638`) calls `novae.spatial_neighbors(adata)` and `model.compute_representations(adata, zero_shot=True)` on the full, intact AnnData — no masking has happened yet.
+- `get_novae_features` (`src/training/train.py:923+`) computes and caches this ONCE per sample, before any masking draw.
+- `_build_masked_item` (`src/training/train.py`) only *indexes* `context_novae_features[context_mask]` from that precomputed array afterward — the embeddings themselves were already computed with the full spatial graph (including what later becomes the masked/query region) intact.
+
+**Consequence**: because Novae's representations are graph-propagated (not per-spot-independent), a context spot adjacent to a masked hole legitimately carries graph-diffused information from its masked neighbors' real expression, before that expression is ever supposed to be "hidden." This affects every config using:
+- `gene_encoder_type` in `("novae", "both", "tokenizer_novae")` — StormLite's context encoder
+- `stpath_new_gene_encoder_type` in `("novae", "both")` — STPath's Route-B residual
+
+That includes several of the strongest results logged above: STPath pretrained hybrid (~0.506), and every StormLite/STPath arm using `gene_encoder_type="both"` (the flagship default for most of this project's batches, including the "small flagship" 0.4546 mean, the "bigger+QK-norm+warmup" 0.5031 cluster, and the gene-tokenizer batch's `tokenizer_novae` arm).
+
+**What this does NOT mean**: it does not mean these models are learning nothing real, or that the reported PCCs are meaningless — `gene_encoder_type="mlp"`-only and plain STPath/interpolation-baseline arms are unaffected and remain clean. It means every Novae-involving number above **cannot currently be interpreted as clean missing-region reconstruction** — the experiment cannot distinguish learned reconstruction from indirect graph-propagated access to hidden expression.
+
+**Status: documented, not yet fixed.** Correct fix (not yet implemented): recompute Novae on a context-only AnnData/graph per masking draw (expensive per-draw; a cached fixed mask-bank is the practical compromise), or drop Novae from same-slide masking experiments entirely until a leak-free precomputation path exists. Until fixed, treat every `novae`/`both`/`tokenizer_novae` result in this log as **potentially contaminated by graph-level target leakage — not suitable for final comparison.** The leak-free reference points going forward are the `mlp`-only, image-only, plain-STPath, and non-Novae interpolation arms.
+
+**Related scoping note, same audit pass**: the masking pipeline hides query gene expression but **never** hides the query location's real H&E image — confirmed via `_build_masked_item`'s `query["images"] = _images_tensor(images, query_mask)` (`src/training/train.py`), which indexes the real, unmasked image at query positions. This is a deliberate, documented design choice, not a bug, but it means every result in this log answers "predict hidden expression where tissue morphology is still visible," not the (also useful, currently untested) "predict expression where imaging is also unavailable." Worth testing under `target_zero`/`all_zero`/shuffled-image conditions before claiming the models are robust to physically missing tissue, not just missing assay measurements.

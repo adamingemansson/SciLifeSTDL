@@ -63,7 +63,8 @@ from src.training.train import (
     load_adata, make_context_query_split, MaskedContextQueryDataset,
     _load_images, _images_tensor, inject_stpath_gene_names,
     get_gigapath_features, save_trained_model, make_dataloader,
-    _downsample_patches, get_novae_features, inject_novae_dim, inject_stpath_novae_dim,
+    _downsample_patches, get_novae_features, get_novae_features_context_only,
+    inject_novae_dim, inject_stpath_novae_dim,
     inject_coord_scale, inject_decoder_gene_names, inject_single_sample_n_genes,
     inject_storm_lite_tokenizer_gene_names, _cap_context_mask,
     PeriodicCheckpointCallback, PeriodicPrintCallback, EMACallback, load_pretrained_weights_into,
@@ -560,7 +561,22 @@ def _build_shared_eval(cfg, adata, coords3d, expr, slice_ids, images,
     context_mask = _cap_context_mask(context_mask, getattr(cfg.masking, "max_context_points", None), EVAL_SEED)
     target_expression = expr[query_mask]
 
-    novae_features = get_novae_features(cfg, adata) if compute_novae else None
+    # 2026-07-20 LEAKAGE FIX (see docs/results_log.md's 2026-07-20 entry,
+    # "CRITICAL -- Novae features leak masked query information"):
+    # get_novae_features computes Novae over the FULL intact sample BEFORE
+    # this function's own context_mask/query_mask split exists -- since
+    # Novae's representations are graph-propagated, a context spot's
+    # embedding could carry graph-diffused information from its
+    # masked/query neighbors' real expression. get_novae_features_context_only
+    # instead runs Novae's own graph construction on a context-ONLY
+    # AnnData, so query spots never exist in the graph at all. This is
+    # the shared, FIXED evaluation draw (EVAL_SEED) every headline number
+    # in results_log.md is actually computed from -- fixing it here fixes
+    # every model's reported metric in one place. Training-time Novae
+    # (get_novae_features, used inside the random per-step masking draws)
+    # is NOT fixed by this change -- see the results_log.md entry's
+    # "Status" note; that's real, bigger follow-up work.
+    novae_features = get_novae_features_context_only(cfg, adata, context_mask) if compute_novae else None
 
     raw_images, gigapath_images = None, None
     if images is not None:
