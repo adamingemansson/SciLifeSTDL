@@ -89,6 +89,41 @@ from src.models.conditioning import (
 )
 
 
+def _knn_additive_mask(coords: torch.Tensor, k: int) -> torch.Tensor:
+    """Additive attention-bias mask (2026-07-20) restricting attention to
+    each token's k nearest spatial neighbors (by real coordinate distance,
+    always including itself) — ports STFlow's real design choice (Huang
+    et al. 2025, "Scalable Generation of Spatial Transcriptomics from
+    Histology Images via Whole-Slide Flow Matching", arXiv 2506.05361,
+    Section 3.3 "Local Spatial Context" — verified via direct PDF read,
+    2026-07-20 literature pass): restricting attention to spatial
+    neighbors is a real, published design choice for exactly this kind of
+    spot-to-spot spatial transformer, not this project's own guess.
+
+    HONEST SCOPE NOTE: STFlow's own implementation only COMPUTES attention
+    over the k neighbors (genuinely O(Nk), their real motivation — see
+    their Figure 5 memory comparison). This function instead masks a
+    DENSE full N x N attention (0 additive bias on kept edges, -inf on
+    dropped edges) computed exactly as before — a real inductive-bias
+    change (forces softmax to assign zero weight to spatially distant
+    tokens) worth testing on its own merits, but it does NOT reduce
+    memory/compute the way STFlow's sparse implementation does. Memory is
+    handled separately by masking.max_context_points (src/training/
+    train.py, added the same day for a real OOM this was originally
+    scoped alongside) — that's still the mechanism to lower if memory is
+    the concern; this is purely an architecture/inductive-bias lever.
+
+    k clipped to min(k, N) so a value larger than the actual token count
+    never errors — degrades gracefully to full attention (no masking)."""
+    N = coords.shape[0]
+    k = min(k, N)
+    dist = torch.cdist(coords, coords)  # [N, N]
+    _, nn_idx = torch.topk(dist, k, dim=-1, largest=False)  # [N, k], nearest incl. self (dist=0)
+    mask = torch.full((N, N), float("-inf"), device=coords.device, dtype=coords.dtype)
+    mask.scatter_(1, nn_idx, 0.0)
+    return mask
+
+
 class _QKNormAttention(nn.Module):
     """Multi-head self-attention with QK-normalization (Henry et al. 2020,
     EMNLP, "Query-Key Normalization for Transformers"; the LayerNorm-over-
@@ -238,6 +273,7 @@ class StormLiteContextEncoder(nn.Module):
                  tokenizer_n_pool_layers: int = 1, tokenizer_n_pool_heads: int = 4,
                  bias_type: str = "frame_averaging", relative_bias_hidden_dim: int = 32,
                  fusion_mode: str = "sum", qk_norm: bool = False,
+                 knn_k: int | None = None,
                  input_already_log1p: bool = False,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
@@ -248,6 +284,8 @@ class StormLiteContextEncoder(nn.Module):
             f"unknown bias_type {bias_type!r}"
         )
         assert fusion_mode in ("sum", "mome"), f"unknown fusion_mode {fusion_mode!r}"
+        assert knn_k is None or knn_k >= 1, f"knn_k must be >= 1 or None, got {knn_k!r}"
+        self.knn_k = knn_k
         self.fusion_mode = fusion_mode
         self.gene_encoder_type = gene_encoder_type
         # input_already_log1p (2026-07-19, real audit finding — see
@@ -515,6 +553,9 @@ class StormLiteContextEncoder(nn.Module):
             # (bias_type="none") preserves plain self-attention with no
             # relative-position term.
             bias = self.pos_bias(coords) if self.pos_bias is not None else None
+            if self.knn_k is not None:
+                knn_mask = _knn_additive_mask(coords, self.knn_k)
+                bias = knn_mask if bias is None else bias + knn_mask
             fused = self.transformer(tokens.unsqueeze(0), mask=bias).squeeze(0)  # self-attention over ALL spots
             return fused[n_context:]  # query positions only
         else:  # "mome" — see _MoMETransformerBlock's own docstring
@@ -543,6 +584,10 @@ class StormLiteContextEncoder(nn.Module):
                 # attention pass over both modalities' tokens.
                 coords_doubled = torch.cat([coords, coords], dim=0)
                 bias = self.pos_bias(coords_doubled)
+            if self.knn_k is not None:
+                coords_doubled_knn = coords_doubled if self.pos_bias is not None else torch.cat([coords, coords], dim=0)
+                knn_mask = _knn_additive_mask(coords_doubled_knn, self.knn_k)
+                bias = knn_mask if bias is None else bias + knn_mask
             for block in self.mome_blocks:
                 tokens = block(tokens, is_image_token, attn_mask=bias)
             tokens = tokens.squeeze(0)  # [2*N_total, hidden_dim]

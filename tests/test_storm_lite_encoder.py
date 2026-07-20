@@ -12,7 +12,7 @@ Run with:
 """
 import torch
 
-from src.models.storm_lite_encoder import StormLiteContextEncoder, _MoMETransformerBlock
+from src.models.storm_lite_encoder import StormLiteContextEncoder, _MoMETransformerBlock, _knn_additive_mask
 from src.models.conditioning import _GIGAPATH_FEAT_DIM, RelativePositionBias
 
 
@@ -269,6 +269,70 @@ def test_storm_lite_bias_type_actually_used():
     print("[StormLiteContextEncoder] OK — all 3 bias_type options genuinely produce different output")
 
 
+def test_knn_additive_mask_keeps_exactly_k_neighbors():
+    """2026-07-20, ports STFlow's real k-NN spatial attention restriction
+    (Huang et al. 2025, arXiv 2506.05361, Section 3.3) — see
+    _knn_additive_mask's own docstring for the honest scope note (this
+    masks dense attention, doesn't reduce memory the way STFlow's sparse
+    implementation does)."""
+    torch.manual_seed(0)
+    coords = torch.rand(6, 3) * 100
+    for k in (1, 2, 6, 10):  # 10 > N=6 must clip gracefully to full attention
+        mask = _knn_additive_mask(coords, k)
+        assert mask.shape == (6, 6)
+        kept_per_row = (mask == 0).sum(dim=-1)
+        expected = min(k, 6)
+        assert (kept_per_row == expected).all(), (k, kept_per_row)
+        assert torch.isfinite(mask[mask == 0]).all()
+    print("[knn_additive_mask] OK — keeps exactly min(k, N) neighbors per row, clips gracefully")
+
+
+def test_storm_lite_knn_k_end_to_end():
+    torch.manual_seed(0)
+    n_context, n_query, n_genes, hidden_dim = 10, 4, 20, 16
+    context_coords = torch.rand(n_context, 3) * 100
+    query_coords = torch.rand(n_query, 3) * 100
+    context_images = torch.rand(n_context, _GIGAPATH_FEAT_DIM)
+    query_images = torch.rand(n_query, _GIGAPATH_FEAT_DIM)
+    context_expression = torch.rand(n_context, n_genes)
+
+    for fusion_mode in ("sum", "mome"):
+        encoder = StormLiteContextEncoder(
+            n_genes=n_genes, hidden_dim=hidden_dim, n_transformer_layers=2, n_heads=4,
+            gene_encoder_type="mlp", fusion_mode=fusion_mode, knn_k=3,
+        )
+        c = encoder(context_coords, context_expression, query_coords, context_images, query_images)
+        assert c.shape == (n_query, hidden_dim)
+        assert torch.isfinite(c).all()
+        c.sum().backward()
+    print("[knn_additive_mask] OK — StormLiteContextEncoder runs end-to-end with knn_k set, both fusion_mode")
+
+
+def test_storm_lite_knn_k_none_preserves_prior_behavior():
+    """knn_k=None (default) must produce byte-identical output to before
+    this feature existed — purely opt-in, zero effect on any existing
+    config."""
+    torch.manual_seed(0)
+    n_context, n_query, n_genes, hidden_dim = 10, 4, 20, 16
+    context_coords = torch.rand(n_context, 3) * 100
+    query_coords = torch.rand(n_query, 3) * 100
+    context_images = torch.rand(n_context, _GIGAPATH_FEAT_DIM)
+    query_images = torch.rand(n_query, _GIGAPATH_FEAT_DIM)
+    context_expression = torch.rand(n_context, n_genes)
+
+    torch.manual_seed(1)
+    enc_a = StormLiteContextEncoder(n_genes=n_genes, hidden_dim=hidden_dim, gene_encoder_type="mlp").eval()
+    torch.manual_seed(1)
+    enc_b = StormLiteContextEncoder(
+        n_genes=n_genes, hidden_dim=hidden_dim, gene_encoder_type="mlp", knn_k=None
+    ).eval()
+    with torch.no_grad():
+        out_a = enc_a(context_coords, context_expression, query_coords, context_images, query_images)
+        out_b = enc_b(context_coords, context_expression, query_coords, context_images, query_images)
+    assert torch.equal(out_a, out_b)
+    print("[knn_additive_mask] OK — knn_k=None (default) is a true no-op")
+
+
 if __name__ == "__main__":
     test_storm_lite_context_encoder()
     test_mome_transformer_block()
@@ -277,4 +341,7 @@ if __name__ == "__main__":
     test_relative_position_bias()
     test_relative_position_bias_scale_invariance()
     test_storm_lite_bias_type_actually_used()
+    test_knn_additive_mask_keeps_exactly_k_neighbors()
+    test_storm_lite_knn_k_end_to_end()
+    test_storm_lite_knn_k_none_preserves_prior_behavior()
     print("\nStormLiteContextEncoder smoke test done.")

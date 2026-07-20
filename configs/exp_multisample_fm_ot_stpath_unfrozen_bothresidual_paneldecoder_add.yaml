@@ -1,0 +1,85 @@
+# Multi-sample generalization check (2026-07-20), st-a100 freed up — pairs
+# with exp_multisample_fm_ot_stormlite_mome_both_paneldecoder_add.yaml as
+# the other half of a clean flagship-vs-flagship multi-sample comparison.
+# Did NOT exist before: every prior multi-sample STPath config
+# (exp_multisample_fm_ot_stpath_bothresidual.yaml) used PRETRAINED STPath
+# weights, which the single-sample flagship comparison
+# (exp_hest1k_fm_ot_stpath_unfrozen_bothresidual_paneldecoder_add.yaml)
+# specifically avoided to isolate architecture from pretraining advantage.
+# This combines that single-sample flagship's exact recipe (stpath_pretrained:
+# false, panel_invariant/add decoder) with the existing multi-sample data
+# section (INT1-INT8) — same "hold pretraining and decoder constant" logic,
+# now testing generalization across samples instead of just architecture.
+#
+# REAL CAVEAT (same as exp_multisample_fm_ot_stpath_bothresidual.yaml):
+# STPathContextEncoder uses ONE FIXED stpath_organ_type/stpath_tech_type
+# across every sample_ids entry — fine here since INT1-INT8 are documented
+# as the same ccRCC/Visium cohort.
+#
+# Direct comparison targets:
+#   - exp_hest1k_fm_ot_stpath_unfrozen_bothresidual_paneldecoder_add.yaml
+#     (same recipe, single-sample INT1 only)
+#   - exp_multisample_fm_ot_stormlite_mome_both_paneldecoder_add.yaml
+#     (this batch's StormLite counterpart)
+#
+# Requires `pip install novae` (Python >=3.11).
+
+experiment_name: multisample_fm_ot_stpath_unfrozen_bothresidual_paneldecoder_add
+
+data:
+  use_images: true
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_ids: [INT1, INT2, INT3, INT4, INT5, INT6, INT7, INT8]
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+
+masking:
+  strategy: random_dropout_patches
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+
+model:
+  name: fm_ot
+  params:
+    context_encoder_type: stpath
+    stpath_pretrained: false        # no pretraining advantage — see header
+    stpath_gene_voc_path: ${oc.env:STPATH_GENE_VOC_PATH}
+    # stpath_model_weight_path deliberately NOT set — nothing to load
+    stpath_organ_type: Kidney      # all of INT1-INT8 are ccRCC — see header caveat
+    stpath_tech_type: Visium
+    stpath_new_gene_encoder_type: both   # Route B residual, ON TOP OF unfrozen
+    decoder_type: panel_invariant   # held constant vs. StormLite's flagship
+    # decoder_gene_names / n_genes NOT set — auto-injected from the shared multi-sample panel
+    decoder_gene_embed_dim: 256
+    decoder_combine_mode: add       # scGPT's real combination rule
+    decoder_mlp_depth: 2
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 1.0e-3
+
+training:
+  epochs: 40000
+  seed: 0
+  log_every_n_steps: 10
+  checkpoint_dir: results/checkpoints/${experiment_name}
+  checkpoint_every_n_steps: 10000
+  log_print_every_n_steps: 1000
+
+evaluation:
+  metrics: [pearson_per_gene, rmse, nonzero_auc, st_fid, st_mmd]
+  embedding_for_fid: pca
+  pca_n_components: 50
+
+logging:
+  backend: wandb
+  project: st3d-lundeberg-lab

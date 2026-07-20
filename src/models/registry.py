@@ -69,6 +69,7 @@ def _build_context_encoder(
     storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
     storm_lite_bias_type: str = "frame_averaging", storm_lite_relative_bias_hidden_dim: int = 32,
     storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
+    storm_lite_knn_k: int | None = None,
     storm_lite_input_already_log1p: bool = False,
     storm_lite_tokenizer_gene_names: list[str] | None = None,
     storm_lite_tokenizer_full_gene_names: list[str] | None = None,
@@ -167,7 +168,7 @@ def _build_context_encoder(
             n_transformer_layers=storm_lite_n_layers, n_heads=storm_lite_n_heads,
             bias_type=storm_lite_bias_type,
             relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
-            fusion_mode=storm_lite_fusion_mode, qk_norm=storm_lite_qk_norm,
+            fusion_mode=storm_lite_fusion_mode, qk_norm=storm_lite_qk_norm, knn_k=storm_lite_knn_k,
             input_already_log1p=storm_lite_input_already_log1p,
             organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
@@ -505,6 +506,7 @@ class WAEGAN(BaseGenerativeModel):
                  storm_lite_bias_type: str = "frame_averaging",
                  storm_lite_relative_bias_hidden_dim: int = 32,
                  storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
+                 storm_lite_knn_k: int | None = None,
                  storm_lite_input_already_log1p: bool = False,
                  storm_lite_tokenizer_gene_names: list[str] | None = None,
                  storm_lite_tokenizer_full_gene_names: list[str] | None = None,
@@ -539,6 +541,7 @@ class WAEGAN(BaseGenerativeModel):
             storm_lite_bias_type=storm_lite_bias_type,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
             storm_lite_fusion_mode=storm_lite_fusion_mode, storm_lite_qk_norm=storm_lite_qk_norm,
+            storm_lite_knn_k=storm_lite_knn_k,
             storm_lite_input_already_log1p=storm_lite_input_already_log1p,
             storm_lite_tokenizer_gene_names=storm_lite_tokenizer_gene_names,
             storm_lite_tokenizer_full_gene_names=storm_lite_tokenizer_full_gene_names,
@@ -869,6 +872,7 @@ class FlowMatchingOT(BaseGenerativeModel):
                  storm_lite_bias_type: str = "frame_averaging",
                  storm_lite_relative_bias_hidden_dim: int = 32,
                  storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
+                 storm_lite_knn_k: int | None = None,
                  storm_lite_input_already_log1p: bool = False,
                  storm_lite_tokenizer_gene_names: list[str] | None = None,
                  storm_lite_tokenizer_full_gene_names: list[str] | None = None,
@@ -884,7 +888,9 @@ class FlowMatchingOT(BaseGenerativeModel):
                  decoder_lloki_hidden_dims: list[int] | None = None,
                  full_gene_names: list[str] | None = None,
                  warmup_steps: int = 0,
-                 velocity_net_type: str = "mlp", velocity_net_n_layers: int = 3):
+                 velocity_net_type: str = "mlp", velocity_net_n_layers: int = 3,
+                 boundary_consistency_weight: float = 0.0,
+                 boundary_consistency_bandwidth: float = 100.0):
         super().__init__()
         self.save_hyperparameters()
         assert path_type in ("ot", "edm"), f"unknown path_type {path_type!r}"
@@ -903,6 +909,7 @@ class FlowMatchingOT(BaseGenerativeModel):
             storm_lite_bias_type=storm_lite_bias_type,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
             storm_lite_fusion_mode=storm_lite_fusion_mode, storm_lite_qk_norm=storm_lite_qk_norm,
+            storm_lite_knn_k=storm_lite_knn_k,
             storm_lite_input_already_log1p=storm_lite_input_already_log1p,
             storm_lite_tokenizer_gene_names=storm_lite_tokenizer_gene_names,
             storm_lite_tokenizer_full_gene_names=storm_lite_tokenizer_full_gene_names,
@@ -975,6 +982,15 @@ class FlowMatchingOT(BaseGenerativeModel):
         self.edm_p_mean = edm_p_mean
         self.edm_p_std = edm_p_std
         self.warmup_steps = warmup_steps
+        # boundary_consistency_weight (2026-07-20, adapted from DISCO
+        # [Duan et al. 2025, "DISCO: A Diffusion Model for Spatial
+        # Transcriptomics Data Completion", verified via direct PDF read]
+        # -- see _boundary_consistency_loss's own docstring for the full
+        # adaptation reasoning and honest scope limits). 0.0 (default) is
+        # a true no-op: the term is skipped entirely in training_step, so
+        # every existing config is byte-for-byte unaffected.
+        self.boundary_consistency_weight = boundary_consistency_weight
+        self.boundary_consistency_bandwidth = boundary_consistency_bandwidth
         assert fm_time_sampling in ("uniform", "logit_normal"), (
             f"unknown fm_time_sampling {fm_time_sampling!r}"
         )
@@ -1071,6 +1087,54 @@ class FlowMatchingOT(BaseGenerativeModel):
         f = self.velocity_net(torch.cat([c_in * z_sigma, t_embed, c], dim=-1))
         return c_skip * z_sigma + c_out * f
 
+    def _boundary_consistency_loss(self, query_coords: torch.Tensor, context_coords: torch.Tensor,
+                                    context_expr: torch.Tensor, pred_expr: torch.Tensor) -> torch.Tensor:
+        """2026-07-20, adapted from DISCO (Duan, Li, Zhang, Song, Zhang
+        2025, "DISCO: A Diffusion Model for Spatial Transcriptomics Data
+        Completion", Proc Int Conf Image Proc — verified via direct PDF
+        read, not a guess). DISCO's own ablation (their Section 3.3) found
+        that removing "integration with neighboring region" during
+        generation was its single biggest lever — MSE 0.89->1.07 (+20%),
+        EMD 18.4->21.9 (+19%) — bigger than removing tissue-type
+        conditioning entirely. Their mechanism: at EVERY diffusion
+        denoising step, real observed neighboring values are re-noised to
+        match that step's noise level and spliced back into the SAME
+        state tensor being denoised, forcing the generated region to stay
+        consistent with real boundary context throughout generation, not
+        just via a single conditioning vector computed once up front.
+
+        HONEST ADAPTATION, not a literal port: FM-OT's state space (a
+        per-query-point LATENT code integrated via ODE) has no shared
+        tensor with context the way DISCO's joint per-cell diffusion state
+        does, so DISCO's exact re-noise-and-splice trick isn't
+        dimensionally transferable. This ports the SAME underlying idea
+        (explicit boundary-consistency supervision, concentrated near real
+        observed context) as a training-time auxiliary loss instead:
+        pulls each query point's DECODED prediction toward its single
+        nearest real context spot's actual measured expression, weighted
+        by an exponential decay in coordinate distance (bandwidth
+        controls how fast the pull fades — small bandwidth: only points
+        immediately at the masked-hole boundary are pulled; large
+        bandwidth: pulls extend deep into the hole). This deliberately
+        does NOT pull every query point toward a neighbor average
+        unconditionally — DISCO's own baselines table shows a plain KNN
+        completion method is a WEAK baseline, underperforming every
+        learned method; an unweighted version of this loss would risk
+        dragging predictions toward that same weak KNN-like behavior.
+        Weighting by distance keeps the effect concentrated exactly where
+        DISCO's ablation showed it mattered (the boundary), leaving deep-
+        hole points free to rely on the model's actual learned generative
+        prior instead of a naive local-smoothness assumption.
+
+        0.0-weight callers (default) never call this at all -- see
+        boundary_consistency_weight in __init__."""
+        dist = torch.cdist(query_coords, context_coords)  # [n_query, n_context]
+        min_dist, nn_idx = dist.min(dim=1)
+        nearest_context_expr = context_expr[nn_idx]  # [n_query, n_genes] (or decoder-panel width)
+        weight = torch.exp(-min_dist / self.boundary_consistency_bandwidth)
+        per_point_loss = ((pred_expr - nearest_context_expr) ** 2).mean(dim=-1)
+        return (weight * per_point_loss).mean()
+
     def _decode(self, h: torch.Tensor, tech: str | None = None) -> torch.Tensor:
         """Dispatches on decoder_type (2026-07-17, see PanelInvariantGeneDecoder
         docstring) so sample()/training_step() don't need their own branching.
@@ -1165,7 +1229,22 @@ class FlowMatchingOT(BaseGenerativeModel):
             fm_loss = (weight[:, None] * (d_pred - z_1_target) ** 2).mean()
 
         loss = self.recon_weight * recon_loss + self.fm_weight * fm_loss
-        self.log_dict({"train/recon": recon_loss, "train/fm_loss": fm_loss, "train/loss": loss})
+        log_dict = {"train/recon": recon_loss, "train/fm_loss": fm_loss}
+        if self.boundary_consistency_weight > 0:
+            # 2026-07-20, adapted from DISCO — see _boundary_consistency_loss's
+            # own docstring. Uses `recon` (this step's own decoded query
+            # prediction, already computed above for recon_loss) rather than
+            # a fresh sample() call — cheap, and the same prediction
+            # recon_loss already supervises, just with an added
+            # boundary-proximity-weighted pull toward real nearest context.
+            boundary_loss = self._boundary_consistency_loss(
+                query["coords"], context["coords"],
+                self._slice_target_for_decoder(context["expression"]), recon,
+            )
+            loss = loss + self.boundary_consistency_weight * boundary_loss
+            log_dict["train/boundary_consistency"] = boundary_loss
+        log_dict["train/loss"] = loss
+        self.log_dict(log_dict)
         return loss
 
     def configure_optimizers(self):
@@ -1252,6 +1331,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  storm_lite_bias_type: str = "frame_averaging",
                  storm_lite_relative_bias_hidden_dim: int = 32,
                  storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
+                 storm_lite_knn_k: int | None = None,
                  storm_lite_input_already_log1p: bool = False,
                  storm_lite_tokenizer_gene_names: list[str] | None = None,
                  storm_lite_tokenizer_full_gene_names: list[str] | None = None,
@@ -1284,6 +1364,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
             storm_lite_bias_type=storm_lite_bias_type,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
             storm_lite_fusion_mode=storm_lite_fusion_mode, storm_lite_qk_norm=storm_lite_qk_norm,
+            storm_lite_knn_k=storm_lite_knn_k,
             storm_lite_input_already_log1p=storm_lite_input_already_log1p,
             storm_lite_tokenizer_gene_names=storm_lite_tokenizer_gene_names,
             storm_lite_tokenizer_full_gene_names=storm_lite_tokenizer_full_gene_names,
