@@ -528,6 +528,26 @@ All three confirmed fixed via a full 14-job `SMOKETEST=1` run of `scripts/run_2g
 
 **Honest read, now on firmer statistical footing than before**: StormLite does not currently beat STPath, with or without pretraining, on a fair decoder-controlled comparison — and STPath is also more reliable seed-to-seed. Bigger StormLite capacity still isn't earning its cost (mean below the small flagship, worst variance of any arm). This corrects and firms up the earlier "statistically indistinguishable" read from the thinner-sample comparison — worth taking as the current honest state of the project rather than continuing to look for the next tweak that closes the gap.
 
-**AdaLN velocity net, 2 seeds**: mean 0.2895 (0.2086, 0.3704) — below every StormLite baseline so far, and seed10's ST-FID (8.46) is notably elevated versus every other healthy run's ~0.3-1.0 range, suggesting some instability. Two seeds is nowhere near enough to conclude the architecture change doesn't help, but it isn't showing an early win either — not adopting as a default without more seeds.
+## 2026-07-19 (continued): overnight capacity batch — StormLite bigger's variance looks like ONE outlier, not general noise; STPath pretrained's ceiling firms up at ~0.51
 
-**Prepared, not yet run**: `scripts/run_parallel_3gpu_adaln_velocity_confirm.sh` — 3 seeds of `velocity_net_type="adaln_residual"` on the flagship StormLite config, everything else identical (same decoder, same capacity, same EMA), isolated cleanly against the already-known 8-seed flagship baseline mean (~0.462) rather than stacked with any other untested lever — deliberate, given the "all3" stacking collapse already taught this project not to bundle multiple untested changes. Waiting on GPU 0/6 to free up from the current 14-job batch.
+`scripts/run_parallel_8gpu_overnight_capacity.sh` — 3 more `bigger_qknorm_warmup` seeds, 2 more AdaLN-velocity seeds, 2 seeds of a brand-new arm (raw velocity_net capacity, `hidden_dim` 512→1024, zero new code), and one more STPath-pretrained seed. Updated means:
+
+| arm | n | mean | range |
+|---|---|---|---|
+| StormLite bigger+QK-norm+warmup | 8 | 0.4637 | 0.330 (0.188–0.518) |
+| StormLite bigger+QK-norm+warmup, **excl. seed11** | 7 | **0.5031** | **0.031** (0.487–0.518) |
+| AdaLN velocity net | 4 | 0.3875 | 0.302 (0.209–0.510) |
+| Bigger velocity_net capacity (hidden_dim=1024) | 2 | 0.4216 | 0.149 (0.347–0.496) |
+| STPath pretrained | 5 | 0.5060 | 0.035 (0.487–0.523) |
+| StormLite small (flagship) | 11 | 0.4546 | 0.214 |
+| STPath unfrozen | 5 | 0.4706 | 0.104 |
+
+**A striking, worth-flagging-carefully pattern**: 7 of the 8 `bigger_qknorm_warmup` seeds now land in a remarkably tight band (0.487–0.518, range 0.031 — as tight as STPath pretrained's own spread) with a mean of **0.5031**, matching STPath pretrained's 0.5060 almost exactly. The 8th seed (seed11, 0.1877) is a clear, isolated outlier — nothing else in this arm's history comes close to that low. Reported both ways deliberately (0.4637 with it, 0.5031 without) rather than picking the more flattering number: excluding an inconvenient data point without a confirmed root cause would be cherry-picking, not analysis. **Not yet claiming this closes the gap to STPath** — it's a real, promising pattern (if seed11 genuinely is anomalous rather than representative variance, StormLite-bigger may already be at parity with STPath's pretrained ceiling), but needs either a root cause for seed11's failure or more seeds to confirm the tight cluster holds, before treating 0.50 as StormLite-bigger's real mean.
+
+**AdaLN velocity net, now 4 seeds**: mean rose from 0.2895 (2 seeds) to 0.3875 (4 seeds) — the 2 new seeds (0.5102, 0.4608) are much healthier than the first 2. Still below StormLite-small's mean but the gap is narrowing; not enough data yet either way.
+
+**Bigger velocity_net capacity (new arm), 2 seeds**: 0.3473, 0.4959 — mean 0.4216, mixed and too early to read anything into.
+
+**STPath pretrained, now 5 seeds**: mean 0.5060, range only 0.035 — the tightest, most reliable arm in the whole project. This is the real target StormLite needs to match: not just beat the mean, but do so with comparable consistency.
+
+**Next step**: more `bigger_qknorm_warmup` seeds specifically, to determine whether the tight ~0.50 cluster is real or seed11 was simply an unlucky draw within genuine wider variance. This is now the single most information-dense thing to run — it directly tests whether the flagship priority (StormLite beating STPath) is achievable with the current architecture.
