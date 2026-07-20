@@ -32,8 +32,12 @@ From the repository root after pulling the pushed branch:
 ```bash
 conda activate st3d
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
-export STPATH_GENE_VOC_PATH=/absolute/path/to/STPath/utils_data/symbol2ensembl.json
-export STPATH_MODEL_WEIGHT_PATH=/absolute/path/to/the/pretrained/stpath/checkpoint.pth
+# The recovery runner resolves these defaults from the STPath checkout next
+# to SciLifeSTDL. The overnight wrapper downloads and checksums stfm.pth when
+# it is missing.
+export STPATH_ROOT=/data/adam.ingemansson/STPath
+export STPATH_GENE_VOC_PATH="$STPATH_ROOT/utils_data/symbol2ensembl.json"
+export STPATH_MODEL_WEIGHT_PATH="$STPATH_ROOT/stfm.pth"
 export GPU_IDS=0,1,2,3,4,5,6,7
 export PYTHON_BIN=python3
 ```
@@ -99,7 +103,40 @@ STPath with the same custom downstream FM head/decoder. These STPath rows are
 the repository's established STPath-conditioned benchmarks; they are not
 mislabelled as official zero-shot STPath.
 
-## Step 5 — repaired deterministic ablations
+For an unattended Wave 1 to Wave 2 handoff on the eight-GPU machine, run:
+
+```bash
+bash scripts/run_recovery_overnight_wave1_to_wave2.sh
+```
+
+The wrapper downloads the official `stfm.pth` if needed and verifies its
+published SHA-256. Before full training, it runs one training step and a
+minimal one-mask audit for every Wave 1 and Wave 2 config. It then runs all
+eight Wave 1 jobs and starts Wave 2 only if every smoke check and Wave 1 job
+succeeds. It refuses to duplicate live recovery jobs.
+
+## Step 5 — Wave 2: matched flagship component ablations
+
+Wave 2 uses configs `08`–`15`, all derived from config `03` with the same
+full gene panel, sample, masks, seed, schedule, decoder settings, and audited
+evaluation unless the named component is the one being changed:
+
+1. MLP expression branch only (Novae removed).
+2. Clean context-only Novae branch only (MLP removed).
+3. No H&E during training or validation, using explicit missing-image masks.
+4. Fifty-percent query-image dropout during training.
+5. Dense decoder instead of the panel-invariant decoder.
+6. Additive fusion instead of MoME.
+7. No frame-averaging spatial attention bias.
+8. QK normalization enabled.
+
+To run Wave 2 by itself after a completed Wave 1:
+
+```bash
+STAGE=ablations bash scripts/run_recovery_suite_8gpu.sh
+```
+
+## Step 6 — repaired deterministic ablations
 
 Only after reviewing Wave 1:
 
@@ -111,7 +148,7 @@ The existing full configs `01`–`08` change one encoder/fusion component at a
 time: builtin, GigaPath, StormLite sum, concat, MoME, no bias, relative bias and
 GNN. Every learned residual config now fails closed unless it beats harmonic.
 
-## Step 6 — later waves, one decision at a time
+## Step 7 — later waves, one decision at a time
 
 ```bash
 STAGE=robustness bash scripts/run_complexity_ladder_8gpu.sh
@@ -128,7 +165,7 @@ STAGE=novae      bash scripts/run_complexity_ladder_8gpu.sh
 Do not run `screen` until the repaired staged path has passed. It intentionally
 chains every stage and is unsuitable for diagnosing a failure.
 
-## Step 7 — confirmation and held-out tissue
+## Step 8 — confirmation and held-out tissue
 
 Promote only components that improve the same masks/seed, using the existing
 promotion scripts. Confirm seeds 0/1/2 at 40k, then generate held-out configs:

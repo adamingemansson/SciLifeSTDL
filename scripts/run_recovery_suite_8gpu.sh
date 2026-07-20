@@ -13,6 +13,7 @@ fi
 
 FRESH="${FRESH:-0}"
 SMOKETEST="${SMOKETEST:-0}"
+SMOKE_STEPS="${SMOKE_STEPS:-20}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 LOG_ROOT="${LOG_ROOT:-logs/recovery_suite/${STAGE}_${RUN_ID}}"
 mkdir -p "$LOG_ROOT"
@@ -23,6 +24,13 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 # import the sibling src package.
 REPO_ROOT="$(pwd -P)"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+STPATH_ROOT="${STPATH_ROOT:-$(dirname "$REPO_ROOT")/STPath}"
+if [[ -z "${STPATH_GENE_VOC_PATH:-}" || "${STPATH_GENE_VOC_PATH:-}" == /absolute/path/* ]]; then
+  export STPATH_GENE_VOC_PATH="$STPATH_ROOT/utils_data/symbol2ensembl.json"
+fi
+if [[ -z "${STPATH_MODEL_WEIGHT_PATH:-}" || "${STPATH_MODEL_WEIGHT_PATH:-}" == /absolute/path/* ]]; then
+  export STPATH_MODEL_WEIGHT_PATH="$STPATH_ROOT/stfm.pth"
+fi
 
 N_CORES="$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
 THREADS_PER_JOB=$((N_CORES / 8))
@@ -56,6 +64,16 @@ case "$STAGE" in
   controls)
     : "${STPATH_GENE_VOC_PATH:?Set STPATH_GENE_VOC_PATH for the STPath controls}"
     : "${STPATH_MODEL_WEIGHT_PATH:?Set STPATH_MODEL_WEIGHT_PATH for pretrained STPath}"
+    if [[ "$STPATH_GENE_VOC_PATH" == /absolute/path/* || ! -f "$STPATH_GENE_VOC_PATH" ]]; then
+      echo "ERROR: STPATH_GENE_VOC_PATH is not a real file: $STPATH_GENE_VOC_PATH" >&2
+      echo "Expected the STPath symbol2ensembl.json vocabulary file." >&2
+      exit 2
+    fi
+    if [[ "$STPATH_MODEL_WEIGHT_PATH" == /absolute/path/* || ! -f "$STPATH_MODEL_WEIGHT_PATH" ]]; then
+      echo "ERROR: STPATH_MODEL_WEIGHT_PATH is not a real file: $STPATH_MODEL_WEIGHT_PATH" >&2
+      echo "Expected the downloaded STPath stfm.pth checkpoint." >&2
+      exit 2
+    fi
     CONFIGS=(
       configs/recovery_suite/04_control_fm_builtin.yaml
       configs/recovery_suite/05_control_fm_stormlite.yaml
@@ -78,13 +96,36 @@ case "$STAGE" in
     )
     SEEDS=(0 0 11 12 10 11 10 11)
     ;;
+  ablations)
+    CONFIGS=(
+      configs/recovery_suite/08_ablation_mlp_only.yaml
+      configs/recovery_suite/09_ablation_novae_only.yaml
+      configs/recovery_suite/10_ablation_no_he.yaml
+      configs/recovery_suite/11_ablation_query_image_dropout.yaml
+      configs/recovery_suite/12_ablation_dense_decoder.yaml
+      configs/recovery_suite/13_ablation_fusion_sum.yaml
+      configs/recovery_suite/14_ablation_no_spatial_bias.yaml
+      configs/recovery_suite/15_ablation_qk_norm.yaml
+    )
+    NAMES=(
+      recovery_ablation_mlp_only_seed10
+      recovery_ablation_novae_only_seed10
+      recovery_ablation_no_he_seed10
+      recovery_ablation_query_image_dropout_seed10
+      recovery_ablation_dense_decoder_seed10
+      recovery_ablation_fusion_sum_seed10
+      recovery_ablation_no_spatial_bias_seed10
+      recovery_ablation_qk_norm_seed10
+    )
+    SEEDS=(10 10 10 10 10 10 10 10)
+    ;;
   *)
-    echo "ERROR: STAGE must be repair or controls" >&2
+    echo "ERROR: STAGE must be repair, controls or ablations" >&2
     exit 2
     ;;
 esac
 
-if [[ "$STAGE" == "controls" && "$SMOKETEST" != "1" ]]; then
+if [[ ( "$STAGE" == "controls" || "$STAGE" == "ablations" ) && "$SMOKETEST" != "1" ]]; then
   # The direct harmonic-residual branch is an independent rejected
   # diagnostic. Wave 1 tests the historically working FM family and only
   # depends on the clean FM flagship being finite/noncollapsed.
@@ -93,7 +134,7 @@ fi
 
 # All context-only Novae jobs consume the same immutable 64-mask schedule.
 # Populate it once before concurrent readers start. The cache is reused safely.
-if [[ "$SMOKETEST" != "1" ]] && [[ "$STAGE" == "repair" || "$STAGE" == "controls" ]]; then
+if [[ "$SMOKETEST" != "1" ]] && [[ "$STAGE" == "repair" || "$STAGE" == "controls" || "$STAGE" == "ablations" ]]; then
   echo "Precomputing/reusing the shared context-only Novae mask cache on 8 GPUs..."
   precompute_pids=()
   for slot in "${!GPU_IDS_ARR[@]}"; do
@@ -142,16 +183,19 @@ for slot in "${!CONFIGS[@]}"; do
   )
   if [[ "$SMOKETEST" == "1" ]]; then
     overrides+=(
-      "training.epochs=20"
-      "training.unique_mask_count=20"
+      "training.epochs=$SMOKE_STEPS"
+      "training.unique_mask_count=$SMOKE_STEPS"
       "training.checkpoint_every_n_steps=0"
       "training.checkpoint_dir=results/checkpoints/recovery_suite/smoke/${RUN_ID}/$name"
       "training.log_print_every_n_steps=1"
-      "validation.every_n_steps=10"
-      "validation.early_stopping_min_steps=20"
+      "validation.every_n_steps=$SMOKE_STEPS"
+      "validation.early_stopping_min_steps=$SMOKE_STEPS"
       "validation.patience_checks=1000"
       "validation.require_anchor_improvement=false"
-      "evaluation.n_samples=2"
+      "validation.n_samples=1"
+      "evaluation.n_validation_masks=1"
+      "evaluation.n_test_masks=1"
+      "evaluation.n_samples=1"
       "evaluation.training_mask_bank_path=results/mask_banks/training/recovery_suite/smoke_${name}.json"
     )
   fi
