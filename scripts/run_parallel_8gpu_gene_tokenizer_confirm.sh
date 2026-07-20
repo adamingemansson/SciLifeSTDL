@@ -25,8 +25,34 @@
 # Usage: bash scripts/run_parallel_4gpu_gene_tokenizer_confirm.sh
 # Smoke test: SMOKETEST=1 bash scripts/run_parallel_4gpu_gene_tokenizer_confirm.sh
 # Logs: logs/parallel_run_gene_tokenizer_confirm/<name>.log
+#
+# 2026-07-20 OOM fix, first real run on tkdgx1 (40GB cards): job on GPU5
+# (bigger+tokenizer seed11) crashed with a CUDA OOM, and several OTHER
+# jobs -- including small-flagship jobs, not just "bigger" ones -- were
+# independently sitting at ~39.5/40GB. Root cause: masking.
+# random_dropout_patches leaves EVERY non-query spot in the drawn slice as
+# context, unbounded, and StormLite's context encoder does full O(n^2)
+# self-attention over context+query -- two jobs on the IDENTICAL config
+# differed only by seed and ended up at 20GB vs 39.5GB purely from which
+# slice/patch draw they got. Two independent fixes:
+#   1. PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True below -- reduces
+#      allocator fragmentation (the crash log showed 15GB reserved-but-
+#      unallocated on top of 20GB actually in use).
+#   2. masking.max_context_points=3000 override -- new, real cap added to
+#      _build_masked_item (src/training/train.py, _cap_context_mask) that
+#      randomly subsamples an oversized context draw down to a bounded
+#      size, so worst-case memory is now deterministic instead of
+#      depending on which slice a given seed happens to draw. 3000 is a
+#      first estimate, not empirically tuned yet -- watch early nvidia-smi
+#      output on the rerun and lower it further if any job still climbs
+#      toward the ceiling.
+# All prior progress from the crashed/at-risk fleet was lost regardless
+# (no mid-training checkpoint-resume exists in this codebase) -- this is a
+# full rerun of all 8 jobs from scratch with both fixes in place.
 
 set -u
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 SMOKETEST="${SMOKETEST:-0}"
 SMOKETEST_EPOCHS="${SMOKETEST_EPOCHS:-2}"
@@ -113,6 +139,7 @@ for i in "${!CONFIGS[@]}"; do
         --override ${extra} \
                     training.seed=${seed} \
                     training.ema_decay=0.999 \
+                    masking.max_context_points=3000 \
                     ${epoch_override} \
                     training.checkpoint_dir=results/checkpoints/${name} \
                     training.checkpoint_every_n_steps=10000 \

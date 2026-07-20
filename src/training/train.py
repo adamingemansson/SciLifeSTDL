@@ -492,6 +492,30 @@ def make_context_query_split(coords3d: np.ndarray, slice_ids: np.ndarray, maskin
     return context_mask, query_mask
 
 
+def _cap_context_mask(context_mask: np.ndarray, max_context_points, seed: int) -> np.ndarray:
+    """Subsample an oversized context mask down to max_context_points
+    (2026-07-20, real-hardware OOM-mitigation follow-up). Every masking
+    strategy leaves ALL non-query spots in the drawn slice(s) as context,
+    unbounded -- and StormLite's context encoder does full O(n^2)
+    self-attention over context+query. Confirmed on tkdgx1: two jobs
+    running the IDENTICAL config differed only by seed, and one drew a
+    slice with a much larger context set, pushing it to ~39.5GB of 40GB
+    while its twin sat at ~20GB. max_context_points=None (default)
+    preserves exact prior behavior for every existing config. Uses seed+3
+    (distinct from augment's seed+2 and multi-sample's seed+1) so this
+    subsampling draw never correlates with those."""
+    if max_context_points is None:
+        return context_mask
+    context_idx = np.where(context_mask)[0]
+    if len(context_idx) <= max_context_points:
+        return context_mask
+    rng = np.random.default_rng(seed + 3)
+    keep = rng.choice(context_idx, size=max_context_points, replace=False)
+    capped = np.zeros_like(context_mask)
+    capped[keep] = True
+    return capped
+
+
 def _images_tensor(images: np.ndarray, mask: np.ndarray) -> torch.Tensor:
     """Slice + tensor-ify per-spot image data for one masking draw.
     Standalone (not a Dataset method) so src/evaluation/run_comparison.py's
@@ -576,6 +600,7 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
     if augment:
         coords3d = augment_coords_xy(coords3d, seed=seed + 2)
     context_mask, query_mask = make_context_query_split(coords3d, slice_ids, masking_cfg, seed)
+    context_mask = _cap_context_mask(context_mask, getattr(masking_cfg, "max_context_points", None), seed)
     context_expr_source = expr if context_gene_features is None else context_gene_features
     context = {
         "coords": torch.tensor(coords3d[context_mask], dtype=torch.float32),

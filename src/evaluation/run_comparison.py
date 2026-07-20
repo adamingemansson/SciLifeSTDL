@@ -65,7 +65,7 @@ from src.training.train import (
     get_gigapath_features, save_trained_model, make_dataloader,
     _downsample_patches, get_novae_features, inject_novae_dim, inject_stpath_novae_dim,
     inject_coord_scale, inject_decoder_gene_names, inject_single_sample_n_genes,
-    inject_storm_lite_tokenizer_gene_names,
+    inject_storm_lite_tokenizer_gene_names, _cap_context_mask,
     PeriodicCheckpointCallback, PeriodicPrintCallback, EMACallback, load_pretrained_weights_into,
 )
 from src.evaluation import metrics as ev
@@ -557,6 +557,7 @@ def _build_shared_eval(cfg, adata, coords3d, expr, slice_ids, images,
     it's computed based on its own scan of the invocation's configs, not
     tied to whether images are enabled."""
     context_mask, query_mask = make_context_query_split(coords3d, slice_ids, cfg.masking, EVAL_SEED)
+    context_mask = _cap_context_mask(context_mask, getattr(cfg.masking, "max_context_points", None), EVAL_SEED)
     target_expression = expr[query_mask]
 
     novae_features = get_novae_features(cfg, adata) if compute_novae else None

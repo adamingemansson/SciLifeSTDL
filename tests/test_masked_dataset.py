@@ -63,7 +63,48 @@ def test_hold_out_slice_variety():
     print(f"[hold_out_slice] OK — {len(distinct_draws)} distinct held-out slices across {len(ds)} draws")
 
 
+def test_max_context_points_caps_context_size():
+    """2026-07-20 real-hardware OOM fix: random_dropout_patches leaves
+    EVERY non-query point as context, unbounded — on tkdgx1, two jobs
+    running the identical config differed only by seed and ended up at
+    ~20GB vs ~39.5GB of a 40GB card purely from which slice draw they got.
+    masking.max_context_points bounds this deterministically."""
+    coords3d, expr, slice_ids = _make_synthetic(n_points=200, n_slices=1)
+    masking_cfg = OmegaConf.create({
+        "strategy": "random_dropout_patches",
+        "params": {"n_patches": 1, "radius_range": [10, 20]},
+        "max_context_points": 50,
+    })
+    ds = MaskedContextQueryDataset(coords3d, expr, slice_ids, masking_cfg, n_items=5, base_seed=0)
+    for i in range(len(ds)):
+        item = ds[i]
+        n_context = item["context"]["coords"].shape[0]
+        assert n_context <= 50, f"context size {n_context} exceeds max_context_points=50"
+    print("[max_context_points] OK — context size capped at 50 across all draws")
+
+
+def test_max_context_points_none_preserves_prior_behavior():
+    """max_context_points absent/None must behave exactly as before — the
+    cap is purely opt-in."""
+    coords3d, expr, slice_ids = _make_synthetic(n_points=200, n_slices=1)
+    masking_cfg = OmegaConf.create({
+        "strategy": "random_dropout_patches",
+        "params": {"n_patches": 1, "radius_range": [10, 20]},
+    })
+    ds = MaskedContextQueryDataset(coords3d, expr, slice_ids, masking_cfg, n_items=3, base_seed=0)
+    for i in range(len(ds)):
+        item = ds[i]
+        n_context = item["context"]["coords"].shape[0]
+        n_query = item["query"]["coords"].shape[0]
+        assert n_context + n_query == coords3d.shape[0], (
+            "without max_context_points, context+query must still cover every point"
+        )
+    print("[max_context_points] OK — absent cap leaves context/query split unchanged")
+
+
 if __name__ == "__main__":
     test_random_dropout_patches_variety()
     test_hold_out_slice_variety()
+    test_max_context_points_caps_context_size()
+    test_max_context_points_none_preserves_prior_behavior()
     print("\nAll MaskedContextQueryDataset smoke tests passed.")
