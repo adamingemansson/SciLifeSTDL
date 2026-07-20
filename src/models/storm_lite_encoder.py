@@ -83,7 +83,7 @@ import torch.nn as nn
 
 from src.models.conditioning import (
     RandomFourierFeatures, GigapathPatchEncoder,
-    MLPGeneEncoder, NovaeGeneEncoder, CombinedGeneEncoder,
+    MLPGeneEncoder, NovaeGeneEncoder, CombinedGeneEncoder, TokenizedGeneEncoder,
     RelativePositionBias, FrameAveragingBias,
     OrganTechEmbedding,
 )
@@ -233,12 +233,15 @@ class StormLiteContextEncoder(nn.Module):
                  coord_scale: float = 1.0,
                  n_transformer_layers: int = 2, n_heads: int = 4,
                  gene_encoder_type: str = "both",
+                 tokenizer_gene_names: list[str] | None = None,
+                 tokenizer_full_gene_names: list[str] | None = None,
+                 tokenizer_n_pool_layers: int = 1, tokenizer_n_pool_heads: int = 4,
                  bias_type: str = "frame_averaging", relative_bias_hidden_dim: int = 32,
                  fusion_mode: str = "sum", qk_norm: bool = False,
                  input_already_log1p: bool = False,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
-        assert gene_encoder_type in ("mlp", "novae", "both"), (
+        assert gene_encoder_type in ("mlp", "novae", "both", "tokenizer", "tokenizer_novae"), (
             f"unknown gene_encoder_type {gene_encoder_type!r}"
         )
         assert bias_type in ("none", "relative_position", "frame_averaging"), (
@@ -291,6 +294,43 @@ class StormLiteContextEncoder(nn.Module):
         elif gene_encoder_type == "novae":
             assert novae_dim is not None, "gene_encoder_type='novae' requires novae_dim"
             self.gene_encoder = NovaeGeneEncoder(novae_dim, hidden_dim)
+        elif gene_encoder_type == "tokenizer":
+            # 2026-07-19 research: per-gene identity-aware tokenization,
+            # see TokenizedGeneEncoder's own docstring. tokenizer_gene_names
+            # (HVG-reduced subset) / tokenizer_full_gene_names (full
+            # training panel, for column alignment) are auto-injected by
+            # train.py's inject_storm_lite_tokenizer_gene_names, same
+            # "fixed vocabulary derived from real data, not hardcoded"
+            # pattern as inject_decoder_gene_names.
+            assert tokenizer_gene_names is not None and tokenizer_full_gene_names is not None, (
+                "gene_encoder_type='tokenizer' requires tokenizer_gene_names "
+                "and tokenizer_full_gene_names"
+            )
+            self.gene_encoder = TokenizedGeneEncoder(
+                tokenizer_gene_names, tokenizer_full_gene_names, hidden_dim,
+                n_pool_layers=tokenizer_n_pool_layers, n_pool_heads=tokenizer_n_pool_heads,
+            )
+        elif gene_encoder_type == "tokenizer_novae":
+            # combines the gene-tokenizer with Novae's pretrained,
+            # spatially-aware whole-profile embedding -- orthogonal axes
+            # (see TokenizedGeneEncoder's docstring: Novae's spatial
+            # awareness comes from ITS OWN pretrained neighbor graph,
+            # independent of per-gene identity), so worth testing together,
+            # not just each alone. Same concat+project combine pattern as
+            # "both" (mlp+novae), for the same "a Linear on the SUM can't
+            # independently reweight what went into it" reasoning (see
+            # CombinedGeneEncoder's own docstring).
+            assert novae_dim is not None, "gene_encoder_type='tokenizer_novae' requires novae_dim"
+            assert tokenizer_gene_names is not None and tokenizer_full_gene_names is not None, (
+                "gene_encoder_type='tokenizer_novae' requires tokenizer_gene_names "
+                "and tokenizer_full_gene_names"
+            )
+            self.gene_encoder = TokenizedGeneEncoder(
+                tokenizer_gene_names, tokenizer_full_gene_names, hidden_dim,
+                n_pool_layers=tokenizer_n_pool_layers, n_pool_heads=tokenizer_n_pool_heads,
+            )
+            self.novae_encoder = NovaeGeneEncoder(novae_dim, hidden_dim)
+            self.gene_combine_proj = nn.Linear(hidden_dim * 2, hidden_dim)
         else:  # "both"
             assert novae_dim is not None, "gene_encoder_type='both' requires novae_dim"
             # combine_mode="concat", not the default "sum" (2026-07-17,
@@ -401,6 +441,15 @@ class StormLiteContextEncoder(nn.Module):
                 "gene_encoder_type='novae' requires context_novae_features"
             )
             return self.gene_encoder(novae_features)
+        elif self.gene_encoder_type == "tokenizer":
+            return self.gene_encoder(self._maybe_log1p(raw_expr))
+        elif self.gene_encoder_type == "tokenizer_novae":
+            assert novae_features is not None, (
+                "gene_encoder_type='tokenizer_novae' requires context_novae_features"
+            )
+            tok_out = self.gene_encoder(self._maybe_log1p(raw_expr))
+            novae_out = self.novae_encoder(novae_features)
+            return self.gene_combine_proj(torch.cat([tok_out, novae_out], dim=-1))
         else:  # "both"
             assert novae_features is not None, (
                 "gene_encoder_type='both' requires context_novae_features"

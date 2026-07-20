@@ -1273,6 +1273,35 @@ def inject_decoder_gene_names(model_cfg: dict, adata) -> None:
         params.setdefault("full_gene_names", adata.var_names.tolist())
 
 
+def inject_storm_lite_tokenizer_gene_names(model_cfg: dict, adata) -> None:
+    """If gene_encoder_type is "tokenizer"/"tokenizer_novae" (2026-07-19
+    research — see TokenizedGeneEncoder's own docstring in conditioning.py),
+    auto-derive storm_lite_tokenizer_gene_names via the same HVG-selection
+    technique inject_decoder_gene_names already uses for
+    decoder_type="gene_attention" (same MAX_SAFE_PANEL_SIZE-guarded
+    "self-attention over gene tokens is O(n_panel^2)" reasoning —
+    TokenizedGeneEncoder's own attention-based pooling has the identical
+    cost profile). storm_lite_tokenizer_full_gene_names is always the full
+    training panel (adata.var_names), needed to align the selected genes'
+    columns in raw_expr every forward pass.
+
+    No-op for every config that doesn't set gene_encoder_type to one of
+    the two tokenizer variants — zero effect on any existing config."""
+    params = model_cfg.get("params", {})
+    gene_encoder_type = params.get("gene_encoder_type")
+    if gene_encoder_type not in ("tokenizer", "tokenizer_novae"):
+        return
+    params.setdefault("storm_lite_tokenizer_full_gene_names", adata.var_names.tolist())
+    if "storm_lite_tokenizer_gene_names" not in params:
+        import scanpy as sc
+        n_target = min(512, adata.n_vars)
+        hvg_adata = adata.copy()
+        sc.pp.highly_variable_genes(hvg_adata, n_top_genes=n_target)
+        params["storm_lite_tokenizer_gene_names"] = (
+            hvg_adata.var_names[hvg_adata.var["highly_variable"]].tolist()
+        )
+
+
 def inject_single_sample_n_genes(model_cfg: dict, adata) -> None:
     """Single-sample n_genes has always been a MANUALLY hardcoded config
     value (e.g. "n_genes: 16570  # INT1 after QC"), unlike every other
@@ -1531,6 +1560,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     inject_single_sample_n_genes(model_cfg, adata)
     inject_stpath_gene_names(model_cfg, adata)
     inject_decoder_gene_names(model_cfg, adata)
+    inject_storm_lite_tokenizer_gene_names(model_cfg, adata)
     inject_coord_scale(model_cfg, coord_scale)
     if context_gene_features is not None:
         inject_novae_dim(model_cfg, context_gene_features.shape[1])
@@ -1561,6 +1591,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     inject_single_sample_n_genes(unresolved_model_cfg, adata)
     inject_stpath_gene_names(unresolved_model_cfg, adata)
     inject_decoder_gene_names(unresolved_model_cfg, adata)
+    inject_storm_lite_tokenizer_gene_names(unresolved_model_cfg, adata)
     inject_coord_scale(unresolved_model_cfg, coord_scale)
     if context_gene_features is not None:
         inject_novae_dim(unresolved_model_cfg, context_gene_features.shape[1])

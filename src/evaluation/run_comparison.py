@@ -65,6 +65,7 @@ from src.training.train import (
     get_gigapath_features, save_trained_model, make_dataloader,
     _downsample_patches, get_novae_features, inject_novae_dim, inject_stpath_novae_dim,
     inject_coord_scale, inject_decoder_gene_names, inject_single_sample_n_genes,
+    inject_storm_lite_tokenizer_gene_names,
     PeriodicCheckpointCallback, PeriodicPrintCallback, EMACallback, load_pretrained_weights_into,
 )
 from src.evaluation import metrics as ev
@@ -179,6 +180,7 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
     inject_single_sample_n_genes(model_cfg, adata)
     inject_stpath_gene_names(model_cfg, adata)
     inject_decoder_gene_names(model_cfg, adata)
+    inject_storm_lite_tokenizer_gene_names(model_cfg, adata)
     inject_coord_scale(model_cfg, coord_scale)
     if context_gene_features is not None:
         inject_novae_dim(model_cfg, context_gene_features.shape[1])
@@ -206,6 +208,7 @@ def _train_model(cfg_path: str, overrides: list[str] | None = None, adata_cache:
     inject_single_sample_n_genes(unresolved_model_cfg, adata)
     inject_stpath_gene_names(unresolved_model_cfg, adata)
     inject_decoder_gene_names(unresolved_model_cfg, adata)
+    inject_storm_lite_tokenizer_gene_names(unresolved_model_cfg, adata)
     inject_coord_scale(unresolved_model_cfg, coord_scale)
     if context_gene_features is not None:
         inject_novae_dim(unresolved_model_cfg, context_gene_features.shape[1])

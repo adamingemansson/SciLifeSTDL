@@ -733,6 +733,81 @@ class CombinedGeneEncoder(nn.Module):
         return mlp_out + novae_out
 
 
+class TokenizedGeneEncoder(nn.Module):
+    """Per-gene identity-aware tokenization + pooling (2026-07-19 research),
+    replacing MLPGeneEncoder's single dense-compression bottleneck with
+    STPath's real design principle -- its GeneExpTokenizer represents each
+    gene as its own identity-aware token (verified via source, see
+    stpath_encoder.py's own docstring), rather than collapsing the whole
+    expression vector through a shared MLP/pretrained-whole-profile
+    embedding the way MLPGeneEncoder/NovaeGeneEncoder both do. Ported as
+    our OWN encoder (same "faithful to the design principle, not every
+    implementation detail" approach already used for MoME-FFN and
+    FrameAveragingBias) rather than porting STPath's tokenizer/binning
+    machinery wholesale.
+
+    Mechanism: a learned per-gene IDENTITY embedding (fixed vocabulary,
+    same "must be fixed at construction time" reasoning as
+    OrganTechEmbedding/inject_stpath_gene_names) ADDED (scGPT's real
+    combination rule, Cui et al. 2024 -- already this codebase's own
+    established choice for PanelInvariantGeneDecoder's combine_mode="add")
+    to a linear projection of that gene's own expression VALUE, forming
+    one token per selected gene. A small self-attention layer then lets
+    genes interact/contextualize each other (closer to genuine per-gene
+    tokenization than plain mean pooling would be) before mean-pooling
+    into ONE final vector per spot -- keeping the exact same [N, feat_dim]
+    output contract as MLPGeneEncoder/NovaeGeneEncoder, so no downstream
+    fusion code needs to change regardless of which gene encoder is active.
+
+    gene_names is the SELECTED (HVG-reduced) subset actually tokenized --
+    the full ~16570-gene training panel is not feasible as individual
+    self-attended tokens (same O(n_panel^2) cost GeneAttentionDecoder's
+    own MAX_SAFE_PANEL_SIZE guard exists for). full_gene_names is the
+    full training panel raw_expr's columns are ordered by, needed to
+    slice out just the selected genes' values every forward pass."""
+
+    MAX_SAFE_PANEL_SIZE = 4096  # O(n_panel^2) self-attention guard, same reasoning as GeneAttentionDecoder
+
+    def __init__(self, gene_names: list[str], full_gene_names: list[str],
+                 feat_dim: int, n_pool_layers: int = 1, n_pool_heads: int = 4):
+        super().__init__()
+        n_panel = len(gene_names)
+        assert n_panel <= self.MAX_SAFE_PANEL_SIZE, (
+            f"gene_names has {n_panel} genes, exceeding MAX_SAFE_PANEL_SIZE="
+            f"{self.MAX_SAFE_PANEL_SIZE} -- self-attention pooling over gene "
+            f"tokens is O(n_panel^2) per spot, same guard as GeneAttentionDecoder"
+        )
+        name_to_idx = {g: i for i, g in enumerate(full_gene_names)}
+        missing = [g for g in gene_names if g not in name_to_idx]
+        assert not missing, (
+            f"gene_names contains {len(missing)} gene(s) not in full_gene_names "
+            f"(e.g. {missing[:5]})"
+        )
+        self.register_buffer(
+            "_gene_col_idx",
+            torch.tensor([name_to_idx[g] for g in gene_names], dtype=torch.long),
+        )
+        self.identity_embed = nn.Embedding(n_panel, feat_dim)
+        self.value_proj = nn.Linear(1, feat_dim)
+        pool_layer = nn.TransformerEncoderLayer(
+            d_model=feat_dim, nhead=n_pool_heads, dim_feedforward=feat_dim * 4,
+            dropout=0.1, batch_first=True,
+        )
+        self.pool_transformer = nn.TransformerEncoder(pool_layer, num_layers=n_pool_layers)
+        self.out_norm = nn.LayerNorm(feat_dim)
+
+    def forward(self, raw_expr: torch.Tensor) -> torch.Tensor:
+        """raw_expr: [B, n_genes_full] (already log1p'd by the caller, same
+        convention as MLPGeneEncoder -- see StormLiteContextEncoder's own
+        _maybe_log1p). Returns [B, feat_dim]."""
+        selected = raw_expr[:, self._gene_col_idx]           # [B, n_panel]
+        values = self.value_proj(selected.unsqueeze(-1))     # [B, n_panel, feat_dim]
+        identity = self.identity_embed.weight.unsqueeze(0)   # [1, n_panel, feat_dim], broadcasts over batch
+        tokens = values + identity                            # [B, n_panel, feat_dim] -- scGPT's real "add" rule
+        pooled = self.pool_transformer(tokens)                # [B, n_panel, feat_dim] -- genes attend to each other
+        return self.out_norm(pooled.mean(dim=1))              # [B, feat_dim]
+
+
 class OrganTechEmbedding(nn.Module):
     """Learned per-organ/per-technology embedding, added identically to
     every spot's representation within one sample (matches STPath's own

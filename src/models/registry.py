@@ -70,6 +70,9 @@ def _build_context_encoder(
     storm_lite_bias_type: str = "frame_averaging", storm_lite_relative_bias_hidden_dim: int = 32,
     storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
     storm_lite_input_already_log1p: bool = False,
+    storm_lite_tokenizer_gene_names: list[str] | None = None,
+    storm_lite_tokenizer_full_gene_names: list[str] | None = None,
+    storm_lite_tokenizer_n_pool_layers: int = 1, storm_lite_tokenizer_n_pool_heads: int = 4,
     organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
 ):
     """Shared by WAE-GAN/FM-OT/VQ-VAE+AR so each model's __init__ doesn't
@@ -149,13 +152,17 @@ def _build_context_encoder(
         )
     elif context_encoder_type == "storm_lite":
         from src.models.storm_lite_encoder import StormLiteContextEncoder
-        assert gene_encoder_type in ("mlp", "novae", "both"), (
+        assert gene_encoder_type in ("mlp", "novae", "both", "tokenizer", "tokenizer_novae"), (
             f"context_encoder_type='storm_lite' requires gene_encoder_type in "
-            f"('mlp', 'novae', 'both'), got {gene_encoder_type!r}"
+            f"('mlp', 'novae', 'both', 'tokenizer', 'tokenizer_novae'), got {gene_encoder_type!r}"
         )
         return StormLiteContextEncoder(
             n_genes=n_genes, novae_dim=novae_dim, coord_dim=coord_dim,
             hidden_dim=cond_hidden_dim, gene_encoder_type=gene_encoder_type,
+            tokenizer_gene_names=storm_lite_tokenizer_gene_names,
+            tokenizer_full_gene_names=storm_lite_tokenizer_full_gene_names,
+            tokenizer_n_pool_layers=storm_lite_tokenizer_n_pool_layers,
+            tokenizer_n_pool_heads=storm_lite_tokenizer_n_pool_heads,
             coord_scale=coord_scale,
             n_transformer_layers=storm_lite_n_layers, n_heads=storm_lite_n_heads,
             bias_type=storm_lite_bias_type,
@@ -499,6 +506,9 @@ class WAEGAN(BaseGenerativeModel):
                  storm_lite_relative_bias_hidden_dim: int = 32,
                  storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
                  storm_lite_input_already_log1p: bool = False,
+                 storm_lite_tokenizer_gene_names: list[str] | None = None,
+                 storm_lite_tokenizer_full_gene_names: list[str] | None = None,
+                 storm_lite_tokenizer_n_pool_layers: int = 1, storm_lite_tokenizer_n_pool_heads: int = 4,
                  coord_scale: float = 1.0,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
                  decoder_type: str = "dense", decoder_gene_names: list[str] | None = None,
@@ -530,6 +540,10 @@ class WAEGAN(BaseGenerativeModel):
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
             storm_lite_fusion_mode=storm_lite_fusion_mode, storm_lite_qk_norm=storm_lite_qk_norm,
             storm_lite_input_already_log1p=storm_lite_input_already_log1p,
+            storm_lite_tokenizer_gene_names=storm_lite_tokenizer_gene_names,
+            storm_lite_tokenizer_full_gene_names=storm_lite_tokenizer_full_gene_names,
+            storm_lite_tokenizer_n_pool_layers=storm_lite_tokenizer_n_pool_layers,
+            storm_lite_tokenizer_n_pool_heads=storm_lite_tokenizer_n_pool_heads,
             coord_scale=coord_scale, organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
         self.encoder = nn.Sequential(
@@ -856,6 +870,9 @@ class FlowMatchingOT(BaseGenerativeModel):
                  storm_lite_relative_bias_hidden_dim: int = 32,
                  storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
                  storm_lite_input_already_log1p: bool = False,
+                 storm_lite_tokenizer_gene_names: list[str] | None = None,
+                 storm_lite_tokenizer_full_gene_names: list[str] | None = None,
+                 storm_lite_tokenizer_n_pool_layers: int = 1, storm_lite_tokenizer_n_pool_heads: int = 4,
                  coord_scale: float = 1.0,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
                  decoder_type: str = "dense", decoder_gene_names: list[str] | None = None,
@@ -887,6 +904,10 @@ class FlowMatchingOT(BaseGenerativeModel):
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
             storm_lite_fusion_mode=storm_lite_fusion_mode, storm_lite_qk_norm=storm_lite_qk_norm,
             storm_lite_input_already_log1p=storm_lite_input_already_log1p,
+            storm_lite_tokenizer_gene_names=storm_lite_tokenizer_gene_names,
+            storm_lite_tokenizer_full_gene_names=storm_lite_tokenizer_full_gene_names,
+            storm_lite_tokenizer_n_pool_layers=storm_lite_tokenizer_n_pool_layers,
+            storm_lite_tokenizer_n_pool_heads=storm_lite_tokenizer_n_pool_heads,
             coord_scale=coord_scale, organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
         # own autoencoder, own weights — compresses expression to a small
@@ -1232,6 +1253,9 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  storm_lite_relative_bias_hidden_dim: int = 32,
                  storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
                  storm_lite_input_already_log1p: bool = False,
+                 storm_lite_tokenizer_gene_names: list[str] | None = None,
+                 storm_lite_tokenizer_full_gene_names: list[str] | None = None,
+                 storm_lite_tokenizer_n_pool_layers: int = 1, storm_lite_tokenizer_n_pool_heads: int = 4,
                  coord_scale: float = 1.0,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
                  decoder_type: str = "dense", decoder_gene_names: list[str] | None = None,
@@ -1261,6 +1285,10 @@ class VQVAEAutoregressive(BaseGenerativeModel):
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
             storm_lite_fusion_mode=storm_lite_fusion_mode, storm_lite_qk_norm=storm_lite_qk_norm,
             storm_lite_input_already_log1p=storm_lite_input_already_log1p,
+            storm_lite_tokenizer_gene_names=storm_lite_tokenizer_gene_names,
+            storm_lite_tokenizer_full_gene_names=storm_lite_tokenizer_full_gene_names,
+            storm_lite_tokenizer_n_pool_layers=storm_lite_tokenizer_n_pool_layers,
+            storm_lite_tokenizer_n_pool_heads=storm_lite_tokenizer_n_pool_heads,
             coord_scale=coord_scale, organ_vocab=organ_vocab, tech_vocab=tech_vocab,
         )
         self.encoder = nn.Sequential(
