@@ -51,7 +51,17 @@ NAMES=(
     "stormlite_mome_tokenizernovae_paneldecoder_bigger_qknorm_warmup_ema_seed11"
 )
 SEEDS=(10 11 10 11 10 11 10 11)
-EPOCHS=(40000 40000 40000 40000 80000 80000 80000 80000)
+# 2026-07-19: ALL 8 jobs at 40k -- deliberately matched, not the "bigger"
+# arm's usual 80k. Big-vs-small used to be confounded with training
+# length (bigger always got 2x the epochs) in every prior comparison in
+# this project; matching epochs here means capacity is the ONLY thing
+# that differs between the small and bigger halves of this batch, so any
+# gap is cleanly attributable to capacity, not training time. NOTE: this
+# means the "bigger" jobs below are NOT directly comparable to the
+# established 80k-epoch bigger_qknorm_warmup baseline (0.4637/0.5031,
+# docs/results_log.md) -- this batch needs its own within-batch big-vs-
+# small read, not a cross-batch one against that different-epoch-budget number.
+EPOCHS=(40000 40000 40000 40000 40000 40000 40000 40000)
 EXTRA_OVERRIDE=(
     "model.params.gene_encoder_type=tokenizer"
     "model.params.gene_encoder_type=tokenizer"
@@ -121,9 +131,12 @@ done
 
 echo ""
 echo "Compare against:"
-echo "  StormLite small (flagship, gene_encoder_type='both'), 11-seed mean: 0.4546"
-echo "  StormLite bigger+QK-norm+warmup (gene_encoder_type='both'), 8-seed mean: 0.4637"
-echo "    (0.5031 over the 7 seeds excluding the one seed11 outlier -- see docs/results_log.md)"
+echo "  StormLite small (flagship, gene_encoder_type='both'), 11-seed mean: 0.4546 (40k epochs)"
+echo "  StormLite bigger+QK-norm+warmup (gene_encoder_type='both'), 8-seed mean: 0.4637, or 0.5031"
+echo "    over 7 seeds excl. the seed11 outlier -- BUT that's at 80k epochs, not this batch's 40k,"
+echo "    so it's NOT a clean cross-batch comparison for the bigger jobs below (jobs 4-7)."
+echo "    The clean read for THIS batch is small-vs-bigger WITHIN it (both at 40k) --"
+echo "    that isolates capacity as the only difference, not training length."
 echo "  STPath unfrozen (the real per-gene-tokenization architecture this is modeled on), 5-seed mean: 0.4706"
 echo "  STPath pretrained (the actual ceiling), 5-seed mean: 0.5060"
 echo "  A real win on the small-flagship tokenizer jobs means it beats 0.4546 outright."
