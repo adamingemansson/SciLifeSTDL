@@ -34,6 +34,19 @@
 # ("does this new architecture idea help?" vs "does the flagship
 # generalize across samples?") cleanly unconfounded from each other.
 #
+# 2026-07-20 REAL BUG FIX: jobs 3/4 originally ran through
+# src.evaluation.run_comparison, same as jobs 1/2 -- but _train_model's
+# own docstring in run_comparison.py says explicitly: "single-sample
+# only -- does not yet support cfg.data.sample_ids ... use
+# `python -m src.training.train` directly for now". Confirmed via a real
+# crash: ConfigAttributeError: Missing key sample_id (run_comparison.py's
+# adata-caching key construction unconditionally reads cfg.data.sample_id,
+# which multi-sample configs never set -- they set sample_ids, plural).
+# Jobs 3/4 below now use src.training.train directly, with its own CLI
+# (--config flag, not positional; no --shuffle-diagnostic, that's a
+# run_comparison.py-only feature) and its own simpler stdout format
+# ("mean PCC: ..." / "RMSE: ...", not the full model/PCC/RMSE/AUC table).
+#
 # Usage: bash scripts/run_parallel_4gpu_sta100_knn_boundary_multisample.sh
 # Smoke test: SMOKETEST=1 bash scripts/run_parallel_4gpu_sta100_knn_boundary_multisample.sh
 # Logs: logs/parallel_run_sta100_knn_boundary_multisample/<name>.log
@@ -67,9 +80,10 @@ EXTRA_OVERRIDE=(
     ""
     ""
 )
+# 1 = multi-sample (use src.training.train), 0 = single-sample (use src.evaluation.run_comparison)
+IS_MULTISAMPLE=(0 0 1 1)
 
 LOG_DIR="logs/parallel_run_sta100_knn_boundary_multisample"
-EXTRA_ARGS="--shuffle-diagnostic"
 SMOKE_OVERRIDE=""
 if [ "$SMOKETEST" = "1" ]; then
     LOG_DIR="logs/parallel_run_sta100_knn_boundary_multisample_smoketest"
@@ -97,33 +111,52 @@ for i in "${!CONFIGS[@]}"; do
     seed="${SEEDS[$i]}"
     extra="${EXTRA_OVERRIDE[$i]}"
     logfile="$LOG_DIR/${name}.log"
-    if [ -f "$logfile" ] && grep -q "^model " "$logfile"; then
+    if [ -f "$logfile" ] && { grep -q "^model " "$logfile" || grep -q "^mean PCC:" "$logfile"; }; then
         echo "  GPU $i: [$name] SKIP (already completed)"
         continue
     fi
     echo "  GPU $i: [$name] START"
     epoch_override=""
     [ "$SMOKETEST" != "1" ] && epoch_override="training.epochs=${EPOCHS[$i]}"
-    CUDA_VISIBLE_DEVICES=$i OMP_NUM_THREADS=$THREADS_PER_JOB MKL_NUM_THREADS=$THREADS_PER_JOB \
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    python3 -m src.evaluation.run_comparison "$cfg" \
-        --override ${extra} \
-                    training.seed=${seed} \
-                    training.ema_decay=0.999 \
-                    ${epoch_override} \
-                    training.checkpoint_dir=results/checkpoints/${name} \
-                    training.checkpoint_every_n_steps=10000 \
-                    training.log_print_every_n_steps=1000 \
-                    ${SMOKE_OVERRIDE} \
-        ${EXTRA_ARGS} > "$logfile" 2>&1 &
+    if [ "${IS_MULTISAMPLE[$i]}" = "1" ]; then
+        CUDA_VISIBLE_DEVICES=$i OMP_NUM_THREADS=$THREADS_PER_JOB MKL_NUM_THREADS=$THREADS_PER_JOB \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        python3 -m src.training.train --config "$cfg" \
+            --override ${extra} \
+                        training.seed=${seed} \
+                        training.ema_decay=0.999 \
+                        ${epoch_override} \
+                        training.checkpoint_dir=results/checkpoints/${name} \
+                        training.checkpoint_every_n_steps=10000 \
+                        training.log_print_every_n_steps=1000 \
+                        ${SMOKE_OVERRIDE} > "$logfile" 2>&1 &
+    else
+        CUDA_VISIBLE_DEVICES=$i OMP_NUM_THREADS=$THREADS_PER_JOB MKL_NUM_THREADS=$THREADS_PER_JOB \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        python3 -m src.evaluation.run_comparison "$cfg" \
+            --override ${extra} \
+                        training.seed=${seed} \
+                        training.ema_decay=0.999 \
+                        ${epoch_override} \
+                        training.checkpoint_dir=results/checkpoints/${name} \
+                        training.checkpoint_every_n_steps=10000 \
+                        training.log_print_every_n_steps=1000 \
+                        ${SMOKE_OVERRIDE} \
+            --shuffle-diagnostic > "$logfile" 2>&1 &
+    fi
 done
 
 wait
 echo ""
 echo "=== All jobs finished. Results: ==="
-for name in "${NAMES[@]}"; do
+for i in "${!NAMES[@]}"; do
+    name="${NAMES[$i]}"
     echo "--- $name ---"
-    grep -m1 -A2 "^model " "$LOG_DIR/${name}.log" 2>/dev/null | tail -2
+    if [ "${IS_MULTISAMPLE[$i]}" = "1" ]; then
+        grep -E "^mean PCC:|^RMSE:" "$LOG_DIR/${name}.log" 2>/dev/null
+    else
+        grep -m1 -A2 "^model " "$LOG_DIR/${name}.log" 2>/dev/null | tail -2
+    fi
 done
 
 echo ""
@@ -134,3 +167,5 @@ echo "  Job 3 (multisample STPath-unfrozen) vs single-sample flagship STPath-unf
 echo "    exp_hest1k_fm_ot_stpath_unfrozen_bothresidual_paneldecoder_add.yaml's own header)"
 echo "  Job 4 (multisample StormLite) vs single-sample StormLite flagship (0.4546) --"
 echo "    also directly comparable to job 3 for a multi-sample StormLite-vs-STPath read"
+echo "  NOTE: jobs 3/4 report only mean PCC + RMSE (src.training.train's own simpler eval,"
+echo "  no AUC/ST-FID/ST-MMD/shuffle-diagnostic -- those are run_comparison.py-only)."
