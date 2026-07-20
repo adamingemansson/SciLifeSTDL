@@ -12,7 +12,9 @@ Run with:
 """
 import torch
 
-from src.models.storm_lite_encoder import StormLiteContextEncoder, _MoMETransformerBlock, _knn_additive_mask
+from src.models.storm_lite_encoder import (
+    StormLiteContextEncoder, _MoMETransformerBlock, _knn_additive_mask, _knn_adjacency,
+)
 from src.models.conditioning import _GIGAPATH_FEAT_DIM, RelativePositionBias
 
 
@@ -333,6 +335,65 @@ def test_storm_lite_knn_k_none_preserves_prior_behavior():
     print("[knn_additive_mask] OK — knn_k=None (default) is a true no-op")
 
 
+def test_knn_adjacency_exactly_k_edges_with_self_loop():
+    torch.manual_seed(0)
+    coords = torch.rand(7, 3) * 100
+    for k in (1, 3, 7, 12):  # 12 > N=7 must clip
+        adj = _knn_adjacency(coords, k)
+        expected = min(k, 7)
+        assert (adj.sum(dim=-1) == expected).all()
+        assert (adj.diag() == 1.0).all(), "self must always be an edge (distance 0 is always nearest)"
+    print("[gnn_fusion] OK — _knn_adjacency has exactly min(k,N) edges per row, always incl. self-loop")
+
+
+def test_storm_lite_fusion_mode_gnn_end_to_end():
+    torch.manual_seed(0)
+    n_context, n_query, n_genes, hidden_dim = 10, 4, 20, 16
+    context_coords = torch.rand(n_context, 3) * 100
+    query_coords = torch.rand(n_query, 3) * 100
+    context_images = torch.rand(n_context, _GIGAPATH_FEAT_DIM)
+    query_images = torch.rand(n_query, _GIGAPATH_FEAT_DIM)
+    context_expression = torch.rand(n_context, n_genes)
+
+    encoder = StormLiteContextEncoder(
+        n_genes=n_genes, hidden_dim=hidden_dim, n_transformer_layers=2,
+        gene_encoder_type="mlp", fusion_mode="gnn", gnn_k=4,
+    )
+    c = encoder(context_coords, context_expression, query_coords, context_images, query_images)
+    assert c.shape == (n_query, hidden_dim)
+    assert torch.isfinite(c).all()
+    c.sum().backward()
+    print("[gnn_fusion] OK — StormLiteContextEncoder fusion_mode='gnn' runs end-to-end, gradients flow")
+
+
+def test_storm_lite_fusion_mode_gnn_differs_from_sum_and_mome():
+    """Genuinely different aggregation mechanism -> genuinely different
+    output, not an accidental no-op reduction to the same computation."""
+    torch.manual_seed(0)
+    n_context, n_query, n_genes, hidden_dim = 10, 4, 20, 16
+    context_coords = torch.rand(n_context, 3) * 100
+    query_coords = torch.rand(n_query, 3) * 100
+    context_images = torch.rand(n_context, _GIGAPATH_FEAT_DIM)
+    query_images = torch.rand(n_query, _GIGAPATH_FEAT_DIM)
+    context_expression = torch.rand(n_context, n_genes)
+
+    outputs = {}
+    for fusion_mode in ("sum", "mome", "gnn"):
+        torch.manual_seed(1)
+        kwargs = {"gnn_k": 4} if fusion_mode == "gnn" else {}
+        encoder = StormLiteContextEncoder(
+            n_genes=n_genes, hidden_dim=hidden_dim, gene_encoder_type="mlp",
+            fusion_mode=fusion_mode, **kwargs,
+        )
+        with torch.no_grad():
+            outputs[fusion_mode] = encoder(
+                context_coords, context_expression, query_coords, context_images, query_images
+            )
+    assert not torch.allclose(outputs["sum"], outputs["gnn"])
+    assert not torch.allclose(outputs["mome"], outputs["gnn"])
+    print("[gnn_fusion] OK — fusion_mode='gnn' produces genuinely different output from 'sum'/'mome'")
+
+
 if __name__ == "__main__":
     test_storm_lite_context_encoder()
     test_mome_transformer_block()
@@ -344,4 +405,7 @@ if __name__ == "__main__":
     test_knn_additive_mask_keeps_exactly_k_neighbors()
     test_storm_lite_knn_k_end_to_end()
     test_storm_lite_knn_k_none_preserves_prior_behavior()
+    test_knn_adjacency_exactly_k_edges_with_self_loop()
+    test_storm_lite_fusion_mode_gnn_end_to_end()
+    test_storm_lite_fusion_mode_gnn_differs_from_sum_and_mome()
     print("\nStormLiteContextEncoder smoke test done.")

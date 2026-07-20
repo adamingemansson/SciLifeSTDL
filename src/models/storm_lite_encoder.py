@@ -124,6 +124,75 @@ def _knn_additive_mask(coords: torch.Tensor, k: int) -> torch.Tensor:
     return mask
 
 
+def _knn_adjacency(coords: torch.Tensor, k: int) -> torch.Tensor:
+    """Float [N, N] adjacency matrix (1.0 = edge, including self; 0.0 = no
+    edge) for the "gnn" fusion_mode's message passing — same underlying
+    k-nearest-neighbor computation as _knn_additive_mask, but returning a
+    real adjacency for aggregation instead of an additive attention bias
+    (different consumer, different return semantics — kept as a separate
+    function rather than sharing one, since a caller reading either name
+    should immediately know what it gets back)."""
+    N = coords.shape[0]
+    k = min(k, N)
+    dist = torch.cdist(coords, coords)
+    _, nn_idx = torch.topk(dist, k, dim=-1, largest=False)
+    adj = torch.zeros(N, N, device=coords.device, dtype=coords.dtype)
+    adj.scatter_(1, nn_idx, 1.0)
+    return adj
+
+
+class _GNNBlock(nn.Module):
+    """One spatial graph-neural-network block (2026-07-20) — a real
+    ALTERNATIVE to StormLite's attention-based fusion, inspired by stMCDI
+    (Li et al. 2024, "stMCDI: Masked Conditional Diffusion Model with
+    Graph Neural Network for Spatial Transcriptomics Data Imputation",
+    arXiv 2403.10863 — confirmed real via direct web search 2026-07-20;
+    its own key idea: a GNN encoder over the spot spatial graph, combined
+    with masked self-supervised completion, which this project's whole
+    context/query masking setup already structurally resembles).
+
+    HONEST GROUNDING NOTE: stMCDI's own literal GNN internals were not
+    independently verified beyond the "GNN encoder over spatial position
+    graph" high-level description (no direct paper/code read, unlike
+    STFlow/DISCO above) — this implements standard GraphSAGE-style mean-
+    aggregation message passing (Hamilton et al. 2017, "Inductive
+    Representation Learning on Large Graphs"), a well-established, real
+    GNN mechanism, rather than guessing at stMCDI's exact layer design.
+    Same "grounded in a verified general mechanism, not a guessed literal
+    port" practice as _MoMETransformerBlock's own MultiST fallback used
+    when STORM's exact internals were unverifiable.
+
+    Real motivation for testing this at all: it replaces StormLite's O(N^2)
+    dense attention with real sparse message passing over a k-NN spatial
+    graph — genuinely different inductive bias from every attention-based
+    fusion_mode tried so far ("sum", "mome"), and unlike storm_lite_knn_k
+    (which only masks dense attention), this is actual sparse aggregation."""
+
+    def __init__(self, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.msg_proj = nn.Linear(d_model, d_model)
+        self.combine_proj = nn.Linear(2 * d_model, d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+        hidden = d_model * 4
+        self.ffn = nn.Sequential(nn.Linear(d_model, hidden), nn.GELU(), nn.Linear(hidden, d_model))
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
+        """x: [1, N, d_model]. adjacency: [N, N] float (1.0=edge incl.
+        self, 0.0=no edge, see _knn_adjacency)."""
+        normed = self.norm1(x)
+        msg = self.msg_proj(normed.squeeze(0))  # [N, d_model]
+        deg = adjacency.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        agg = torch.matmul(adjacency, msg) / deg  # mean of neighbor messages, [N, d_model]
+        combined = self.combine_proj(torch.cat([normed.squeeze(0), agg], dim=-1))
+        x = x + self.dropout1(combined).unsqueeze(0)
+        normed2 = self.norm2(x)
+        x = x + self.dropout2(self.ffn(normed2))
+        return x
+
+
 class _QKNormAttention(nn.Module):
     """Multi-head self-attention with QK-normalization (Henry et al. 2020,
     EMNLP, "Query-Key Normalization for Transformers"; the LayerNorm-over-
@@ -273,7 +342,7 @@ class StormLiteContextEncoder(nn.Module):
                  tokenizer_n_pool_layers: int = 1, tokenizer_n_pool_heads: int = 4,
                  bias_type: str = "frame_averaging", relative_bias_hidden_dim: int = 32,
                  fusion_mode: str = "sum", qk_norm: bool = False,
-                 knn_k: int | None = None,
+                 knn_k: int | None = None, gnn_k: int = 8,
                  input_already_log1p: bool = False,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
@@ -283,7 +352,8 @@ class StormLiteContextEncoder(nn.Module):
         assert bias_type in ("none", "relative_position", "frame_averaging"), (
             f"unknown bias_type {bias_type!r}"
         )
-        assert fusion_mode in ("sum", "mome"), f"unknown fusion_mode {fusion_mode!r}"
+        assert fusion_mode in ("sum", "mome", "gnn"), f"unknown fusion_mode {fusion_mode!r}"
+        self.gnn_k = gnn_k
         assert knn_k is None or knn_k >= 1, f"knn_k must be >= 1 or None, got {knn_k!r}"
         self.knn_k = knn_k
         self.fusion_mode = fusion_mode
@@ -443,6 +513,18 @@ class StormLiteContextEncoder(nn.Module):
             # modality) pair — combines each query spot's final image-
             # token and gene-token representations after the MoME blocks.
             self.mome_output_proj = nn.Linear(2 * hidden_dim, hidden_dim)
+        elif fusion_mode == "gnn":
+            # 2026-07-20, stMCDI-inspired (see _GNNBlock's own docstring
+            # for the full grounding/honesty note) — sparse message
+            # passing over a k-NN spatial graph instead of dense
+            # attention. Reuses the "sum" path's token construction
+            # (img_embed + gene_embed + coord_embed) below; bias_type is
+            # irrelevant here (no attention step to bias) and silently
+            # unused if set, same as relative_bias_hidden_dim already is
+            # for bias_type != "relative_position".
+            self.gnn_blocks = nn.ModuleList([
+                _GNNBlock(hidden_dim) for _ in range(n_transformer_layers)
+            ])
         else:  # "sum" — original design, unchanged
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=hidden_dim, nhead=n_heads, batch_first=True
@@ -557,6 +639,20 @@ class StormLiteContextEncoder(nn.Module):
                 knn_mask = _knn_additive_mask(coords, self.knn_k)
                 bias = knn_mask if bias is None else bias + knn_mask
             fused = self.transformer(tokens.unsqueeze(0), mask=bias).squeeze(0)  # self-attention over ALL spots
+            return fused[n_context:]  # query positions only
+        elif self.fusion_mode == "gnn":
+            # 2026-07-20, stMCDI-inspired — see _GNNBlock's own docstring.
+            # Same token construction as "sum" (this fusion_mode differs
+            # only in HOW tokens are combined afterward: sparse k-NN
+            # message passing instead of dense attention).
+            tokens = img_embed + gene_embed + coord_embed
+            if self.organ_tech_embed is not None and organ is not None and tech is not None:
+                tokens = tokens + self.organ_tech_embed(organ, tech, n_total, device)
+            adjacency = _knn_adjacency(coords, self.gnn_k)
+            fused = tokens.unsqueeze(0)
+            for block in self.gnn_blocks:
+                fused = block(fused, adjacency)
+            fused = fused.squeeze(0)
             return fused[n_context:]  # query positions only
         else:  # "mome" — see _MoMETransformerBlock's own docstring
             img_tokens = img_embed + coord_embed + self.modality_embed[0]
