@@ -1,4 +1,4 @@
-experiment_name: screen_clean_novae_hr_both
+experiment_name: recovery_harmonic_residual_stormlite_concat
 data:
   source: hest1k
   hest_data_dir: data/raw/hest1k
@@ -8,7 +8,7 @@ data:
   min_cells: 3
   expression_transform: normalize_log1p
   expression_target_sum: 10000.0
-  novae_mode: context_only
+  novae_mode: disabled
   require_image_coverage: true
   use_images: true
 masking:
@@ -16,9 +16,7 @@ masking:
   max_context_points: 768
   params:
     n_patches: 3
-    radius_range:
-    - 250
-    - 450
+    radius_range: [250, 450]
 model:
   name: harmonic_residual
   params:
@@ -31,12 +29,17 @@ model:
     residual_scale_floor: 0.05
     lr: 0.001
     context_encoder_type: storm_lite
-    gene_encoder_type: both
-    storm_lite_fusion_mode: mome
-    storm_lite_qk_norm: true
+    gene_encoder_type: mlp
+    storm_lite_fusion_mode: concat
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    storm_lite_qk_norm: false
+    storm_lite_bias_type: frame_averaging
 training:
   epochs: 10000
   seed: 0
+  mask_seed: 700000
+  unique_mask_count: 10000
   log_every_n_steps: 10
   log_print_every_n_steps: 250
   checkpoint_every_n_steps: 2500
@@ -46,36 +49,32 @@ training:
   query_image_dropout_p: 0.0
   all_image_dropout_p: 0.0
   gradient_clip_val: 1.0
-  checkpoint_dir: results/checkpoints/complexity_ladder/screen_clean_novae_hr_both
-  unique_mask_count: 256
+  checkpoint_dir: results/checkpoints/recovery_suite/recovery_harmonic_residual_stormlite_concat
 validation:
   enabled: true
   every_n_steps: 500
-  patience_checks: 8
-  early_stopping_min_steps: 7500
-  require_anchor_improvement: true
-  anchor_min_delta: 0.0001
+  patience_checks: 1000
+  early_stopping_min_steps: 10000
   min_delta: 0.0001
   metric: rmse
   n_samples: 4
   sampling_seed: 800000
+  require_anchor_improvement: true
+  anchor_min_delta: 0.0001
+  min_correction_rms: 0.0001
 evaluation:
-  mask_bank_path: results/mask_banks/INT1_image_coverage.json
+  mask_bank_path: results/mask_banks/recovery_suite/INT1_recovery.json
   n_validation_masks: 4
   n_test_masks: 8
   validation_seed: 700000
   test_seed: 900000
   sampling_seed: 1200000
   n_samples: 8
-  image_modes:
-  - full
-  - target_zero
-  - all_zero
-  - shuffled
+  image_modes: [full, target_zero, all_zero, shuffled]
   validation_image_mode: full
   k_neighborhood: 8
   pca_n_components: 50
-  training_mask_bank_path: results/mask_banks/training/complexity_ladder/clean_novae_screen_10k_u256.json
+  training_mask_bank_path: results/mask_banks/training/recovery_suite/residual_diagnostic_10k.json
 logging:
   backend: csv
   project: st3d-lundeberg-lab

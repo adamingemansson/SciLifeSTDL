@@ -15,6 +15,11 @@ def metric_mean(mode_payload: dict, name: str):
     return value.get("mean") if isinstance(value, dict) else value
 
 
+def format_metric(value) -> str:
+    """Format optional metrics without crashing on intentionally absent modes."""
+    return "n/a" if value is None else f"{float(value):.4f}"
+
+
 def collect(root: Path) -> list[dict]:
     rows = []
     for exp_dir in sorted(path for path in root.glob("*") if path.is_dir()):
@@ -55,10 +60,10 @@ def main() -> None:
     for row in rows[:10]:
         print(
             f"{row['experiment_name']:<48} "
-            f"PCC={row.get('full_pcc', float('nan')):.4f} "
-            f"RMSE={row.get('full_rmse', float('nan')):.4f} "
-            f"target0={row.get('target_zero_rmse', float('nan')):.4f} "
-            f"all0={row.get('all_zero_rmse', float('nan')):.4f}"
+            f"PCC={format_metric(row.get('full_pcc'))} "
+            f"RMSE={format_metric(row.get('full_rmse'))} "
+            f"target0={format_metric(row.get('target_zero_rmse'))} "
+            f"all0={format_metric(row.get('all_zero_rmse'))}"
         )
 
 

@@ -1170,7 +1170,10 @@ def _training_seed_bank_for_config(cfg, obs_names) -> tuple[dict, Path]:
         path,
         obs_names,
         n_items=int(cfg.training.epochs),
-        base_seed=int(cfg.training.seed),
+        # Keep model initialization seeds and masking schedules independent.
+        # Recovery/confirmation runs can then compare seeds on identical
+        # tissue holes instead of changing both factors at once.
+        base_seed=int(cfg.training.get("mask_seed", cfg.training.seed)),
         masking_cfg=cfg.masking,
         unique_mask_count=int(cfg.training.get("unique_mask_count", cfg.training.epochs)),
     )
@@ -1318,6 +1321,39 @@ def inject_expression_preprocessing(model_cfg: dict, adata) -> None:
         params.setdefault("storm_lite_input_already_log1p", already_log1p)
     elif context_encoder_type == "stpath":
         params.setdefault("stpath_input_already_log1p", already_log1p)
+
+
+def _pooled_gene_std(expressions: list[np.ndarray]) -> np.ndarray:
+    """Per-gene standard deviation using training samples only."""
+    if not expressions:
+        raise ValueError("at least one training expression matrix is required")
+    total_n = 0
+    total_sum = None
+    total_sumsq = None
+    for expression in expressions:
+        values = np.asarray(expression, dtype=np.float64)
+        if values.ndim != 2:
+            raise ValueError(f"expression matrix must be 2-D, got {values.shape}")
+        if total_sum is not None and values.shape[1] != total_sum.shape[0]:
+            raise ValueError("training expression matrices do not share one gene panel")
+        sample_sum = values.sum(axis=0)
+        sample_sumsq = np.square(values).sum(axis=0)
+        total_sum = sample_sum if total_sum is None else total_sum + sample_sum
+        total_sumsq = sample_sumsq if total_sumsq is None else total_sumsq + sample_sumsq
+        total_n += values.shape[0]
+    if total_n < 2:
+        raise ValueError("at least two training observations are required for gene scaling")
+    variance = np.maximum(total_sumsq / total_n - np.square(total_sum / total_n), 0.0)
+    return np.sqrt(variance).astype(np.float32)
+
+
+def inject_residual_gene_scale(model_cfg: dict, expressions: list[np.ndarray]) -> None:
+    """Inject training-only gene scales for ``harmonic_residual`` models."""
+    if model_cfg.get("name") != "harmonic_residual":
+        return
+    params = model_cfg.get("params", {})
+    if "residual_gene_scale" not in params:
+        params["residual_gene_scale"] = _pooled_gene_std(expressions).tolist()
 
 
 def inject_coord_scale(model_cfg: dict, coord_scale: float) -> None:
@@ -1802,6 +1838,7 @@ def _main_multi_sample(cfg) -> None:
         inject_stpath_gene_names(model_cfg, fit_adatas[0])
         inject_storm_lite_tokenizer_gene_names(model_cfg, fit_adatas[0])
         inject_expression_preprocessing(model_cfg, fit_adatas[0])
+        inject_residual_gene_scale(model_cfg, [sample[1] for sample in train_samples])
         if novae_dim is not None:
             if context_encoder_type == "stpath":
                 inject_stpath_novae_dim(model_cfg, novae_dim)
@@ -1900,6 +1937,11 @@ def _main_multi_sample(cfg) -> None:
             n_samples=int(validation_cfg.get("n_samples", 4)),
             history_path=Path(checkpoint_dir) / "validation_history.json",
             seed=int(validation_cfg.get("sampling_seed", 800_000)),
+            early_stopping_min_steps=int(validation_cfg.get("early_stopping_min_steps", 0)),
+            require_anchor_improvement=bool(validation_cfg.get("require_anchor_improvement", False)),
+            anchor_min_delta=float(validation_cfg.get("anchor_min_delta", 0.0)),
+            min_correction_rms=float(validation_cfg.get("min_correction_rms", 0.0)),
+            quality_gate_path=Path(checkpoint_dir) / "quality_gate.json",
         )
         callbacks.append(validation_callback)
     else:
@@ -1932,6 +1974,8 @@ def _main_multi_sample(cfg) -> None:
         elif ema_callback is not None:
             print("best held-out-sample validation state selected; EMA final-state application skipped")
         save_trained_model(model, unresolved_model_cfg, gene_names, checkpoint_dir)
+        if validation_callback is not None:
+            validation_callback.raise_if_quality_gate_failed()
 
     if test_ids:
         from src.evaluation.audit_evaluation import evaluate_model_on_mask_bank
@@ -2025,6 +2069,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     inject_decoder_gene_names(model_cfg, adata)
     inject_storm_lite_tokenizer_gene_names(model_cfg, adata)
     inject_expression_preprocessing(model_cfg, adata)
+    inject_residual_gene_scale(model_cfg, [expr])
     inject_coord_scale(model_cfg, coord_scale)
     if novae_inputs["feature_dim"] is not None:
         if context_encoder_type == "stpath":
@@ -2052,6 +2097,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     inject_decoder_gene_names(unresolved_model_cfg, adata)
     inject_storm_lite_tokenizer_gene_names(unresolved_model_cfg, adata)
     inject_expression_preprocessing(unresolved_model_cfg, adata)
+    inject_residual_gene_scale(unresolved_model_cfg, [expr])
     inject_coord_scale(unresolved_model_cfg, coord_scale)
     if novae_inputs["feature_dim"] is not None:
         if context_encoder_type == "stpath":
@@ -2111,6 +2157,11 @@ def main(cfg_path: str, overrides: list[str] | None = None):
                 n_samples=int(validation_cfg.get("n_samples", 4)),
                 history_path=Path(checkpoint_dir) / "validation_history.json",
                 seed=int(validation_cfg.get("sampling_seed", 800_000)),
+                early_stopping_min_steps=int(validation_cfg.get("early_stopping_min_steps", 0)),
+                require_anchor_improvement=bool(validation_cfg.get("require_anchor_improvement", False)),
+                anchor_min_delta=float(validation_cfg.get("anchor_min_delta", 0.0)),
+                min_correction_rms=float(validation_cfg.get("min_correction_rms", 0.0)),
+                quality_gate_path=Path(checkpoint_dir) / "quality_gate.json",
             )
             callbacks.append(validation_callback)
         else:
@@ -2154,6 +2205,8 @@ def main(cfg_path: str, overrides: list[str] | None = None):
         saved_path = save_trained_model(model, unresolved_model_cfg, adata.var_names.tolist(), checkpoint_dir)
         if saved_path is not None:
             print(f"Saved trained model (weights + config + gene names) to {saved_path.parent}")
+        if validation_callback is not None:
+            validation_callback.raise_if_quality_gate_failed()
 
     # Full untouched-test-bank evaluation: predictive mean, uncertainty,
     # fixed-dimensional ST-FID/ST-MMD and explicit image-availability modes.

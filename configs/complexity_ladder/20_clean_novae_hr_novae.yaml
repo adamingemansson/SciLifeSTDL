@@ -27,6 +27,8 @@ model:
     hidden_dim: 512
     harmonic_k: 8
     harmonic_ridge: 0.0001
+    residual_init_std: 0.001
+    residual_scale_floor: 0.05
     lr: 0.001
     context_encoder_type: storm_lite
     gene_encoder_type: novae
@@ -50,6 +52,9 @@ validation:
   enabled: true
   every_n_steps: 500
   patience_checks: 8
+  early_stopping_min_steps: 7500
+  require_anchor_improvement: true
+  anchor_min_delta: 0.0001
   min_delta: 0.0001
   metric: rmse
   n_samples: 4

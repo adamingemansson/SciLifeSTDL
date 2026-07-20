@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Run the post-audit complexity ladder in dependency-ordered stages.
+# Despite the historical filename, DEVICES may contain any positive number
+# of single-job GPU ids; use the 8-GPU wrapper for the current machine.
 set -Eeuo pipefail
 
 DEVICES_STRING="${DEVICES:-0 1 2 3}"
 read -r -a GPU_IDS <<< "$DEVICES_STRING"
-if (( ${#GPU_IDS[@]} != 4 )); then
-  echo "ERROR: DEVICES must contain exactly four ids, e.g. DEVICES='0 1 2 3'" >&2
+if (( ${#GPU_IDS[@]} < 1 )); then
+  echo "ERROR: DEVICES must contain at least one GPU id" >&2
   exit 2
 fi
 
@@ -64,6 +66,8 @@ run_config() {
       evaluation.training_mask_bank_path="results/mask_banks/training/complexity_ladder/smoke_${name}.json"
       validation.every_n_steps=100
       validation.patience_checks=2
+      validation.early_stopping_min_steps=300
+      validation.require_anchor_improvement=false
       evaluation.n_samples=2)
   fi
   run_command "$gpu" "$name" "${cmd[@]}"
@@ -105,7 +109,7 @@ run_wave() {
   local offset=0
   while (( offset < ${#configs[@]} )); do
     local pids=() names=() failed=0
-    for slot in 0 1 2 3; do
+    for slot in "${!GPU_IDS[@]}"; do
       local idx=$((offset + slot))
       (( idx < ${#configs[@]} )) || break
       local config="${configs[$idx]}" gpu="${GPU_IDS[$slot]}"
@@ -131,7 +135,7 @@ run_wave() {
       echo "Stopping after failed wave '$wave'. Logs: $LOG_ROOT" >&2
       exit 1
     fi
-    offset=$((offset + 4))
+    offset=$((offset + ${#GPU_IDS[@]}))
   done
 }
 

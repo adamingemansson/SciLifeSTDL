@@ -493,10 +493,23 @@ class SetSummaryBaseline(BaseGenerativeModel):
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
 
-
 @register_model("harmonic_residual")
 class HarmonicResidualModel(BaseGenerativeModel):
-    """Zero-initialized learned correction around a harmonic anchor."""
+    """Learn a variance-standardized correction around a harmonic anchor.
+
+    The first implementation zero-initialized the output layer and optimized
+    absolute full-panel MSE.  With roughly 16k genes this made the harmonic
+    anchor an extremely sticky solution: the zero output layer blocked every
+    upstream gradient on the first update, while low-variance genes dominated
+    the averaged loss.  Architecturally different encoders consequently
+    produced nearly identical anchor-only predictions.
+
+    ``residual_gene_scale`` is derived from training samples only by
+    ``src.training.train``.  The network predicts residuals in standardized
+    units and converts them back to expression units for sampling.  This gives
+    every informative gene a usable optimization signal without changing the
+    expression-space prediction or evaluation contract.
+    """
 
     def __init__(
         self, n_genes: int, coord_dim: int = 3, cond_hidden_dim: int = 256,
@@ -514,6 +527,9 @@ class HarmonicResidualModel(BaseGenerativeModel):
         storm_lite_tokenizer_full_gene_names: list[str] | None = None,
         storm_lite_tokenizer_n_pool_layers: int = 1,
         storm_lite_tokenizer_n_pool_heads: int = 4,
+        residual_gene_scale: list[float] | None = None,
+        residual_scale_floor: float = 0.05,
+        residual_init_std: float = 1e-3,
         organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
     ):
         super().__init__()
@@ -541,8 +557,26 @@ class HarmonicResidualModel(BaseGenerativeModel):
             nn.Linear(hidden_dim + cond_hidden_dim, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, n_genes),
         )
-        nn.init.zeros_(self.residual[-1].weight)
+        if residual_init_std <= 0:
+            raise ValueError("residual_init_std must be positive")
+        if residual_scale_floor <= 0:
+            raise ValueError("residual_scale_floor must be positive")
+        nn.init.normal_(self.residual[-1].weight, mean=0.0, std=float(residual_init_std))
         nn.init.zeros_(self.residual[-1].bias)
+        if residual_gene_scale is None:
+            scale = torch.ones(n_genes, dtype=torch.float32)
+        else:
+            scale = torch.as_tensor(residual_gene_scale, dtype=torch.float32)
+            if scale.shape != (n_genes,):
+                raise ValueError(
+                    f"residual_gene_scale must have shape ({n_genes},), got {tuple(scale.shape)}"
+                )
+            if not torch.isfinite(scale).all():
+                raise ValueError("residual_gene_scale contains non-finite values")
+        self.register_buffer(
+            "residual_gene_scale",
+            scale.clamp_min(float(residual_scale_floor)),
+        )
         self.harmonic_k, self.harmonic_ridge, self.lr = int(harmonic_k), float(harmonic_ridge), float(lr)
 
     def _anchor(self, context, query):
@@ -552,21 +586,53 @@ class HarmonicResidualModel(BaseGenerativeModel):
         )
 
     def sample(self, context, query):
-        anchor = self._anchor(context, query)
+        anchor = self._anchor(context, query).detach()
         c = self._encode_context(context, query)
-        correction = self.residual(torch.cat([self.anchor_proj(anchor), c], dim=-1))
+        standardized_correction = self.residual(
+            torch.cat([self.anchor_proj(anchor), c], dim=-1)
+        )
+        correction = standardized_correction * self.residual_gene_scale
         return {"coords": query["coords"], "expression": anchor + correction,
-                "anchor_expression": anchor, "residual_expression": correction}
+                "anchor_expression": anchor, "residual_expression": correction,
+                "standardized_residual_expression": standardized_correction}
 
     def training_step(self, batch, batch_idx):
         out = self.sample(batch["context"], batch["query"])
-        loss = nn.functional.mse_loss(out["expression"], batch["target_expression"])
-        anchor_loss = nn.functional.mse_loss(out["anchor_expression"], batch["target_expression"])
-        self.log_dict({"train/loss": loss, "train/anchor_mse": anchor_loss})
+        target = batch["target_expression"]
+        residual_target = (target - out["anchor_expression"]) / self.residual_gene_scale
+        loss = nn.functional.mse_loss(
+            out["standardized_residual_expression"], residual_target
+        )
+        absolute_mse = nn.functional.mse_loss(out["expression"], target)
+        anchor_loss = nn.functional.mse_loss(out["anchor_expression"], target)
+        correction_rms = out["residual_expression"].square().mean().sqrt()
+        target_residual_rms = (target - out["anchor_expression"]).square().mean().sqrt()
+        self.log_dict({
+            "train/loss": loss,
+            "train/absolute_mse": absolute_mse,
+            "train/anchor_mse": anchor_loss,
+            "train/correction_rms": correction_rms,
+            "train/target_residual_rms": target_residual_rms,
+        })
         return loss
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
+
+    def on_after_backward(self) -> None:
+        """Expose whether the repaired residual signal reaches its encoder."""
+        context_sq = torch.zeros((), device=self.device)
+        for parameter in self.context_encoder.parameters():
+            if parameter.grad is not None:
+                context_sq = context_sq + parameter.grad.detach().square().sum()
+        output_sq = torch.zeros((), device=self.device)
+        for parameter in self.residual[-1].parameters():
+            if parameter.grad is not None:
+                output_sq = output_sq + parameter.grad.detach().square().sum()
+        self.log_dict({
+            "train/context_grad_norm": context_sq.sqrt(),
+            "train/residual_output_grad_norm": output_sq.sqrt(),
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -620,7 +686,6 @@ class VAEBaseline(BaseGenerativeModel):
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.lr)
-
 
 # ---------------------------------------------------------------------------
 # WAE-GAN: Wasserstein Auto-Encoder with an adversarial latent regularizer

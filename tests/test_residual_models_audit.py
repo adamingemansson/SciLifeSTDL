@@ -25,7 +25,7 @@ def test_mlp_gene_encoder_uses_lightweight_default():
     assert first.weight.numel() < 10_000_000
 
 
-def test_harmonic_residual_starts_exactly_at_anchor():
+def test_harmonic_residual_starts_near_anchor_with_upstream_gradients():
     model = build_model({
         "name": "harmonic_residual",
         "params": {
@@ -35,8 +35,29 @@ def test_harmonic_residual_starts_exactly_at_anchor():
     })
     item = _item()
     out = model.sample(item["context"], item["query"])
-    assert torch.equal(out["residual_expression"], torch.zeros_like(out["residual_expression"]))
-    assert torch.allclose(out["expression"], out["anchor_expression"])
+    assert torch.count_nonzero(out["residual_expression"]) > 0
+    assert out["residual_expression"].square().mean().sqrt() < 0.05
+    loss = model.training_step(item, 0)
+    loss.backward()
+    assert model.residual[0].weight.grad is not None
+    assert model.residual[0].weight.grad.norm() > 0
+    context_grad = sum(
+        p.grad.norm() for p in model.context_encoder.parameters() if p.grad is not None
+    )
+    assert context_grad > 0
+
+
+def test_harmonic_residual_uses_configured_gene_scales():
+    model = build_model({
+        "name": "harmonic_residual",
+        "params": {
+            "n_genes": 3, "cond_hidden_dim": 8, "hidden_dim": 8,
+            "gene_encoder_type": "mlp", "gene_feat_dim": 4,
+            "residual_gene_scale": [0.01, 0.2, 2.0],
+            "residual_scale_floor": 0.05,
+        },
+    })
+    assert torch.allclose(model.residual_gene_scale, torch.tensor([0.05, 0.2, 2.0]))
 
 
 def test_residual_flow_loads_and_freezes_validated_autoencoder(tmp_path: Path):

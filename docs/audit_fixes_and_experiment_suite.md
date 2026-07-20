@@ -119,8 +119,10 @@ The suite starts with global mean, nearest-neighbour, local mean, inverse-distan
 weighted and graph-harmonic interpolation. It also includes strict learned mean
 and sum set summaries without attention, images or graph message passing.
 
-`harmonic_residual` predicts a zero-initialized correction around the harmonic
-anchor. Its initial output is exactly the deterministic anchor.
+`harmonic_residual` predicts a small-nonzero-initialized, per-gene-standardized
+correction around the harmonic anchor. Exact zero initialization was removed
+after it blocked initial upstream gradients and the deterministic ladder stayed
+near the anchor. Recovery configs require the learned model to beat the anchor.
 
 `residual_fm_ot` models expression residuals around the same anchor. Before any
 residual-flow job runs, a separate autoencoder is trained specifically on

@@ -66,7 +66,12 @@ class FixedMaskValidationCallback(pl.Callback):
     def __init__(self, items: list[dict], every_n_steps: int = 1000,
                  patience_checks: int = 5, min_delta: float = 1e-4,
                  metric: str = "rmse", n_samples: int = 4,
-                 history_path: str | Path | None = None, seed: int = 12345):
+                 history_path: str | Path | None = None, seed: int = 12345,
+                 early_stopping_min_steps: int = 0,
+                 require_anchor_improvement: bool = False,
+                 anchor_min_delta: float = 0.0,
+                 min_correction_rms: float = 0.0,
+                 quality_gate_path: str | Path | None = None):
         super().__init__()
         if metric not in {"rmse", "pcc"}:
             raise ValueError("validation metric must be 'rmse' or 'pcc'")
@@ -78,8 +83,16 @@ class FixedMaskValidationCallback(pl.Callback):
         self.n_samples = max(1, int(n_samples))
         self.history_path = Path(history_path) if history_path else None
         self.seed = int(seed)
+        self.early_stopping_min_steps = max(0, int(early_stopping_min_steps))
+        self.require_anchor_improvement = bool(require_anchor_improvement)
+        self.anchor_min_delta = float(anchor_min_delta)
+        self.min_correction_rms = max(0.0, float(min_correction_rms))
+        self.quality_gate_path = Path(quality_gate_path) if quality_gate_path else None
         self.best_score = float("inf") if metric == "rmse" else -float("inf")
         self.best_state: dict[str, torch.Tensor] | None = None
+        self.anchor_score: float | None = None
+        self.correction_rms: float | None = None
+        self.quality_gate_passed: bool | None = None
         self.bad_checks = 0
         self.history: list[dict] = []
 
@@ -113,10 +126,50 @@ class FixedMaskValidationCallback(pl.Callback):
         model.train(was_training)
         return float(np.mean(values))
 
+    @torch.no_grad()
+    def _score_anchor(self, model: torch.nn.Module) -> float | None:
+        values = []
+        was_training = model.training
+        model.eval()
+        for cpu_item in self.items:
+            item = move_to_device(cpu_item, model.device)
+            output = model.sample(item["context"], item["query"])
+            pred = output.get("anchor_expression")
+            if pred is None:
+                model.train(was_training)
+                return None
+            target = item["target_expression"]
+            if self.metric == "rmse":
+                value = torch.sqrt(torch.mean((pred - target) ** 2)).item()
+            else:
+                pred_c = pred - pred.mean(dim=0, keepdim=True)
+                target_c = target - target.mean(dim=0, keepdim=True)
+                denom = torch.sqrt((pred_c**2).sum(0) * (target_c**2).sum(0)).clamp_min(1e-8)
+                value = ((pred_c * target_c).sum(0) / denom).nanmean().item()
+            values.append(value)
+        model.train(was_training)
+        return float(np.mean(values))
+
     def _improved(self, score: float) -> bool:
         if self.metric == "rmse":
             return score < self.best_score - self.min_delta
         return score > self.best_score + self.min_delta
+
+    @torch.no_grad()
+    def _score_correction_rms(self, model: torch.nn.Module) -> float | None:
+        values = []
+        was_training = model.training
+        model.eval()
+        for cpu_item in self.items:
+            item = move_to_device(cpu_item, model.device)
+            output = model.sample(item["context"], item["query"])
+            correction = output.get("residual_expression")
+            if correction is None:
+                model.train(was_training)
+                return None
+            values.append(correction.square().mean().sqrt().item())
+        model.train(was_training)
+        return float(np.mean(values))
 
     def _write_history(self) -> None:
         if self.history_path is None:
@@ -126,10 +179,37 @@ class FixedMaskValidationCallback(pl.Callback):
         tmp.write_text(json.dumps({
             "metric": self.metric,
             "best_score": self.best_score,
+            "anchor_score": self.anchor_score,
+            "correction_rms": self.correction_rms,
+            "minimum_correction_rms": self.min_correction_rms,
             "n_samples": self.n_samples,
             "history": self.history,
         }, indent=2))
         tmp.replace(self.history_path)
+
+    def _write_quality_gate(self) -> None:
+        if self.quality_gate_path is None:
+            return
+        self.quality_gate_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "required": self.require_anchor_improvement,
+            "passed": self.quality_gate_passed,
+            "metric": self.metric,
+            "best_score": self.best_score,
+            "anchor_score": self.anchor_score,
+            "required_improvement": self.anchor_min_delta,
+            "correction_rms": self.correction_rms,
+            "minimum_correction_rms": self.min_correction_rms,
+        }
+        tmp = self.quality_gate_path.with_suffix(self.quality_gate_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2))
+        tmp.replace(self.quality_gate_path)
+
+    def on_train_start(self, trainer, pl_module):
+        self.anchor_score = self._score_anchor(pl_module)
+        if self.anchor_score is not None:
+            self.history.append({"step": 0, f"anchor_{self.metric}": self.anchor_score})
+            self._write_history()
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         step = int(trainer.global_step)
@@ -142,11 +222,12 @@ class FixedMaskValidationCallback(pl.Callback):
             self.best_score = score
             self.best_state = compact_state_dict(pl_module)
             self.bad_checks = 0
-        else:
+        elif step >= self.early_stopping_min_steps:
             self.bad_checks += 1
         self._write_history()
         print(f"validation step={step} {self.metric}={score:.6f} best={self.best_score:.6f}")
-        if self.bad_checks >= self.patience_checks:
+        if (step >= self.early_stopping_min_steps
+                and self.bad_checks >= self.patience_checks):
             print(f"early stopping after {self.bad_checks} validation checks without improvement")
             trainer.should_stop = True
 
@@ -162,4 +243,26 @@ class FixedMaskValidationCallback(pl.Callback):
             self.history.append({"step": step, self.metric: score, "improved": True, "final_check": True})
         if self.best_state is not None:
             pl_module.load_state_dict(self.best_state, strict=False)
+        self.correction_rms = self._score_correction_rms(pl_module)
+        if self.anchor_score is None:
+            self.quality_gate_passed = None
+        elif self.metric == "rmse":
+            self.quality_gate_passed = self.best_score < self.anchor_score - self.anchor_min_delta
+        else:
+            self.quality_gate_passed = self.best_score > self.anchor_score + self.anchor_min_delta
+        if (self.quality_gate_passed is True and self.min_correction_rms > 0
+                and (self.correction_rms is None
+                     or self.correction_rms < self.min_correction_rms)):
+            self.quality_gate_passed = False
         self._write_history()
+        self._write_quality_gate()
+
+    def raise_if_quality_gate_failed(self) -> None:
+        if self.require_anchor_improvement and self.quality_gate_passed is not True:
+            raise RuntimeError(
+                "residual-model quality gate failed: the best validation checkpoint "
+                f"did not beat the harmonic anchor by {self.anchor_min_delta:g} "
+                f"{self.metric} (best={self.best_score:.6f}, anchor={self.anchor_score}). "
+                f"correction_rms={self.correction_rms}, required>={self.min_correction_rms:g}. "
+                "Do not promote this run to later experiment stages."
+            )

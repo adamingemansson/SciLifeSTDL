@@ -24,17 +24,17 @@ it improves fixed-mask validation/test results.
 9. **Held-out samples.** Run finalists with INT1-INT8 train, INT9-INT10
    validation and INT11-INT12 test.
 
-## Commands on four A100 devices
+## Commands on eight A100 devices
 
 ```bash
 # One quick infrastructure check; clean Novae is intentionally excluded.
-STAGE=smoke DEVICES="0 1 2 3" bash scripts/run_complexity_ladder_4gpu.sh
+STAGE=smoke bash scripts/run_complexity_ladder_8gpu.sh
 
-STAGE=baselines     DEVICES="0 1 2 3" bash scripts/run_complexity_ladder_4gpu.sh
-STAGE=deterministic DEVICES="0 1 2 3" bash scripts/run_complexity_ladder_4gpu.sh
-STAGE=robustness    DEVICES="0 1 2 3" bash scripts/run_complexity_ladder_4gpu.sh
-STAGE=generative    DEVICES="0 1 2 3" bash scripts/run_complexity_ladder_4gpu.sh
-STAGE=novae         DEVICES="0 1 2 3" bash scripts/run_complexity_ladder_4gpu.sh
+STAGE=baselines     bash scripts/run_complexity_ladder_8gpu.sh
+STAGE=deterministic bash scripts/run_complexity_ladder_8gpu.sh
+STAGE=robustness    bash scripts/run_complexity_ladder_8gpu.sh
+STAGE=generative    bash scripts/run_complexity_ladder_8gpu.sh
+STAGE=novae         bash scripts/run_complexity_ladder_8gpu.sh
 ```
 
 The clean-Novae stage first runs `precompute_context_novae_cache.py`. Only
@@ -79,7 +79,7 @@ python scripts/promote_complexity_winners.py \
   configs/complexity_ladder/04_hr_stormlite_concat_mlp.yaml \
   configs/complexity_ladder/17_residual_fm_stormlite_mome_mlp.yaml
 
-STAGE=confirm DEVICES="0 1 2 3" bash scripts/run_complexity_ladder_4gpu.sh
+STAGE=confirm bash scripts/run_complexity_ladder_8gpu.sh
 ```
 
 Promotion creates matched 40k configs for seeds 0, 1 and 2 under
@@ -101,7 +101,7 @@ python scripts/promote_heldout_winners.py \
   configs/complexity_ladder/confirm/<deterministic-winner-seed0>.yaml \
   configs/complexity_ladder/confirm/<residual-flow-winner-seed0>.yaml
 
-STAGE=heldout DEVICES="0 1 2 3" bash scripts/run_complexity_ladder_4gpu.sh
+STAGE=heldout bash scripts/run_complexity_ladder_8gpu.sh
 ```
 
 The runner pretrains the training-panel residual autoencoder first when a
