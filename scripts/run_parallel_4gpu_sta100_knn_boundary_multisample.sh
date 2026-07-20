@@ -106,7 +106,7 @@ for i in "${!CONFIGS[@]}"; do
     [ "$SMOKETEST" != "1" ] && epoch_override="training.epochs=${EPOCHS[$i]}"
     CUDA_VISIBLE_DEVICES=$i OMP_NUM_THREADS=$THREADS_PER_JOB MKL_NUM_THREADS=$THREADS_PER_JOB \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    python -m src.evaluation.run_comparison "$cfg" \
+    python3 -m src.evaluation.run_comparison "$cfg" \
         --override ${extra} \
                     training.seed=${seed} \
                     training.ema_decay=0.999 \
