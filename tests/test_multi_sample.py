@@ -234,3 +234,24 @@ if __name__ == "__main__":
     test_multi_sample_dataset_carries_gene_features_per_sample()
     test_inject_multi_sample_n_genes()
     print("\nAll multi-sample loader/dataset smoke tests passed.")
+
+
+def test_load_multi_sample_reference_panel_does_not_intersect_with_test():
+    with tempfile.TemporaryDirectory() as tmp:
+        hest_dir = Path(tmp)
+        reference = ["G2", "G1"]
+        _make_synthetic_sample(hest_dir, "TRAIN", ["G0", "G1", "G2"], seed=0)
+        _make_synthetic_sample(hest_dir, "TEST", ["G3", "G2", "G1"], seed=1)
+        heldout = load_multi_sample(
+            hest_dir, ["TEST"], min_genes=1, min_cells=1,
+            reference_genes=reference,
+        )
+        assert list(heldout[0].var_names) == reference
+
+        _make_synthetic_sample(hest_dir, "BADTEST", ["G1", "G3"], seed=2)
+        import pytest
+        with pytest.raises(ValueError, match="Refusing to intersect with test data"):
+            load_multi_sample(
+                hest_dir, ["BADTEST"], min_genes=1, min_cells=1,
+                reference_genes=reference,
+            )

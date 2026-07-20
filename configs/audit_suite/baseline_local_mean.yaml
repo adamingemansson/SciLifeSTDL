@@ -1,0 +1,63 @@
+experiment_name: baseline_local_mean
+data:
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+  expression_transform: normalize_log1p
+  expression_target_sum: 10000.0
+  novae_mode: disabled
+  require_image_coverage: true
+  use_images: false
+masking:
+  strategy: random_dropout_patches
+  max_context_points: 768
+  params:
+    n_patches: 3
+    radius_range:
+    - 250
+    - 450
+model:
+  name: spatial_baseline
+  params:
+    mode: local_mean
+    k: 8
+training:
+  epochs: 1
+  seed: 0
+  log_every_n_steps: 10
+  log_print_every_n_steps: 250
+  checkpoint_every_n_steps: 5000
+  num_workers: 0
+  augment_coords: true
+  image_mode: full
+  query_image_dropout_p: 0.0
+  all_image_dropout_p: 0.0
+  gradient_clip_val: 1.0
+  checkpoint_dir: results/checkpoints/audit_suite/baseline_local_mean
+validation:
+  enabled: false
+  every_n_steps: 1000
+  patience_checks: 6
+  min_delta: 0.0001
+  metric: rmse
+  n_samples: 4
+  sampling_seed: 800000
+evaluation:
+  mask_bank_path: results/mask_banks/INT1_image_coverage.json
+  n_validation_masks: 4
+  n_test_masks: 8
+  validation_seed: 700000
+  test_seed: 900000
+  sampling_seed: 1200000
+  n_samples: 20
+  image_modes:
+  - full
+  validation_image_mode: full
+  k_neighborhood: 8
+  pca_n_components: 50
+logging:
+  backend: csv
+  project: st3d-lundeberg-lab

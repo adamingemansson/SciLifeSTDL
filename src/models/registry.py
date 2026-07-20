@@ -21,6 +21,7 @@ To add a new architecture:
     3. Reference "your_name" in a config file. Nothing else changes.
 """
 from __future__ import annotations
+import math
 import abc
 from typing import Any
 
@@ -33,6 +34,7 @@ from src.models.conditioning import (
     GeneAttentionDecoder, LLOKIStyleDecoder,
 )
 from src.models.vqvae import VectorQuantizer, morton_order
+from src.models.spatial_baselines import interpolate, harmonic_interpolate
 
 _MODEL_REGISTRY: dict[str, type["BaseGenerativeModel"]] = {}
 
@@ -65,12 +67,12 @@ def _build_context_encoder(
     stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
     stpath_tech_type: str = "Visium",
     stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None,
-    stpath_pretrained: bool = True,
+    stpath_pretrained: bool = True, stpath_input_already_log1p: bool = True,
     storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
     storm_lite_bias_type: str = "frame_averaging", storm_lite_relative_bias_hidden_dim: int = 32,
     storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
     storm_lite_knn_k: int | None = None, storm_lite_gnn_k: int = 8,
-    storm_lite_input_already_log1p: bool = False,
+    storm_lite_input_already_log1p: bool = True,
     storm_lite_tokenizer_gene_names: list[str] | None = None,
     storm_lite_tokenizer_full_gene_names: list[str] | None = None,
     storm_lite_tokenizer_n_pool_layers: int = 1, storm_lite_tokenizer_n_pool_heads: int = 4,
@@ -149,7 +151,7 @@ def _build_context_encoder(
             model_weight_path=stpath_model_weight_path, organ_type=stpath_organ_type,
             tech_type=stpath_tech_type, hidden_dim=cond_hidden_dim,
             new_gene_encoder_type=stpath_new_gene_encoder_type, novae_dim=stpath_novae_dim,
-            pretrained=stpath_pretrained,
+            pretrained=stpath_pretrained, input_already_log1p=stpath_input_already_log1p,
         )
     elif context_encoder_type == "storm_lite":
         from src.models.storm_lite_encoder import StormLiteContextEncoder
@@ -258,7 +260,7 @@ def _build_decoder(
             f"GeneAttentionDecoder.MAX_SAFE_PANEL_SIZE={GeneAttentionDecoder.MAX_SAFE_PANEL_SIZE} "
             f"— restrict decoder_gene_names to a realistic target panel size "
             f"(see GeneAttentionDecoder's own docstring); this is NOT meant "
-            f"for full-vocabulary decoding, use decoder_type='panel_invariant' "
+            f"for fixed-vocabulary gene-conditioned decoding, use decoder_type='gene_conditioned_vocabulary' "
             f"for that."
         )
         return GeneAttentionDecoder(
@@ -336,6 +338,8 @@ class BaseGenerativeModel(pl.LightningModule, abc.ABC):
         return self.context_encoder(
             context["coords"], context["expression"], query["coords"],
             context_images=context.get("images"), query_images=query.get("images"),
+            context_image_available=context.get("image_available"),
+            query_image_available=query.get("image_available"),
             context_novae_features=context.get("novae_features"),
             organ=context.get("organ"), tech=context.get("tech"),
         )
@@ -415,6 +419,154 @@ class InterpolationBaseline(BaseGenerativeModel):
 
     def configure_optimizers(self):
         return None  # no parameters to optimize
+
+
+
+@register_model("spatial_baseline")
+class SpatialInterpolationBaseline(BaseGenerativeModel):
+    """Unified deterministic baseline family.
+
+    ``mode`` can be ``global_mean``, ``nearest``, ``local_mean``, ``idw`` or
+    ``harmonic``. Keeping every floor behind one implementation prevents
+    evaluation/config drift between baselines.
+    """
+
+    def __init__(self, mode: str = "harmonic", k: int = 8, power: float = 1.0,
+                 ridge: float = 1e-4):
+        super().__init__()
+        self.mode, self.k, self.power, self.ridge = mode, int(k), float(power), float(ridge)
+
+    def sample(self, context, query):
+        expression = interpolate(
+            self.mode, context["coords"], context["expression"], query["coords"],
+            k=self.k, power=self.power, ridge=self.ridge,
+        )
+        return {"coords": query["coords"], "expression": expression}
+
+    def training_step(self, batch, batch_idx):
+        return None
+
+    def configure_optimizers(self):
+        return None
+
+
+@register_model("set_summary_baseline")
+class SetSummaryBaseline(BaseGenerativeModel):
+    """Strict learned mean/sum embedding baseline.
+
+    Context rows are encoded independently and aggregated with exactly the
+    configured operation. Query coordinates are then combined with that one
+    global summary. There is no attention, graph propagation or image branch,
+    making this a transparent capacity-matched check of whether sophisticated
+    context models beat a learned set statistic.
+    """
+
+    def __init__(self, n_genes: int, coord_dim: int = 3, hidden_dim: int = 256,
+                 aggregation: str = "mean", lr: float = 1e-3):
+        super().__init__()
+        if aggregation not in {"mean", "sum"}:
+            raise ValueError("aggregation must be 'mean' or 'sum'")
+        self.aggregation = aggregation
+        self.lr = float(lr)
+        self.context_row = nn.Sequential(
+            nn.Linear(n_genes + coord_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
+        )
+        self.query_net = nn.Sequential(
+            nn.Linear(hidden_dim + coord_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, n_genes),
+        )
+
+    def sample(self, context, query):
+        row = self.context_row(torch.cat([context["expression"], context["coords"]], dim=-1))
+        summary = row.mean(dim=0, keepdim=True) if self.aggregation == "mean" else row.sum(dim=0, keepdim=True)
+        summary = summary.expand(query["coords"].shape[0], -1)
+        pred = self.query_net(torch.cat([summary, query["coords"]], dim=-1))
+        return {"coords": query["coords"], "expression": pred}
+
+    def training_step(self, batch, batch_idx):
+        pred = self.sample(batch["context"], batch["query"])["expression"]
+        loss = nn.functional.mse_loss(pred, batch["target_expression"])
+        self.log("train/loss", loss)
+        return loss
+
+    def configure_optimizers(self):
+        return torch.optim.AdamW(self.parameters(), lr=self.lr)
+
+
+@register_model("harmonic_residual")
+class HarmonicResidualModel(BaseGenerativeModel):
+    """Zero-initialized learned correction around a harmonic anchor."""
+
+    def __init__(
+        self, n_genes: int, coord_dim: int = 3, cond_hidden_dim: int = 256,
+        hidden_dim: int = 512, harmonic_k: int = 8, harmonic_ridge: float = 1e-4,
+        lr: float = 1e-3, context_encoder_type: str = "builtin",
+        image_encoder_type: str = "none", image_feat_dim: int = 64,
+        image_patch_size: int = 256, gene_encoder_type: str = "mlp",
+        gene_feat_dim: int = 256, novae_dim: int | None = None,
+        coord_scale: float = 1.0, storm_lite_n_layers: int = 2,
+        storm_lite_n_heads: int = 4, storm_lite_bias_type: str = "frame_averaging",
+        storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
+        storm_lite_knn_k: int | None = None, storm_lite_gnn_k: int = 8,
+        storm_lite_input_already_log1p: bool = True,
+        storm_lite_tokenizer_gene_names: list[str] | None = None,
+        storm_lite_tokenizer_full_gene_names: list[str] | None = None,
+        storm_lite_tokenizer_n_pool_layers: int = 1,
+        storm_lite_tokenizer_n_pool_heads: int = 4,
+        organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+        self.context_encoder = _build_context_encoder(
+            n_genes=n_genes, coord_dim=coord_dim, cond_hidden_dim=cond_hidden_dim,
+            context_encoder_type=context_encoder_type,
+            image_encoder_type=image_encoder_type, image_feat_dim=image_feat_dim,
+            image_patch_size=image_patch_size, gene_encoder_type=gene_encoder_type,
+            gene_feat_dim=gene_feat_dim, novae_dim=novae_dim, coord_scale=coord_scale,
+            storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
+            storm_lite_bias_type=storm_lite_bias_type,
+            storm_lite_fusion_mode=storm_lite_fusion_mode,
+            storm_lite_qk_norm=storm_lite_qk_norm,
+            storm_lite_knn_k=storm_lite_knn_k, storm_lite_gnn_k=storm_lite_gnn_k,
+            storm_lite_input_already_log1p=storm_lite_input_already_log1p,
+            storm_lite_tokenizer_gene_names=storm_lite_tokenizer_gene_names,
+            storm_lite_tokenizer_full_gene_names=storm_lite_tokenizer_full_gene_names,
+            storm_lite_tokenizer_n_pool_layers=storm_lite_tokenizer_n_pool_layers,
+            storm_lite_tokenizer_n_pool_heads=storm_lite_tokenizer_n_pool_heads,
+            organ_vocab=organ_vocab, tech_vocab=tech_vocab,
+        )
+        self.anchor_proj = nn.Sequential(nn.Linear(n_genes, hidden_dim), nn.GELU())
+        self.residual = nn.Sequential(
+            nn.Linear(hidden_dim + cond_hidden_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, n_genes),
+        )
+        nn.init.zeros_(self.residual[-1].weight)
+        nn.init.zeros_(self.residual[-1].bias)
+        self.harmonic_k, self.harmonic_ridge, self.lr = int(harmonic_k), float(harmonic_ridge), float(lr)
+
+    def _anchor(self, context, query):
+        return harmonic_interpolate(
+            context["coords"], context["expression"], query["coords"],
+            k=self.harmonic_k, ridge=self.harmonic_ridge,
+        )
+
+    def sample(self, context, query):
+        anchor = self._anchor(context, query)
+        c = self._encode_context(context, query)
+        correction = self.residual(torch.cat([self.anchor_proj(anchor), c], dim=-1))
+        return {"coords": query["coords"], "expression": anchor + correction,
+                "anchor_expression": anchor, "residual_expression": correction}
+
+    def training_step(self, batch, batch_idx):
+        out = self.sample(batch["context"], batch["query"])
+        loss = nn.functional.mse_loss(out["expression"], batch["target_expression"])
+        anchor_loss = nn.functional.mse_loss(out["anchor_expression"], batch["target_expression"])
+        self.log_dict({"train/loss": loss, "train/anchor_mse": anchor_loss})
+        return loss
+
+    def configure_optimizers(self):
+        return torch.optim.AdamW(self.parameters(), lr=self.lr)
 
 
 # ---------------------------------------------------------------------------
@@ -502,13 +654,13 @@ class WAEGAN(BaseGenerativeModel):
                  stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
                  stpath_tech_type: str = "Visium",
                  stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None,
-                 stpath_pretrained: bool = True,
+                 stpath_pretrained: bool = True, stpath_input_already_log1p: bool = True,
                  storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
                  storm_lite_bias_type: str = "frame_averaging",
                  storm_lite_relative_bias_hidden_dim: int = 32,
                  storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
                  storm_lite_knn_k: int | None = None, storm_lite_gnn_k: int = 8,
-                 storm_lite_input_already_log1p: bool = False,
+                 storm_lite_input_already_log1p: bool = True,
                  storm_lite_tokenizer_gene_names: list[str] | None = None,
                  storm_lite_tokenizer_full_gene_names: list[str] | None = None,
                  storm_lite_tokenizer_n_pool_layers: int = 1, storm_lite_tokenizer_n_pool_heads: int = 4,
@@ -538,6 +690,7 @@ class WAEGAN(BaseGenerativeModel):
             stpath_tech_type=stpath_tech_type,
             stpath_new_gene_encoder_type=stpath_new_gene_encoder_type, stpath_novae_dim=stpath_novae_dim,
             stpath_pretrained=stpath_pretrained,
+            stpath_input_already_log1p=stpath_input_already_log1p,
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
             storm_lite_bias_type=storm_lite_bias_type,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
@@ -868,13 +1021,13 @@ class FlowMatchingOT(BaseGenerativeModel):
                  stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
                  stpath_tech_type: str = "Visium",
                  stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None,
-                 stpath_pretrained: bool = True,
+                 stpath_pretrained: bool = True, stpath_input_already_log1p: bool = True,
                  storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
                  storm_lite_bias_type: str = "frame_averaging",
                  storm_lite_relative_bias_hidden_dim: int = 32,
                  storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
                  storm_lite_knn_k: int | None = None, storm_lite_gnn_k: int = 8,
-                 storm_lite_input_already_log1p: bool = False,
+                 storm_lite_input_already_log1p: bool = True,
                  storm_lite_tokenizer_gene_names: list[str] | None = None,
                  storm_lite_tokenizer_full_gene_names: list[str] | None = None,
                  storm_lite_tokenizer_n_pool_layers: int = 1, storm_lite_tokenizer_n_pool_heads: int = 4,
@@ -906,6 +1059,7 @@ class FlowMatchingOT(BaseGenerativeModel):
             stpath_tech_type=stpath_tech_type,
             stpath_new_gene_encoder_type=stpath_new_gene_encoder_type, stpath_novae_dim=stpath_novae_dim,
             stpath_pretrained=stpath_pretrained,
+            stpath_input_already_log1p=stpath_input_already_log1p,
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
             storm_lite_bias_type=storm_lite_bias_type,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,
@@ -1266,6 +1420,163 @@ class FlowMatchingOT(BaseGenerativeModel):
         return opt
 
 
+
+@register_model("residual_fm_ot")
+class ResidualFlowMatchingOT(FlowMatchingOT):
+    """Flow matching on residuals around a graph-harmonic completion.
+
+    The deterministic spatial interpolation carries low-frequency structure;
+    the autoencoder and flow model only learn ``target - harmonic_anchor``.
+    This makes the baseline explicit in every prediction and prevents a
+    stochastic model from spending capacity relearning simple smoothness.
+    """
+
+    def __init__(self, *args, harmonic_k: int = 8, harmonic_ridge: float = 1e-4,
+                 pretrained_autoencoder_path: str | None = None,
+                 freeze_pretrained_autoencoder: bool = True,
+                 pretrained_autoencoder_max_rmse: float | None = None,
+                 pretrained_autoencoder_min_pcc: float | None = None,
+                 pretrained_autoencoder_gene_names: list[str] | None = None,
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        self.harmonic_k = int(harmonic_k)
+        self.harmonic_ridge = float(harmonic_ridge)
+        self.pretrained_ae_decoder = None
+        if pretrained_autoencoder_path is not None:
+            if self.decoder_type != "dense":
+                raise ValueError("pretrained residual autoencoder currently requires decoder_type='dense'")
+            checkpoint = torch.load(pretrained_autoencoder_path, map_location="cpu")
+            if checkpoint.get("target_type") != "harmonic_residual":
+                raise ValueError(
+                    "pretrained autoencoder was not validated on harmonic residuals. "
+                    "Re-run scripts/pretrain_expression_autoencoder.py with the audit config; "
+                    "absolute-expression autoencoders are incompatible with residual_fm_ot."
+                )
+            checkpoint_k = int(checkpoint.get("harmonic_k", -1))
+            checkpoint_ridge = float(checkpoint.get("harmonic_ridge", float("nan")))
+            if checkpoint_k != self.harmonic_k or not math.isclose(
+                checkpoint_ridge, self.harmonic_ridge, rel_tol=0.0, abs_tol=1e-12
+            ):
+                raise ValueError(
+                    "pretrained autoencoder harmonic anchor does not match the residual flow "
+                    f"configuration: checkpoint k/ridge={checkpoint_k}/{checkpoint_ridge}, "
+                    f"model={self.harmonic_k}/{self.harmonic_ridge}"
+                )
+            checkpoint_genes = [str(g) for g in checkpoint.get("gene_names", [])]
+            if pretrained_autoencoder_gene_names is not None:
+                expected_gene_names = [str(g) for g in pretrained_autoencoder_gene_names]
+                if checkpoint_genes != expected_gene_names:
+                    raise ValueError(
+                        "pretrained autoencoder gene names/order do not match the fit-derived "
+                        "model panel; refusing a width-only match that could permute genes"
+                    )
+            validation_rmse = float(checkpoint.get("validation_rmse", float("inf")))
+            validation_pcc = float(checkpoint.get("validation_pcc", -float("inf")))
+            if (pretrained_autoencoder_max_rmse is not None
+                    and validation_rmse > float(pretrained_autoencoder_max_rmse)):
+                raise ValueError(
+                    f"pretrained autoencoder RMSE {validation_rmse:.6f} exceeds required "
+                    f"maximum {float(pretrained_autoencoder_max_rmse):.6f}"
+                )
+            if (pretrained_autoencoder_min_pcc is not None
+                    and validation_pcc < float(pretrained_autoencoder_min_pcc)):
+                raise ValueError(
+                    f"pretrained autoencoder PCC {validation_pcc:.4f} is below required "
+                    f"minimum {float(pretrained_autoencoder_min_pcc):.4f}"
+                )
+            expected_genes = int(self.n_genes)
+            if int(checkpoint["n_genes"]) != expected_genes:
+                raise ValueError(
+                    f"autoencoder gene width {checkpoint['n_genes']} does not match model width {expected_genes}"
+                )
+            if int(checkpoint["latent_dim"]) != int(self.latent_dim):
+                raise ValueError("autoencoder latent_dim does not match residual flow model")
+            self.encoder.load_state_dict(checkpoint["encoder_state"])
+            ae_hidden_dim = int(checkpoint["hidden_dim"])
+            self.pretrained_ae_decoder = nn.Sequential(
+                nn.Linear(self.latent_dim, ae_hidden_dim), nn.ReLU(),
+                nn.Linear(ae_hidden_dim, expected_genes),
+            )
+            self.pretrained_ae_decoder.load_state_dict(checkpoint["decoder_state"])
+            # The pretrained decoder carries the initial reconstruction. The
+            # context-conditioned decoder starts as an exact zero correction.
+            last_linear = next(
+                (module for module in reversed(list(self.decoder.modules()))
+                 if isinstance(module, nn.Linear)), None
+            )
+            if last_linear is None:
+                raise RuntimeError("dense conditional decoder has no Linear output layer")
+            nn.init.zeros_(last_linear.weight)
+            nn.init.zeros_(last_linear.bias)
+            if freeze_pretrained_autoencoder:
+                for parameter in self.encoder.parameters():
+                    parameter.requires_grad = False
+                for parameter in self.pretrained_ae_decoder.parameters():
+                    parameter.requires_grad = False
+
+    def _harmonic_anchor(self, context, query):
+        anchor = harmonic_interpolate(
+            context["coords"], context["expression"], query["coords"],
+            k=self.harmonic_k, ridge=self.harmonic_ridge,
+        )
+        idx = getattr(self, "_decoder_target_col_idx", None)
+        return anchor if idx is None else anchor[:, idx]
+
+    def _decode(self, h: torch.Tensor, tech: str | None = None) -> torch.Tensor:
+        conditional = super()._decode(h, tech=tech)
+        if self.pretrained_ae_decoder is None:
+            return conditional
+        base = self.pretrained_ae_decoder(h[:, :self.latent_dim])
+        return base + conditional
+
+    def sample(self, context, query):
+        residual = super().sample(context, query)
+        anchor = self._harmonic_anchor(context, query)
+        residual_expression = residual["expression"]
+        expression = anchor + residual_expression
+        return {"coords": query["coords"], "expression": expression,
+                "anchor_expression": anchor, "residual_expression": residual_expression}
+
+    def training_step(self, batch, batch_idx):
+        context, query = batch["context"], batch["query"]
+        x_abs = self._slice_target_for_decoder(batch["target_expression"])
+        anchor = self._harmonic_anchor(context, query).detach()
+        x_1 = x_abs - anchor
+        n = x_1.shape[0]
+        c = self._encode_context(context, query)
+
+        z_1 = self.encoder(x_1)
+        recon_residual = self._decode(torch.cat([z_1, c], dim=-1), tech=query.get("tech"))
+        recon_loss = nn.functional.mse_loss(recon_residual, x_1)
+        absolute_recon_loss = nn.functional.mse_loss(anchor + recon_residual, x_abs)
+        z_1_target = z_1.detach()
+
+        if self.path_type == "ot":
+            z_0 = self._couple_noise(z_1_target)
+            t = self._sample_flow_time(n)
+            z_t = (1 - t[:, None]) * z_0 + t[:, None] * z_1_target
+            target_velocity = z_1_target - z_0
+            pred_velocity = self._velocity(z_t, t, c)
+            fm_loss = nn.functional.mse_loss(pred_velocity, target_velocity)
+        else:
+            log_sigma = self.edm_p_mean + self.edm_p_std * torch.randn(n, device=self.device)
+            sigma = torch.exp(log_sigma)
+            noise = torch.randn_like(z_1_target)
+            z_sigma = z_1_target + sigma[:, None] * noise
+            d_pred = self._edm_denoise(z_sigma, sigma, c)
+            weight = (sigma**2 + self.sigma_data**2) / (sigma * self.sigma_data) ** 2
+            fm_loss = (weight[:, None] * (d_pred - z_1_target) ** 2).mean()
+
+        loss = self.recon_weight * recon_loss + self.fm_weight * fm_loss
+        self.log_dict({
+            "train/loss": loss,
+            "train/residual_recon": recon_loss,
+            "train/absolute_recon": absolute_recon_loss,
+            "train/fm_loss": fm_loss,
+        })
+        return loss
+
+
 # ---------------------------------------------------------------------------
 # VQ-VAE + autoregressive transformer (docs/architecture_plan.md
 # "Prioritization" #3). Own encoder/decoder/VectorQuantizer (own weights,
@@ -1327,13 +1638,13 @@ class VQVAEAutoregressive(BaseGenerativeModel):
                  stpath_model_weight_path: str | None = None, stpath_organ_type: str = "Kidney",
                  stpath_tech_type: str = "Visium",
                  stpath_new_gene_encoder_type: str = "none", stpath_novae_dim: int | None = None,
-                 stpath_pretrained: bool = True,
+                 stpath_pretrained: bool = True, stpath_input_already_log1p: bool = True,
                  storm_lite_n_layers: int = 2, storm_lite_n_heads: int = 4,
                  storm_lite_bias_type: str = "frame_averaging",
                  storm_lite_relative_bias_hidden_dim: int = 32,
                  storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
                  storm_lite_knn_k: int | None = None, storm_lite_gnn_k: int = 8,
-                 storm_lite_input_already_log1p: bool = False,
+                 storm_lite_input_already_log1p: bool = True,
                  storm_lite_tokenizer_gene_names: list[str] | None = None,
                  storm_lite_tokenizer_full_gene_names: list[str] | None = None,
                  storm_lite_tokenizer_n_pool_layers: int = 1, storm_lite_tokenizer_n_pool_heads: int = 4,
@@ -1361,6 +1672,7 @@ class VQVAEAutoregressive(BaseGenerativeModel):
             stpath_tech_type=stpath_tech_type,
             stpath_new_gene_encoder_type=stpath_new_gene_encoder_type, stpath_novae_dim=stpath_novae_dim,
             stpath_pretrained=stpath_pretrained,
+            stpath_input_already_log1p=stpath_input_already_log1p,
             storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
             storm_lite_bias_type=storm_lite_bias_type,
             storm_lite_relative_bias_hidden_dim=storm_lite_relative_bias_hidden_dim,

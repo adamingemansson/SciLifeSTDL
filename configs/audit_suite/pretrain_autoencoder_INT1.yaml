@@ -1,0 +1,50 @@
+experiment_name: pretrain_expression_autoencoder_INT1
+data:
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+  expression_transform: normalize_log1p
+  expression_target_sum: 10000.0
+  novae_mode: disabled
+  require_image_coverage: true
+  use_images: false
+model:
+  name: expression_autoencoder_pretrain
+  params: {}
+  hidden_dim: 256
+  latent_dim: 32
+  harmonic_k: 8
+  harmonic_ridge: 0.0001
+training:
+  seed: 0
+  batch_size: 256
+  steps: 20000
+  validate_every_n_steps: 500
+  patience_checks: 10
+  min_delta: 1.0e-05
+  lr: 0.001
+  checkpoint_dir: results/checkpoints/audit_suite/expression_autoencoder_INT1
+  required_max_validation_rmse: 1.0
+  required_min_validation_pcc: 0.9
+  residual_training_mask_seed: 100000
+  max_rows_per_mask: 128
+  residual_training_masks: 128
+  max_training_residual_rows: 8192
+  max_validation_residual_rows: 2048
+masking:
+  strategy: random_dropout_patches
+  max_context_points: 768
+  params:
+    n_patches: 3
+    radius_range:
+    - 250
+    - 450
+evaluation:
+  mask_bank_path: results/mask_banks/INT1_image_coverage.json
+  n_validation_masks: 4
+  n_test_masks: 8
+  validation_seed: 700000
+  test_seed: 900000

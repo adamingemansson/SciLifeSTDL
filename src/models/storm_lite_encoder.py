@@ -124,6 +124,27 @@ def _knn_additive_mask(coords: torch.Tensor, k: int) -> torch.Tensor:
     return mask
 
 
+
+
+def _knn_edge_index(coords: torch.Tensor, k: int, chunk_size: int = 1024) -> torch.Tensor:
+    """Return sparse directed k-NN edges as ``[2, N*k]`` indices.
+
+    The first row is the receiving node and the second row is its neighbor.
+    Distances are computed in row chunks, avoiding both the persistent dense
+    ``N x N`` adjacency and a full-distance allocation. Self edges are included.
+    """
+    n = coords.shape[0]
+    k = min(k, n)
+    receivers, senders = [], []
+    for start in range(0, n, chunk_size):
+        stop = min(start + chunk_size, n)
+        dist = torch.cdist(coords[start:stop], coords)
+        nn_idx = torch.topk(dist, k, dim=-1, largest=False).indices
+        recv = torch.arange(start, stop, device=coords.device)[:, None].expand(-1, k)
+        receivers.append(recv.reshape(-1))
+        senders.append(nn_idx.reshape(-1))
+    return torch.stack([torch.cat(receivers), torch.cat(senders)], dim=0)
+
 def _knn_adjacency(coords: torch.Tensor, k: int) -> torch.Tensor:
     """Float [N, N] adjacency matrix (1.0 = edge, including self; 0.0 = no
     edge) for the "gnn" fusion_mode's message passing — same underlying
@@ -179,14 +200,22 @@ class _GNNBlock(nn.Module):
         self.ffn = nn.Sequential(nn.Linear(d_model, hidden), nn.GELU(), nn.Linear(hidden, d_model))
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
-        """x: [1, N, d_model]. adjacency: [N, N] float (1.0=edge incl.
-        self, 0.0=no edge, see _knn_adjacency)."""
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        """Sparse GraphSAGE mean aggregation over ``edge_index``.
+
+        ``edge_index[0]`` contains receivers and ``edge_index[1]`` their
+        neighbors. No dense adjacency matrix is materialized.
+        """
         normed = self.norm1(x)
-        msg = self.msg_proj(normed.squeeze(0))  # [N, d_model]
-        deg = adjacency.sum(dim=-1, keepdim=True).clamp(min=1.0)
-        agg = torch.matmul(adjacency, msg) / deg  # mean of neighbor messages, [N, d_model]
-        combined = self.combine_proj(torch.cat([normed.squeeze(0), agg], dim=-1))
+        nodes = normed.squeeze(0)
+        msg = self.msg_proj(nodes)
+        recv, send = edge_index[0], edge_index[1]
+        agg = torch.zeros_like(msg)
+        agg.index_add_(0, recv, msg[send])
+        deg = torch.zeros(msg.shape[0], 1, device=msg.device, dtype=msg.dtype)
+        deg.index_add_(0, recv, torch.ones(recv.shape[0], 1, device=msg.device, dtype=msg.dtype))
+        agg = agg / deg.clamp(min=1.0)
+        combined = self.combine_proj(torch.cat([nodes, agg], dim=-1))
         x = x + self.dropout1(combined).unsqueeze(0)
         normed2 = self.norm2(x)
         x = x + self.dropout2(self.ffn(normed2))
@@ -343,7 +372,7 @@ class StormLiteContextEncoder(nn.Module):
                  bias_type: str = "frame_averaging", relative_bias_hidden_dim: int = 32,
                  fusion_mode: str = "sum", qk_norm: bool = False,
                  knn_k: int | None = None, gnn_k: int = 8,
-                 input_already_log1p: bool = False,
+                 input_already_log1p: bool = True,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
         assert gene_encoder_type in ("mlp", "novae", "both", "tokenizer", "tokenizer_novae"), (
@@ -367,9 +396,9 @@ class StormLiteContextEncoder(nn.Module):
         # the exact current (double-log) behavior for every existing config
         # / all historical comparisons; True skips the redundant second
         # log1p, feeding the gene encoder the correctly-single-log-normalized
-        # values. An A/B knob, not a blind flip — the double-log is a
-        # consistent confound across all models (so comparisons stay fair),
-        # and whether removing it actually helps is an empirical question.
+        # values. False is retained only as an explicit historical-
+        # reproduction switch; the default is True because applying a second
+        # nonlinear transform after the loader contract is a preprocessing bug.
         self.input_already_log1p = input_already_log1p
         # relative-position attention bias (2026-07-16/17 — see module
         # docstring's "Coordinate handling" for the full reasoning behind
@@ -397,6 +426,7 @@ class StormLiteContextEncoder(nn.Module):
         # MLP (task-trained, no pretraining)/Novae (frozen pretrained)/
         # both this run is testing.
         self.image_encoder = GigapathPatchEncoder(hidden_dim)
+        self.missing_image_token = nn.Parameter(torch.randn(hidden_dim) * 0.02)
         if gene_encoder_type == "mlp":
             self.gene_encoder = MLPGeneEncoder(n_genes, hidden_dim)
         elif gene_encoder_type == "novae":
@@ -588,6 +618,8 @@ class StormLiteContextEncoder(nn.Module):
     def forward(self, context_coords: torch.Tensor, context_expression: torch.Tensor,
                 query_coords: torch.Tensor, context_images: torch.Tensor,
                 query_images: torch.Tensor,
+                context_image_available: torch.Tensor | None = None,
+                query_image_available: torch.Tensor | None = None,
                 context_novae_features: torch.Tensor | None = None,
                 organ: str | None = None, tech: str | None = None) -> torch.Tensor:
         """context_images/query_images: raw H&E patches OR precomputed
@@ -611,9 +643,21 @@ class StormLiteContextEncoder(nn.Module):
         coords = torch.cat([context_coords, query_coords], dim=0)
         coord_embed = self.coord_norm(self.coord_proj(self.coord_encoder(coords)))
 
-        img_embed = self.img_norm(torch.cat([
-            self.image_encoder(context_images), self.image_encoder(query_images),
-        ], dim=0))
+        context_img = self.image_encoder(context_images)
+        query_img = self.image_encoder(query_images)
+        # Preserve a zero-gradient graph edge in full-image batches. This
+        # keeps distributed/gradient-accounting code from treating the
+        # missing-modality token as an unused parameter, while its value still
+        # has exactly zero effect unless an availability mask selects it.
+        context_img = context_img + self.missing_image_token[None, :] * 0.0
+        query_img = query_img + self.missing_image_token[None, :] * 0.0
+        if context_image_available is not None:
+            available = context_image_available.to(context_img.device).bool()
+            context_img = torch.where(available[:, None], context_img, self.missing_image_token[None, :])
+        if query_image_available is not None:
+            available = query_image_available.to(query_img.device).bool()
+            query_img = torch.where(available[:, None], query_img, self.missing_image_token[None, :])
+        img_embed = self.img_norm(torch.cat([context_img, query_img], dim=0))
 
         gene_embed_raw = torch.zeros(n_total, self.hidden_dim, device=device)
         gene_embed_raw[:n_context] = self._encode_gene(context_expression, context_novae_features)
@@ -648,10 +692,10 @@ class StormLiteContextEncoder(nn.Module):
             tokens = img_embed + gene_embed + coord_embed
             if self.organ_tech_embed is not None and organ is not None and tech is not None:
                 tokens = tokens + self.organ_tech_embed(organ, tech, n_total, device)
-            adjacency = _knn_adjacency(coords, self.gnn_k)
+            edge_index = _knn_edge_index(coords, self.gnn_k)
             fused = tokens.unsqueeze(0)
             for block in self.gnn_blocks:
-                fused = block(fused, adjacency)
+                fused = block(fused, edge_index)
             fused = fused.squeeze(0)
             return fused[n_context:]  # query positions only
         else:  # "mome" — see _MoMETransformerBlock's own docstring

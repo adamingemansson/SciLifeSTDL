@@ -1,0 +1,104 @@
+experiment_name: pretrain_expression_autoencoder_heldout_shared_panel
+data:
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+  expression_transform: normalize_log1p
+  expression_target_sum: 10000.0
+  novae_mode: disabled
+  require_image_coverage: true
+  use_images: false
+  sample_ids:
+  - INT1
+  - INT2
+  - INT3
+  - INT4
+  - INT5
+  - INT6
+  - INT7
+  - INT8
+  - INT9
+  - INT10
+  - INT11
+  - INT12
+  train_sample_ids:
+  - INT1
+  - INT2
+  - INT3
+  - INT4
+  - INT5
+  - INT6
+  - INT7
+  - INT8
+  validation_sample_ids:
+  - INT9
+  - INT10
+  test_sample_ids:
+  - INT11
+  - INT12
+  organ_by_sample:
+    INT1: Kidney
+    INT2: Kidney
+    INT3: Kidney
+    INT4: Kidney
+    INT5: Kidney
+    INT6: Kidney
+    INT7: Kidney
+    INT8: Kidney
+    INT9: Kidney
+    INT10: Kidney
+    INT11: Kidney
+    INT12: Kidney
+  tech_by_sample:
+    INT1: Visium
+    INT2: Visium
+    INT3: Visium
+    INT4: Visium
+    INT5: Visium
+    INT6: Visium
+    INT7: Visium
+    INT8: Visium
+    INT9: Visium
+    INT10: Visium
+    INT11: Visium
+    INT12: Visium
+model:
+  name: expression_autoencoder_pretrain
+  params: {}
+  hidden_dim: 256
+  latent_dim: 32
+  harmonic_k: 8
+  harmonic_ridge: 0.0001
+training:
+  seed: 0
+  batch_size: 256
+  steps: 30000
+  validate_every_n_steps: 500
+  patience_checks: 10
+  min_delta: 1.0e-05
+  lr: 0.001
+  checkpoint_dir: results/checkpoints/audit_suite/expression_autoencoder_heldout
+  required_max_validation_rmse: 1.0
+  required_min_validation_pcc: 0.9
+  residual_training_mask_seed: 100000
+  max_rows_per_mask: 128
+  residual_training_masks_per_sample: 32
+  max_training_residual_rows: 16384
+  max_validation_residual_rows: 4096
+masking:
+  strategy: random_dropout_patches
+  max_context_points: 768
+  params:
+    n_patches: 3
+    radius_range:
+    - 250
+    - 450
+evaluation:
+  mask_bank_dir: results/mask_banks/heldout
+  n_validation_masks: 4
+  n_test_masks: 8
+  validation_seed: 700000
+  test_seed: 900000

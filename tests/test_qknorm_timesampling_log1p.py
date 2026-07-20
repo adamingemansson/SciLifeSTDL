@@ -8,10 +8,12 @@ audit + literature research (see docs/results_log.md):
   2. Logit-normal flow-matching timestep sampling (FlowMatchingOT
      ._sample_flow_time) — SD3 / Esser et al. 2024 (arXiv 2403.03206).
   3. input_already_log1p flag (StormLiteContextEncoder._maybe_log1p) —
-     opt-out of the double-log1p the audit found (basic_qc_and_normalize
-     already log1p's adata.X, the gene encoder logged it again).
+     prevents the double-log1p the audit found (basic_qc_and_normalize
+     already log1p's adata.X, so the safe default now passes it through).
 
-All three are opt-in with defaults that preserve the exact prior behavior.
+QK normalization and logit-normal time sampling remain opt-in. The expression
+preprocessing default intentionally changed because the prior behavior was a
+correctness bug rather than a model ablation.
 
 Run with: python -m tests.test_qknorm_timesampling_log1p
 """
@@ -132,25 +134,24 @@ def test_uniform_time_sampling_is_the_default_and_unchanged():
 def test_input_already_log1p_flag_toggles_the_redundant_log1p():
     """input_already_log1p=True skips the encoder's log1p (the audit
     fix — data is already log1p'd by basic_qc_and_normalize); False
-    (default) keeps applying it (unchanged behavior / historical-comparison
-    fairness)."""
+    explicitly reproduces the historical double-log path."""
     torch.manual_seed(0)
     x = torch.rand(5, 10) * 9.0  # log-normalized-scale values
 
-    enc_off = StormLiteContextEncoder(n_genes=10, novae_dim=8, hidden_dim=16,
-                                       fusion_mode="mome", gene_encoder_type="both")
-    assert not enc_off.input_already_log1p
-    assert torch.equal(enc_off._maybe_log1p(x), torch.log1p(x)), (
-        "default must still apply log1p (double-log preserved for comparison fairness)"
+    enc_safe = StormLiteContextEncoder(n_genes=10, novae_dim=8, hidden_dim=16,
+                                        fusion_mode="mome", gene_encoder_type="both")
+    assert enc_safe.input_already_log1p
+    assert torch.equal(enc_safe._maybe_log1p(x), x), (
+        "safe default must pass already-log1p expression through unchanged"
     )
 
-    enc_on = StormLiteContextEncoder(n_genes=10, novae_dim=8, hidden_dim=16,
-                                      fusion_mode="mome", gene_encoder_type="both",
-                                      input_already_log1p=True)
-    assert torch.equal(enc_on._maybe_log1p(x), x), (
-        "input_already_log1p=True must pass expression through unchanged (no double-log1p)"
+    enc_legacy = StormLiteContextEncoder(n_genes=10, novae_dim=8, hidden_dim=16,
+                                          fusion_mode="mome", gene_encoder_type="both",
+                                          input_already_log1p=False)
+    assert torch.equal(enc_legacy._maybe_log1p(x), torch.log1p(x)), (
+        "input_already_log1p=False must explicitly reproduce the historical second log1p"
     )
-    print("[input_already_log1p] OK — False applies log1p (default), True skips the redundant second log1p")
+    print("[input_already_log1p] OK — safe default is single-log; False is explicit legacy mode")
 
 
 if __name__ == "__main__":

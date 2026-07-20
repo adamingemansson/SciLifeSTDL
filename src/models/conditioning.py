@@ -563,25 +563,28 @@ class MLPGeneEncoder(nn.Module):
     encoder image features already get (ImagePatchEncoder/
     GigapathPatchEncoder), instead of being the only modality fused in raw.
 
-    Architecture follows the "nonlinear MLP autoencoder — best practical
-    starting point" recommendation surfaced in project research (2026-07-16,
-    comparing GEX-encoder options for the STPath-GEX-bottleneck question):
-    Linear(G, 2048) -> LayerNorm+GELU -> Linear(2048, 512) -> LayerNorm+GELU
-    -> Linear(512, feat_dim). Deliberately ENCODER-ONLY, no decoder/separate
-    reconstruction loss — unlike the autoencoder sketch that recommendation
-    was based on, this follows this codebase's own established convention
-    for per-modality encoders in this file (ImagePatchEncoder,
-    GigapathPatchEncoder: pure encoders, trained end-to-end from whatever
-    downstream generative loss the whole model uses, no separate
-    pretraining stage) rather than introducing a new training pattern.
+    The original implementation hard-coded a 2048-unit first layer. On a
+    16,570-gene panel that single matrix contains about 34 million weights,
+    making a supposedly lightweight control unnecessarily large and difficult
+    to compare fairly with other encoders. The safer default below is a
+    configurable 512 -> 256 bottleneck. Callers that intentionally need the
+    historical capacity can still pass ``hidden_dim=2048,
+    bottleneck_dim=512`` explicitly.
+
+    This remains an encoder-only module trained by the downstream objective.
+    The residual-flow audit suite separately pretrains a complete expression
+    autoencoder and validates it before freezing it.
     """
 
-    def __init__(self, n_genes: int, feat_dim: int = 256):
+    def __init__(self, n_genes: int, feat_dim: int = 256,
+                 hidden_dim: int = 512, bottleneck_dim: int = 256):
         super().__init__()
+        if min(n_genes, feat_dim, hidden_dim, bottleneck_dim) <= 0:
+            raise ValueError("MLPGeneEncoder dimensions must all be positive")
         self.net = nn.Sequential(
-            nn.Linear(n_genes, 2048), nn.LayerNorm(2048), nn.GELU(),
-            nn.Linear(2048, 512), nn.LayerNorm(512), nn.GELU(),
-            nn.Linear(512, feat_dim),
+            nn.Linear(n_genes, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, bottleneck_dim), nn.LayerNorm(bottleneck_dim), nn.GELU(),
+            nn.Linear(bottleneck_dim, feat_dim),
         )
 
     def forward(self, expression: torch.Tensor) -> torch.Tensor:
@@ -1301,6 +1304,9 @@ class SpatialContextEncoder(nn.Module):
             node_in_dim += image_feat_dim
             query_in_dim += image_feat_dim
 
+        if self.use_images:
+            self.missing_image_token = nn.Parameter(torch.randn(image_feat_dim) * 0.02)
+
         self.node_proj = nn.Linear(node_in_dim, hidden_dim)
         self.message_layers = nn.ModuleList(
             _KNNMessageLayer(hidden_dim) for _ in range(n_message_layers)
@@ -1325,6 +1331,8 @@ class SpatialContextEncoder(nn.Module):
     def forward(self, context_coords: torch.Tensor, context_expression: torch.Tensor,
                 query_coords: torch.Tensor, context_images: torch.Tensor | None = None,
                 query_images: torch.Tensor | None = None,
+                context_image_available: torch.Tensor | None = None,
+                query_image_available: torch.Tensor | None = None,
                 context_novae_features: torch.Tensor | None = None,
                 organ: str | None = None, tech: str | None = None) -> torch.Tensor:
         # NOTE: gene_encoder_type applies to context_expression only, same
@@ -1355,7 +1363,13 @@ class SpatialContextEncoder(nn.Module):
         context_coord_feat = self.coord_encoder(context_coords)
         node_feats = [self._encode_gene(context_expression), context_coord_feat]
         if self.use_images:
-            node_feats.append(self.image_encoder(context_images))
+            context_image_feat = self.image_encoder(context_images)
+            if context_image_available is not None:
+                available = context_image_available.to(context_image_feat.device).bool()
+                context_image_feat = torch.where(
+                    available[:, None], context_image_feat, self.missing_image_token[None, :]
+                )
+            node_feats.append(context_image_feat)
         node_repr = self.node_proj(torch.cat(node_feats, dim=-1))
         if self.organ_tech_embed is not None and organ is not None and tech is not None:
             node_repr = node_repr + self.organ_tech_embed(
@@ -1371,7 +1385,13 @@ class SpatialContextEncoder(nn.Module):
         query_knn = _knn_indices(query_coords, context_coords, self.k_neighbors)
         query_feats = [self.coord_encoder(query_coords)]
         if self.use_images:
-            query_feats.append(self.image_encoder(query_images))
+            query_image_feat = self.image_encoder(query_images)
+            if query_image_available is not None:
+                available = query_image_available.to(query_image_feat.device).bool()
+                query_image_feat = torch.where(
+                    available[:, None], query_image_feat, self.missing_image_token[None, :]
+                )
+            query_feats.append(query_image_feat)
         query_feat = self.query_proj(torch.cat(query_feats, dim=-1))
         if self.organ_tech_embed is not None and organ is not None and tech is not None:
             query_feat = query_feat + self.organ_tech_embed(

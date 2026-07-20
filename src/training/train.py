@@ -34,6 +34,11 @@ from omegaconf import OmegaConf
 
 from src.data import loaders, masking
 from src.data.augmentation import augment_coords_xy
+from src.data.context_features import ContextOnlyNovaeProvider, model_uses_novae, novae_input_mode
+from src.data.mask_bank import (
+    ensure_mask_bank, ensure_training_seed_bank, record_masks, split_records,
+)
+from src.training.validation import FixedMaskValidationCallback, predictive_samples
 from src.models.registry import build_model
 from src.evaluation import metrics as ev
 
@@ -535,12 +540,81 @@ def _images_tensor(images: np.ndarray, mask: np.ndarray) -> torch.Tensor:
     return torch.tensor(selected, dtype=torch.float32)  # already-precomputed features [n, feat_dim]
 
 
+def _prepare_images_for_split(
+    images: np.ndarray | None,
+    context_mask: np.ndarray,
+    query_mask: np.ndarray,
+    mode: str = "full",
+    seed: int = 0,
+    query_dropout_p: float = 0.0,
+    all_dropout_p: float = 0.0,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    """Build image tensors plus explicit availability masks for one split.
+
+    ``mode`` defines the scientific task rather than silently assuming query
+    histology is always present: ``full`` keeps all images, ``target_zero``
+    removes query images, ``all_zero`` removes both context and query images,
+    and ``shuffled`` permutes query images as a diagnostic. Training-time
+    modality dropout is applied after the mode using deterministic RNG draws.
+    Missing rows are zeroed *and* marked unavailable so encoders can substitute
+    a learned missing-image token instead of treating an all-zero image as a
+    real tissue patch.
+    """
+    if images is None:
+        return None, None, None, None
+    if mode not in {"full", "target_zero", "all_zero", "shuffled"}:
+        raise ValueError(f"unknown image mode {mode!r}")
+
+    context_images = _images_tensor(images, context_mask)
+    query_images = _images_tensor(images, query_mask)
+    context_available = torch.ones(context_images.shape[0], dtype=torch.bool)
+    query_available = torch.ones(query_images.shape[0], dtype=torch.bool)
+    rng = np.random.default_rng(seed + 17)
+
+    if mode == "target_zero":
+        query_available[:] = False
+    elif mode == "all_zero":
+        context_available[:] = False
+        query_available[:] = False
+    elif mode == "shuffled" and query_images.shape[0] > 1:
+        perm = torch.as_tensor(rng.permutation(query_images.shape[0]), dtype=torch.long)
+        query_images = query_images[perm]
+
+    if all_dropout_p > 0 and rng.random() < all_dropout_p:
+        context_available[:] = False
+        query_available[:] = False
+    elif query_dropout_p > 0:
+        drop = torch.as_tensor(rng.random(query_images.shape[0]) < query_dropout_p)
+        query_available &= ~drop
+
+    def _zero_unavailable(x: torch.Tensor, available: torch.Tensor) -> torch.Tensor:
+        if bool(available.all()):
+            return x
+        x = x.clone()
+        x[~available] = 0
+        return x
+
+    return (
+        _zero_unavailable(context_images, context_available),
+        _zero_unavailable(query_images, query_available),
+        context_available,
+        query_available,
+    )
+
+
 def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.ndarray,
                         masking_cfg, images: np.ndarray | None, seed: int,
                         context_gene_features: np.ndarray | None = None,
                         context_novae_features: np.ndarray | None = None,
+                        context_gene_feature_provider=None,
+                        context_novae_feature_provider=None,
                         organ: str | None = None, tech: str | None = None,
-                        augment: bool = False) -> dict:
+                        augment: bool = False,
+                        image_mode: str = "full",
+                        query_image_dropout_p: float = 0.0,
+                        all_image_dropout_p: float = 0.0,
+                        fixed_context_mask: np.ndarray | None = None,
+                        fixed_query_mask: np.ndarray | None = None) -> dict:
     """One {context, query, target_expression} training item for a SINGLE
     sample's data. Factored out of MaskedContextQueryDataset.__getitem__
     (2026-07-15) so MultiSampleMaskedContextQueryDataset below can reuse
@@ -597,23 +671,47 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
     random choices this pipeline can make per item never correlate through
     a shared seed. False (default) leaves coords3d byte-identical to the
     original, unaugmented behavior."""
-    if augment:
-        coords3d = augment_coords_xy(coords3d, seed=seed + 2)
-    context_mask, query_mask = make_context_query_split(coords3d, slice_ids, masking_cfg, seed)
-    context_mask = _cap_context_mask(context_mask, getattr(masking_cfg, "max_context_points", None), seed)
-    context_expr_source = expr if context_gene_features is None else context_gene_features
+    if fixed_context_mask is not None or fixed_query_mask is not None:
+        if fixed_context_mask is None or fixed_query_mask is None:
+            raise ValueError("fixed_context_mask and fixed_query_mask must be provided together")
+        if augment:
+            raise ValueError("fixed mask-bank items must not use coordinate augmentation")
+        context_mask = np.asarray(fixed_context_mask, dtype=bool)
+        query_mask = np.asarray(fixed_query_mask, dtype=bool)
+    else:
+        if augment:
+            coords3d = augment_coords_xy(coords3d, seed=seed + 2)
+        context_mask, query_mask = make_context_query_split(coords3d, slice_ids, masking_cfg, seed)
+        context_mask = _cap_context_mask(context_mask, getattr(masking_cfg, "max_context_points", None), seed)
+    if context_gene_feature_provider is not None and context_gene_features is not None:
+        raise ValueError("provide either context_gene_features or context_gene_feature_provider, not both")
+    if context_novae_feature_provider is not None and context_novae_features is not None:
+        raise ValueError("provide either context_novae_features or context_novae_feature_provider, not both")
+
+    if context_gene_feature_provider is not None:
+        context_expr = np.asarray(context_gene_feature_provider(context_mask), dtype=np.float32)
+    else:
+        context_expr_source = expr if context_gene_features is None else context_gene_features
+        context_expr = np.asarray(context_expr_source[context_mask], dtype=np.float32)
     context = {
         "coords": torch.tensor(coords3d[context_mask], dtype=torch.float32),
-        "expression": torch.tensor(context_expr_source[context_mask], dtype=torch.float32),
+        "expression": torch.tensor(context_expr, dtype=torch.float32),
     }
-    if context_novae_features is not None:
+    if context_novae_feature_provider is not None:
+        novae_context = np.asarray(context_novae_feature_provider(context_mask), dtype=np.float32)
+        context["novae_features"] = torch.tensor(novae_context, dtype=torch.float32)
+    elif context_novae_features is not None:
         context["novae_features"] = torch.tensor(
             context_novae_features[context_mask], dtype=torch.float32
         )
     query = {"coords": torch.tensor(coords3d[query_mask], dtype=torch.float32)}
     if images is not None:
-        context["images"] = _images_tensor(images, context_mask)
-        query["images"] = _images_tensor(images, query_mask)
+        c_img, q_img, c_available, q_available = _prepare_images_for_split(
+            images, context_mask, query_mask, mode=image_mode, seed=seed,
+            query_dropout_p=query_image_dropout_p, all_dropout_p=all_image_dropout_p,
+        )
+        context["images"], query["images"] = c_img, q_img
+        context["image_available"], query["image_available"] = c_available, q_available
     if organ is not None:
         context["organ"] = organ
         query["organ"] = organ
@@ -635,14 +733,21 @@ class MaskedContextQueryDataset(Dataset):
                  images: np.ndarray | None = None,
                  context_gene_features: np.ndarray | None = None,
                  context_novae_features: np.ndarray | None = None,
+                 context_gene_feature_provider=None,
+                 context_novae_feature_provider=None,
                  organ: str | None = None, tech: str | None = None,
-                 augment: bool = False):
+                 augment: bool = False,
+                 image_mode: str = "full",
+                 query_image_dropout_p: float = 0.0,
+                 all_image_dropout_p: float = 0.0,
+                 seed_schedule: list[int] | None = None):
         self.coords3d = coords3d
         self.expr = expr
         self.slice_ids = slice_ids
         self.masking_cfg = masking_cfg
-        self.n_items = n_items
-        self.base_seed = base_seed
+        self.seed_schedule = [int(x) for x in seed_schedule] if seed_schedule is not None else None
+        self.n_items = len(self.seed_schedule) if self.seed_schedule is not None else int(n_items)
+        self.base_seed = int(base_seed)
         # optional per-spot image data (task #17/#18/#20), already aligned
         # to coords3d/expr's row order by the caller — either raw H&E
         # patches [N, H, W, 3] uint8 (image_encoder_type "cnn") or
@@ -661,6 +766,11 @@ class MaskedContextQueryDataset(Dataset):
         # context_novae_features docstring for why this can't reuse
         # context_gene_features above.
         self.context_novae_features = context_novae_features
+        self.context_gene_feature_provider = context_gene_feature_provider
+        self.context_novae_feature_provider = context_novae_feature_provider
+        self.image_mode = image_mode
+        self.query_image_dropout_p = float(query_image_dropout_p)
+        self.all_image_dropout_p = float(all_image_dropout_p)
         # whole-sample metadata (2026-07-16, multi-sample follow-up) — see
         # _build_masked_item's organ/tech docstring
         self.organ = organ
@@ -674,12 +784,17 @@ class MaskedContextQueryDataset(Dataset):
         return self.n_items
 
     def __getitem__(self, idx):
-        seed = self.base_seed + idx
+        seed = self.seed_schedule[idx] if self.seed_schedule is not None else self.base_seed + idx
         return _build_masked_item(
             self.coords3d, self.expr, self.slice_ids, self.masking_cfg, self.images, seed,
             context_gene_features=self.context_gene_features,
             context_novae_features=self.context_novae_features,
+            context_gene_feature_provider=self.context_gene_feature_provider,
+            context_novae_feature_provider=self.context_novae_feature_provider,
             organ=self.organ, tech=self.tech, augment=self.augment,
+            image_mode=self.image_mode,
+            query_image_dropout_p=self.query_image_dropout_p,
+            all_image_dropout_p=self.all_image_dropout_p,
         )
 
 
@@ -732,30 +847,49 @@ class MultiSampleMaskedContextQueryDataset(Dataset):
     _build_masked_item, per sample, per item."""
 
     def __init__(self, samples: list[tuple], masking_cfg, n_items: int, base_seed: int = 0,
-                 augment: bool = False):
+                 augment: bool = False, image_mode: str = "full",
+                 query_image_dropout_p: float = 0.0, all_image_dropout_p: float = 0.0,
+                 seed_schedule: list[int] | None = None):
         assert samples, "samples must be non-empty"
         self.samples = samples
         self.masking_cfg = masking_cfg
-        self.n_items = n_items
-        self.base_seed = base_seed
+        self.seed_schedule = [int(x) for x in seed_schedule] if seed_schedule is not None else None
+        self.n_items = len(self.seed_schedule) if self.seed_schedule is not None else int(n_items)
+        self.base_seed = int(base_seed)
         self.augment = augment
+        self.image_mode = image_mode
+        self.query_image_dropout_p = float(query_image_dropout_p)
+        self.all_image_dropout_p = float(all_image_dropout_p)
 
     def __len__(self):
         return self.n_items
 
     def __getitem__(self, idx):
-        seed = self.base_seed + idx
+        seed = self.seed_schedule[idx] if self.seed_schedule is not None else self.base_seed + idx
         # separate RNG draw for "which sample" vs. the masking split
         # itself (seed + 1, passed to _build_masked_item) so the two
         # choices aren't spuriously correlated through a shared seed
         sample_idx = int(np.random.default_rng(seed).integers(len(self.samples)))
+        sample = tuple(self.samples[sample_idx])
+        if len(sample) == 8:
+            # Backwards-compatible tuple form used by older configs/tests:
+            # providers were added later and default to absent.
+            sample = (*sample, None, None)
+        if len(sample) != 10:
+            raise ValueError(f"multi-sample tuple must have 8 or 10 entries, got {len(sample)}")
         (coords3d, expr, slice_ids, images, organ, tech,
-         context_gene_features, context_novae_features) = self.samples[sample_idx]
+         context_gene_features, context_novae_features,
+         context_gene_feature_provider, context_novae_feature_provider) = sample
         return _build_masked_item(
             coords3d, expr, slice_ids, self.masking_cfg, images, seed + 1,
             context_gene_features=context_gene_features,
             context_novae_features=context_novae_features,
+            context_gene_feature_provider=context_gene_feature_provider,
+            context_novae_feature_provider=context_novae_feature_provider,
             organ=organ, tech=tech, augment=self.augment,
+            image_mode=self.image_mode,
+            query_image_dropout_p=self.query_image_dropout_p,
+            all_image_dropout_p=self.all_image_dropout_p,
         )
 
 
@@ -785,7 +919,22 @@ def make_dataloader(dataset, cfg) -> DataLoader:
     RAM. pin_memory is only actually useful with a CUDA accelerator
     (speeds up host->device transfer), so it's tied to
     torch.cuda.is_available() rather than always on."""
-    num_workers = cfg.training.get("num_workers", 0)
+    num_workers = int(cfg.training.get("num_workers", 0))
+    has_context_provider = bool(
+        getattr(dataset, "context_gene_feature_provider", None)
+        or getattr(dataset, "context_novae_feature_provider", None)
+    )
+    if isinstance(dataset, MultiSampleMaskedContextQueryDataset):
+        has_context_provider = any(
+            len(sample) >= 10 and (sample[8] is not None or sample[9] is not None)
+            for sample in dataset.samples
+        )
+    if has_context_provider and num_workers > 0:
+        raise ValueError(
+            "context-only Novae providers hold AnnData/model state and must use "
+            "training.num_workers=0; multiprocessing copies can corrupt caches or "
+            "multiply memory unexpectedly"
+        )
     return DataLoader(
         dataset, batch_size=1, collate_fn=_collate_identity,
         num_workers=num_workers,
@@ -804,7 +953,9 @@ def load_adata(cfg):
     else:
         adata = loaders.load_multi_slice(cfg.data.paths, cfg.data.z_positions)
     return loaders.basic_qc_and_normalize(
-        adata, min_genes=cfg.data.min_genes, min_cells=cfg.data.min_cells
+        adata, min_genes=cfg.data.min_genes, min_cells=cfg.data.min_cells,
+        transform=cfg.data.get("expression_transform", "normalize_log1p"),
+        target_sum=float(cfg.data.get("expression_target_sum", 1e4)),
     )
 
 
@@ -952,6 +1103,187 @@ def get_novae_features(cfg, adata, sample_id: str | None = None) -> np.ndarray:
     return features
 
 
+
+def prepare_novae_inputs(cfg, adata, model_params: dict, coords3d: np.ndarray,
+                         slice_ids: np.ndarray, sample_id: str | None = None) -> dict:
+    """Resolve Novae inputs without silently exposing hidden query expression."""
+    result = {
+        "mode": "disabled", "context_gene_features": None,
+        "context_novae_features": None, "context_gene_feature_provider": None,
+        "context_novae_feature_provider": None, "feature_dim": None,
+    }
+    if not model_uses_novae(dict(model_params)):
+        return result
+    mode = novae_input_mode(cfg, dict(model_params))
+    result["mode"] = mode
+    encoder = model_params.get("context_encoder_type", "builtin")
+    is_builtin_replacement = encoder == "builtin"
+    if mode == "unsafe_full_graph":
+        features = get_novae_features(cfg, adata, sample_id=sample_id)
+        key = "context_gene_features" if is_builtin_replacement else "context_novae_features"
+        result[key] = features
+        result["feature_dim"] = int(features.shape[1])
+        print("WARNING: using unsafe full-graph Novae features for historical reproduction; "
+              "reported metrics are contaminated by query-expression leakage.")
+        return result
+
+    sid = sample_id or str(cfg.data.get("sample_id", "sample"))
+    provider = ContextOnlyNovaeProvider(
+        adata,
+        cache_dir=_cache_root(cfg) / "novae_context_cache",
+        sample_id=sid,
+    )
+    # Probe one deterministic context mask before model construction so the
+    # real installed Novae feature width can be injected into the architecture.
+    probe_context, _ = make_context_query_split(coords3d, slice_ids, cfg.masking, seed=606_060)
+    probe_context = _cap_context_mask(
+        probe_context, getattr(cfg.masking, "max_context_points", None), 606_060
+    )
+    probe = provider(probe_context)
+    result["feature_dim"] = int(probe.shape[1])
+    key = "context_gene_feature_provider" if is_builtin_replacement else "context_novae_feature_provider"
+    result[key] = provider
+    return result
+
+
+def _mask_bank_for_config(cfg, adata, coords3d: np.ndarray, slice_ids: np.ndarray) -> tuple[dict, Path]:
+    evaluation = cfg.get("evaluation", {})
+    default_path = f"results/mask_banks/{cfg.data.get('sample_id', cfg.experiment_name)}.json"
+    path = Path(evaluation.get("mask_bank_path", default_path))
+    counts = {
+        "validation": int(evaluation.get("n_validation_masks", 4)),
+        "test": int(evaluation.get("n_test_masks", 8)),
+    }
+    seeds = {
+        "validation": int(evaluation.get("validation_seed", 700_000)),
+        "test": int(evaluation.get("test_seed", 900_000)),
+    }
+    bank = ensure_mask_bank(path, coords3d, slice_ids, adata.obs_names, cfg.masking, counts, seeds)
+    return bank, path
+
+
+def _training_seed_bank_for_config(cfg, obs_names) -> tuple[dict, Path]:
+    evaluation = cfg.get("evaluation", {})
+    default_path = f"results/mask_banks/training/{cfg.experiment_name}.json"
+    path = Path(evaluation.get("training_mask_bank_path", default_path))
+    return ensure_training_seed_bank(
+        path,
+        obs_names,
+        n_items=int(cfg.training.epochs),
+        base_seed=int(cfg.training.seed),
+        masking_cfg=cfg.masking,
+    )
+
+
+def _fixed_items_from_bank(cfg, adata, coords3d, expr, slice_ids, images, bank, split,
+                           novae_inputs: dict, organ=None, tech=None) -> list[dict]:
+    image_mode = str(cfg.get("evaluation", {}).get("validation_image_mode", "full"))
+    items = []
+    for record in split_records(bank, split):
+        context_mask, query_mask = record_masks(record, adata.obs_names)
+        items.append(_build_masked_item(
+            coords3d, expr, slice_ids, cfg.masking, images, int(record["seed"]),
+            context_gene_features=novae_inputs.get("context_gene_features"),
+            context_novae_features=novae_inputs.get("context_novae_features"),
+            context_gene_feature_provider=novae_inputs.get("context_gene_feature_provider"),
+            context_novae_feature_provider=novae_inputs.get("context_novae_feature_provider"),
+            organ=organ, tech=tech, augment=False, image_mode=image_mode,
+            fixed_context_mask=context_mask, fixed_query_mask=query_mask,
+        ))
+    return items
+
+
+def build_experiment_logger(cfg, checkpoint_dir: str):
+    logging_cfg = cfg.get("logging", {})
+    backend = str(logging_cfg.get("backend", "csv")).lower()
+    if backend in {"none", "false", "off"}:
+        return False
+    if backend == "csv":
+        from pytorch_lightning.loggers import CSVLogger
+        return CSVLogger(save_dir=str(Path(checkpoint_dir) / "logs"), name="lightning")
+    if backend == "wandb":
+        try:
+            from pytorch_lightning.loggers import WandbLogger
+        except Exception as exc:
+            raise RuntimeError("logging.backend=wandb requires the wandb package") from exc
+        return WandbLogger(
+            project=str(logging_cfg.get("project", "scilifestdl")),
+            name=str(cfg.experiment_name),
+            save_dir=str(Path(checkpoint_dir) / "logs"),
+            log_model=False,
+        )
+    raise ValueError(f"unknown logging backend {backend!r}")
+
+
+def write_run_manifest(cfg, checkpoint_dir: str, mask_bank_path: str | Path | None = None,
+                       training_mask_bank_path: str | Path | None = None) -> None:
+    """Persist enough state to reproduce and audit one run."""
+    import datetime as _datetime
+    import importlib.metadata
+    import os
+    import platform
+    import subprocess
+    import sys
+    from hashlib import sha256
+
+    out = Path(checkpoint_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    resolved = OmegaConf.to_yaml(cfg, resolve=True)
+    (out / "resolved_config.yaml").write_text(resolved)
+    try:
+        git_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        git_dirty = bool(subprocess.check_output(
+            ["git", "status", "--porcelain"], text=True, stderr=subprocess.DEVNULL
+        ).strip())
+    except Exception:
+        git_commit, git_dirty = "unavailable", None
+    try:
+        packages = {
+            dist.metadata.get("Name", "unknown"): dist.version
+            for dist in importlib.metadata.distributions()
+            if dist.metadata.get("Name")
+        }
+    except Exception:
+        packages = {}
+    cuda_devices = []
+    if torch.cuda.is_available():
+        for index in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(index)
+            cuda_devices.append({
+                "index": index,
+                "name": props.name,
+                "total_memory_bytes": int(props.total_memory),
+                "compute_capability": [int(props.major), int(props.minor)],
+            })
+    manifest = {
+        "experiment_name": str(cfg.experiment_name),
+        "created_utc": _datetime.datetime.now(_datetime.timezone.utc).isoformat(),
+        "resolved_config_sha256": sha256(resolved.encode()).hexdigest(),
+        "git_commit": git_commit,
+        "git_worktree_dirty": git_dirty,
+        "python": platform.python_version(),
+        "python_executable": sys.executable,
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "torch": torch.__version__,
+        "torch_cuda_version": torch.version.cuda,
+        "cudnn_version": torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None,
+        "pytorch_lightning": pl.__version__,
+        "packages": dict(sorted(packages.items(), key=lambda kv: kv[0].lower())),
+        "mask_bank_path": str(mask_bank_path) if mask_bank_path else None,
+        "training_mask_bank_path": str(training_mask_bank_path) if training_mask_bank_path else None,
+        "cuda_available": bool(torch.cuda.is_available()),
+        "cuda_device_count": int(torch.cuda.device_count()),
+        "cuda_devices": cuda_devices,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+    }
+    tmp = out / "run_manifest.json.tmp"
+    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    tmp.replace(out / "run_manifest.json")
+
+
 def inject_novae_dim(model_cfg: dict, novae_dim: int) -> None:
     """If a config sets gene_encoder_type: "novae" or "both" (2026-07-16;
     "both" added for StormLiteContextEncoder's CombinedGeneEncoder mode —
@@ -970,6 +1302,23 @@ def inject_novae_dim(model_cfg: dict, novae_dim: int) -> None:
         params["novae_dim"] = novae_dim
 
 
+def inject_expression_preprocessing(model_cfg: dict, adata) -> None:
+    """Tell encoders whether the loader already applied the single log1p.
+
+    The loader records its contract in ``adata.uns``. Encoder flags are
+    injected only when a config did not explicitly override them, preserving
+    the ability to reproduce a historical double-log run while making clean
+    configs correct by default.
+    """
+    params = model_cfg.get("params", {})
+    already_log1p = loaders.expression_is_log1p(adata)
+    context_encoder_type = params.get("context_encoder_type")
+    if context_encoder_type == "storm_lite":
+        params.setdefault("storm_lite_input_already_log1p", already_log1p)
+    elif context_encoder_type == "stpath":
+        params.setdefault("stpath_input_already_log1p", already_log1p)
+
+
 def inject_coord_scale(model_cfg: dict, coord_scale: float) -> None:
     """RandomFourierFeatures real-scale bug fix (2026-07-17 — see that
     class's own docstring in conditioning.py): auto-derive coord_scale
@@ -983,8 +1332,12 @@ def inject_coord_scale(model_cfg: dict, coord_scale: float) -> None:
     geometry-aware attention bias, unaffected by this mechanism. Mutates
     model_cfg["params"] in place; no-op for every other config."""
     params = model_cfg.get("params", {})
-    if params.get("context_encoder_type", "builtin") in ("builtin", "storm_lite") \
-            and "coord_scale" not in params:
+    context_model_names = {
+        "wae_gan", "fm_ot", "vqvae_ar", "harmonic_residual", "residual_fm_ot"
+    }
+    if (model_cfg.get("name") in context_model_names
+            and params.get("context_encoder_type", "builtin") in ("builtin", "storm_lite")
+            and "coord_scale" not in params):
         params["coord_scale"] = coord_scale
 
 
@@ -1044,9 +1397,12 @@ def _load_images(cfg, adata, sample_id: str | None = None):
     _downsample_patches) rather than kept at the native 224x224, since
     that resolution reduction is what actually made image_patch_size do
     something (see this function's real fix below)."""
-    if not cfg.data.get("use_images", False):
-        return adata, None
     sid = sample_id if sample_id is not None else cfg.data.sample_id
+    if not cfg.data.get("use_images", False):
+        if cfg.data.get("require_image_coverage", False):
+            barcodes = loaders.load_hest_patch_barcodes(cfg.data.hest_data_dir, sid)
+            adata = loaders.align_adata_to_patch_barcodes(adata, barcodes)
+        return adata, None
     patches, barcodes = loaders.load_hest_patches(cfg.data.hest_data_dir, sid)
 
     model_params = cfg.model.get("params", {})
@@ -1116,7 +1472,10 @@ def _load_data(cfg) -> tuple:
     return adata, coords3d, expr, slice_ids, images
 
 
-def load_multi_sample_data(cfg) -> tuple[list[tuple], list]:
+def load_multi_sample_data(
+    cfg, sample_ids: list[str] | None = None,
+    reference_gene_names: list[str] | None = None,
+) -> tuple[list[tuple], list]:
     """Multi-sample counterpart to _load_data. Wired into main() below
     (2026-07-16) via cfg.data.sample_ids — a list, in place of the
     single-sample configs' cfg.data.sample_id. Reads optional
@@ -1174,11 +1533,27 @@ def load_multi_sample_data(cfg) -> tuple[list[tuple], list]:
     tuples would just mean unpacking the same thing twice. Image QC only
     ever drops ROWS (spots), never gene columns, so the shared gene panel
     load_multi_sample already aligned stays valid regardless."""
+    sample_ids = list(sample_ids if sample_ids is not None else cfg.data.sample_ids)
+    configured_ids = list(cfg.data.get("sample_ids", sample_ids))
+
+    def _metadata_for(ids, list_key, mapping_key):
+        mapping = cfg.data.get(mapping_key)
+        if mapping is not None:
+            return [mapping.get(str(sid)) for sid in ids]
+        values = cfg.data.get(list_key)
+        if values is None:
+            return None
+        by_id = {str(sid): value for sid, value in zip(configured_ids, list(values))}
+        return [by_id.get(str(sid)) for sid in ids]
+
     adatas = loaders.load_multi_sample(
-        cfg.data.hest_data_dir, list(cfg.data.sample_ids),
+        cfg.data.hest_data_dir, sample_ids,
         min_genes=cfg.data.min_genes, min_cells=cfg.data.min_cells,
-        organs=list(cfg.data.organs) if cfg.data.get("organs") is not None else None,
-        techs=list(cfg.data.techs) if cfg.data.get("techs") is not None else None,
+        organs=_metadata_for(sample_ids, "organs", "organ_by_sample"),
+        techs=_metadata_for(sample_ids, "techs", "tech_by_sample"),
+        expression_transform=cfg.data.get("expression_transform", "normalize_log1p"),
+        expression_target_sum=float(cfg.data.get("expression_target_sum", 1e4)),
+        reference_genes=reference_gene_names,
     )
     model_params = cfg.model.get("params", {})
     context_encoder_type = model_params.get("context_encoder_type", "builtin")
@@ -1186,9 +1561,9 @@ def load_multi_sample_data(cfg) -> tuple[list[tuple], list]:
 
     samples = []
     updated_adatas = []
-    for sample_id, adata in zip(cfg.data.sample_ids, adatas):
+    for sample_id, adata in zip(sample_ids, adatas):
         images = None
-        if use_images:
+        if use_images or cfg.data.get("require_image_coverage", False):
             adata, images = _load_images(cfg, adata, sample_id=sample_id)
 
         coords3d = loaders.get_coords_3d(adata)
@@ -1199,19 +1574,14 @@ def load_multi_sample_data(cfg) -> tuple[list[tuple], list]:
         organ = str(adata.obs["organ"].iloc[0]) if "organ" in adata.obs else None
         tech = str(adata.obs["tech"].iloc[0]) if "tech" in adata.obs else None
 
-        context_gene_features = None
-        context_novae_features = None
-        if context_encoder_type == "builtin" and model_params.get("gene_encoder_type") == "novae":
-            context_gene_features = get_novae_features(cfg, adata, sample_id=sample_id)
-        elif (context_encoder_type == "stpath"
-              and model_params.get("stpath_new_gene_encoder_type") in ("novae", "both")):
-            context_novae_features = get_novae_features(cfg, adata, sample_id=sample_id)
-        elif (context_encoder_type == "storm_lite"
-              and model_params.get("gene_encoder_type") in ("novae", "both", "tokenizer_novae")):
-            context_novae_features = get_novae_features(cfg, adata, sample_id=sample_id)
-
-        samples.append((coords3d, expr, slice_ids, images, organ, tech,
-                         context_gene_features, context_novae_features))
+        novae_inputs = prepare_novae_inputs(
+            cfg, adata, model_params, coords3d, slice_ids, sample_id=str(sample_id)
+        )
+        samples.append((
+            coords3d, expr, slice_ids, images, organ, tech,
+            novae_inputs["context_gene_features"], novae_inputs["context_novae_features"],
+            novae_inputs["context_gene_feature_provider"], novae_inputs["context_novae_feature_provider"],
+        ))
         updated_adatas.append(adata)
     return samples, updated_adatas
 
@@ -1240,6 +1610,13 @@ def inject_organ_tech_vocab(model_cfg: dict, adatas: list) -> None:
     organ_vocab, tech_vocab = build_organ_tech_vocab(organs, techs)
     params.setdefault("organ_vocab", organ_vocab)
     params.setdefault("tech_vocab", tech_vocab)
+
+
+def inject_pretrained_autoencoder_gene_names(model_cfg: dict, adata) -> None:
+    """Inject the exact fit-derived gene order expected by residual AE checkpoints."""
+    params = model_cfg.get("params", {})
+    if model_cfg.get("name") == "residual_fm_ot" and params.get("pretrained_autoencoder_path"):
+        params.setdefault("pretrained_autoencoder_gene_names", adata.var_names.tolist())
 
 
 def inject_stpath_gene_names(model_cfg: dict, adata) -> None:
@@ -1281,7 +1658,7 @@ def inject_decoder_gene_names(model_cfg: dict, adata) -> None:
     LLOKIStyleDecoder's own docstring)."""
     params = model_cfg.get("params", {})
     decoder_type = params.get("decoder_type")
-    if decoder_type == "panel_invariant" and "decoder_gene_names" not in params:
+    if decoder_type in ("panel_invariant", "gene_conditioned_vocabulary") and "decoder_gene_names" not in params:
         params["decoder_gene_names"] = adata.var_names.tolist()
     elif decoder_type == "gene_attention" and "decoder_gene_names" not in params:
         import scanpy as sc
@@ -1341,6 +1718,8 @@ def inject_single_sample_n_genes(model_cfg: dict, adata) -> None:
     produce it. UNCONDITIONAL overwrite (not setdefault, unlike every
     other inject_* here) — deliberately corrects a stale/wrong hardcoded
     value rather than trusting it. Mutates model_cfg["params"] in place."""
+    if model_cfg.get("name") in {"interp_baseline", "spatial_baseline"}:
+        return
     params = model_cfg.get("params", {})
     params["n_genes"] = adata.n_vars
 
@@ -1359,158 +1738,236 @@ def inject_multi_sample_n_genes(model_cfg: dict, adatas: list) -> None:
     intersection (its own documented guarantee), so any one sample's
     count is correct for all of them. Mutates model_cfg["params"] in
     place; no-op if n_genes is already explicitly set."""
+    if model_cfg.get("name") in {"interp_baseline", "spatial_baseline"}:
+        return
     params = model_cfg.get("params", {})
     params.setdefault("n_genes", adatas[0].n_vars)
 
 
 def _main_multi_sample(cfg) -> None:
-    """Multi-sample training entry point (2026-07-16), called from main()
-    when cfg.data.sample_ids is set. Mirrors main()'s single-sample flow
-    (build model -> train on fresh masking draws -> save -> eval on one
-    held-out draw) but over MultiSampleMaskedContextQueryDataset instead
-    of MaskedContextQueryDataset — see that class's own docstring for why
-    samples are kept spatially separate rather than pooled.
+    """Train on explicit samples and validate/test on held-out samples.
 
-    UPDATED 2026-07-17: images/Novae/STPath ARE now supported (see
-    load_multi_sample_data's own updated docstring for the real gap this
-    closes and the STPath organ/tech caveat that still applies)."""
-    samples, adatas = load_multi_sample_data(cfg)
-    gene_names = adatas[0].var_names.tolist()  # shared panel, same order across samples (load_multi_sample's guarantee)
-    augment = cfg.training.get("augment_coords", False)
-    # 2026-07-17: RandomFourierFeatures real-scale bug fix — see
-    # inject_coord_scale's own docstring. Derived from the FIRST sample
-    # only (same convention as gene_names above) — every sample fed
-    # through this one model instance should share a comparable physical
-    # pixel resolution for this single fixed coord_scale to make sense
-    # (same "confirm sample_ids share a platform before pooling"
-    # assumption load_multi_sample's own docstring already documents).
-    coord_scale = float(samples[0][0][:, :2].std())
-    # context_gene_features/context_novae_features (2026-07-17): a
-    # per-CONFIG decision (context_encoder_type/gene_encoder_type), not
-    # per-sample data — every sample in `samples` has them set (or all
-    # None), see load_multi_sample_data's own dispatch loop, so any one
-    # sample's shape is representative for injecting *_novae_dim below.
+    Clean multi-sample configs should declare ``data.train_sample_ids``,
+    ``data.validation_sample_ids`` and ``data.test_sample_ids``. The shared
+    gene panel is established from training slides only; validation/test
+    slides are aligned to it and are never drawn by the training Dataset.
+    """
+    train_ids = list(cfg.data.get("train_sample_ids", cfg.data.get("sample_ids", [])))
+    validation_ids = list(cfg.data.get("validation_sample_ids", []))
+    test_ids = list(cfg.data.get("test_sample_ids", []))
+    if not train_ids:
+        raise ValueError("multi-sample training requires data.train_sample_ids or data.sample_ids")
+    # Establish the model vocabulary from training slides only. Validation
+    # and test slides are loaded afterwards against that immutable panel;
+    # neither split can shrink or reorder the output vocabulary.
+    train_ids = list(dict.fromkeys(train_ids))
+    train_loaded_samples, train_adatas = load_multi_sample_data(cfg, sample_ids=train_ids)
+    gene_names = train_adatas[0].var_names.tolist()
+    validation_samples, validation_adatas = [], []
+    if validation_ids:
+        validation_samples, validation_adatas = load_multi_sample_data(
+            cfg, sample_ids=validation_ids, reference_gene_names=gene_names
+        )
+    test_samples, test_adatas = [], []
+    if test_ids:
+        test_samples, test_adatas = load_multi_sample_data(
+            cfg, sample_ids=test_ids, reference_gene_names=gene_names
+        )
+    all_ids = [*train_ids, *validation_ids, *test_ids]
+    samples = [*train_loaded_samples, *validation_samples, *test_samples]
+    adatas = [*train_adatas, *validation_adatas, *test_adatas]
+    by_id = {str(sid): (sample, adata) for sid, sample, adata in zip(all_ids, samples, adatas)}
+    train_samples = [by_id[str(sid)][0] for sid in train_ids]
+    fit_adatas = train_adatas
+    augment = bool(cfg.training.get("augment_coords", False))
+    coord_scale = float(np.mean([sample[0][:, :2].std() for sample in train_samples]))
     context_encoder_type = cfg.model.get("params", {}).get("context_encoder_type", "builtin")
-    context_gene_features, context_novae_features = samples[0][6], samples[0][7]
+
+    novae_dim = None
+    for sample in samples:
+        for source in (sample[6], sample[7]):
+            if source is not None:
+                novae_dim = int(source.shape[1])
+        for provider in (sample[8], sample[9]):
+            if provider is not None and provider.output_dim is not None:
+                novae_dim = int(provider.output_dim)
+
+    def _inject(model_cfg: dict) -> None:
+        inject_multi_sample_n_genes(model_cfg, fit_adatas)
+        inject_organ_tech_vocab(model_cfg, fit_adatas)
+        inject_coord_scale(model_cfg, coord_scale)
+        inject_decoder_gene_names(model_cfg, fit_adatas[0])
+        inject_pretrained_autoencoder_gene_names(model_cfg, fit_adatas[0])
+        inject_stpath_gene_names(model_cfg, fit_adatas[0])
+        inject_storm_lite_tokenizer_gene_names(model_cfg, fit_adatas[0])
+        inject_expression_preprocessing(model_cfg, fit_adatas[0])
+        if novae_dim is not None:
+            if context_encoder_type == "stpath":
+                inject_stpath_novae_dim(model_cfg, novae_dim)
+            else:
+                inject_novae_dim(model_cfg, novae_dim)
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
-    inject_multi_sample_n_genes(model_cfg, adatas)
-    inject_organ_tech_vocab(model_cfg, adatas)
-    inject_coord_scale(model_cfg, coord_scale)
-    inject_decoder_gene_names(model_cfg, adatas[0])
-    inject_stpath_gene_names(model_cfg, adatas[0])
-    if context_gene_features is not None:
-        inject_novae_dim(model_cfg, context_gene_features.shape[1])
-    if context_novae_features is not None:
-        # storm_lite reuses novae_dim's param name; STPath's residual uses
-        # the distinct stpath_novae_dim — same dispatch as main()'s own
-        # single-sample injection block.
-        if context_encoder_type == "storm_lite":
-            inject_novae_dim(model_cfg, context_novae_features.shape[1])
-        else:
-            inject_stpath_novae_dim(model_cfg, context_novae_features.shape[1])
+    _inject(model_cfg)
     model = build_model(model_cfg)
-    # init_checkpoint_dir (2026-07-19): opt-in pretrain->finetune warm
-    # start, unset by default — see load_pretrained_weights_into's own
-    # docstring for the full reasoning (motivated by STPath's own
-    # pretrained-vs-unfrozen ablation showing pretraining alone is worth
-    # ~0.086 PCC, architecture held constant).
     init_checkpoint_dir = cfg.training.get("init_checkpoint_dir")
     if init_checkpoint_dir:
         load_pretrained_weights_into(model, init_checkpoint_dir)
-    # unresolved copy for checkpointing — same reasoning as main()'s own
-    # unresolved_model_cfg (keeps ${oc.env:...} interpolations literal)
     unresolved_model_cfg = OmegaConf.to_container(cfg.model, resolve=False)
-    inject_multi_sample_n_genes(unresolved_model_cfg, adatas)
-    inject_organ_tech_vocab(unresolved_model_cfg, adatas)
-    inject_coord_scale(unresolved_model_cfg, coord_scale)
-    inject_decoder_gene_names(unresolved_model_cfg, adatas[0])
-    inject_stpath_gene_names(unresolved_model_cfg, adatas[0])
-    if context_gene_features is not None:
-        inject_novae_dim(unresolved_model_cfg, context_gene_features.shape[1])
-    if context_novae_features is not None:
-        if context_encoder_type == "storm_lite":
-            inject_novae_dim(unresolved_model_cfg, context_novae_features.shape[1])
-        else:
-            inject_stpath_novae_dim(unresolved_model_cfg, context_novae_features.shape[1])
+    _inject(unresolved_model_cfg)
 
     checkpoint_dir = cfg.training.get("checkpoint_dir", f"results/checkpoints/{cfg.experiment_name}")
+    composite_train_obs_names = [
+        f"{sid}:{name}"
+        for sid in train_ids
+        for name in by_id[str(sid)][1].obs_names
+    ]
+    training_bank, training_bank_path = _training_seed_bank_for_config(
+        cfg, composite_train_obs_names
+    )
+    write_run_manifest(cfg, checkpoint_dir, training_mask_bank_path=training_bank_path)
+    split_manifest = {
+        "train_sample_ids": train_ids,
+        "validation_sample_ids": validation_ids,
+        "test_sample_ids": test_ids,
+        "shared_gene_count": len(gene_names),
+    }
+    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    (Path(checkpoint_dir) / "sample_split.json").write_text(json.dumps(split_manifest, indent=2))
+
+    evaluation_cfg = cfg.get("evaluation", {})
+    mask_bank_dir = Path(evaluation_cfg.get("mask_bank_dir", "results/mask_banks"))
+
+    def _sample_bank(sample_id: str, sample, adata):
+        coords3d, _expr, slice_ids = sample[0], sample[1], sample[2]
+        counts = {
+            "validation": int(evaluation_cfg.get("n_validation_masks", 4)),
+            "test": int(evaluation_cfg.get("n_test_masks", 8)),
+        }
+        seeds = {
+            "validation": int(evaluation_cfg.get("validation_seed", 700_000)),
+            "test": int(evaluation_cfg.get("test_seed", 900_000)),
+        }
+        path = mask_bank_dir / f"{sample_id}.json"
+        return ensure_mask_bank(path, coords3d, slice_ids, adata.obs_names, cfg.masking, counts, seeds), path
+
+    def _novae_dict(sample):
+        return {
+            "context_gene_features": sample[6],
+            "context_novae_features": sample[7],
+            "context_gene_feature_provider": sample[8],
+            "context_novae_feature_provider": sample[9],
+        }
+
+    callbacks = []
+    checkpoint_every_n_steps = cfg.training.get("checkpoint_every_n_steps")
+    if checkpoint_every_n_steps:
+        callbacks.append(PeriodicCheckpointCallback(
+            unresolved_model_cfg, gene_names, checkpoint_dir,
+            save_every_n_steps=checkpoint_every_n_steps,
+        ))
+    log_print_every_n_steps = cfg.training.get("log_print_every_n_steps")
+    if log_print_every_n_steps:
+        callbacks.append(PeriodicPrintCallback(log_print_every_n_steps))
+    ema_decay = cfg.training.get("ema_decay")
+    ema_callback = EMACallback(ema_decay) if ema_decay else None
+    if ema_callback is not None:
+        callbacks.append(ema_callback)
+
+    validation_cfg = cfg.get("validation", {})
+    if validation_ids and bool(validation_cfg.get("enabled", True)):
+        validation_items = []
+        for sid in validation_ids:
+            sample, adata = by_id[str(sid)]
+            bank, _ = _sample_bank(str(sid), sample, adata)
+            coords3d, expr, slice_ids, images, organ, tech = sample[:6]
+            for record in split_records(bank, "validation"):
+                context_mask, query_mask = record_masks(record, adata.obs_names)
+                ni = _novae_dict(sample)
+                validation_items.append(_build_masked_item(
+                    coords3d, expr, slice_ids, cfg.masking, images, int(record["seed"]),
+                    **ni, organ=organ, tech=tech, augment=False,
+                    image_mode=str(evaluation_cfg.get("validation_image_mode", "full")),
+                    fixed_context_mask=context_mask, fixed_query_mask=query_mask,
+                ))
+        validation_callback = FixedMaskValidationCallback(
+            validation_items,
+            every_n_steps=int(validation_cfg.get("every_n_steps", 1000)),
+            patience_checks=int(validation_cfg.get("patience_checks", 5)),
+            min_delta=float(validation_cfg.get("min_delta", 1e-4)),
+            metric=str(validation_cfg.get("metric", "rmse")),
+            n_samples=int(validation_cfg.get("n_samples", 4)),
+            history_path=Path(checkpoint_dir) / "validation_history.json",
+            seed=int(validation_cfg.get("sampling_seed", 800_000)),
+        )
+        callbacks.append(validation_callback)
+    else:
+        validation_callback = None
+
     if list(model.parameters()):
         dataset = MultiSampleMaskedContextQueryDataset(
-            samples, cfg.masking, n_items=cfg.training.epochs, base_seed=cfg.training.seed,
-            augment=augment,
+            train_samples, cfg.masking, n_items=int(cfg.training.epochs),
+            base_seed=int(cfg.training.seed), augment=augment,
+            image_mode=str(cfg.training.get("image_mode", "full")),
+            query_image_dropout_p=float(cfg.training.get("query_image_dropout_p", 0.0)),
+            all_image_dropout_p=float(cfg.training.get("all_image_dropout_p", 0.0)),
+            seed_schedule=training_bank["seeds"],
         )
-        dataloader = make_dataloader(dataset, cfg)
-        # PeriodicCheckpointCallback (2026-07-17): opt-in via
-        # training.checkpoint_every_n_steps, unset by default — see that
-        # class's own docstring.
-        callbacks = []
-        checkpoint_every_n_steps = cfg.training.get("checkpoint_every_n_steps")
-        if checkpoint_every_n_steps:
-            callbacks.append(PeriodicCheckpointCallback(
-                unresolved_model_cfg, gene_names, checkpoint_dir,
-                save_every_n_steps=checkpoint_every_n_steps,
-            ))
-        # PeriodicPrintCallback (2026-07-19): opt-in via
-        # training.log_print_every_n_steps, unset by default — see that
-        # class's own docstring (found via the mome_both_bigger collapse
-        # investigation: no per-step loss survives into a redirected log
-        # file otherwise).
-        log_print_every_n_steps = cfg.training.get("log_print_every_n_steps")
-        if log_print_every_n_steps:
-            callbacks.append(PeriodicPrintCallback(log_print_every_n_steps))
-        # EMACallback (2026-07-19): opt-in via training.ema_decay, unset by
-        # default — see that class's own docstring (found via 5 identically
-        # -configured StormLite+decoder seeds landing anywhere from PCC
-        # 0.366 to 0.493 — EMA is the standard fix for run-to-run noise
-        # this large).
-        ema_decay = cfg.training.get("ema_decay")
-        ema_callback = EMACallback(ema_decay) if ema_decay else None
-        if ema_callback is not None:
-            callbacks.append(ema_callback)
         trainer = pl.Trainer(
             max_epochs=1,
             accelerator="auto",
-            log_every_n_steps=cfg.training.log_every_n_steps,
+            log_every_n_steps=int(cfg.training.log_every_n_steps),
             enable_checkpointing=False,
-            logger=False,
+            logger=build_experiment_logger(cfg, checkpoint_dir),
             callbacks=callbacks,
-            # gradient_clip_val (2026-07-19, real fix — see PeriodicPrintCallback's
-            # own docstring for the collapsed run this was found investigating):
-            # no trainer in this codebase clipped gradients before this. 1.0 is the
-            # standard default value in the flow-matching/diffusion/transformer
-            # literature (e.g. used throughout Lipman et al. 2022 follow-ups) —
-            # a safe, zero-cost-if-unneeded guard against the exact kind of
-            # gradient-explosion-driven collapse-to-constant-output failure mode
-            # a bigger/deeper StormLite (mome_both_bigger) hit, in both single-
-            # and multi-sample settings, while the smaller default StormLite
-            # trained fine under the identical (unclipped) optimizer setup.
-            gradient_clip_val=1.0,
+            gradient_clip_val=(
+                float(cfg.training.get("gradient_clip_val", 1.0))
+                if model.automatic_optimization else None
+            ),
         )
-        trainer.fit(model, dataloader)
-        if ema_callback is not None:
-            # apply EMA weights BEFORE the final eval/save below, so both
-            # see the smoothed weights, not the raw last-step state — see
-            # EMACallback.apply_to_model's own docstring.
+        trainer.fit(model, make_dataloader(dataset, cfg))
+        if ema_callback is not None and validation_callback is None:
             ema_callback.apply_to_model(model)
-        saved_path = save_trained_model(model, unresolved_model_cfg, gene_names, checkpoint_dir)
-        if saved_path is not None:
-            print(f"Saved trained model (weights + config + gene names) to {saved_path.parent}")
+        elif ema_callback is not None:
+            print("best held-out-sample validation state selected; EMA final-state application skipped")
+        save_trained_model(model, unresolved_model_cfg, gene_names, checkpoint_dir)
 
-    eval_item = MultiSampleMaskedContextQueryDataset(
-        samples, cfg.masking, n_items=1, base_seed=cfg.training.seed + cfg.training.epochs + 1,
-        augment=augment,
-    )[0]
-    context, query = eval_item["context"], eval_item["query"]
-    target_expression = eval_item["target_expression"].numpy()
-
-    model.eval()
-    with torch.no_grad():
-        output = model.sample(context, query)
-    pred = output["expression"].detach().cpu().numpy()
-    pcc = ev.pearson_per_gene(pred, target_expression)
-    print(f"mean PCC: {np.nanmean(pcc):.4f}")
-    print(f"RMSE: {ev.rmse(pred, target_expression):.4f}")
+    if test_ids:
+        from src.evaluation.audit_evaluation import evaluate_model_on_mask_bank
+        test_results = {}
+        for sid in test_ids:
+            sample, adata = by_id[str(sid)]
+            bank, bank_path = _sample_bank(str(sid), sample, adata)
+            coords3d, expr, slice_ids, images, organ, tech = sample[:6]
+            test_results[str(sid)] = evaluate_model_on_mask_bank(
+                model, cfg, adata, coords3d, expr, slice_ids, images, bank,
+                _novae_dict(sample),
+                output_path=Path(checkpoint_dir) / f"audit_test_metrics_{sid}.json",
+                organ=organ, tech=tech,
+            )
+        aggregate = {}
+        for mode in list(evaluation_cfg.get("image_modes", ["full"])):
+            mode_rows = []
+            for sid, result in test_results.items():
+                summary = result["image_modes"][str(mode)]["summary"]
+                mode_rows.append({
+                    "sample_id": sid,
+                    "pcc": summary["pcc"]["mean"],
+                    "rmse": summary["rmse"]["mean"],
+                })
+            aggregate[str(mode)] = {
+                "per_sample": mode_rows,
+                "pcc_mean": float(np.mean([r["pcc"] for r in mode_rows])),
+                "rmse_mean": float(np.mean([r["rmse"] for r in mode_rows])),
+            }
+        (Path(checkpoint_dir) / "heldout_sample_summary.json").write_text(
+            json.dumps(aggregate, indent=2)
+        )
+        full = aggregate.get("full", next(iter(aggregate.values())))
+        print(f"held-out-sample PCC: {full['pcc_mean']:.4f}")
+        print(f"held-out-sample RMSE: {full['rmse_mean']:.4f}")
+    else:
+        print("WARNING: no data.test_sample_ids configured; no held-out-sample test was run.")
 
 
 def main(cfg_path: str, overrides: list[str] | None = None):
@@ -1547,35 +2004,15 @@ def main(cfg_path: str, overrides: list[str] | None = None):
 
     adata, coords3d, expr, slice_ids, images = _load_data(cfg)
 
-    # gene_encoder_type="novae" (2026-07-15) / stpath_new_gene_encoder_type=
-    # "novae" (2026-07-16, Route B residual): precompute once, row-aligned
-    # to the (possibly image-QC-filtered) adata _load_data already
-    # returned — must happen before build_model, since *_novae_dim needs
-    # to be injected into model_cfg first, same ordering as
-    # inject_stpath_gene_names below. The two are mutually exclusive in
-    # practice (a config is "builtin" or "stpath", never both) but use
-    # separate variables/injectors regardless — see
-    # _build_masked_item's context_novae_features docstring for why they
-    # can't share a mechanism.
     model_params = cfg.model.get("params", {})
     context_encoder_type = model_params.get("context_encoder_type", "builtin")
-    context_gene_features = None
-    context_novae_features = None
-    if context_encoder_type == "builtin" and model_params.get("gene_encoder_type") == "novae":
-        # REPLACES context["expression"] — SpatialContextEncoder's own switch
-        context_gene_features = get_novae_features(cfg, adata)
-    elif (context_encoder_type == "stpath"
-          and model_params.get("stpath_new_gene_encoder_type") in ("novae", "both")):
-        # ADDITIVE context["novae_features"] — STPath's Route-B residual
-        context_novae_features = get_novae_features(cfg, adata)
-    elif (context_encoder_type == "storm_lite"
-          and model_params.get("gene_encoder_type") in ("novae", "both", "tokenizer_novae")):
-        # ADDITIVE context["novae_features"] too — StormLiteContextEncoder
-        # reuses the gene_encoder_type param name but, like STPath, needs
-        # this as a separate channel from raw context["expression"], never
-        # a replacement (its "both" mode needs BOTH simultaneously) — see
-        # storm_lite_encoder.py's own forward()/_encode_gene.
-        context_novae_features = get_novae_features(cfg, adata)
+    novae_inputs = prepare_novae_inputs(
+        cfg, adata, model_params, coords3d, slice_ids, sample_id=cfg.data.get("sample_id")
+    )
+    context_gene_features = novae_inputs["context_gene_features"]
+    context_novae_features = novae_inputs["context_novae_features"]
+    context_gene_feature_provider = novae_inputs["context_gene_feature_provider"]
+    context_novae_feature_provider = novae_inputs["context_novae_feature_provider"]
 
     # 2026-07-17: RandomFourierFeatures real-scale bug fix — see
     # inject_coord_scale's own docstring
@@ -1586,17 +2023,13 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     inject_stpath_gene_names(model_cfg, adata)
     inject_decoder_gene_names(model_cfg, adata)
     inject_storm_lite_tokenizer_gene_names(model_cfg, adata)
+    inject_expression_preprocessing(model_cfg, adata)
     inject_coord_scale(model_cfg, coord_scale)
-    if context_gene_features is not None:
-        inject_novae_dim(model_cfg, context_gene_features.shape[1])
-    if context_novae_features is not None:
-        # storm_lite reuses novae_dim's param name (inject_novae_dim);
-        # STPath's residual uses the distinct stpath_novae_dim
-        # (inject_stpath_novae_dim) — see each function's own docstring.
-        if context_encoder_type == "storm_lite":
-            inject_novae_dim(model_cfg, context_novae_features.shape[1])
+    if novae_inputs["feature_dim"] is not None:
+        if context_encoder_type == "stpath":
+            inject_stpath_novae_dim(model_cfg, novae_inputs["feature_dim"])
         else:
-            inject_stpath_novae_dim(model_cfg, context_novae_features.shape[1])
+            inject_novae_dim(model_cfg, novae_inputs["feature_dim"])
     model = build_model(model_cfg)
     # init_checkpoint_dir (2026-07-19): opt-in pretrain->finetune warm
     # start — see _main_multi_sample's identical block / load_pretrained_
@@ -1617,14 +2050,14 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     inject_stpath_gene_names(unresolved_model_cfg, adata)
     inject_decoder_gene_names(unresolved_model_cfg, adata)
     inject_storm_lite_tokenizer_gene_names(unresolved_model_cfg, adata)
+    inject_expression_preprocessing(unresolved_model_cfg, adata)
     inject_coord_scale(unresolved_model_cfg, coord_scale)
-    if context_gene_features is not None:
-        inject_novae_dim(unresolved_model_cfg, context_gene_features.shape[1])
-    if context_novae_features is not None:
-        if context_encoder_type == "storm_lite":
-            inject_novae_dim(unresolved_model_cfg, context_novae_features.shape[1])
+    if novae_inputs["feature_dim"] is not None:
+        if context_encoder_type == "stpath":
+            inject_stpath_novae_dim(unresolved_model_cfg, novae_inputs["feature_dim"])
         else:
-            inject_stpath_novae_dim(unresolved_model_cfg, context_novae_features.shape[1])
+            inject_novae_dim(unresolved_model_cfg, novae_inputs["feature_dim"])
+
 
     # Train (skipped entirely for parameter-free baselines like interp_baseline) --
     augment = cfg.training.get("augment_coords", False)
@@ -1635,25 +2068,53 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     # None for every training step.
     organ = str(adata.obs["organ"].iloc[0]) if "organ" in adata.obs else None
     tech = str(adata.obs["tech"].iloc[0]) if "tech" in adata.obs else None
+    bank, mask_bank_path = _mask_bank_for_config(cfg, adata, coords3d, slice_ids)
+    training_bank, training_bank_path = _training_seed_bank_for_config(cfg, adata.obs_names)
+    checkpoint_dir = cfg.training.get("checkpoint_dir", f"results/checkpoints/{cfg.experiment_name}")
+    write_run_manifest(cfg, checkpoint_dir, mask_bank_path, training_bank_path)
     if list(model.parameters()):
         dataset = MaskedContextQueryDataset(
             coords3d, expr, slice_ids, cfg.masking,
             n_items=cfg.training.epochs, base_seed=cfg.training.seed, images=images,
             context_gene_features=context_gene_features,
             context_novae_features=context_novae_features,
-            organ=organ, tech=tech,
-            augment=augment,
+            context_gene_feature_provider=context_gene_feature_provider,
+            context_novae_feature_provider=context_novae_feature_provider,
+            organ=organ, tech=tech, augment=augment,
+            image_mode=str(cfg.training.get("image_mode", "full")),
+            query_image_dropout_p=float(cfg.training.get("query_image_dropout_p", 0.0)),
+            all_image_dropout_p=float(cfg.training.get("all_image_dropout_p", 0.0)),
+            seed_schedule=training_bank["seeds"],
         )
         dataloader = make_dataloader(dataset, cfg)
         # .get() with the same default every real config's own YAML comment
         # documents, not a bare attribute access — configs that don't
         # declare checkpoint_dir (e.g. tests/test_run_comparison.py's
         # synthetic configs) must still work, not crash on a missing key
-        checkpoint_dir = cfg.training.get("checkpoint_dir", f"results/checkpoints/{cfg.experiment_name}")
         # PeriodicCheckpointCallback (2026-07-17): opt-in via
         # training.checkpoint_every_n_steps, unset by default — see that
         # class's own docstring.
         callbacks = []
+        validation_cfg = cfg.get("validation", {})
+        if bool(validation_cfg.get("enabled", True)):
+            validation_items = _fixed_items_from_bank(
+                cfg, adata, coords3d, expr, slice_ids, images, bank, "validation",
+                novae_inputs, organ=organ, tech=tech,
+            )
+            validation_callback = FixedMaskValidationCallback(
+                validation_items,
+                every_n_steps=int(validation_cfg.get("every_n_steps", 1000)),
+                patience_checks=int(validation_cfg.get("patience_checks", 5)),
+                min_delta=float(validation_cfg.get("min_delta", 1e-4)),
+                metric=str(validation_cfg.get("metric", "rmse")),
+                n_samples=int(validation_cfg.get("n_samples", 4)),
+                history_path=Path(checkpoint_dir) / "validation_history.json",
+                seed=int(validation_cfg.get("sampling_seed", 800_000)),
+            )
+            callbacks.append(validation_callback)
+        else:
+            validation_callback = None
+
         checkpoint_every_n_steps = cfg.training.get("checkpoint_every_n_steps")
         if checkpoint_every_n_steps:
             callbacks.append(PeriodicCheckpointCallback(
@@ -1677,36 +2138,33 @@ def main(cfg_path: str, overrides: list[str] | None = None):
             accelerator="auto",
             log_every_n_steps=cfg.training.log_every_n_steps,
             enable_checkpointing=False,
-            logger=False,
+            logger=build_experiment_logger(cfg, checkpoint_dir),
             callbacks=callbacks,
-            gradient_clip_val=1.0,
+            gradient_clip_val=(
+                float(cfg.training.get("gradient_clip_val", 1.0))
+                if model.automatic_optimization else None
+            ),
         )
         trainer.fit(model, dataloader)
-        if ema_callback is not None:
+        if ema_callback is not None and validation_callback is None:
             ema_callback.apply_to_model(model)
+        elif ema_callback is not None:
+            print("best fixed-mask validation state selected; EMA final-state application skipped")
         saved_path = save_trained_model(model, unresolved_model_cfg, adata.var_names.tolist(), checkpoint_dir)
         if saved_path is not None:
             print(f"Saved trained model (weights + config + gene names) to {saved_path.parent}")
 
-    # Evaluate on a held-out masking draw not seen during training -----------
-    eval_item = MaskedContextQueryDataset(
-        coords3d, expr, slice_ids, cfg.masking,
-        n_items=1, base_seed=cfg.training.seed + cfg.training.epochs + 1, images=images,
-        context_gene_features=context_gene_features,
-        context_novae_features=context_novae_features,
+    # Full untouched-test-bank evaluation: predictive mean, uncertainty,
+    # fixed-dimensional ST-FID/ST-MMD and explicit image-availability modes.
+    from src.evaluation.audit_evaluation import evaluate_model_on_mask_bank
+    metrics = evaluate_model_on_mask_bank(
+        model, cfg, adata, coords3d, expr, slice_ids, images, bank, novae_inputs,
+        output_path=Path(checkpoint_dir) / "audit_test_metrics.json",
         organ=organ, tech=tech,
-        augment=augment,
-    )[0]
-    context, query = eval_item["context"], eval_item["query"]
-    target_expression = eval_item["target_expression"].numpy()
-
-    model.eval()
-    with torch.no_grad():
-        output = model.sample(context, query)
-    pred = output["expression"].detach().cpu().numpy()
-    pcc = ev.pearson_per_gene(pred, target_expression)
-    print(f"mean PCC: {np.nanmean(pcc):.4f}")
-    print(f"RMSE: {ev.rmse(pred, target_expression):.4f}")
+    )
+    full_summary = metrics["image_modes"].get("full", next(iter(metrics["image_modes"].values())))["summary"]
+    print(f"test-bank mean PCC: {full_summary['pcc']['mean']:.4f} ± {full_summary['pcc']['std']:.4f}")
+    print(f"test-bank RMSE: {full_summary['rmse']['mean']:.4f} ± {full_summary['rmse']['std']:.4f}")
 
 
 if __name__ == "__main__":

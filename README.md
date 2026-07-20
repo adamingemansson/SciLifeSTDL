@@ -68,6 +68,25 @@ conda activate st3d
 python -c "import scanpy, torch; print(torch.cuda.is_available())"
 ```
 
+
+## Validity-audit experiment suite
+
+The clean benchmark path and the staged four-device runner are documented in
+[`docs/audit_fixes_and_experiment_suite.md`](docs/audit_fixes_and_experiment_suite.md).
+After installing the environment and making the HEST-1k data/caches available:
+
+```bash
+# Print every wave without launching training.
+DRY_RUN=1 DEVICES="0 1 2 3" bash scripts/run_audit_suite_4gpu.sh
+
+# Run consecutive waves, with at most one job on each of four GPUs.
+DEVICES="0 1 2 3" bash scripts/run_audit_suite_4gpu.sh
+```
+
+The runner first validates harmonic-residual autoencoders, then executes
+nonparametric baselines, clean controls, deterministic residual models,
+residual flow matching, matched seeds and held-out-slide experiments.
+
 ## Project phases (see docs/project_proposal.md for detail)
 
 1. **Scoping** — pick the concrete sub-problem (3D inter-slice gap filling vs.

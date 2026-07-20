@@ -169,7 +169,7 @@ class STPathContextEncoder(nn.Module):
                  organ_type: str = "Kidney", tech_type: str = "Visium",
                  hidden_dim: int = 256, device: str = "cpu",
                  new_gene_encoder_type: str = "none", novae_dim: int | None = None,
-                 pretrained: bool = True):
+                 pretrained: bool = True, input_already_log1p: bool = True):
         """pretrained=False (2026-07-16, "STPath's own architecture trained
         from scratch on our pilot data" arm — the fair counterpart to a
         STORM-lite comparison, see src/models/storm_lite_encoder.py):
@@ -188,6 +188,7 @@ class STPathContextEncoder(nn.Module):
         )
         self.new_gene_encoder_type = new_gene_encoder_type
         self.pretrained = pretrained
+        self.input_already_log1p = input_already_log1p
         from stpath.model.model import STFM
         from stpath.model.nn_utils.config import ModelConfig
         from stpath.tokenization import (
@@ -293,6 +294,10 @@ class STPathContextEncoder(nn.Module):
         # at once (src/evaluation/run_comparison.py, see its own fix for
         # the bigger cause: not releasing models between configs).
         self.tile_encoder = None
+        # Explicit learned representation for unavailable histology. STPath's
+        # image tokenizer consumes 1536-d GigaPath features, so the token lives
+        # in that same space and is trainable even when the backbone is frozen.
+        self.missing_image_token = nn.Parameter(torch.randn(1536) * 0.02)
 
         # STPath's pre-head hidden state was trained for STPath's own
         # objective, not ours — its activation scale is whatever that
@@ -344,6 +349,8 @@ class STPathContextEncoder(nn.Module):
     def forward(self, context_coords: torch.Tensor, context_expression: torch.Tensor,
                 query_coords: torch.Tensor, context_images: torch.Tensor,
                 query_images: torch.Tensor,
+                context_image_available: torch.Tensor | None = None,
+                query_image_available: torch.Tensor | None = None,
                 context_novae_features: torch.Tensor | None = None,
                 organ: str | None = None, tech: str | None = None) -> torch.Tensor:
         """context_images/query_images: raw H&E patches [N, 3, H, W] float
@@ -396,13 +403,20 @@ class STPathContextEncoder(nn.Module):
         coords[:, 1] -= coords[:, 1].min()
         coords = self._rescale_coords(coords)
 
-        img_feats = torch.cat([
-            self._gigapath_features(context_images), self._gigapath_features(query_images),
-        ], dim=0)
+        context_img = self._gigapath_features(context_images)
+        query_img = self._gigapath_features(query_images)
+        if context_image_available is not None:
+            available = context_image_available.to(context_img.device).bool()
+            context_img = torch.where(available[:, None], context_img, self.missing_image_token[None, :])
+        if query_image_available is not None:
+            available = query_image_available.to(query_img.device).bool()
+            query_img = torch.where(available[:, None], query_img, self.missing_image_token[None, :])
+        img_feats = torch.cat([context_img, query_img], dim=0)
 
         n_total = n_context + n_query
         ge_tokens = self.tokenizer.ge_tokenizer.mask_token.float().to(device).repeat(n_total, 1)
-        expr = torch.log1p(context_expression)[:, self._valid_gene_pos]
+        processed_expression = context_expression if self.input_already_log1p else torch.log1p(context_expression)
+        expr = processed_expression[:, self._valid_gene_pos]
         context_one_hot = self.tokenizer.ge_tokenizer.convert_gene_exp_to_one_hot_tensor(
             self.tokenizer.ge_tokenizer.n_tokens, expr, self._context_gene_ids.to(device)
         )
@@ -433,7 +447,7 @@ class STPathContextEncoder(nn.Module):
             # string, not isinstance, so "both" (CombinedGeneEncoder, needing
             # BOTH inputs at once) fits the same dispatch cleanly.
             if self.new_gene_encoder_type == "mlp":
-                mlp_input = torch.log1p(context_expression)
+                mlp_input = processed_expression
                 extra_embed[:n_context] = self.new_gene_encoder(mlp_input)
             elif self.new_gene_encoder_type == "novae":
                 assert context_novae_features is not None, (
@@ -444,7 +458,7 @@ class STPathContextEncoder(nn.Module):
                 assert context_novae_features is not None, (
                     "new_gene_encoder_type='both' requires context_novae_features"
                 )
-                mlp_input = torch.log1p(context_expression)
+                mlp_input = processed_expression
                 extra_embed[:n_context] = self.new_gene_encoder(mlp_input, context_novae_features)
             self.model.input_encoder.set_extra_embed(extra_embed)
 

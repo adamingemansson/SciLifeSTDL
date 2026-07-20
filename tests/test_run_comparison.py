@@ -49,7 +49,18 @@ def _write_config(path: Path, model_name: str, model_params: dict, hest_dir: Pat
             "params": {"n_patches": 2, "radius_range": [30, 60]},
         },
         "model": {"name": model_name, "params": model_params},
-        "training": {"epochs": epochs, "seed": 0, "log_every_n_steps": 10},
+        "training": {
+            "epochs": epochs, "seed": 0, "log_every_n_steps": 10,
+            "checkpoint_dir": str(path.parent / f"checkpoints_{model_name}"),
+        },
+        "validation": {"enabled": False},
+        "evaluation": {
+            "mask_bank_path": str(path.parent / f"mask_bank_{model_name}.json"),
+            "n_validation_masks": 1, "n_test_masks": 2,
+            "n_samples": 2, "image_modes": ["full"],
+            "pca_n_components": 5,
+        },
+        "logging": {"backend": "none"},
     }
     path.write_text(yaml.safe_dump(cfg))
 
@@ -78,7 +89,7 @@ def test_run_comparison_end_to_end():
             _write_config(path, name, params, hest_dir, epochs=5)
             configs.append(str(path))
 
-        main(configs)  # just needs to run without raising
+        main(configs, pca_components=5)  # just needs to run without raising
         print("[run_comparison] OK — ran all 5 models (4 trained + interp_baseline) end-to-end")
 
 

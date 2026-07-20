@@ -39,15 +39,69 @@ def load_multi_slice(paths: list[str | Path], z_positions: list[float] | None = 
     return combined
 
 
-def basic_qc_and_normalize(adata: ad.AnnData, min_genes: int = 200,
-                            min_cells: int = 3) -> ad.AnnData:
-    """Standard scanpy-style QC + normalization. Adjust thresholds per dataset."""
+EXPRESSION_STATE_KEY = "_scilifestdl_expression_state"
+
+
+def basic_qc_and_normalize(
+    adata: ad.AnnData,
+    min_genes: int = 200,
+    min_cells: int = 3,
+    transform: str = "normalize_log1p",
+    target_sum: float = 1e4,
+    force: bool = False,
+) -> ad.AnnData:
+    """Apply the repository's single, explicit expression preprocessing contract.
+
+    ``transform`` is one of:
+
+    - ``"normalize_log1p"``: library-size normalize to ``target_sum`` and
+      apply exactly one ``log1p`` (the recommended/default contract).
+    - ``"normalize"``: library-size normalize only.
+    - ``"none"``: QC-filter only; leave expression values untouched.
+
+    The applied state is recorded in ``adata.uns[EXPRESSION_STATE_KEY]``. A
+    second call with the same contract is a no-op instead of applying another
+    normalization/log transform. A conflicting second call raises unless
+    ``force=True``. This prevents the accidental double-``log1p`` that used to
+    occur when the loader and a context encoder both transformed ``adata.X``.
+    """
     import scanpy as sc
+
+    allowed = {"normalize_log1p", "normalize", "none"}
+    if transform not in allowed:
+        raise ValueError(f"unknown expression transform {transform!r}; expected one of {sorted(allowed)}")
+
+    requested = {
+        "transform": transform,
+        "target_sum": float(target_sum),
+        "min_genes": int(min_genes),
+        "min_cells": int(min_cells),
+    }
+    existing = adata.uns.get(EXPRESSION_STATE_KEY)
+    if existing is not None and not force:
+        existing_dict = dict(existing)
+        if existing_dict == requested:
+            return adata
+        raise ValueError(
+            "AnnData already has expression preprocessing with a different SciLifeSTDL "
+            f"state: existing={existing_dict}, requested={requested}. Pass force=True "
+            "only when intentionally rebuilding from untransformed values."
+        )
+
     sc.pp.filter_cells(adata, min_genes=min_genes)
     sc.pp.filter_genes(adata, min_cells=min_cells)
-    sc.pp.normalize_total(adata, target_sum=1e4)
-    sc.pp.log1p(adata)
+    if transform in {"normalize", "normalize_log1p"}:
+        sc.pp.normalize_total(adata, target_sum=target_sum)
+    if transform == "normalize_log1p":
+        sc.pp.log1p(adata)
+    adata.uns[EXPRESSION_STATE_KEY] = requested
     return adata
+
+
+def expression_is_log1p(adata: ad.AnnData) -> bool:
+    """Return whether ``adata.X`` follows the recorded single-log contract."""
+    state = adata.uns.get(EXPRESSION_STATE_KEY, {})
+    return dict(state).get("transform") == "normalize_log1p"
 
 
 def get_coords_3d(adata: ad.AnnData) -> np.ndarray:
@@ -96,6 +150,30 @@ def load_hest_patches(hest_data_dir: str | Path, sample_id: str
         barcodes = np.array([b.decode() if isinstance(b, bytes) else b for b in raw_barcodes])
     return patches, barcodes
 
+
+
+def load_hest_patch_barcodes(hest_data_dir: str | Path, sample_id: str) -> np.ndarray:
+    """Read only patch barcodes without materializing the large image array."""
+    import h5py
+    hest_data_dir = Path(hest_data_dir)
+    matches = [m for m in hest_data_dir.rglob(f"*{sample_id}*.h5") if "patches" in m.parts]
+    if not matches:
+        raise FileNotFoundError(f"No patches/{sample_id}.h5 file found under {hest_data_dir}")
+    with h5py.File(matches[0], "r") as f:
+        raw = f["barcode"][:, 0]
+        return np.array([b.decode() if isinstance(b, bytes) else str(b) for b in raw])
+
+
+def align_adata_to_patch_barcodes(adata: ad.AnnData, barcodes: np.ndarray) -> ad.AnnData:
+    """Apply the same H&E-coverage cohort filter without loading pixels."""
+    available = set(map(str, barcodes))
+    has_patch = np.asarray([str(name) in available for name in adata.obs_names], dtype=bool)
+    if not has_patch.any():
+        raise ValueError("None of the adata spots matched any H&E patch barcode")
+    n_dropped = int((~has_patch).sum())
+    if n_dropped:
+        print(f"align_adata_to_patch_barcodes: dropping {n_dropped}/{adata.n_obs} spots without H&E coverage")
+    return adata[has_patch].copy()
 
 def align_patches_to_adata(adata: ad.AnnData, patches: np.ndarray, barcodes: np.ndarray
                             ) -> tuple[ad.AnnData, np.ndarray]:
@@ -170,7 +248,10 @@ def load_hest_sample(hest_data_dir: str | Path, sample_id: str,
 def load_multi_sample(hest_data_dir: str | Path, sample_ids: list[str],
                        min_genes: int = 200, min_cells: int = 3,
                        organs: list[str] | None = None,
-                       techs: list[str] | None = None) -> list[ad.AnnData]:
+                       techs: list[str] | None = None,
+                       expression_transform: str = "normalize_log1p",
+                       expression_target_sum: float = 1e4,
+                       reference_genes: list[str] | None = None) -> list[ad.AnnData]:
     """Multiple INDEPENDENT HEST-1k samples (different patients/sections,
     not a serial z-series of the same tissue block — for that, use
     load_multi_slice instead) for multi-sample training (scaffolding,
@@ -192,8 +273,12 @@ def load_multi_sample(hest_data_dir: str | Path, sample_ids: list[str],
     src/training/train.py) draw each masking split from exactly ONE
     sample's own coordinate system, never blending across samples.
 
-    All samples ARE aligned to a SHARED gene panel (the intersection of
-    every sample's post-QC var_names, in a fixed sorted order) — the
+    All samples ARE aligned to a SHARED gene panel. By default this is the
+    intersection of every supplied sample's post-QC var_names in a fixed
+    sorted order. When ``reference_genes`` is supplied (the strict held-out
+    path), each sample is only reordered/subset to that already fit-derived
+    panel and missing genes raise; held-out test samples therefore cannot
+    participate in choosing the vocabulary. The
     generative models here use a dense fixed-width decoder (n_genes is
     baked into the architecture at construction time), so every sample
     fed through the same model instance must present identically-shaped,
@@ -225,18 +310,45 @@ def load_multi_sample(hest_data_dir: str | Path, sample_ids: list[str],
             load_hest_sample(hest_data_dir, sid,
                               organ=organs[i] if organs is not None else None,
                               tech=techs[i] if techs is not None else None),
-            min_genes=min_genes, min_cells=min_cells)
+            min_genes=min_genes,
+            # A held-out sample must not select the evaluation vocabulary by
+            # expression prevalence. Keep every measured gene, then align to
+            # the training-derived reference panel below. Missing reference
+            # names still raise and therefore distinguish an unmeasured gene
+            # from a measured all-zero/rare gene.
+            min_cells=0 if reference_genes is not None else min_cells,
+            transform=expression_transform, target_sum=expression_target_sum)
         for i, sid in enumerate(sample_ids)
     ]
-    shared_genes = sorted(set.intersection(*(set(a.var_names) for a in adatas)))
-    if not shared_genes:
-        raise ValueError(
-            f"No genes shared across all samples {sample_ids!r} after per-sample QC — "
-            "likely mixing different gene panels/platforms (see this function's "
-            "docstring); check the `technology` column in HEST-1k's metadata CSV."
-        )
+    if reference_genes is None:
+        shared_genes = sorted(set.intersection(*(set(a.var_names) for a in adatas)))
+        if not shared_genes:
+            raise ValueError(
+                f"No genes shared across all samples {sample_ids!r} after per-sample QC — "
+                "likely mixing different gene panels/platforms (see this function's "
+                "docstring); check the `technology` column in HEST-1k's metadata CSV."
+            )
+        panel_source = "fit-sample intersection"
+    else:
+        # Strict held-out evaluation: the target vocabulary is established
+        # from train/validation samples before any test slide is loaded.  Test
+        # slides may be reordered to that vocabulary, but they are never
+        # allowed to shrink or otherwise choose it.
+        shared_genes = [str(g) for g in reference_genes]
+        if len(shared_genes) != len(set(shared_genes)):
+            raise ValueError("reference_genes contains duplicates")
+        for sid, a in zip(sample_ids, adatas):
+            missing = [g for g in shared_genes if g not in a.var_names]
+            if missing:
+                raise ValueError(
+                    f"held-out sample {sid!r} is missing {len(missing)} genes from the "
+                    f"fit-derived reference panel (examples: {missing[:5]}). Refusing "
+                    "to intersect with test data because that would make the test set "
+                    "participate in model-vocabulary selection."
+                )
+        panel_source = "predeclared fit-derived reference"
     for sid, a in zip(sample_ids, adatas):
         n_before = a.n_vars
         print(f"load_multi_sample: {sid} keeps {len(shared_genes)}/{n_before} genes "
-              f"({len(shared_genes) / n_before:.0%}) after intersecting with the shared panel")
+              f"({len(shared_genes) / n_before:.0%}) using {panel_source}")
     return [a[:, shared_genes].copy() for a in adatas]
