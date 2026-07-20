@@ -18,6 +18,11 @@ LOG_ROOT="${LOG_ROOT:-logs/recovery_suite/${STAGE}_${RUN_ID}}"
 mkdir -p "$LOG_ROOT"
 export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# Directly executed helper scripts live under scripts/, so Python otherwise
+# places that directory (not the repository root) on sys.path and cannot
+# import the sibling src package.
+REPO_ROOT="$(pwd -P)"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 N_CORES="$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
 THREADS_PER_JOB=$((N_CORES / 8))

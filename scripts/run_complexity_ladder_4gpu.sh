@@ -22,6 +22,10 @@ LOG_ROOT="${LOG_ROOT:-logs/complexity_ladder/${STAGE}_${RUN_ID}}"
 CFG="configs/complexity_ladder"
 mkdir -p "$LOG_ROOT"
 export PYTHONUNBUFFERED=1
+# Direct helper-script entry points must be able to import the sibling src
+# package when the runner is launched from the repository root.
+REPO_ROOT="$(pwd -P)"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 checkpoint_dir_for_config() {
   "$PYTHON_BIN" - "$1" <<'PY'

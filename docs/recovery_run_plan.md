@@ -31,6 +31,7 @@ From the repository root after pulling the pushed branch:
 
 ```bash
 conda activate st3d
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export STPATH_GENE_VOC_PATH=/absolute/path/to/STPath/utils_data/symbol2ensembl.json
 export STPATH_MODEL_WEIGHT_PATH=/absolute/path/to/the/pretrained/stpath/checkpoint.pth
 export GPU_IDS=0,1,2,3,4,5,6,7
