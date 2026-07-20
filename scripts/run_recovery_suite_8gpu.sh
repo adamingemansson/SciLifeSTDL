@@ -196,6 +196,7 @@ for slot in "${!CONFIGS[@]}"; do
       "evaluation.n_validation_masks=1"
       "evaluation.n_test_masks=1"
       "evaluation.n_samples=1"
+      "evaluation.mask_bank_path=results/mask_banks/recovery_suite/smoke_${name}.json"
       "evaluation.training_mask_bank_path=results/mask_banks/training/recovery_suite/smoke_${name}.json"
     )
   fi
