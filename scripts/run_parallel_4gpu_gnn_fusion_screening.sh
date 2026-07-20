@@ -65,8 +65,26 @@ if [ "$SMOKETEST" = "1" ]; then
 fi
 mkdir -p "$LOG_DIR"
 
-N_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 TOTAL_JOBS=${#CONFIGS[@]}
+
+# GPU_IDS (2026-07-20): comma-separated physical device indices, one per
+# job, e.g. GPU_IDS=4,5,6,7 to use GPUs 4-7 instead of the default
+# 0..(N-1). Wrapping the whole script in CUDA_VISIBLE_DEVICES=4,5,6,7
+# does NOT work -- each job below sets its own per-process
+# CUDA_VISIBLE_DEVICES, which overrides rather than combines with an
+# outer value. Default reproduces the original 0..(N-1) behavior exactly.
+if [ -n "${GPU_IDS:-}" ]; then
+    IFS=',' read -ra GPU_ID_ARR <<< "$GPU_IDS"
+else
+    GPU_ID_ARR=()
+    for ((j = 0; j < TOTAL_JOBS; j++)); do GPU_ID_ARR+=("$j"); done
+fi
+if [ "${#GPU_ID_ARR[@]}" -ne "$TOTAL_JOBS" ]; then
+    echo "ERROR: GPU_IDS has ${#GPU_ID_ARR[@]} entries but there are $TOTAL_JOBS jobs -- must match exactly."
+    exit 1
+fi
+
+N_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 if [ "$TOTAL_JOBS" -gt "$N_GPUS" ]; then
     echo "ERROR: $TOTAL_JOBS configs but only $N_GPUS GPUs visible."
     exit 1
@@ -75,22 +93,23 @@ N_CORES=$(nproc)
 THREADS_PER_JOB=$((N_CORES / TOTAL_JOBS))
 [ "$THREADS_PER_JOB" -lt 1 ] && THREADS_PER_JOB=1
 
-echo "Launching $TOTAL_JOBS jobs on GPUs 0-$((TOTAL_JOBS - 1)), ${THREADS_PER_JOB} CPU threads each, logs in $LOG_DIR..."
+echo "Launching $TOTAL_JOBS jobs on physical GPUs [${GPU_ID_ARR[*]}], ${THREADS_PER_JOB} CPU threads each, logs in $LOG_DIR..."
 
 for i in "${!CONFIGS[@]}"; do
     cfg="${CONFIGS[$i]}"
     name="${NAMES[$i]}"
     seed="${SEEDS[$i]}"
     extra="${EXTRA_OVERRIDE[$i]}"
+    gpu="${GPU_ID_ARR[$i]}"
     logfile="$LOG_DIR/${name}.log"
     if [ -f "$logfile" ] && grep -q "^model " "$logfile"; then
-        echo "  GPU $i: [$name] SKIP (already completed)"
+        echo "  GPU $gpu: [$name] SKIP (already completed)"
         continue
     fi
-    echo "  GPU $i: [$name] START"
+    echo "  GPU $gpu: [$name] START"
     epoch_override=""
     [ "$SMOKETEST" != "1" ] && epoch_override="training.epochs=${SCREEN_EPOCHS}"
-    CUDA_VISIBLE_DEVICES=$i OMP_NUM_THREADS=$THREADS_PER_JOB MKL_NUM_THREADS=$THREADS_PER_JOB \
+    CUDA_VISIBLE_DEVICES=$gpu OMP_NUM_THREADS=$THREADS_PER_JOB MKL_NUM_THREADS=$THREADS_PER_JOB \
     python3 -m src.evaluation.run_comparison "$cfg" \
         --override ${extra} \
                     training.seed=${seed} \
