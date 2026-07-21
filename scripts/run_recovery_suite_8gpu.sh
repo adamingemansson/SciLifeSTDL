@@ -256,8 +256,46 @@ case "$STAGE" in
     )
     SEEDS=(10 10 10 10)
     ;;
+  wave4_hr)
+    CONFIGS=(
+      configs/recovery_suite/40_wave4_hr_mlp_only.yaml
+      configs/recovery_suite/41_wave4_hr_novae_only.yaml
+      configs/recovery_suite/42_wave4_hr_fusion_sum.yaml
+      configs/recovery_suite/43_wave4_hr_no_spatial_bias.yaml
+      configs/recovery_suite/44_wave4_hr_relative_position.yaml
+      configs/recovery_suite/45_wave4_hr_gnn_knn8.yaml
+      configs/recovery_suite/46_wave4_hr_transformer_large.yaml
+      configs/recovery_suite/47_wave4_hr_harmonic_k16.yaml
+    )
+    NAMES=(
+      missing_tissue_wave4_hr_mlp_only_seed10
+      missing_tissue_wave4_hr_novae_only_seed10
+      missing_tissue_wave4_hr_fusion_sum_seed10
+      missing_tissue_wave4_hr_no_spatial_bias_seed10
+      missing_tissue_wave4_hr_relative_position_seed10
+      missing_tissue_wave4_hr_gnn_knn8_seed10
+      missing_tissue_wave4_hr_transformer_large_seed10
+      missing_tissue_wave4_hr_harmonic_k16_seed10
+    )
+    SEEDS=(10 10 10 10 10 10 10 10)
+    ;;
+  wave4_fm)
+    CONFIGS=(
+      configs/recovery_suite/48_wave4_fm_latent128_refopt.yaml
+      configs/recovery_suite/49_wave4_fm_decoder512_refopt.yaml
+      configs/recovery_suite/50_wave4_fm_latent128_decoder512_refopt.yaml
+      configs/recovery_suite/51_wave4_fm_latent128_decoder512_flow1024_refopt.yaml
+    )
+    NAMES=(
+      missing_tissue_wave4_fm_latent128_refopt_seed10
+      missing_tissue_wave4_fm_decoder512_refopt_seed10
+      missing_tissue_wave4_fm_latent128_decoder512_refopt_seed10
+      missing_tissue_wave4_fm_latent128_decoder512_flow1024_refopt_seed10
+    )
+    SEEDS=(10 10 10 10)
+    ;;
   *)
-    echo "ERROR: STAGE must be repair, controls, ablations, wave3, component40k, missing_tissue or missing_tissue_controls" >&2
+    echo "ERROR: STAGE must be repair, controls, ablations, wave3, component40k, missing_tissue, missing_tissue_controls, wave4_hr or wave4_fm" >&2
     exit 2
     ;;
 esac
@@ -271,7 +309,7 @@ fi
 
 # All context-only Novae jobs consume the same immutable 64-mask schedule.
 # Populate it once before concurrent readers start. The cache is reused safely.
-if [[ "$SMOKETEST" != "1" ]] && [[ "$STAGE" == "repair" || "$STAGE" == "controls" || "$STAGE" == "ablations" || "$STAGE" == "wave3" || "$STAGE" == "component40k" || "$STAGE" == "missing_tissue" || "$STAGE" == "missing_tissue_controls" ]]; then
+if [[ "$SMOKETEST" != "1" ]] && [[ "$STAGE" == "repair" || "$STAGE" == "controls" || "$STAGE" == "ablations" || "$STAGE" == "wave3" || "$STAGE" == "component40k" || "$STAGE" == "missing_tissue" || "$STAGE" == "missing_tissue_controls" || "$STAGE" == "wave4_hr" || "$STAGE" == "wave4_fm" ]]; then
   echo "Precomputing/reusing the shared context-only Novae mask cache on $GPU_COUNT GPUs..."
   precompute_pids=()
   for slot in "${!GPU_IDS_ARR[@]}"; do
@@ -414,6 +452,10 @@ if [[ "$STAGE" == "missing_tissue" ]]; then
   collect_args+=(--experiment-prefix missing_tissue_)
 elif [[ "$STAGE" == "missing_tissue_controls" ]]; then
   collect_args+=(--experiment-prefix missing_tissue_control_)
+elif [[ "$STAGE" == "wave4_hr" ]]; then
+  collect_args+=(--experiment-prefix missing_tissue_wave4_hr_)
+elif [[ "$STAGE" == "wave4_fm" ]]; then
+  collect_args+=(--experiment-prefix missing_tissue_wave4_fm_)
 fi
 "$PYTHON_BIN" scripts/collect_audit_results.py "${collect_args[@]}"
 
