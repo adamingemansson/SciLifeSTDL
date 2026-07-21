@@ -1992,7 +1992,7 @@ def _main_multi_sample(cfg) -> None:
     else:
         validation_callback = None
 
-    if list(model.parameters()):
+    if any(parameter.requires_grad for parameter in model.parameters()):
         dataset = MultiSampleMaskedContextQueryDataset(
             train_samples, cfg.masking, n_items=int(cfg.training.epochs),
             base_seed=int(cfg.training.seed), augment=augment,
@@ -2167,7 +2167,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     training_bank, training_bank_path = _training_seed_bank_for_config(cfg, adata.obs_names)
     checkpoint_dir = cfg.training.get("checkpoint_dir", f"results/checkpoints/{cfg.experiment_name}")
     write_run_manifest(cfg, checkpoint_dir, mask_bank_path, training_bank_path)
-    if list(model.parameters()):
+    if any(parameter.requires_grad for parameter in model.parameters()):
         dataset = MaskedContextQueryDataset(
             coords3d, expr, slice_ids, cfg.masking,
             n_items=cfg.training.epochs, base_seed=cfg.training.seed, images=images,

@@ -209,6 +209,7 @@ def evaluate_model_on_mask_bank(
         "n_samples_per_mask": n_samples,
         "requested_pca_components": requested_pca,
         "effective_pca_components": effective_pca,
+        "n_evaluated_genes": int(metric_expr.shape[1]),
         "primary_image_mode": primary_image_mode,
         "image_modes": {},
         "spatial_domain_label_source": domain_label_source,

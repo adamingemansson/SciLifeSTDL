@@ -450,6 +450,76 @@ class SpatialInterpolationBaseline(BaseGenerativeModel):
         return None
 
 
+@register_model("stpath_official")
+class OfficialSTPathBaseline(BaseGenerativeModel):
+    """Released frozen STPath prediction head with no project-specific head.
+
+    The shared STPath wrapper is reused only to construct the authors'
+    tokenizer/model inputs.  Its Novae/MLP residual, projection, FM module and
+    project decoder are all bypassed.  Missing query H&E is represented by a
+    zero 1536-d image feature, making ``target_zero`` an explicitly labelled
+    out-of-distribution stress test of released STPath rather than pretending
+    that the original model was trained for absent tissue images.
+    """
+
+    def __init__(
+        self,
+        n_genes: int,
+        stpath_gene_names: list[str],
+        stpath_gene_voc_path: str,
+        stpath_model_weight_path: str,
+        stpath_organ_type: str = "Kidney",
+        stpath_tech_type: str = "Visium",
+        stpath_input_already_log1p: bool = True,
+        context_encoder_type: str = "stpath",
+    ):
+        super().__init__()
+        if context_encoder_type != "stpath":
+            raise ValueError("stpath_official requires context_encoder_type='stpath'")
+        from src.models.stpath_encoder import STPathContextEncoder
+
+        self.predictor = STPathContextEncoder(
+            gene_names=stpath_gene_names,
+            gene_voc_path=stpath_gene_voc_path,
+            model_weight_path=stpath_model_weight_path,
+            organ_type=stpath_organ_type,
+            tech_type=stpath_tech_type,
+            hidden_dim=512,
+            new_gene_encoder_type="none",
+            pretrained=True,
+            input_already_log1p=stpath_input_already_log1p,
+        )
+        with torch.no_grad():
+            self.predictor.missing_image_token.zero_()
+        for parameter in self.predictor.parameters():
+            parameter.requires_grad_(False)
+        valid_positions = torch.as_tensor(
+            self.predictor._valid_gene_pos, dtype=torch.long
+        )
+        if valid_positions.numel() == 0:
+            raise ValueError("none of the evaluation genes are supported by STPath")
+        self.register_buffer("_decoder_target_col_idx", valid_positions)
+        self.n_genes = int(n_genes)
+
+    def sample(self, context, query):
+        expression = self.predictor(
+            context["coords"], context["expression"], query["coords"],
+            context_images=context.get("images"),
+            query_images=query.get("images"),
+            context_image_available=context.get("image_available"),
+            query_image_available=query.get("image_available"),
+            organ=context.get("organ"), tech=context.get("tech"),
+            return_official_predictions=True,
+        )
+        return {"coords": query["coords"], "expression": expression}
+
+    def training_step(self, batch, batch_idx):
+        return None
+
+    def configure_optimizers(self):
+        return None
+
+
 @register_model("set_summary_baseline")
 class SetSummaryBaseline(BaseGenerativeModel):
     """Strict learned mean/sum embedding baseline.

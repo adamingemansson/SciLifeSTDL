@@ -352,7 +352,8 @@ class STPathContextEncoder(nn.Module):
                 context_image_available: torch.Tensor | None = None,
                 query_image_available: torch.Tensor | None = None,
                 context_novae_features: torch.Tensor | None = None,
-                organ: str | None = None, tech: str | None = None) -> torch.Tensor:
+                organ: str | None = None, tech: str | None = None,
+                return_official_predictions: bool = False) -> torch.Tensor:
         """context_images/query_images: raw H&E patches [N, 3, H, W] float
         in [0,1] — required (STPath has no meaningful expression-only
         mode). context_novae_features: [N_context, novae_dim] precomputed
@@ -472,7 +473,7 @@ class STPathContextEncoder(nn.Module):
         # killed by a blanket no_grad).
         needs_grad = self.new_gene_encoder is not None or not self.pretrained
         if needs_grad:
-            _, x = self.model.prediction_head(
+            pred, x = self.model.prediction_head(
                 img_tokens=img_feats,
                 coords=coords,
                 ge_tokens=ge_tokens,
@@ -483,7 +484,7 @@ class STPathContextEncoder(nn.Module):
             )
         else:
             with torch.no_grad():  # STPath itself is frozen (see __init__) - skip building its autograd graph
-                _, x = self.model.prediction_head(
+                pred, x = self.model.prediction_head(
                     img_tokens=img_feats,
                     coords=coords,
                     ge_tokens=ge_tokens,
@@ -492,5 +493,11 @@ class STPathContextEncoder(nn.Module):
                     organ_tokens=organ_ids,
                     return_all=True,
                 )
+        if return_official_predictions:
+            # Direct released-STPath output, restricted to the input panel's
+            # supported genes and kept in the same order as the real target.
+            # This bypasses embedding_norm/proj and every downstream model in
+            # this repository; it is the honest frozen-head benchmark.
+            return pred[n_context:, self._context_gene_ids]
         x = self.embedding_norm(x[n_context:])  # query positions only; trainable
         return self.proj(x)  # trainable

@@ -219,8 +219,31 @@ case "$STAGE" in
     )
     SEEDS=(10 10 10 10 10 10 10 10)
     ;;
+  missing_tissue_controls)
+    : "${STPATH_GENE_VOC_PATH:?Set STPATH_GENE_VOC_PATH for missing-tissue controls}"
+    : "${STPATH_MODEL_WEIGHT_PATH:?Set STPATH_MODEL_WEIGHT_PATH for official/pretrained STPath}"
+    if [[ ! -f "$STPATH_GENE_VOC_PATH" || ! -f "$STPATH_MODEL_WEIGHT_PATH" ]]; then
+      echo "ERROR: missing-tissue controls require real STPath vocabulary and checkpoint files." >&2
+      echo "vocabulary: $STPATH_GENE_VOC_PATH" >&2
+      echo "checkpoint: $STPATH_MODEL_WEIGHT_PATH" >&2
+      exit 2
+    fi
+    CONFIGS=(
+      configs/recovery_suite/36_missing_tissue_official_stpath.yaml
+      configs/recovery_suite/37_missing_tissue_stpath_fm_pretrained.yaml
+      configs/recovery_suite/38_missing_tissue_stpath_fm_scratch.yaml
+      configs/recovery_suite/39_missing_tissue_stormlite_deterministic.yaml
+    )
+    NAMES=(
+      missing_tissue_control_official_stpath
+      missing_tissue_control_stpath_fm_pretrained_seed10
+      missing_tissue_control_stpath_fm_scratch_seed10
+      missing_tissue_control_stormlite_deterministic_seed10
+    )
+    SEEDS=(10 10 10 10)
+    ;;
   *)
-    echo "ERROR: STAGE must be repair, controls, ablations, wave3, component40k or missing_tissue" >&2
+    echo "ERROR: STAGE must be repair, controls, ablations, wave3, component40k, missing_tissue or missing_tissue_controls" >&2
     exit 2
     ;;
 esac
@@ -234,7 +257,7 @@ fi
 
 # All context-only Novae jobs consume the same immutable 64-mask schedule.
 # Populate it once before concurrent readers start. The cache is reused safely.
-if [[ "$SMOKETEST" != "1" ]] && [[ "$STAGE" == "repair" || "$STAGE" == "controls" || "$STAGE" == "ablations" || "$STAGE" == "wave3" || "$STAGE" == "component40k" || "$STAGE" == "missing_tissue" ]]; then
+if [[ "$SMOKETEST" != "1" ]] && [[ "$STAGE" == "repair" || "$STAGE" == "controls" || "$STAGE" == "ablations" || "$STAGE" == "wave3" || "$STAGE" == "component40k" || "$STAGE" == "missing_tissue" || "$STAGE" == "missing_tissue_controls" ]]; then
   echo "Precomputing/reusing the shared context-only Novae mask cache on $GPU_COUNT GPUs..."
   precompute_pids=()
   for slot in "${!GPU_IDS_ARR[@]}"; do
@@ -375,6 +398,8 @@ collect_args=(
 )
 if [[ "$STAGE" == "missing_tissue" ]]; then
   collect_args+=(--experiment-prefix missing_tissue_)
+elif [[ "$STAGE" == "missing_tissue_controls" ]]; then
+  collect_args+=(--experiment-prefix missing_tissue_control_)
 fi
 "$PYTHON_BIN" scripts/collect_audit_results.py "${collect_args[@]}"
 

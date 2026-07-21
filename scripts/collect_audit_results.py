@@ -42,6 +42,7 @@ def _primary_summary(metrics: dict) -> dict:
         "n_test_masks": metrics.get("n_test_masks"),
         "n_samples_per_mask": metrics.get("n_samples_per_mask"),
         "effective_pca_components": metrics.get("effective_pca_components"),
+        "n_evaluated_genes": metrics.get("n_evaluated_genes"),
     }
 
 
