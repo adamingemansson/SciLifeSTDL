@@ -119,13 +119,44 @@ case "$STAGE" in
     )
     SEEDS=(10 10 10 10 10 10 10 10)
     ;;
+  wave3)
+    : "${STPATH_GENE_VOC_PATH:?Set STPATH_GENE_VOC_PATH for the Wave 3 STPath benchmark}"
+    : "${STPATH_MODEL_WEIGHT_PATH:?Set STPATH_MODEL_WEIGHT_PATH for the Wave 3 STPath benchmark}"
+    if [[ ! -f "$STPATH_GENE_VOC_PATH" || ! -f "$STPATH_MODEL_WEIGHT_PATH" ]]; then
+      echo "ERROR: Wave 3 requires real STPath vocabulary and checkpoint files." >&2
+      echo "vocabulary: $STPATH_GENE_VOC_PATH" >&2
+      echo "checkpoint: $STPATH_MODEL_WEIGHT_PATH" >&2
+      exit 2
+    fi
+    CONFIGS=(
+      configs/recovery_suite/05_control_fm_stormlite.yaml
+      configs/recovery_suite/05_control_fm_stormlite.yaml
+      configs/recovery_suite/16_wave3_stormlite_control_cap3000.yaml
+      configs/recovery_suite/06_stpath_pretrained_benchmark.yaml
+      configs/recovery_suite/17_wave3_flagship_modern_transport.yaml
+      configs/recovery_suite/18_wave3_flagship_adaln_warmup.yaml
+      configs/recovery_suite/19_wave3_flagship_modern_recipe.yaml
+      configs/recovery_suite/19_wave3_flagship_modern_recipe.yaml
+    )
+    NAMES=(
+      recovery_wave3_stormlite_control_seed1
+      recovery_wave3_stormlite_control_seed2
+      recovery_wave3_stormlite_matched_cap3000_seed0
+      recovery_wave3_stpath_pretrained_seed12
+      recovery_wave3_flagship_modern_transport_seed10
+      recovery_wave3_flagship_adaln_warmup_seed10
+      recovery_wave3_flagship_modern_recipe_seed10
+      recovery_wave3_flagship_modern_recipe_seed11
+    )
+    SEEDS=(1 2 0 12 10 10 10 11)
+    ;;
   *)
-    echo "ERROR: STAGE must be repair, controls or ablations" >&2
+    echo "ERROR: STAGE must be repair, controls, ablations or wave3" >&2
     exit 2
     ;;
 esac
 
-if [[ ( "$STAGE" == "controls" || "$STAGE" == "ablations" ) && "$SMOKETEST" != "1" ]]; then
+if [[ ( "$STAGE" == "controls" || "$STAGE" == "ablations" || "$STAGE" == "wave3" ) && "$SMOKETEST" != "1" ]]; then
   # The direct harmonic-residual branch is an independent rejected
   # diagnostic. Wave 1 tests the historically working FM family and only
   # depends on the clean FM flagship being finite/noncollapsed.
@@ -134,7 +165,7 @@ fi
 
 # All context-only Novae jobs consume the same immutable 64-mask schedule.
 # Populate it once before concurrent readers start. The cache is reused safely.
-if [[ "$SMOKETEST" != "1" ]] && [[ "$STAGE" == "repair" || "$STAGE" == "controls" || "$STAGE" == "ablations" ]]; then
+if [[ "$SMOKETEST" != "1" ]] && [[ "$STAGE" == "repair" || "$STAGE" == "controls" || "$STAGE" == "ablations" || "$STAGE" == "wave3" ]]; then
   echo "Precomputing/reusing the shared context-only Novae mask cache on 8 GPUs..."
   precompute_pids=()
   for slot in "${!GPU_IDS_ARR[@]}"; do

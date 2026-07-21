@@ -136,6 +136,25 @@ To run Wave 2 by itself after a completed Wave 1:
 STAGE=ablations bash scripts/run_recovery_suite_8gpu.sh
 ```
 
+## Wave 3 — confirmation and modern-recipe bridge
+
+Wave 3 confirms the strong original StormLite control at seeds 1–2, runs one
+StormLite control matched to the flagship's cap-3000/64-mask setting, adds a
+third audited pretrained-STPath seed, and separates the modern transport stack
+from AdaLN velocity/warmup before testing their combined transferable recipe at
+two seeds. QK normalization remains off because Wave 2 rejected it. Full-panel
+genes and context-only Novae are retained.
+
+Run the fail-closed launcher, which performs one step plus a minimal audit for
+all eight configs before starting full training:
+
+```bash
+bash scripts/run_recovery_wave3_8gpu.sh
+```
+
+Wave 4 is not auto-started because its multi-slide architecture must be chosen
+from Wave 3 rather than predetermined.
+
 ## Step 6 — repaired deterministic ablations
 
 Only after reviewing Wave 1:

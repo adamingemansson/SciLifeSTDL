@@ -1,0 +1,89 @@
+# Wave 3: match the strong modern StormLite control to the flagship's
+# 3000-point context cap, fixed 64-mask schedule and audit bank. Separate
+# Wave 3 jobs on config 05 confirm the original 30k-mask control unchanged.
+experiment_name: recovery_wave3_stormlite_control_cap3000
+data:
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+  expression_transform: normalize_log1p
+  expression_target_sum: 10000.0
+  novae_mode: disabled
+  require_image_coverage: true
+  use_images: true
+masking:
+  strategy: random_dropout_patches
+  max_context_points: 3000
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+model:
+  name: fm_ot
+  params:
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 0.001
+    fm_time_sampling: logit_normal
+    fm_coupling: minibatch_ot
+    ode_solver: heun
+    velocity_net_type: adaln_residual
+    velocity_net_n_layers: 3
+    decoder_type: dense
+    warmup_steps: 1000
+    context_encoder_type: storm_lite
+    gene_encoder_type: mlp
+    storm_lite_fusion_mode: mome
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    storm_lite_qk_norm: true
+    storm_lite_bias_type: frame_averaging
+training:
+  epochs: 30000
+  seed: 0
+  mask_seed: 700000
+  unique_mask_count: 64
+  log_every_n_steps: 10
+  log_print_every_n_steps: 250
+  checkpoint_every_n_steps: 5000
+  num_workers: 0
+  augment_coords: true
+  image_mode: full
+  query_image_dropout_p: 0.0
+  all_image_dropout_p: 0.0
+  gradient_clip_val: 1.0
+  checkpoint_dir: results/checkpoints/recovery_suite/recovery_wave3_stormlite_control_cap3000
+validation:
+  enabled: true
+  every_n_steps: 1000
+  patience_checks: 6
+  early_stopping_min_steps: 10000
+  min_delta: 0.0001
+  metric: rmse
+  n_samples: 4
+  sampling_seed: 800000
+evaluation:
+  mask_bank_path: results/mask_banks/recovery_suite/INT1_recovery_3000.json
+  n_validation_masks: 4
+  n_test_masks: 8
+  validation_seed: 700000
+  test_seed: 900000
+  sampling_seed: 1200000
+  n_samples: 20
+  image_modes: [full, target_zero, all_zero, shuffled]
+  validation_image_mode: full
+  k_neighborhood: 8
+  pca_n_components: 50
+  training_mask_bank_path: results/mask_banks/training/recovery_suite/fixed_novae_64_seed700000.json
+logging:
+  backend: csv
+  project: st3d-lundeberg-lab
