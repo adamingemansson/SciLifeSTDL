@@ -102,6 +102,7 @@ class FixedMaskValidationCallback(pl.Callback):
         self.min_correction_rms = max(0.0, float(min_correction_rms))
         self.quality_gate_path = Path(quality_gate_path) if quality_gate_path else None
         self.best_score = float("inf") if metric == "rmse" else -float("inf")
+        self.patience_score = float("inf") if metric == "rmse" else -float("inf")
         self.best_state: dict[str, torch.Tensor] | None = None
         self.anchor_score: float | None = None
         self.correction_rms: float | None = None
@@ -164,9 +165,21 @@ class FixedMaskValidationCallback(pl.Callback):
         return float(np.mean(values))
 
     def _improved(self, score: float) -> bool:
+        """Whether ``score`` is the numerically best checkpoint seen.
+
+        Checkpoint selection must not use ``min_delta``.  ``min_delta`` is an
+        early-stopping tolerance: using it here can retain an older, worse
+        checkpoint whenever several individually small improvements add up.
+        """
         if self.metric == "rmse":
-            return score < self.best_score - self.min_delta
-        return score > self.best_score + self.min_delta
+            return score < self.best_score
+        return score > self.best_score
+
+    def _meaningfully_improved(self, score: float) -> bool:
+        """Whether ``score`` clears the tolerance used to reset patience."""
+        if self.metric == "rmse":
+            return score < self.patience_score - self.min_delta
+        return score > self.patience_score + self.min_delta
 
     @torch.no_grad()
     def _score_correction_rms(self, model: torch.nn.Module) -> float | None:
@@ -229,11 +242,19 @@ class FixedMaskValidationCallback(pl.Callback):
         if step == 0 or step % self.every_n_steps:
             return
         score = self._score(pl_module, step)
+        meaningfully_improved = self._meaningfully_improved(score)
         improved = self._improved(score)
-        self.history.append({"step": step, self.metric: score, "improved": improved})
+        self.history.append({
+            "step": step,
+            self.metric: score,
+            "improved": improved,
+            "patience_reset": meaningfully_improved,
+        })
         if improved:
             self.best_score = score
             self.best_state = compact_state_dict(pl_module)
+        if meaningfully_improved:
+            self.patience_score = score
             self.bad_checks = 0
         elif step >= self.early_stopping_min_steps:
             self.bad_checks += 1

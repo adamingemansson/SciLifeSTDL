@@ -100,6 +100,23 @@ def test_early_stopping_patience_does_not_accumulate_before_min_steps():
     assert callback.early_stopping_min_steps == 500
 
 
+def test_checkpoint_selection_keeps_small_real_improvements():
+    callback = FixedMaskValidationCallback([], metric="rmse", min_delta=0.1)
+    callback.best_score = 1.0
+    callback.patience_score = 1.0
+
+    # This is a real best checkpoint but is intentionally too small an
+    # improvement to reset early-stopping patience.
+    assert callback._improved(0.95) is True
+    assert callback._meaningfully_improved(0.95) is False
+
+    pcc_callback = FixedMaskValidationCallback([], metric="pcc", min_delta=0.1)
+    pcc_callback.best_score = 0.5
+    pcc_callback.patience_score = 0.5
+    assert pcc_callback._improved(0.55) is True
+    assert pcc_callback._meaningfully_improved(0.55) is False
+
+
 def test_required_anchor_quality_gate_fails_closed():
     callback = FixedMaskValidationCallback([], require_anchor_improvement=True)
     callback.best_score = 0.5
