@@ -30,7 +30,7 @@ training:
   epochs: 1
   seed: 10
   mask_seed: 700000
-  unique_mask_count: 64
+  unique_mask_count: 1
   log_every_n_steps: 10
   num_workers: 0
   augment_coords: false
@@ -53,7 +53,7 @@ evaluation:
   validation_image_mode: target_zero
   k_neighborhood: 8
   pca_n_components: 50
-  training_mask_bank_path: results/mask_banks/training/recovery_suite/missing_tissue_10k_64_seed700000.json
+  training_mask_bank_path: results/mask_banks/training/recovery_suite/missing_tissue_anchor_1_seed700000.json
 logging:
   backend: csv
   project: st3d-lundeberg-lab
