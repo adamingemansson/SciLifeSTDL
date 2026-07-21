@@ -8,7 +8,7 @@ Run with: python -m tests.test_masked_dataset
 import numpy as np
 from omegaconf import OmegaConf
 
-from src.training.train import MaskedContextQueryDataset
+from src.training.train import MaskedContextQueryDataset, evaluation_query_exclusion_mask
 
 
 def _make_synthetic(n_points=200, n_genes=30, n_slices=3, seed=0):
@@ -115,9 +115,63 @@ def test_nearest_query_context_cap_keeps_boundary_spots():
     assert set(np.flatnonzero(capped)) == {7, 8, 11, 12}
 
 
+def test_single_sample_training_excludes_all_evaluation_query_spots():
+    coords3d, expr, slice_ids = _make_synthetic(n_points=240, n_genes=12, n_slices=1)
+    coords3d[:, 0] = np.arange(len(coords3d), dtype=np.float64)
+    coords3d[:, 1] = 0.0
+    coords3d[:, 2] = 0.0
+    masking_cfg = OmegaConf.create({
+        "strategy": "random_dropout_patches",
+        "params": {"n_patches": 1, "radius_range": [20, 45]},
+        "max_context_points": 80,
+        "context_selection": "nearest_query",
+    })
+    names = np.asarray([f"spot-{i}" for i in range(len(coords3d))])
+    bank = {
+        "records": [
+            {
+                "split": "validation", "index": 0,
+                "context_obs_names": names[20:].tolist(),
+                "query_obs_names": names[:20].tolist(),
+            },
+            {
+                "split": "test", "index": 0,
+                "context_obs_names": np.concatenate([names[:20], names[40:]]).tolist(),
+                "query_obs_names": names[20:40].tolist(),
+            },
+        ]
+    }
+    excluded = evaluation_query_exclusion_mask(bank, names)
+    assert set(np.flatnonzero(excluded)) == set(range(40))
+
+    provider_masks = []
+
+    def provider(context_mask):
+        provider_masks.append(np.asarray(context_mask, dtype=bool).copy())
+        return np.zeros((int(context_mask.sum()), 4), dtype=np.float32)
+
+    dataset = MaskedContextQueryDataset(
+        coords3d, expr, slice_ids, masking_cfg, n_items=12, base_seed=100,
+        context_novae_feature_provider=provider,
+        excluded_training_mask=excluded,
+    )
+    excluded_coord_rows = {tuple(row) for row in coords3d[excluded]}
+    for index in range(len(dataset)):
+        item = dataset[index]
+        used_rows = {
+            tuple(row) for row in np.concatenate([
+                item["context"]["coords"].numpy(), item["query"]["coords"].numpy()
+            ])
+        }
+        assert not used_rows & excluded_coord_rows
+    assert provider_masks
+    assert all(not np.any(mask & excluded) for mask in provider_masks)
+
+
 if __name__ == "__main__":
     test_random_dropout_patches_variety()
     test_hold_out_slice_variety()
     test_max_context_points_caps_context_size()
     test_max_context_points_none_preserves_prior_behavior()
+    test_single_sample_training_excludes_all_evaluation_query_spots()
     print("\nAll MaskedContextQueryDataset smoke tests passed.")

@@ -124,6 +124,11 @@ def _validate_task_contract(cfg) -> None:
 
     if cfg.get("data", {}).get("sample_ids") is not None:
         _validated_sample_groups(cfg)
+        if bool(cfg.get("training", {}).get("exclude_evaluation_query_spots", False)):
+            raise ValueError(
+                "training.exclude_evaluation_query_spots is a within-slide safeguard; "
+                "sample-held-out training already excludes complete validation/test samples"
+            )
 
     training = cfg.get("training", {})
     evaluation = cfg.get("evaluation", {})
@@ -665,6 +670,67 @@ def _cap_context_mask(
     )
 
 
+def make_training_context_query_split(
+    coords3d: np.ndarray,
+    slice_ids: np.ndarray,
+    masking_cfg,
+    seed: int,
+    excluded_training_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Draw one training split, optionally on evaluation-safe observations.
+
+    With exclusions, candidates are drawn on the original coordinate system
+    and rejected if their query overlaps a reserved spot. This preserves the
+    original spot-spacing estimate and contiguous patch geometry; drawing on
+    the punctured eligible subset would silently change both. Reserved rows
+    are then removed from context before its deterministic cap is applied.
+    """
+    if excluded_training_mask is None:
+        context_mask, query_mask = make_context_query_split(
+            coords3d, slice_ids, masking_cfg, seed
+        )
+    else:
+        excluded = np.asarray(excluded_training_mask, dtype=bool)
+        if excluded.shape != (coords3d.shape[0],):
+            raise ValueError(
+                f"excluded_training_mask shape {excluded.shape} does not match "
+                f"{coords3d.shape[0]} observations"
+            )
+        eligible = ~excluded
+        if int(eligible.sum()) < 2:
+            raise ValueError("evaluation-spot exclusion leaves fewer than two training spots")
+        context_mask = query_mask = None
+        candidate_seed = int(seed)
+        for attempt in range(10_000):
+            candidate_seed = int(seed) + attempt * 1_000_003
+            candidate_context, candidate_query = make_context_query_split(
+                coords3d, slice_ids, masking_cfg, candidate_seed
+            )
+            if np.any(candidate_query & excluded):
+                continue
+            candidate_context = np.asarray(candidate_context, dtype=bool) & eligible
+            if candidate_context.any() and candidate_query.any():
+                context_mask = candidate_context
+                query_mask = np.asarray(candidate_query, dtype=bool)
+                break
+        if context_mask is None or query_mask is None:
+            raise ValueError(
+                "could not draw a training patch disjoint from immutable evaluation "
+                "queries after 10000 deterministic attempts; reduce the reserved mask bank"
+            )
+    context_mask = _cap_context_mask(
+        context_mask,
+        getattr(masking_cfg, "max_context_points", None),
+        candidate_seed if excluded_training_mask is not None else seed,
+        coords3d=coords3d,
+        query_mask=query_mask,
+        selection=str(getattr(masking_cfg, "context_selection", "random")),
+    )
+    if not context_mask.any() or not query_mask.any():
+        raise ValueError(f"training mask seed {seed} produced an empty context or query")
+    return context_mask, query_mask
+
+
 def _images_tensor(images: np.ndarray, mask: np.ndarray) -> torch.Tensor:
     """Slice + tensor-ify per-spot image data for one masking draw.
     Standalone (not a Dataset method) so src/evaluation/run_comparison.py's
@@ -760,7 +826,8 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
                         context_gex_mode: str = "full",
                         context_gex_dropout_p: float = 0.0,
                         fixed_context_mask: np.ndarray | None = None,
-                        fixed_query_mask: np.ndarray | None = None) -> dict:
+                        fixed_query_mask: np.ndarray | None = None,
+                        excluded_training_mask: np.ndarray | None = None) -> dict:
     """One {context, query, target_expression} training item for a SINGLE
     sample's data. Factored out of MaskedContextQueryDataset.__getitem__
     (2026-07-15) so MultiSampleMaskedContextQueryDataset below can reuse
@@ -832,19 +899,16 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
             raise ValueError("fixed_context_mask and fixed_query_mask must be provided together")
         if augment:
             raise ValueError("fixed mask-bank items must not use coordinate augmentation")
+        if excluded_training_mask is not None:
+            raise ValueError("excluded_training_mask is only valid for random training draws")
         context_mask = np.asarray(fixed_context_mask, dtype=bool)
         query_mask = np.asarray(fixed_query_mask, dtype=bool)
     else:
         if augment:
             coords3d = augment_coords_xy(coords3d, seed=seed + 2)
-        context_mask, query_mask = make_context_query_split(coords3d, slice_ids, masking_cfg, seed)
-        context_mask = _cap_context_mask(
-            context_mask,
-            getattr(masking_cfg, "max_context_points", None),
-            seed,
-            coords3d=coords3d,
-            query_mask=query_mask,
-            selection=str(getattr(masking_cfg, "context_selection", "random")),
+        context_mask, query_mask = make_training_context_query_split(
+            coords3d, slice_ids, masking_cfg, seed,
+            excluded_training_mask=excluded_training_mask,
         )
     if context_gene_feature_provider is not None and context_gene_features is not None:
         raise ValueError("provide either context_gene_features or context_gene_feature_provider, not both")
@@ -940,6 +1004,7 @@ class MaskedContextQueryDataset(Dataset):
                  all_image_dropout_p: float = 0.0,
                  context_gex_mode: str = "full",
                  context_gex_dropout_p: float = 0.0,
+                 excluded_training_mask: np.ndarray | None = None,
                  seed_schedule: list[int] | None = None):
         self.coords3d = coords3d
         self.expr = expr
@@ -973,6 +1038,10 @@ class MaskedContextQueryDataset(Dataset):
         self.all_image_dropout_p = float(all_image_dropout_p)
         self.context_gex_mode = str(context_gex_mode)
         self.context_gex_dropout_p = float(context_gex_dropout_p)
+        self.excluded_training_mask = (
+            None if excluded_training_mask is None
+            else np.asarray(excluded_training_mask, dtype=bool).copy()
+        )
         # whole-sample metadata (2026-07-16, multi-sample follow-up) — see
         # _build_masked_item's organ/tech docstring
         self.organ = organ
@@ -999,6 +1068,7 @@ class MaskedContextQueryDataset(Dataset):
             all_image_dropout_p=self.all_image_dropout_p,
             context_gex_mode=self.context_gex_mode,
             context_gex_dropout_p=self.context_gex_dropout_p,
+            excluded_training_mask=self.excluded_training_mask,
         )
 
 
@@ -1399,10 +1469,77 @@ def _mask_bank_for_config(cfg, adata, coords3d: np.ndarray, slice_ids: np.ndarra
     return bank, path
 
 
+def evaluation_query_exclusion_mask(bank: dict, obs_names) -> np.ndarray:
+    """Union of every immutable validation/test query spot.
+
+    A within-slide experiment is only a legitimate held-out-spot diagnostic
+    when final evaluation spots never appear anywhere in training.  Returning
+    one union mask lets the training dataset remove those observations before
+    drawing both its context and query sets, which also prevents their GEX from
+    entering context-only Novae graphs.
+    """
+    names = list(obs_names)
+    excluded = np.zeros(len(names), dtype=bool)
+    records = [
+        record for split in ("validation", "test")
+        for record in split_records(bank, split)
+    ]
+    if not records:
+        raise ValueError("evaluation mask bank has no validation/test records to reserve")
+    for record in records:
+        _context, query = record_masks(record, names)
+        excluded |= query
+    if not excluded.any():
+        raise ValueError("evaluation query union is empty")
+    if excluded.all():
+        raise ValueError("evaluation query union reserves every observation")
+    return excluded
+
+
+def write_training_exclusion_manifest(
+    checkpoint_dir: str | Path, obs_names, excluded_mask: np.ndarray
+) -> Path:
+    """Persist the exact spots forbidden from within-slide training."""
+    names = np.asarray([str(name) for name in obs_names])
+    excluded = np.asarray(excluded_mask, dtype=bool)
+    if excluded.shape != (len(names),):
+        raise ValueError("training exclusion mask does not match observation names")
+    reserved = names[excluded].tolist()
+    payload = {
+        "version": 1,
+        "policy": "exclude_union_of_validation_and_test_queries_from_training_context_and_targets",
+        "n_observations": int(len(names)),
+        "n_excluded": int(excluded.sum()),
+        "excluded_obs_names_sha256": hashlib.sha256(
+            "\n".join(reserved).encode("utf-8")
+        ).hexdigest(),
+        "excluded_obs_names": reserved,
+    }
+    path = Path(checkpoint_dir) / "training_exclusion.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    os.replace(tmp, path)
+    return path
+
+
 def _training_seed_bank_for_config(cfg, obs_names) -> tuple[dict, Path]:
     evaluation = cfg.get("evaluation", {})
     default_path = f"results/mask_banks/training/{cfg.experiment_name}.json"
     path = Path(evaluation.get("training_mask_bank_path", default_path))
+    masking_fingerprint_cfg = cfg.masking
+    if bool(cfg.training.get("exclude_evaluation_query_spots", False)):
+        masking_fingerprint_cfg = {
+            "masking": OmegaConf.to_container(cfg.masking, resolve=True),
+            "evaluation_query_exclusion": {
+                "enabled": True,
+                "mask_bank_path": str(evaluation.get("mask_bank_path", "")),
+                "n_validation_masks": int(evaluation.get("n_validation_masks", 4)),
+                "n_test_masks": int(evaluation.get("n_test_masks", 8)),
+                "validation_seed": int(evaluation.get("validation_seed", 700_000)),
+                "test_seed": int(evaluation.get("test_seed", 900_000)),
+            },
+        }
     return ensure_training_seed_bank(
         path,
         obs_names,
@@ -1411,7 +1548,7 @@ def _training_seed_bank_for_config(cfg, obs_names) -> tuple[dict, Path]:
         # Recovery/confirmation runs can then compare seeds on identical
         # tissue holes instead of changing both factors at once.
         base_seed=int(cfg.training.get("mask_seed", cfg.training.seed)),
-        masking_cfg=cfg.masking,
+        masking_cfg=masking_fingerprint_cfg,
         unique_mask_count=int(cfg.training.get("unique_mask_count", cfg.training.epochs)),
     )
 
@@ -2403,6 +2540,21 @@ def main(cfg_path: str, overrides: list[str] | None = None):
 
     adata, coords3d, expr, slice_ids, images = _load_data(cfg)
 
+    # A same-slide diagnostic must reserve evaluation targets before *any*
+    # learned-model statistic is derived. Besides excluding these rows from
+    # training items below, fit gene-loss scaling and coordinate scaling only
+    # on eligible observations. Otherwise the final targets would influence
+    # optimization even though they never appeared in a minibatch.
+    bank, mask_bank_path = _mask_bank_for_config(cfg, adata, coords3d, slice_ids)
+    training_excluded_mask = None
+    if bool(cfg.training.get("exclude_evaluation_query_spots", False)):
+        training_excluded_mask = evaluation_query_exclusion_mask(bank, adata.obs_names)
+    training_stat_mask = (
+        np.ones(adata.n_obs, dtype=bool)
+        if training_excluded_mask is None else ~training_excluded_mask
+    )
+    training_expr = expr[training_stat_mask]
+
     model_params = cfg.model.get("params", {})
     context_encoder_type = model_params.get("context_encoder_type", "builtin")
     novae_inputs = prepare_novae_inputs(
@@ -2415,7 +2567,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
 
     # 2026-07-17: RandomFourierFeatures real-scale bug fix — see
     # inject_coord_scale's own docstring
-    coord_scale = float(coords3d[:, :2].std())
+    coord_scale = float(coords3d[training_stat_mask, :2].std())
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     inject_single_sample_n_genes(model_cfg, adata)
@@ -2423,9 +2575,9 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     inject_decoder_gene_names(model_cfg, adata)
     inject_storm_lite_tokenizer_gene_names(model_cfg, adata)
     inject_expression_preprocessing(model_cfg, adata)
-    inject_residual_gene_scale(model_cfg, [expr])
-    inject_direct_regression_stats(model_cfg, [expr])
-    inject_transport_gene_scale(model_cfg, [expr])
+    inject_residual_gene_scale(model_cfg, [training_expr])
+    inject_direct_regression_stats(model_cfg, [training_expr])
+    inject_transport_gene_scale(model_cfg, [training_expr])
     inject_coord_scale(model_cfg, coord_scale)
     if novae_inputs["feature_dim"] is not None:
         if context_encoder_type == "stpath":
@@ -2453,9 +2605,9 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     inject_decoder_gene_names(unresolved_model_cfg, adata)
     inject_storm_lite_tokenizer_gene_names(unresolved_model_cfg, adata)
     inject_expression_preprocessing(unresolved_model_cfg, adata)
-    inject_residual_gene_scale(unresolved_model_cfg, [expr])
-    inject_direct_regression_stats(unresolved_model_cfg, [expr])
-    inject_transport_gene_scale(unresolved_model_cfg, [expr])
+    inject_residual_gene_scale(unresolved_model_cfg, [training_expr])
+    inject_direct_regression_stats(unresolved_model_cfg, [training_expr])
+    inject_transport_gene_scale(unresolved_model_cfg, [training_expr])
     inject_coord_scale(unresolved_model_cfg, coord_scale)
     if novae_inputs["feature_dim"] is not None:
         if context_encoder_type == "stpath":
@@ -2473,10 +2625,18 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     # None for every training step.
     organ = str(adata.obs["organ"].iloc[0]) if "organ" in adata.obs else None
     tech = str(adata.obs["tech"].iloc[0]) if "tech" in adata.obs else None
-    bank, mask_bank_path = _mask_bank_for_config(cfg, adata, coords3d, slice_ids)
     training_bank, training_bank_path = _training_seed_bank_for_config(cfg, adata.obs_names)
     checkpoint_dir = cfg.training.get("checkpoint_dir", f"results/checkpoints/{cfg.experiment_name}")
     write_run_manifest(cfg, checkpoint_dir, mask_bank_path, training_bank_path)
+    if training_excluded_mask is not None:
+        exclusion_path = write_training_exclusion_manifest(
+            checkpoint_dir, adata.obs_names, training_excluded_mask
+        )
+        print(
+            f"within-slide leakage guard: excluded "
+            f"{int(training_excluded_mask.sum())}/{adata.n_obs} immutable evaluation "
+            f"query spots from all training context and targets; audit: {exclusion_path}"
+        )
     if any(parameter.requires_grad for parameter in model.parameters()):
         dataset = MaskedContextQueryDataset(
             coords3d, expr, slice_ids, cfg.masking,
@@ -2491,6 +2651,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
             all_image_dropout_p=float(cfg.training.get("all_image_dropout_p", 0.0)),
             context_gex_mode=str(cfg.training.get("context_gex_mode", "full")),
             context_gex_dropout_p=float(cfg.training.get("context_gex_dropout_p", 0.0)),
+            excluded_training_mask=training_excluded_mask,
             seed_schedule=training_bank["seeds"],
         )
         dataloader = make_dataloader(dataset, cfg)

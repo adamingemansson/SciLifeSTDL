@@ -1,0 +1,98 @@
+# Leakage-safe within-slide diagnostic base on INT7.
+# All validation/test query spots are excluded from every training input/target.
+experiment_name: transport_marathon_single_int7_base
+data:
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  hest_cache_dir: data/cache/hest1k
+  sample_id: INT7
+  holdout_unit: spot
+  task: intra_slice
+  task_contract: missing_tissue
+  modality_ablation: both
+  min_genes: 200
+  min_cells: 3
+  expression_transform: normalize_log1p
+  expression_target_sum: 10000.0
+  novae_mode: context_only
+  require_image_coverage: true
+  use_images: true
+  organ: Kidney
+  tech: Visium
+masking:
+  strategy: random_dropout_patches
+  max_context_points: 1024
+  context_selection: nearest_query
+  params:
+    n_patches: 1
+    radius_range: [3.0, 5.0]
+    radius_unit: spot_spacing
+    shape: mixed
+model:
+  name: context_transport_regressor
+  params:
+    coord_dim: 3
+    conditioning_mode: storm_lite
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    cond_hidden_dim: 256
+    transport_k: 32
+    score_hidden_dim: 128
+    storm_lite_fusion_mode: mome
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    storm_lite_knn_k: 32
+    storm_lite_bias_type: frame_averaging
+    storm_lite_qk_norm: true
+    storm_lite_use_absolute_coords: false
+    storm_lite_input_already_log1p: true
+    target_scale_floor: 0.05
+    lr: 0.0003
+training:
+  epochs: 20000
+  seed: 10
+  mask_seed: 730000
+  unique_mask_count: 256
+  exclude_evaluation_query_spots: true
+  log_every_n_steps: 10
+  log_print_every_n_steps: 1000
+  checkpoint_every_n_steps: 10000
+  num_workers: 0
+  augment_coords: false
+  image_mode: target_zero
+  query_image_dropout_p: 0.0
+  all_image_dropout_p: 0.0
+  context_gex_mode: full
+  context_gex_dropout_p: 0.0
+  gradient_clip_val: 1.0
+  checkpoint_dir: results/checkpoints/recovery_suite/transport_marathon_single_int7_base
+validation:
+  enabled: true
+  every_n_steps: 1000
+  patience_checks: 1000
+  early_stopping_min_steps: 20000
+  require_anchor_improvement: false
+  anchor_min_delta: 0.001
+  min_correction_rms: 0.0001
+  min_delta: 0.0001
+  metric: rmse
+  n_samples: 1
+  sampling_seed: 847000
+evaluation:
+  mask_bank_path: results/mask_banks/recovery_suite/transport_marathon_single_int7_v1.json
+  n_validation_masks: 4
+  n_test_masks: 8
+  validation_seed: 747000
+  test_seed: 947000
+  sampling_seed: 1247000
+  n_samples: 1
+  primary_image_mode: target_zero
+  image_modes: [target_zero, all_zero]
+  validation_image_mode: target_zero
+  context_gex_mode: full
+  k_neighborhood: 8
+  pca_n_components: 50
+  training_mask_bank_path: results/mask_banks/training/recovery_suite/transport_marathon_single_int7_20k_256_seed730000.json
+logging:
+  backend: csv
+  project: st3d-lundeberg-lab

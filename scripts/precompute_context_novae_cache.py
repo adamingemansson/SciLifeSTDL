@@ -22,8 +22,10 @@ from src.training.train import (
     _mask_bank_for_config,
     _training_seed_bank_for_config,
     _validated_sample_groups,
+    evaluation_query_exclusion_mask,
     load_multi_sample_data,
     make_context_query_split,
+    make_training_context_query_split,
     prepare_novae_inputs,
 )
 
@@ -148,6 +150,16 @@ def main(config_path: str, include_test: bool = True,
     if provider is None:
         raise RuntimeError("config does not request context-only Novae features")
 
+    eval_bank, eval_path = _mask_bank_for_config(cfg, adata, coords3d, slice_ids)
+    excluded_training_mask = None
+    if bool(cfg.training.get("exclude_evaluation_query_spots", False)):
+        excluded_training_mask = evaluation_query_exclusion_mask(eval_bank, adata.obs_names)
+        print(
+            f"within-slide leakage guard: excluding "
+            f"{int(excluded_training_mask.sum())}/{adata.n_obs} evaluation query spots "
+            f"from every precomputed training graph"
+        )
+
     training_bank, training_path = _training_seed_bank_for_config(cfg, adata.obs_names)
     unique_seeds = list(OrderedDict.fromkeys(int(x) for x in training_bank["seeds"]))
     selected_seeds = [
@@ -160,20 +172,14 @@ def main(config_path: str, include_test: bool = True,
         f"from {training_path} ({len(training_bank['seeds'])} total steps)"
     )
     for i, seed in enumerate(selected_seeds, start=1):
-        context_mask, query_mask = make_context_query_split(coords3d, slice_ids, cfg.masking, seed)
-        context_mask = _cap_context_mask(
-            context_mask,
-            getattr(cfg.masking, "max_context_points", None),
-            seed,
-            coords3d=coords3d,
-            query_mask=query_mask,
-            selection=str(getattr(cfg.masking, "context_selection", "random")),
+        context_mask, _query_mask = make_training_context_query_split(
+            coords3d, slice_ids, cfg.masking, seed,
+            excluded_training_mask=excluded_training_mask,
         )
         provider(np.asarray(context_mask, dtype=bool))
         if i == 1 or i % 25 == 0 or i == len(selected_seeds):
             print(f"  training cache {i}/{len(selected_seeds)}")
 
-    eval_bank, eval_path = _mask_bank_for_config(cfg, adata, coords3d, slice_ids)
     splits = ["validation", "test"] if include_test else ["validation"]
     eval_tasks = [
         (split, record)

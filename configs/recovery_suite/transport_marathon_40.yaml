@@ -1,0 +1,98 @@
+# Explicit 40-run overnight matrix. Slots 0-3 map to st-a100 GPUs 1,2,3,5.
+# Each slot contains exactly ten sequential jobs; every trainable run is 20k steps.
+profiles:
+  uniform:
+    data: {modality_ablation: gex_only, novae_mode: disabled}
+    model: {params: {conditioning_mode: uniform, gene_encoder_type: mlp}}
+    training: {image_mode: all_zero}
+    evaluation: {primary_image_mode: all_zero, image_modes: [all_zero], validation_image_mode: all_zero}
+  geometry:
+    data: {modality_ablation: gex_only, novae_mode: disabled}
+    model: {params: {conditioning_mode: geometry, gene_encoder_type: mlp}}
+    training: {image_mode: all_zero}
+    evaluation: {primary_image_mode: all_zero, image_modes: [all_zero], validation_image_mode: all_zero}
+  gex_both:
+    data: {modality_ablation: gex_only, novae_mode: context_only}
+    model: {params: {conditioning_mode: storm_lite, gene_encoder_type: both, storm_lite_fusion_mode: mome, storm_lite_qk_norm: true}}
+    training: {image_mode: all_zero}
+    evaluation: {primary_image_mode: all_zero, image_modes: [all_zero], validation_image_mode: all_zero}
+  full_both: {}
+  gex_mlp:
+    data: {modality_ablation: gex_only, novae_mode: disabled}
+    model: {params: {conditioning_mode: storm_lite, gene_encoder_type: mlp, storm_lite_fusion_mode: mome, storm_lite_qk_norm: true}}
+    training: {image_mode: all_zero}
+    evaluation: {primary_image_mode: all_zero, image_modes: [all_zero], validation_image_mode: all_zero}
+  gex_novae:
+    data: {modality_ablation: gex_only, novae_mode: context_only}
+    model: {params: {conditioning_mode: storm_lite, gene_encoder_type: novae, storm_lite_fusion_mode: mome, storm_lite_qk_norm: true}}
+    training: {image_mode: all_zero}
+    evaluation: {primary_image_mode: all_zero, image_modes: [all_zero], validation_image_mode: all_zero}
+  full_mlp:
+    data: {modality_ablation: both, novae_mode: disabled}
+    model: {params: {conditioning_mode: storm_lite, gene_encoder_type: mlp, storm_lite_fusion_mode: mome, storm_lite_qk_norm: true}}
+  full_novae:
+    data: {modality_ablation: both, novae_mode: context_only}
+    model: {params: {conditioning_mode: storm_lite, gene_encoder_type: novae, storm_lite_fusion_mode: mome, storm_lite_qk_norm: true}}
+  full_sum:
+    model: {params: {storm_lite_fusion_mode: sum, storm_lite_qk_norm: false}}
+  full_noqk:
+    model: {params: {storm_lite_fusion_mode: mome, storm_lite_qk_norm: false}}
+  full_bias_none:
+    model: {params: {storm_lite_bias_type: none}}
+  full_bias_relative:
+    model: {params: {storm_lite_bias_type: relative_position}}
+  full_layers1:
+    model: {params: {storm_lite_n_layers: 1}}
+  full_layers4:
+    model: {params: {storm_lite_n_layers: 4}}
+
+runs:
+  # Cross-sample: four k sweeps for each transport conditioner.
+  - {id: C01, slot: 0, scope: cross, family: geometry, profile: geometry, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_geometry_k8_seed10, seed: 10, overrides: {model: {params: {transport_k: 8}}}}
+  - {id: C02, slot: 1, scope: cross, family: geometry, profile: geometry, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_geometry_k16_seed10, seed: 10, overrides: {model: {params: {transport_k: 16}}}}
+  - {id: C03, slot: 2, scope: cross, family: geometry, profile: geometry, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_geometry_k32_seed10, seed: 10, overrides: {model: {params: {transport_k: 32}}}}
+  - {id: C04, slot: 3, scope: cross, family: geometry, profile: geometry, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_geometry_k64_seed10, seed: 10, overrides: {model: {params: {transport_k: 64}}}}
+  - {id: C05, slot: 0, scope: cross, family: gex_both, profile: gex_both, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_gex_both_k8_seed10, seed: 10, overrides: {model: {params: {transport_k: 8}}}}
+  - {id: C06, slot: 1, scope: cross, family: gex_both, profile: gex_both, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_gex_both_k16_seed10, seed: 10, overrides: {model: {params: {transport_k: 16}}}}
+  - {id: C07, slot: 2, scope: cross, family: gex_both, profile: gex_both, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_gex_both_k32_seed10, seed: 10, overrides: {model: {params: {transport_k: 32}}}}
+  - {id: C08, slot: 3, scope: cross, family: gex_both, profile: gex_both, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_gex_both_k64_seed10, seed: 10, overrides: {model: {params: {transport_k: 64}}}}
+  - {id: C09, slot: 0, scope: cross, family: full_both, profile: full_both, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_full_both_k8_seed10, seed: 10, overrides: {model: {params: {transport_k: 8}}}}
+  - {id: C10, slot: 1, scope: cross, family: full_both, profile: full_both, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_full_both_k16_seed10, seed: 10, overrides: {model: {params: {transport_k: 16}}}}
+  - {id: C11, slot: 2, scope: cross, family: full_both, profile: full_both, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_full_both_k32_seed10, seed: 10, overrides: {model: {params: {transport_k: 32}}}}
+  - {id: C12, slot: 3, scope: cross, family: full_both, profile: full_both, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_full_both_k64_seed10, seed: 10, overrides: {model: {params: {transport_k: 64}}}}
+
+  # Cross-sample conditioner content: raw-MLP, Novae, or both.
+  - {id: C13, slot: 0, scope: cross, family: conditioner_encoder, profile: gex_mlp, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_gex_mlp_k32_seed10, seed: 10, overrides: {}}
+  - {id: C14, slot: 1, scope: cross, family: conditioner_encoder, profile: gex_novae, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_gex_novae_k32_seed10, seed: 10, overrides: {}}
+  - {id: C15, slot: 2, scope: cross, family: conditioner_encoder, profile: full_mlp, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_full_mlp_k32_seed10, seed: 10, overrides: {}}
+  - {id: C16, slot: 3, scope: cross, family: conditioner_encoder, profile: full_novae, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_full_novae_k32_seed10, seed: 10, overrides: {}}
+
+  # Cross-sample fusion/geometry depth diagnostics, one change at a time.
+  - {id: C17, slot: 0, scope: cross, family: architecture, profile: full_sum, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_full_sum_k32_seed10, seed: 10, overrides: {}}
+  - {id: C18, slot: 1, scope: cross, family: architecture, profile: full_noqk, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_full_mome_noqk_k32_seed10, seed: 10, overrides: {}}
+  - {id: C19, slot: 2, scope: cross, family: architecture, profile: full_bias_none, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_full_bias_none_k32_seed10, seed: 10, overrides: {}}
+  - {id: C20, slot: 3, scope: cross, family: architecture, profile: full_bias_relative, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_full_bias_relative_k32_seed10, seed: 10, overrides: {}}
+  - {id: C21, slot: 0, scope: cross, family: architecture, profile: full_layers1, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_full_layers1_k32_seed10, seed: 10, overrides: {}}
+  - {id: C22, slot: 1, scope: cross, family: architecture, profile: full_layers4, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_full_layers4_k32_seed10, seed: 10, overrides: {}}
+  - {id: C23, slot: 2, scope: cross, family: uniform, profile: uniform, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_uniform_k32, seed: 10, overrides: {}}
+  - {id: C24, slot: 3, scope: cross, family: seed, profile: full_both, base_config: configs/recovery_suite/145_transport_marathon_cross.yaml, name: transport20k_cross_full_both_k32_seed11, seed: 11, overrides: {}}
+
+  # Leakage-safe within-slide INT7: evaluation-query union never enters training.
+  - {id: S701, slot: 0, scope: single_int7, family: uniform, profile: uniform, base_config: configs/recovery_suite/146_transport_marathon_single_int7.yaml, name: transport20k_single_int7_uniform_k32, seed: 10, overrides: {model: {params: {transport_k: 32}}}}
+  - {id: S702, slot: 1, scope: single_int7, family: geometry, profile: geometry, base_config: configs/recovery_suite/146_transport_marathon_single_int7.yaml, name: transport20k_single_int7_geometry_k16_seed10, seed: 10, overrides: {model: {params: {transport_k: 16}}}}
+  - {id: S703, slot: 2, scope: single_int7, family: geometry, profile: geometry, base_config: configs/recovery_suite/146_transport_marathon_single_int7.yaml, name: transport20k_single_int7_geometry_k32_seed10, seed: 10, overrides: {model: {params: {transport_k: 32}}}}
+  - {id: S704, slot: 3, scope: single_int7, family: geometry, profile: geometry, base_config: configs/recovery_suite/146_transport_marathon_single_int7.yaml, name: transport20k_single_int7_geometry_k64_seed10, seed: 10, overrides: {model: {params: {transport_k: 64}}}}
+  - {id: S705, slot: 0, scope: single_int7, family: gex_both, profile: gex_both, base_config: configs/recovery_suite/146_transport_marathon_single_int7.yaml, name: transport20k_single_int7_gex_both_k16_seed10, seed: 10, overrides: {model: {params: {transport_k: 16}}}}
+  - {id: S706, slot: 1, scope: single_int7, family: gex_both, profile: gex_both, base_config: configs/recovery_suite/146_transport_marathon_single_int7.yaml, name: transport20k_single_int7_gex_both_k32_seed10, seed: 10, overrides: {model: {params: {transport_k: 32}}}}
+  - {id: S707, slot: 2, scope: single_int7, family: full_both, profile: full_both, base_config: configs/recovery_suite/146_transport_marathon_single_int7.yaml, name: transport20k_single_int7_full_both_k16_seed10, seed: 10, overrides: {model: {params: {transport_k: 16}}}}
+  - {id: S708, slot: 3, scope: single_int7, family: full_both, profile: full_both, base_config: configs/recovery_suite/146_transport_marathon_single_int7.yaml, name: transport20k_single_int7_full_both_k32_seed10, seed: 10, overrides: {model: {params: {transport_k: 32}}}}
+
+  # Leakage-safe within-slide INT8: identical matrix and independent reserved spots.
+  - {id: S801, slot: 0, scope: single_int8, family: uniform, profile: uniform, base_config: configs/recovery_suite/147_transport_marathon_single_int8.yaml, name: transport20k_single_int8_uniform_k32, seed: 10, overrides: {model: {params: {transport_k: 32}}}}
+  - {id: S802, slot: 1, scope: single_int8, family: geometry, profile: geometry, base_config: configs/recovery_suite/147_transport_marathon_single_int8.yaml, name: transport20k_single_int8_geometry_k16_seed10, seed: 10, overrides: {model: {params: {transport_k: 16}}}}
+  - {id: S803, slot: 2, scope: single_int8, family: geometry, profile: geometry, base_config: configs/recovery_suite/147_transport_marathon_single_int8.yaml, name: transport20k_single_int8_geometry_k32_seed10, seed: 10, overrides: {model: {params: {transport_k: 32}}}}
+  - {id: S804, slot: 3, scope: single_int8, family: geometry, profile: geometry, base_config: configs/recovery_suite/147_transport_marathon_single_int8.yaml, name: transport20k_single_int8_geometry_k64_seed10, seed: 10, overrides: {model: {params: {transport_k: 64}}}}
+  - {id: S805, slot: 0, scope: single_int8, family: gex_both, profile: gex_both, base_config: configs/recovery_suite/147_transport_marathon_single_int8.yaml, name: transport20k_single_int8_gex_both_k16_seed10, seed: 10, overrides: {model: {params: {transport_k: 16}}}}
+  - {id: S806, slot: 1, scope: single_int8, family: gex_both, profile: gex_both, base_config: configs/recovery_suite/147_transport_marathon_single_int8.yaml, name: transport20k_single_int8_gex_both_k32_seed10, seed: 10, overrides: {model: {params: {transport_k: 32}}}}
+  - {id: S807, slot: 2, scope: single_int8, family: full_both, profile: full_both, base_config: configs/recovery_suite/147_transport_marathon_single_int8.yaml, name: transport20k_single_int8_full_both_k16_seed10, seed: 10, overrides: {model: {params: {transport_k: 16}}}}
+  - {id: S808, slot: 3, scope: single_int8, family: full_both, profile: full_both, base_config: configs/recovery_suite/147_transport_marathon_single_int8.yaml, name: transport20k_single_int8_full_both_k32_seed10, seed: 10, overrides: {model: {params: {transport_k: 32}}}}
