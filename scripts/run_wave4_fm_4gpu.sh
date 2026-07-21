@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Four matched FM capacity tests on the shared st-a100 allocation. GPU_IDS and
-# SERVER_PROFILE may select a safe subset of GPUs 0-3, producing sequential batches.
+# SERVER_PROFILE explicitly select the GPUs allocated for this invocation.
 set -Eeuo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"

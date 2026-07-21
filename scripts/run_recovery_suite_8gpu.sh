@@ -30,6 +30,20 @@ case "$SERVER_PROFILE" in
       seen_shared_gpu[$gpu]=1
     done
     ;;
+  explicit_subset)
+    declare -A seen_explicit_gpu=()
+    for gpu in "${GPU_IDS_ARR[@]}"; do
+      if [[ ! "$gpu" =~ ^[0-7]$ ]]; then
+        echo "ERROR: explicit_subset GPU IDs must be drawn from 0-7; got $gpu." >&2
+        exit 2
+      fi
+      if [[ -n "${seen_explicit_gpu[$gpu]:-}" ]]; then
+        echo "ERROR: explicit_subset contains duplicate GPU ID $gpu." >&2
+        exit 2
+      fi
+      seen_explicit_gpu[$gpu]=1
+    done
+    ;;
   dedicated8)
     if [[ "$GPU_IDS_CSV" != "0,1,2,3,4,5,6,7" ]]; then
       echo "ERROR: dedicated8 requires GPU_IDS=0,1,2,3,4,5,6,7." >&2
@@ -37,7 +51,7 @@ case "$SERVER_PROFILE" in
     fi
     ;;
   *)
-    echo "ERROR: SERVER_PROFILE must be shared4, shared_subset or dedicated8." >&2
+    echo "ERROR: SERVER_PROFILE must be shared4, shared_subset, explicit_subset or dedicated8." >&2
     exit 2
     ;;
 esac
