@@ -1,0 +1,59 @@
+# Wave 4C pure interpolation control: no learned residual, harmonic k=16.
+experiment_name: missing_tissue_wave4c_harmonic_anchor_k16
+data:
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  hest_cache_dir: data/cache/hest1k
+  sample_id: INT1
+  task: intra_slice
+  task_contract: missing_tissue
+  min_genes: 200
+  min_cells: 3
+  expression_transform: normalize_log1p
+  expression_target_sum: 10000.0
+  novae_mode: disabled
+  require_image_coverage: true
+  use_images: true
+masking:
+  strategy: random_dropout_patches
+  max_context_points: 3000
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+model:
+  name: spatial_baseline
+  params:
+    mode: harmonic
+    k: 16
+    ridge: 0.0001
+training:
+  epochs: 1
+  seed: 10
+  mask_seed: 700000
+  unique_mask_count: 64
+  log_every_n_steps: 10
+  num_workers: 0
+  augment_coords: false
+  image_mode: target_zero
+  query_image_dropout_p: 0.0
+  all_image_dropout_p: 0.0
+  checkpoint_dir: results/checkpoints/recovery_suite/missing_tissue_wave4c_harmonic_anchor_k16
+validation:
+  enabled: false
+evaluation:
+  mask_bank_path: results/mask_banks/recovery_suite/INT1_recovery_3000.json
+  n_validation_masks: 4
+  n_test_masks: 8
+  validation_seed: 700000
+  test_seed: 900000
+  sampling_seed: 1200000
+  n_samples: 1
+  primary_image_mode: target_zero
+  image_modes: [target_zero, all_zero]
+  validation_image_mode: target_zero
+  k_neighborhood: 8
+  pca_n_components: 50
+  training_mask_bank_path: results/mask_banks/training/recovery_suite/missing_tissue_10k_64_seed700000.json
+logging:
+  backend: csv
+  project: st3d-lundeberg-lab
