@@ -1,4 +1,4 @@
-# Collapse recovery and component-ablation plan (8×A100)
+# Collapse recovery and component-ablation plan (4×A100 allocation)
 
 This plan repairs the failed harmonic-residual ladder without replacing the
 working project. It keeps the full post-QC gene panel, INT1 screening cohort,
@@ -38,7 +38,8 @@ export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export STPATH_ROOT=/data/adam.ingemansson/STPath
 export STPATH_GENE_VOC_PATH="$STPATH_ROOT/utils_data/symbol2ensembl.json"
 export STPATH_MODEL_WEIGHT_PATH="$STPATH_ROOT/stfm.pth"
-export GPU_IDS=0,1,2,3,4,5,6,7
+export GPU_IDS=0,1,2,3
+export CPU_THREADS_PER_JOB=4
 export PYTHON_BIN=python3
 ```
 
@@ -73,17 +74,17 @@ SMOKETEST=1 STAGE=repair bash scripts/run_recovery_suite_8gpu.sh
 STAGE=repair bash scripts/run_recovery_suite_8gpu.sh
 ```
 
-Eight single-GPU jobs run concurrently:
+Eight single-GPU jobs run as two consecutive batches of four:
 
-| GPU slot | Run | Isolated question |
+| Job slot | Run | Isolated question |
 |---:|---|---|
 | 0 | harmonic anchor | exact deterministic reference |
 | 1–3 | repaired builtin residual, seeds 0/1/2 | can the repaired head learn beyond harmonic? |
 | 4–6 | repaired StormLite concat, seeds 0/1/2 | does the context/image encoder now reach the output? |
 | 7 | fixed-Novae flagship, seed 10 | did the audited branch preserve the older FM-OT path? |
 
-Before training, the context-only Novae cache is sharded across all eight
-A100s. The script then calls `check_recovery_gate.py`. It blocks promotion unless all six
+Before training, the context-only Novae cache is sharded across GPUs 0–3.
+The script then calls `check_recovery_gate.py`. It blocks promotion unless all six
 residual runs beat their own validation anchor with nontrivial corrections and
 the current-audit flagship produces finite, nonconstant, image-sensitive
 results. Preserve failed logs; do not launch later stages after a failure.
@@ -103,7 +104,7 @@ STPath with the same custom downstream FM head/decoder. These STPath rows are
 the repository's established STPath-conditioned benchmarks; they are not
 mislabelled as official zero-shot STPath.
 
-For an unattended Wave 1 to Wave 2 handoff on the eight-GPU machine, run:
+For an unattended Wave 1 to Wave 2 handoff on the four allocated GPUs, run:
 
 ```bash
 bash scripts/run_recovery_overnight_wave1_to_wave2.sh
@@ -155,9 +156,10 @@ bash scripts/run_recovery_wave3_8gpu.sh
 Wave 4 is not auto-started because its multi-slide architecture must be chosen
 from Wave 3 rather than predetermined.
 
-## Step 6 — repaired deterministic ablations
+## Archived deterministic ladder — do not launch
 
-Only after reviewing Wave 1:
+The direct harmonic-residual family failed its quality gate. The historical
+command is retained for provenance, not as the next recovery wave:
 
 ```bash
 STAGE=deterministic bash scripts/run_complexity_ladder_8gpu.sh

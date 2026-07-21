@@ -3,6 +3,7 @@
 set -Eeuo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+CPU_THREADS_PER_JOB="${CPU_THREADS_PER_JOB:-4}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 
 if pgrep -f -- 'src.training.train.*recovery_wave3_' >/dev/null; then
@@ -17,7 +18,8 @@ SMOKE_STEPS=1 \
 STAGE=wave3 \
 RUN_ID="${RUN_ID}_smoke" \
 LOG_ROOT="logs/recovery_suite/smoke_wave3_${RUN_ID}" \
-GPU_IDS=0,1,2,3,4,5,6,7 \
+GPU_IDS=0,1,2,3 \
+CPU_THREADS_PER_JOB="$CPU_THREADS_PER_JOB" \
 PYTHON_BIN="$PYTHON_BIN" \
 bash scripts/run_recovery_suite_8gpu.sh
 
@@ -26,7 +28,8 @@ echo "===== Wave 3 full runs ====="
 STAGE=wave3 \
 RUN_ID="${RUN_ID}_full" \
 LOG_ROOT="logs/recovery_suite/wave3_${RUN_ID}" \
-GPU_IDS=0,1,2,3,4,5,6,7 \
+GPU_IDS=0,1,2,3 \
+CPU_THREADS_PER_JOB="$CPU_THREADS_PER_JOB" \
 PYTHON_BIN="$PYTHON_BIN" \
 bash scripts/run_recovery_suite_8gpu.sh
 

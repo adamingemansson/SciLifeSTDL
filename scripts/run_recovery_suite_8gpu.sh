@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
-# Staged recovery/ablation runner for one machine with eight GPUs.
+# Staged recovery/ablation runner. The legacy filename is retained for
+# compatibility, but server policy now enforces four GPUs and bounded CPU use.
 set -Eeuo pipefail
 
 STAGE="${STAGE:-repair}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-GPU_IDS_CSV="${GPU_IDS:-0,1,2,3,4,5,6,7}"
+GPU_IDS_CSV="${GPU_IDS:-0,1,2,3}"
 IFS=',' read -r -a GPU_IDS_ARR <<< "$GPU_IDS_CSV"
-if [[ "${#GPU_IDS_ARR[@]}" -ne 8 ]]; then
-  echo "ERROR: GPU_IDS must contain exactly eight comma-separated ids." >&2
+if [[ "$GPU_IDS_CSV" != "0,1,2,3" ]]; then
+  echo "ERROR: server allocation is fixed to GPU_IDS=0,1,2,3." >&2
+  exit 2
+fi
+GPU_COUNT="${#GPU_IDS_ARR[@]}"
+
+CPU_THREADS_PER_JOB="${CPU_THREADS_PER_JOB:-4}"
+if [[ ! "$CPU_THREADS_PER_JOB" =~ ^[0-9]+$ ]] \
+    || (( CPU_THREADS_PER_JOB < 1 || CPU_THREADS_PER_JOB > 4 )); then
+  echo "ERROR: CPU_THREADS_PER_JOB must be an integer from 1 to 4 (default: 4)." >&2
   exit 2
 fi
 
@@ -32,9 +41,7 @@ if [[ -z "${STPATH_MODEL_WEIGHT_PATH:-}" || "${STPATH_MODEL_WEIGHT_PATH:-}" == /
   export STPATH_MODEL_WEIGHT_PATH="$STPATH_ROOT/stfm.pth"
 fi
 
-N_CORES="$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
-THREADS_PER_JOB=$((N_CORES / 8))
-(( THREADS_PER_JOB > 0 )) || THREADS_PER_JOB=1
+THREADS_PER_JOB="$CPU_THREADS_PER_JOB"
 
 declare -a CONFIGS NAMES SEEDS
 case "$STAGE" in
@@ -166,14 +173,15 @@ fi
 # All context-only Novae jobs consume the same immutable 64-mask schedule.
 # Populate it once before concurrent readers start. The cache is reused safely.
 if [[ "$SMOKETEST" != "1" ]] && [[ "$STAGE" == "repair" || "$STAGE" == "controls" || "$STAGE" == "ablations" || "$STAGE" == "wave3" ]]; then
-  echo "Precomputing/reusing the shared context-only Novae mask cache on 8 GPUs..."
+  echo "Precomputing/reusing the shared context-only Novae mask cache on $GPU_COUNT GPUs..."
   precompute_pids=()
   for slot in "${!GPU_IDS_ARR[@]}"; do
     CUDA_VISIBLE_DEVICES="${GPU_IDS_ARR[$slot]}" \
       OMP_NUM_THREADS="$THREADS_PER_JOB" MKL_NUM_THREADS="$THREADS_PER_JOB" \
+      OPENBLAS_NUM_THREADS="$THREADS_PER_JOB" NUMEXPR_NUM_THREADS="$THREADS_PER_JOB" \
       "$PYTHON_BIN" scripts/precompute_context_novae_cache.py \
         --config configs/recovery_suite/03_fixed_novae_flagship_regression.yaml \
-        --shard-index "$slot" --num-shards 8 \
+        --shard-index "$slot" --num-shards "$GPU_COUNT" \
         > "$LOG_ROOT/precompute_context_novae_shard${slot}.log" 2>&1 &
     precompute_pids+=("$!")
   done
@@ -191,70 +199,101 @@ if [[ "$SMOKETEST" != "1" ]] && [[ "$STAGE" == "repair" || "$STAGE" == "controls
   fi
 fi
 
-pids=()
-for slot in "${!CONFIGS[@]}"; do
-  config="${CONFIGS[$slot]}"
-  name="${NAMES[$slot]}"
-  seed="${SEEDS[$slot]}"
-  gpu="${GPU_IDS_ARR[$slot]}"
-  checkpoint="results/checkpoints/recovery_suite/$name"
-  metrics="$checkpoint/audit_test_metrics.json"
-  log="$LOG_ROOT/$name.log"
-
-  if [[ "$FRESH" != "1" && -f "$metrics" ]]; then
-    echo "GPU $gpu -> $name: SKIP (completed metrics found)"
-    pids+=("")
-    continue
-  fi
-
-  overrides=(
-    "experiment_name=$name"
-    "training.seed=$seed"
-    "training.checkpoint_dir=$checkpoint"
-  )
-  if [[ "$SMOKETEST" == "1" ]]; then
-    overrides+=(
-      "training.epochs=$SMOKE_STEPS"
-      "training.unique_mask_count=$SMOKE_STEPS"
-      "training.checkpoint_every_n_steps=0"
-      "training.checkpoint_dir=results/checkpoints/recovery_suite/smoke/${RUN_ID}/$name"
-      "training.log_print_every_n_steps=1"
-      "validation.every_n_steps=$SMOKE_STEPS"
-      "validation.early_stopping_min_steps=$SMOKE_STEPS"
-      "validation.patience_checks=1000"
-      "validation.require_anchor_improvement=false"
-      "validation.n_samples=1"
-      "evaluation.n_validation_masks=1"
-      "evaluation.n_test_masks=1"
-      "evaluation.n_samples=1"
-      "evaluation.mask_bank_path=results/mask_banks/recovery_suite/smoke_${name}.json"
-      "evaluation.training_mask_bank_path=results/mask_banks/training/recovery_suite/smoke_${name}.json"
-    )
-  fi
-
-  echo "GPU $gpu -> $name"
-  (
-    printf 'command:' > "$log"
-    printf ' %q' env "CUDA_VISIBLE_DEVICES=$gpu" "$PYTHON_BIN" -m src.training.train \
-      --config "$config" --override "${overrides[@]}" >> "$log"
-    printf '\n' >> "$log"
-    CUDA_VISIBLE_DEVICES="$gpu" OMP_NUM_THREADS="$THREADS_PER_JOB" \
-      MKL_NUM_THREADS="$THREADS_PER_JOB" \
-      "$PYTHON_BIN" -m src.training.train --config "$config" \
-      --override "${overrides[@]}" >> "$log" 2>&1
-  ) &
-  pids+=("$!")
-done
-
 failed=0
-for slot in "${!pids[@]}"; do
-  [[ -n "${pids[$slot]}" ]] || continue
-  if wait "${pids[$slot]}"; then
-    echo "DONE: ${NAMES[$slot]}"
-  else
-    failed=1
-    echo "FAILED: ${NAMES[$slot]}" >&2
-    tail -80 "$LOG_ROOT/${NAMES[$slot]}.log" >&2 || true
+JOB_COUNT="${#CONFIGS[@]}"
+for (( batch_start=0; batch_start<JOB_COUNT; batch_start+=GPU_COUNT )); do
+  batch_number=$((batch_start / GPU_COUNT + 1))
+  batch_total=$(((JOB_COUNT + GPU_COUNT - 1) / GPU_COUNT))
+  echo "Starting batch $batch_number/$batch_total with at most $GPU_COUNT jobs " \
+       "and $THREADS_PER_JOB CPU threads per job."
+  pids=()
+  batch_names=()
+
+  for (( local_slot=0; local_slot<GPU_COUNT; local_slot++ )); do
+    job_index=$((batch_start + local_slot))
+    (( job_index < JOB_COUNT )) || break
+    config="${CONFIGS[$job_index]}"
+    name="${NAMES[$job_index]}"
+    seed="${SEEDS[$job_index]}"
+    gpu="${GPU_IDS_ARR[$local_slot]}"
+    checkpoint="results/checkpoints/recovery_suite/$name"
+    metrics="$checkpoint/audit_test_metrics.json"
+    log="$LOG_ROOT/$name.log"
+
+    if [[ "$FRESH" != "1" && -f "$metrics" ]]; then
+      echo "GPU $gpu -> $name: SKIP (completed metrics found)"
+      continue
+    fi
+
+    overrides=(
+      "experiment_name=$name"
+      "training.seed=$seed"
+      "training.checkpoint_dir=$checkpoint"
+    )
+    if [[ "$SMOKETEST" == "1" ]]; then
+      overrides+=(
+        "training.epochs=$SMOKE_STEPS"
+        "training.unique_mask_count=$SMOKE_STEPS"
+        "training.checkpoint_every_n_steps=0"
+        "training.checkpoint_dir=results/checkpoints/recovery_suite/smoke/${RUN_ID}/$name"
+        "training.log_print_every_n_steps=1"
+        "validation.every_n_steps=$SMOKE_STEPS"
+        "validation.early_stopping_min_steps=$SMOKE_STEPS"
+        "validation.patience_checks=1000"
+        "validation.require_anchor_improvement=false"
+        "validation.n_samples=1"
+        "evaluation.n_validation_masks=1"
+        "evaluation.n_test_masks=1"
+        "evaluation.n_samples=1"
+        "evaluation.mask_bank_path=results/mask_banks/recovery_suite/smoke_${name}.json"
+        "evaluation.training_mask_bank_path=results/mask_banks/training/recovery_suite/smoke_${name}.json"
+      )
+    fi
+
+    echo "GPU $gpu -> $name"
+    (
+      started_epoch="$(date +%s)"
+      printf 'command:' > "$log"
+      printf ' %q' env "CUDA_VISIBLE_DEVICES=$gpu" \
+        "OMP_NUM_THREADS=$THREADS_PER_JOB" "MKL_NUM_THREADS=$THREADS_PER_JOB" \
+        "OPENBLAS_NUM_THREADS=$THREADS_PER_JOB" "NUMEXPR_NUM_THREADS=$THREADS_PER_JOB" \
+        "$PYTHON_BIN" -m src.training.train --config "$config" \
+        --override "${overrides[@]}" >> "$log"
+      printf '\n' >> "$log"
+      printf 'started_at_utc: %s\n' "$(date -u +%FT%TZ)" >> "$log"
+      if CUDA_VISIBLE_DEVICES="$gpu" OMP_NUM_THREADS="$THREADS_PER_JOB" \
+          MKL_NUM_THREADS="$THREADS_PER_JOB" \
+          OPENBLAS_NUM_THREADS="$THREADS_PER_JOB" \
+          NUMEXPR_NUM_THREADS="$THREADS_PER_JOB" \
+          "$PYTHON_BIN" -m src.training.train --config "$config" \
+          --override "${overrides[@]}" >> "$log" 2>&1; then
+        run_status=0
+      else
+        run_status=$?
+      fi
+      finished_epoch="$(date +%s)"
+      printf 'finished_at_utc: %s\n' "$(date -u +%FT%TZ)" >> "$log"
+      printf 'wall_seconds: %d\n' "$((finished_epoch - started_epoch))" >> "$log"
+      printf 'exit_status: %d\n' "$run_status" >> "$log"
+      exit "$run_status"
+    ) &
+    pids+=("$!")
+    batch_names+=("$name")
+  done
+
+  for i in "${!pids[@]}"; do
+    if wait "${pids[$i]}"; then
+      echo "DONE: ${batch_names[$i]}"
+    else
+      failed=1
+      echo "FAILED: ${batch_names[$i]}" >&2
+      tail -80 "$LOG_ROOT/${batch_names[$i]}.log" >&2 || true
+    fi
+  done
+
+  if (( failed )); then
+    echo "Stage $STAGE failed in batch $batch_number. Later batches were not started." >&2
+    break
   fi
 done
 

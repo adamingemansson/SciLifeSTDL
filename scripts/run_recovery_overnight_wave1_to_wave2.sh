@@ -3,6 +3,7 @@
 set -Eeuo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+CPU_THREADS_PER_JOB="${CPU_THREADS_PER_JOB:-4}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 REPO_ROOT="$(pwd -P)"
 STPATH_ROOT="${STPATH_ROOT:-$(dirname "$REPO_ROOT")/STPath}"
@@ -57,7 +58,8 @@ SMOKE_STEPS=1 \
 STAGE=controls \
 RUN_ID="${RUN_ID}_smoke_wave1" \
 LOG_ROOT="logs/recovery_suite/smoke_controls_${RUN_ID}" \
-GPU_IDS=0,1,2,3,4,5,6,7 \
+GPU_IDS=0,1,2,3 \
+CPU_THREADS_PER_JOB="$CPU_THREADS_PER_JOB" \
 PYTHON_BIN="$PYTHON_BIN" \
 bash scripts/run_recovery_suite_8gpu.sh
 
@@ -67,7 +69,8 @@ SMOKE_STEPS=1 \
 STAGE=ablations \
 RUN_ID="${RUN_ID}_smoke_wave2" \
 LOG_ROOT="logs/recovery_suite/smoke_ablations_${RUN_ID}" \
-GPU_IDS=0,1,2,3,4,5,6,7 \
+GPU_IDS=0,1,2,3 \
+CPU_THREADS_PER_JOB="$CPU_THREADS_PER_JOB" \
 PYTHON_BIN="$PYTHON_BIN" \
 bash scripts/run_recovery_suite_8gpu.sh
 
@@ -77,7 +80,8 @@ echo "===== Wave 1: matched FM and STPath controls ====="
 STAGE=controls \
 RUN_ID="${RUN_ID}_wave1" \
 LOG_ROOT="logs/recovery_suite/controls_${RUN_ID}" \
-GPU_IDS=0,1,2,3,4,5,6,7 \
+GPU_IDS=0,1,2,3 \
+CPU_THREADS_PER_JOB="$CPU_THREADS_PER_JOB" \
 PYTHON_BIN="$PYTHON_BIN" \
 bash scripts/run_recovery_suite_8gpu.sh
 
@@ -87,7 +91,8 @@ echo "===== Wave 1 complete; starting Wave 2 component ablations ====="
 STAGE=ablations \
 RUN_ID="${RUN_ID}_wave2" \
 LOG_ROOT="logs/recovery_suite/ablations_${RUN_ID}" \
-GPU_IDS=0,1,2,3,4,5,6,7 \
+GPU_IDS=0,1,2,3 \
+CPU_THREADS_PER_JOB="$CPU_THREADS_PER_JOB" \
 PYTHON_BIN="$PYTHON_BIN" \
 bash scripts/run_recovery_suite_8gpu.sh
 
