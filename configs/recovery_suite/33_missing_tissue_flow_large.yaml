@@ -88,7 +88,7 @@ evaluation:
   validation_image_mode: target_zero
   k_neighborhood: 8
   pca_n_components: 50
-  training_mask_bank_path: results/mask_banks/training/recovery_suite/fixed_novae_64_seed700000.json
+  training_mask_bank_path: results/mask_banks/training/recovery_suite/missing_tissue_10k_64_seed700000.json
 logging:
   backend: csv
   project: st3d-lundeberg-lab
