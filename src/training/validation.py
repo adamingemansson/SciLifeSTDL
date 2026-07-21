@@ -294,8 +294,8 @@ class FixedMaskValidationCallback(pl.Callback):
     def raise_if_quality_gate_failed(self) -> None:
         if self.require_anchor_improvement and self.quality_gate_passed is not True:
             raise RuntimeError(
-                "residual-model quality gate failed: the best validation checkpoint "
-                f"did not beat the harmonic anchor by {self.anchor_min_delta:g} "
+                "model quality gate failed: the best validation checkpoint "
+                f"did not beat its declared anchor by {self.anchor_min_delta:g} "
                 f"{self.metric} (best={self.best_score:.6f}, anchor={self.anchor_score}). "
                 f"correction_rms={self.correction_rms}, required>={self.min_correction_rms:g}. "
                 "Do not promote this run to later experiment stages."

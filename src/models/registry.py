@@ -713,6 +713,138 @@ class HarmonicResidualModel(BaseGenerativeModel):
         })
 
 
+@register_model("direct_context_regressor")
+class DirectContextRegressor(BaseGenerativeModel):
+    """Predict absolute query expression directly from learned context.
+
+    Unlike :class:`HarmonicResidualModel`, this model never computes or feeds
+    a spatial interpolation into the prediction path.  Training-only per-gene
+    mean/scale statistics condition the regression problem numerically; the
+    reported output is converted back to the original normalized-log
+    expression units.  The mean-only tensor is exposed as ``anchor_expression``
+    solely so fixed-mask validation can report a transparent non-spatial
+    baseline gate.
+    """
+
+    def __init__(
+        self, n_genes: int, coord_dim: int = 3, cond_hidden_dim: int = 256,
+        hidden_dim: int = 512, lr: float = 3e-4,
+        context_encoder_type: str = "storm_lite",
+        image_encoder_type: str = "none", image_feat_dim: int = 64,
+        image_patch_size: int = 256, gene_encoder_type: str = "mlp",
+        gene_feat_dim: int = 256, novae_dim: int | None = None,
+        coord_scale: float = 1.0, storm_lite_n_layers: int = 2,
+        storm_lite_n_heads: int = 4, storm_lite_bias_type: str = "frame_averaging",
+        storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
+        storm_lite_knn_k: int | None = None, storm_lite_gnn_k: int = 8,
+        storm_lite_local_k: int = 32,
+        storm_lite_use_absolute_coords: bool = True,
+        storm_lite_input_already_log1p: bool = True,
+        storm_lite_tokenizer_gene_names: list[str] | None = None,
+        storm_lite_tokenizer_full_gene_names: list[str] | None = None,
+        storm_lite_tokenizer_n_pool_layers: int = 1,
+        storm_lite_tokenizer_n_pool_heads: int = 4,
+        target_gene_mean: list[float] | None = None,
+        target_gene_scale: list[float] | None = None,
+        target_scale_floor: float = 0.05,
+        organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+        self.context_encoder = _build_context_encoder(
+            n_genes=n_genes, coord_dim=coord_dim, cond_hidden_dim=cond_hidden_dim,
+            context_encoder_type=context_encoder_type,
+            image_encoder_type=image_encoder_type, image_feat_dim=image_feat_dim,
+            image_patch_size=image_patch_size, gene_encoder_type=gene_encoder_type,
+            gene_feat_dim=gene_feat_dim, novae_dim=novae_dim, coord_scale=coord_scale,
+            storm_lite_n_layers=storm_lite_n_layers, storm_lite_n_heads=storm_lite_n_heads,
+            storm_lite_bias_type=storm_lite_bias_type,
+            storm_lite_fusion_mode=storm_lite_fusion_mode,
+            storm_lite_qk_norm=storm_lite_qk_norm,
+            storm_lite_knn_k=storm_lite_knn_k, storm_lite_gnn_k=storm_lite_gnn_k,
+            storm_lite_local_k=storm_lite_local_k,
+            storm_lite_use_absolute_coords=storm_lite_use_absolute_coords,
+            storm_lite_input_already_log1p=storm_lite_input_already_log1p,
+            storm_lite_tokenizer_gene_names=storm_lite_tokenizer_gene_names,
+            storm_lite_tokenizer_full_gene_names=storm_lite_tokenizer_full_gene_names,
+            storm_lite_tokenizer_n_pool_layers=storm_lite_tokenizer_n_pool_layers,
+            storm_lite_tokenizer_n_pool_heads=storm_lite_tokenizer_n_pool_heads,
+            organ_vocab=organ_vocab, tech_vocab=tech_vocab,
+        )
+        self.decoder = nn.Sequential(
+            nn.LayerNorm(cond_hidden_dim),
+            nn.Linear(cond_hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, n_genes),
+        )
+        if target_scale_floor <= 0:
+            raise ValueError("target_scale_floor must be positive")
+        mean = torch.zeros(n_genes) if target_gene_mean is None else torch.as_tensor(
+            target_gene_mean, dtype=torch.float32
+        )
+        scale = torch.ones(n_genes) if target_gene_scale is None else torch.as_tensor(
+            target_gene_scale, dtype=torch.float32
+        )
+        if mean.shape != (n_genes,) or scale.shape != (n_genes,):
+            raise ValueError(
+                f"target gene statistics must both have shape ({n_genes},), "
+                f"got mean={tuple(mean.shape)}, scale={tuple(scale.shape)}"
+            )
+        if not torch.isfinite(mean).all() or not torch.isfinite(scale).all():
+            raise ValueError("target gene statistics contain non-finite values")
+        self.register_buffer("target_gene_mean", mean)
+        self.register_buffer("target_gene_scale", scale.clamp_min(float(target_scale_floor)))
+        self.lr = float(lr)
+
+    def sample(self, context, query):
+        condition = self._encode_context(context, query)
+        standardized = self.decoder(condition)
+        mean = self.target_gene_mean.unsqueeze(0).expand_as(standardized)
+        expression = mean + standardized * self.target_gene_scale
+        return {
+            "coords": query["coords"],
+            "expression": expression,
+            "anchor_expression": mean,
+            "residual_expression": expression - mean,
+            "standardized_expression": standardized,
+        }
+
+    def training_step(self, batch, batch_idx):
+        out = self.sample(batch["context"], batch["query"])
+        target = batch["target_expression"]
+        standardized_target = (
+            target - self.target_gene_mean
+        ) / self.target_gene_scale
+        loss = nn.functional.mse_loss(out["standardized_expression"], standardized_target)
+        absolute_mse = nn.functional.mse_loss(out["expression"], target)
+        mean_baseline_mse = nn.functional.mse_loss(out["anchor_expression"], target)
+        prediction_delta_rms = out["residual_expression"].square().mean().sqrt()
+        self.log_dict({
+            "train/loss": loss,
+            "train/absolute_mse": absolute_mse,
+            "train/mean_baseline_mse": mean_baseline_mse,
+            "train/prediction_delta_rms": prediction_delta_rms,
+        })
+        return loss
+
+    def configure_optimizers(self):
+        return torch.optim.AdamW(self.parameters(), lr=self.lr)
+
+    def on_after_backward(self) -> None:
+        context_sq = torch.zeros((), device=self.device)
+        for parameter in self.context_encoder.parameters():
+            if parameter.grad is not None:
+                context_sq = context_sq + parameter.grad.detach().square().sum()
+        decoder_sq = torch.zeros((), device=self.device)
+        for parameter in self.decoder.parameters():
+            if parameter.grad is not None:
+                decoder_sq = decoder_sq + parameter.grad.detach().square().sum()
+        self.log_dict({
+            "train/context_grad_norm": context_sq.sqrt(),
+            "train/decoder_grad_norm": decoder_sq.sqrt(),
+        })
+
+
 # ---------------------------------------------------------------------------
 # VAE baseline. Unconditioned placeholder — see docs/architecture_plan.md
 # "Known gaps" for the conditioning encoder this still needs.

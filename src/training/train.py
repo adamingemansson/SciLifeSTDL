@@ -1623,6 +1623,31 @@ def _pooled_gene_std(expressions: list[np.ndarray]) -> np.ndarray:
     return np.sqrt(variance).astype(np.float32)
 
 
+def _pooled_gene_mean_std(expressions: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """Training-only pooled mean and standard deviation for direct regression."""
+    if not expressions:
+        raise ValueError("at least one training expression matrix is required")
+    total_n = 0
+    total_sum = None
+    total_sumsq = None
+    for expression in expressions:
+        values = np.asarray(expression, dtype=np.float64)
+        if values.ndim != 2:
+            raise ValueError(f"expression matrix must be 2-D, got {values.shape}")
+        if total_sum is not None and values.shape[1] != total_sum.shape[0]:
+            raise ValueError("training expression matrices do not share one gene panel")
+        sample_sum = values.sum(axis=0)
+        sample_sumsq = np.square(values).sum(axis=0)
+        total_sum = sample_sum if total_sum is None else total_sum + sample_sum
+        total_sumsq = sample_sumsq if total_sumsq is None else total_sumsq + sample_sumsq
+        total_n += values.shape[0]
+    if total_n < 2:
+        raise ValueError("at least two training observations are required for gene statistics")
+    mean = total_sum / total_n
+    variance = np.maximum(total_sumsq / total_n - np.square(mean), 0.0)
+    return mean.astype(np.float32), np.sqrt(variance).astype(np.float32)
+
+
 def inject_residual_gene_scale(model_cfg: dict, expressions: list[np.ndarray]) -> None:
     """Inject training-only gene scales for ``harmonic_residual`` models."""
     if model_cfg.get("name") != "harmonic_residual":
@@ -1630,6 +1655,17 @@ def inject_residual_gene_scale(model_cfg: dict, expressions: list[np.ndarray]) -
     params = model_cfg.get("params", {})
     if "residual_gene_scale" not in params:
         params["residual_gene_scale"] = _pooled_gene_std(expressions).tolist()
+
+
+def inject_direct_regression_stats(model_cfg: dict, expressions: list[np.ndarray]) -> None:
+    """Inject training-only target normalization for direct context regression."""
+    if model_cfg.get("name") != "direct_context_regressor":
+        return
+    params = model_cfg.get("params", {})
+    if "target_gene_mean" not in params or "target_gene_scale" not in params:
+        mean, scale = _pooled_gene_mean_std(expressions)
+        params.setdefault("target_gene_mean", mean.tolist())
+        params.setdefault("target_gene_scale", scale.tolist())
 
 
 def inject_coord_scale(model_cfg: dict, coord_scale: float) -> None:
@@ -1646,7 +1682,8 @@ def inject_coord_scale(model_cfg: dict, coord_scale: float) -> None:
     model_cfg["params"] in place; no-op for every other config."""
     params = model_cfg.get("params", {})
     context_model_names = {
-        "wae_gan", "fm_ot", "vqvae_ar", "harmonic_residual", "residual_fm_ot"
+        "wae_gan", "fm_ot", "vqvae_ar", "harmonic_residual", "residual_fm_ot",
+        "direct_context_regressor",
     }
     if (model_cfg.get("name") in context_model_names
             and params.get("context_encoder_type", "builtin") in ("builtin", "storm_lite")
@@ -2113,6 +2150,7 @@ def _main_multi_sample(cfg) -> None:
         inject_storm_lite_tokenizer_gene_names(model_cfg, fit_adatas[0])
         inject_expression_preprocessing(model_cfg, fit_adatas[0])
         inject_residual_gene_scale(model_cfg, [sample[1] for sample in train_samples])
+        inject_direct_regression_stats(model_cfg, [sample[1] for sample in train_samples])
         if novae_dim is not None:
             if context_encoder_type == "stpath":
                 inject_stpath_novae_dim(model_cfg, novae_dim)
@@ -2376,6 +2414,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     inject_storm_lite_tokenizer_gene_names(model_cfg, adata)
     inject_expression_preprocessing(model_cfg, adata)
     inject_residual_gene_scale(model_cfg, [expr])
+    inject_direct_regression_stats(model_cfg, [expr])
     inject_coord_scale(model_cfg, coord_scale)
     if novae_inputs["feature_dim"] is not None:
         if context_encoder_type == "stpath":
@@ -2404,6 +2443,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     inject_storm_lite_tokenizer_gene_names(unresolved_model_cfg, adata)
     inject_expression_preprocessing(unresolved_model_cfg, adata)
     inject_residual_gene_scale(unresolved_model_cfg, [expr])
+    inject_direct_regression_stats(unresolved_model_cfg, [expr])
     inject_coord_scale(unresolved_model_cfg, coord_scale)
     if novae_inputs["feature_dim"] is not None:
         if context_encoder_type == "stpath":
