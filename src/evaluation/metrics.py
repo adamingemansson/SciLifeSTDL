@@ -12,12 +12,20 @@ from scipy.stats import pearsonr
 
 
 def pearson_per_gene(pred: np.ndarray, true: np.ndarray) -> np.ndarray:
-    """[G] array of per-gene Pearson r between predicted and true expression."""
+    """Per-gene PCC with eligibility defined from ground truth only.
+
+    A truth-constant gene is not identifiable within the evaluated region and
+    is returned as NaN. A constant prediction for a truth-variable gene is a
+    model failure and receives 0 instead of disappearing from the mean.
+    """
     G = pred.shape[1]
     out = np.zeros(G)
     for g in range(G):
-        if np.std(pred[:, g]) < 1e-8 or np.std(true[:, g]) < 1e-8:
+        if np.std(true[:, g]) < 1e-8:
             out[g] = np.nan
+            continue
+        if np.std(pred[:, g]) < 1e-8:
+            out[g] = 0.0
             continue
         out[g] = pearsonr(pred[:, g], true[:, g])[0]
     return out

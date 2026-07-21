@@ -371,7 +371,7 @@ class StormLiteContextEncoder(nn.Module):
                  tokenizer_n_pool_layers: int = 1, tokenizer_n_pool_heads: int = 4,
                  bias_type: str = "frame_averaging", relative_bias_hidden_dim: int = 32,
                  fusion_mode: str = "sum", qk_norm: bool = False,
-                 knn_k: int | None = None, gnn_k: int = 8,
+                 knn_k: int | None = None, gnn_k: int = 8, local_k: int = 32,
                  input_already_log1p: bool = True,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
@@ -381,8 +381,13 @@ class StormLiteContextEncoder(nn.Module):
         assert bias_type in ("none", "relative_position", "frame_averaging"), (
             f"unknown bias_type {bias_type!r}"
         )
-        assert fusion_mode in ("sum", "concat", "mome", "gnn"), f"unknown fusion_mode {fusion_mode!r}"
+        assert fusion_mode in ("sum", "concat", "mome", "gnn", "local_pool"), (
+            f"unknown fusion_mode {fusion_mode!r}"
+        )
         self.gnn_k = gnn_k
+        if local_k < 1:
+            raise ValueError(f"local_k must be >= 1, got {local_k}")
+        self.local_k = int(local_k)
         assert knn_k is None or knn_k >= 1, f"knn_k must be >= 1 or None, got {knn_k!r}"
         self.knn_k = knn_k
         self.fusion_mode = fusion_mode
@@ -410,7 +415,9 @@ class StormLiteContextEncoder(nn.Module):
         # comparison arm. "none": no relative bias at all (only absolute
         # RandomFourierFeatures baked into each token below).
         self.bias_type = bias_type
-        if bias_type == "frame_averaging":
+        if fusion_mode == "local_pool":
+            self.pos_bias = None
+        elif bias_type == "frame_averaging":
             self.pos_bias = FrameAveragingBias(n_heads, coord_scale)
         elif bias_type == "relative_position":
             self.pos_bias = RelativePositionBias(coord_dim, relative_bias_hidden_dim)
@@ -493,8 +500,9 @@ class StormLiteContextEncoder(nn.Module):
         # — safe as a per-call-shared FIXED value here since this class
         # calls coord_encoder ONCE on context+query coords concatenated
         # together (unlike SpatialContextEncoder's separate calls).
-        self.coord_encoder = RandomFourierFeatures(coord_dim, rff_features, rff_sigma, coord_scale)
-        self.coord_proj = nn.Linear(2 * rff_features, hidden_dim)
+        if fusion_mode != "local_pool":
+            self.coord_encoder = RandomFourierFeatures(coord_dim, rff_features, rff_sigma, coord_scale)
+            self.coord_proj = nn.Linear(2 * rff_features, hidden_dim)
 
         # Learned placeholder for query positions' missing gene signal —
         # same role as STPath's own mask_token (its GeneExpTokenizer), but
@@ -504,7 +512,8 @@ class StormLiteContextEncoder(nn.Module):
         # possible specifically because Novae/MLP don't need a fixed
         # cross-dataset gene vocabulary the way STPath's tokenized
         # architecture does).
-        self.mask_token = nn.Parameter(torch.randn(hidden_dim) * 0.02)
+        if fusion_mode != "local_pool":
+            self.mask_token = nn.Parameter(torch.randn(hidden_dim) * 0.02)
 
         # LayerNorm on each branch before combining (2026-07-17, StormLite
         # underperformance investigation) — a fresh-init numerical check
@@ -518,10 +527,28 @@ class StormLiteContextEncoder(nn.Module):
         # in BOTH fusion_mode paths below.
         self.img_norm = nn.LayerNorm(hidden_dim)
         self.gene_norm = nn.LayerNorm(hidden_dim)
-        self.coord_norm = nn.LayerNorm(hidden_dim)
+        if fusion_mode != "local_pool":
+            self.coord_norm = nn.LayerNorm(hidden_dim)
 
         self.hidden_dim = hidden_dim
-        if fusion_mode == "mome":
+        if fusion_mode == "local_pool":
+            # Missing-tissue diagnostic path: no absolute position encoding,
+            # target image token, self-attention, or query GEX token.  Each
+            # query is represented only by a distance-weighted pool of its
+            # nearest observed context spots.  Distances are divided by the
+            # kth-neighbour distance before softmax, so translation, rotation
+            # and global coordinate scale cannot identify a slide.
+            self.local_context_proj = nn.Sequential(
+                nn.Linear(2 * hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+            )
+            self.local_output_proj = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+            )
+        elif fusion_mode == "mome":
             # 2026-07-17: real STORM detail (Online Methods, "Spatial
             # encoder" — see _MoMETransformerBlock's own docstring) —
             # needs separate image/gene tokens (not summed) to route
@@ -624,8 +651,8 @@ class StormLiteContextEncoder(nn.Module):
         return raw_expr if self.input_already_log1p else torch.log1p(raw_expr)
 
     def forward(self, context_coords: torch.Tensor, context_expression: torch.Tensor,
-                query_coords: torch.Tensor, context_images: torch.Tensor,
-                query_images: torch.Tensor,
+                query_coords: torch.Tensor, context_images: torch.Tensor | None,
+                query_images: torch.Tensor | None,
                 context_image_available: torch.Tensor | None = None,
                 query_image_available: torch.Tensor | None = None,
                 context_novae_features: torch.Tensor | None = None,
@@ -636,17 +663,47 @@ class StormLiteContextEncoder(nn.Module):
         novae_dim] precomputed Novae features, only required when
         gene_encoder_type != "mlp". Returns c [N_query, hidden_dim].
 
-        Query positions get a real image token (H&E at query locations is
-        genuinely available — only expression is being predicted, never
-        masked in the input) but the LEARNED mask_token for gene signal
-        (real expression there would leak the prediction target) — same
-        context/query asymmetry STPath's own ge_tokens already encode,
-        and the same reasoning STPathContextEncoder's residual_embed
-        zero-fills query rows for."""
+        Historical fusion modes preserve their original context/query token
+        construction.  ``local_pool`` is stricter: it never reads
+        ``query_images`` and only uses query coordinates to select relative
+        neighbours, matching the missing-tissue contract where the target
+        region contains neither H&E nor GEX."""
         n_context = context_coords.shape[0]
         n_query = query_coords.shape[0]
         n_total = n_context + n_query
         device = context_coords.device
+
+        if self.fusion_mode == "local_pool":
+            if n_context < 1 or n_query < 1:
+                raise ValueError("local_pool requires non-empty context and query sets")
+            if context_images is None:
+                context_img = self.missing_image_token[None, :].expand(n_context, -1)
+            else:
+                context_img = self.image_encoder(context_images)
+                context_img = context_img + self.missing_image_token[None, :] * 0.0
+                if context_image_available is not None:
+                    available = context_image_available.to(context_img.device).bool()
+                    context_img = torch.where(
+                        available[:, None], context_img, self.missing_image_token[None, :]
+                    )
+            context_img = self.img_norm(context_img)
+            context_gene = self.gene_norm(
+                self._encode_gene(context_expression, context_novae_features)
+            )
+            context_tokens = self.local_context_proj(
+                torch.cat([context_img, context_gene], dim=-1)
+            )
+
+            distances = torch.cdist(query_coords[:, :2], context_coords[:, :2])
+            k = min(self.local_k, n_context)
+            nearest_distance, nearest_index = torch.topk(
+                distances, k=k, dim=-1, largest=False, sorted=True
+            )
+            local_scale = nearest_distance[:, -1:].clamp_min(1e-6)
+            weights = torch.softmax(-nearest_distance / local_scale, dim=-1)
+            neighbours = context_tokens[nearest_index]
+            pooled = torch.sum(weights[..., None] * neighbours, dim=1)
+            return self.local_output_proj(pooled)
 
         coords = torch.cat([context_coords, query_coords], dim=0)
         coord_embed = self.coord_norm(self.coord_proj(self.coord_encoder(coords)))

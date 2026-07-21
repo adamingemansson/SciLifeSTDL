@@ -34,6 +34,7 @@ def _primary_summary(metrics: dict) -> dict:
         "context_gex_mode": metrics.get("context_gex_mode", "full"),
         "modality_ablation": metrics.get("modality_ablation", "both"),
         "pcc": mean("pcc"),
+        "n_pcc_genes": mean("n_pcc_genes"),
         "rmse": mean("rmse"),
         "nonzero_auc": mean("nonzero_auc"),
         "st_fid": mean("st_fid"),
@@ -76,7 +77,7 @@ def collect(
         heldout = experiment_dir / "heldout_sample_summary.json"
         if heldout.exists():
             payload = json.loads(heldout.read_text())
-            # Version 2 records the intervention contract and all headline
+            # Version 2+ records the intervention contract and all headline
             # metrics. Keep compatibility with older mode-at-top-level files.
             modes = payload.get("image_modes", payload)
             primary_mode = str(payload.get("primary_image_mode", "full"))
@@ -87,6 +88,7 @@ def collect(
                 "context_gex_mode": payload.get("context_gex_mode", "full"),
                 "modality_ablation": payload.get("modality_ablation", "both"),
                 "pcc": primary.get("pcc_mean"),
+                "n_pcc_genes": primary.get("n_pcc_genes_mean"),
                 "rmse": primary.get("rmse_mean"),
                 "nonzero_auc": primary.get("nonzero_auc_mean"),
                 "st_fid": primary.get("st_fid_mean"),

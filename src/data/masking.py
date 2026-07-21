@@ -158,6 +158,7 @@ def random_dropout_patches(coords_xy: np.ndarray, slice_ids: np.ndarray,
                             n_patches: int = 3, radius_range=(50, 150),
                             seed: int | None = None,
                             shape: str = "circle",
+                            radius_unit: str = "coordinate",
                             aspect_ratio_range=(1.5, 3.0),
                             blob_strength_range=(0.2, 0.45),
                             blob_harmonics: int = 4,
@@ -175,8 +176,15 @@ def random_dropout_patches(coords_xy: np.ndarray, slice_ids: np.ndarray,
     random — the single call that best matches "real damage isn't one
     consistent shape across a whole dataset"). radius_range is reused as
     the base/semi-major radius for every shape so existing configs' tuned
-    radius_range values stay meaningful without retuning per shape."""
+    radius_range values stay meaningful without retuning per shape.
+
+    ``radius_unit="coordinate"`` is the exact historical behavior.  The
+    opt-in ``spot_spacing`` mode expresses radii in median nearest-neighbour
+    distances on the selected slice, making hole size comparable across
+    slides with different pixel coordinate scales.
+    """
     assert shape in ("circle", "ellipse", "irregular", "mixed"), f"unknown shape {shape!r}"
+    assert radius_unit in ("coordinate", "spot_spacing"), f"unknown radius_unit {radius_unit!r}"
     rng = np.random.default_rng(seed)
     query_mask = np.zeros(len(coords_xy), dtype=bool)
     unique_slices = np.unique(slice_ids)
@@ -188,6 +196,17 @@ def random_dropout_patches(coords_xy: np.ndarray, slice_ids: np.ndarray,
         center_idx = rng.choice(in_slice_idx)
         center = coords_xy[center_idx]
         radius = rng.uniform(*radius_range)
+        if radius_unit == "spot_spacing":
+            from scipy.spatial import cKDTree
+
+            slice_coords = np.asarray(coords_xy[in_slice_idx], dtype=np.float64)
+            if len(slice_coords) < 2:
+                continue
+            neighbour_distances, _ = cKDTree(slice_coords).query(slice_coords, k=2)
+            spacing = float(np.median(neighbour_distances[:, 1]))
+            if not np.isfinite(spacing) or spacing <= 0:
+                raise ValueError(f"could not determine positive spot spacing for slice {s!r}")
+            radius *= spacing
         patch_seed = None if seed is None else seed * 10_000 + i  # deterministic-but-distinct per patch
 
         this_shape = shape

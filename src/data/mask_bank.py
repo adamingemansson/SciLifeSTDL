@@ -36,13 +36,50 @@ def make_split(coords3d: np.ndarray, slice_ids: np.ndarray, masking_cfg, seed: i
     raise ValueError(f"unknown masking strategy {strategy!r}")
 
 
-def cap_context_mask(context_mask: np.ndarray, max_context_points, seed: int) -> np.ndarray:
+def cap_context_mask(
+    context_mask: np.ndarray,
+    max_context_points,
+    seed: int,
+    *,
+    coords3d: np.ndarray | None = None,
+    query_mask: np.ndarray | None = None,
+    selection: str = "random",
+) -> np.ndarray:
+    """Cap context size without changing historical configs silently.
+
+    ``selection="random"`` is the exact legacy behavior.  The opt-in
+    ``nearest_query`` mode keeps the observed spots closest to the missing
+    region.  That is the relevant context for a local reconstruction model
+    and avoids spending a finite context budget on unrelated parts of a
+    slide.  Stable index tie-breaking makes the result deterministic.
+    """
     if max_context_points is None:
         return context_mask
     idx = np.flatnonzero(context_mask)
     if len(idx) <= int(max_context_points):
         return context_mask
-    keep = np.random.default_rng(seed + 3).choice(idx, size=int(max_context_points), replace=False)
+    if selection == "random":
+        keep = np.random.default_rng(seed + 3).choice(
+            idx, size=int(max_context_points), replace=False
+        )
+    elif selection == "nearest_query":
+        if coords3d is None or query_mask is None:
+            raise ValueError(
+                "context_selection='nearest_query' requires coords3d and query_mask"
+            )
+        query_idx = np.flatnonzero(np.asarray(query_mask, dtype=bool))
+        if not len(query_idx):
+            raise ValueError("cannot select context nearest an empty query region")
+        from scipy.spatial import cKDTree
+
+        coords = np.asarray(coords3d, dtype=np.float64)[:, :2]
+        distance, _ = cKDTree(coords[query_idx]).query(coords[idx], k=1)
+        order = np.lexsort((idx, distance))
+        keep = idx[order[: int(max_context_points)]]
+    else:
+        raise ValueError(
+            f"unknown context_selection {selection!r}; expected 'random' or 'nearest_query'"
+        )
     out = np.zeros_like(context_mask, dtype=bool)
     out[keep] = True
     return out
@@ -104,12 +141,20 @@ def build_mask_bank(
     names = np.asarray([str(x) for x in obs_names])
     records = []
     max_context = _cfg_get(masking_cfg, "max_context_points", None)
+    context_selection = str(_cfg_get(masking_cfg, "context_selection", "random"))
     for split, count in split_counts.items():
         base_seed = int(split_seeds[split])
         for i in range(int(count)):
             seed = base_seed + i
             context, query = make_split(coords3d, slice_ids, masking_cfg, seed)
-            context = cap_context_mask(context, max_context, seed)
+            context = cap_context_mask(
+                context,
+                max_context,
+                seed,
+                coords3d=coords3d,
+                query_mask=query,
+                selection=context_selection,
+            )
             if not query.any() or not context.any():
                 raise ValueError(f"mask seed {seed} produced an empty context or query")
             records.append({

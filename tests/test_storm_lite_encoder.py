@@ -366,6 +366,41 @@ def test_storm_lite_fusion_mode_gnn_end_to_end():
     print("[gnn_fusion] OK — StormLiteContextEncoder fusion_mode='gnn' runs end-to-end, gradients flow")
 
 
+def test_local_pool_ignores_query_images_and_absolute_coordinate_frame():
+    """The missing-tissue path must not merely zero target H&E downstream:
+    it must be independent of the query-image tensor and absolute frame."""
+    torch.manual_seed(0)
+    n_context, n_query, n_genes, hidden_dim = 12, 5, 20, 16
+    context_coords = torch.rand(n_context, 3) * 100
+    query_coords = torch.rand(n_query, 3) * 100
+    context_images = torch.rand(n_context, _GIGAPATH_FEAT_DIM)
+    context_expression = torch.rand(n_context, n_genes)
+    encoder = StormLiteContextEncoder(
+        n_genes=n_genes, hidden_dim=hidden_dim, gene_encoder_type="mlp",
+        fusion_mode="local_pool", local_k=4,
+    ).eval()
+    with torch.no_grad():
+        reference = encoder(
+            context_coords, context_expression, query_coords,
+            context_images, torch.randn(n_query, _GIGAPATH_FEAT_DIM),
+        )
+        # Rotate, uniformly rescale and translate x/y together.
+        angle = torch.tensor(0.73)
+        rotation = torch.stack([
+            torch.stack([torch.cos(angle), -torch.sin(angle)]),
+            torch.stack([torch.sin(angle), torch.cos(angle)]),
+        ])
+        transformed_context = context_coords.clone()
+        transformed_query = query_coords.clone()
+        transformed_context[:, :2] = context_coords[:, :2] @ rotation.T * 7.0 + 1234.0
+        transformed_query[:, :2] = query_coords[:, :2] @ rotation.T * 7.0 + 1234.0
+        transformed = encoder(
+            transformed_context, context_expression, transformed_query,
+            context_images, None,
+        )
+    assert torch.allclose(reference, transformed, atol=2e-5, rtol=2e-5)
+
+
 def test_storm_lite_fusion_mode_gnn_differs_from_sum_and_mome():
     """Genuinely different aggregation mechanism -> genuinely different
     output, not an accidental no-op reduction to the same computation."""

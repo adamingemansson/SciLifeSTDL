@@ -37,7 +37,7 @@ from src.data import loaders, masking
 from src.data.augmentation import augment_coords_xy
 from src.data.context_features import ContextOnlyNovaeProvider, model_uses_novae, novae_input_mode
 from src.data.mask_bank import (
-    ensure_mask_bank, ensure_training_seed_bank, record_masks, split_records,
+    cap_context_mask, ensure_mask_bank, ensure_training_seed_bank, record_masks, split_records,
 )
 from src.training.validation import FixedMaskValidationCallback, predictive_samples
 from src.models.registry import build_model
@@ -635,7 +635,15 @@ def make_context_query_split(coords3d: np.ndarray, slice_ids: np.ndarray, maskin
     return context_mask, query_mask
 
 
-def _cap_context_mask(context_mask: np.ndarray, max_context_points, seed: int) -> np.ndarray:
+def _cap_context_mask(
+    context_mask: np.ndarray,
+    max_context_points,
+    seed: int,
+    *,
+    coords3d: np.ndarray | None = None,
+    query_mask: np.ndarray | None = None,
+    selection: str = "random",
+) -> np.ndarray:
     """Subsample an oversized context mask down to max_context_points
     (2026-07-20, real-hardware OOM-mitigation follow-up). Every masking
     strategy leaves ALL non-query spots in the drawn slice(s) as context,
@@ -647,16 +655,14 @@ def _cap_context_mask(context_mask: np.ndarray, max_context_points, seed: int) -
     preserves exact prior behavior for every existing config. Uses seed+3
     (distinct from augment's seed+2 and multi-sample's seed+1) so this
     subsampling draw never correlates with those."""
-    if max_context_points is None:
-        return context_mask
-    context_idx = np.where(context_mask)[0]
-    if len(context_idx) <= max_context_points:
-        return context_mask
-    rng = np.random.default_rng(seed + 3)
-    keep = rng.choice(context_idx, size=max_context_points, replace=False)
-    capped = np.zeros_like(context_mask)
-    capped[keep] = True
-    return capped
+    return cap_context_mask(
+        context_mask,
+        max_context_points,
+        seed,
+        coords3d=coords3d,
+        query_mask=query_mask,
+        selection=selection,
+    )
 
 
 def _images_tensor(images: np.ndarray, mask: np.ndarray) -> torch.Tensor:
@@ -832,7 +838,14 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
         if augment:
             coords3d = augment_coords_xy(coords3d, seed=seed + 2)
         context_mask, query_mask = make_context_query_split(coords3d, slice_ids, masking_cfg, seed)
-        context_mask = _cap_context_mask(context_mask, getattr(masking_cfg, "max_context_points", None), seed)
+        context_mask = _cap_context_mask(
+            context_mask,
+            getattr(masking_cfg, "max_context_points", None),
+            seed,
+            coords3d=coords3d,
+            query_mask=query_mask,
+            selection=str(getattr(masking_cfg, "context_selection", "random")),
+        )
     if context_gene_feature_provider is not None and context_gene_features is not None:
         raise ValueError("provide either context_gene_features or context_gene_feature_provider, not both")
     if context_novae_feature_provider is not None and context_novae_features is not None:
@@ -1352,9 +1365,16 @@ def prepare_novae_inputs(cfg, adata, model_params: dict, coords3d: np.ndarray,
     )
     # Probe one deterministic context mask before model construction so the
     # real installed Novae feature width can be injected into the architecture.
-    probe_context, _ = make_context_query_split(coords3d, slice_ids, cfg.masking, seed=606_060)
+    probe_context, probe_query = make_context_query_split(
+        coords3d, slice_ids, cfg.masking, seed=606_060
+    )
     probe_context = _cap_context_mask(
-        probe_context, getattr(cfg.masking, "max_context_points", None), 606_060
+        probe_context,
+        getattr(cfg.masking, "max_context_points", None),
+        606_060,
+        coords3d=coords3d,
+        query_mask=probe_query,
+        selection=str(getattr(cfg.masking, "context_selection", "random")),
     )
     probe = provider(probe_context)
     result["feature_dim"] = int(probe.shape[1])
@@ -1503,6 +1523,42 @@ def write_run_manifest(cfg, checkpoint_dir: str, mask_bank_path: str | Path | No
         "cuda_devices": cuda_devices,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
     }
+    if str(cfg.get("data", {}).get("source", "")) == "hest1k":
+        sample_ids = list(cfg.data.get("sample_ids", [cfg.data.get("sample_id")]))
+        sample_ids = [str(sid) for sid in sample_ids if sid is not None]
+        source_files = []
+        for sample_id in sample_ids:
+            for kind, suffix, required_part in (
+                ("expression", ".h5ad", None),
+                ("patches", ".h5", "patches"),
+            ):
+                if kind == "patches" and not (
+                    bool(cfg.data.get("use_images", False))
+                    or bool(cfg.data.get("require_image_coverage", False))
+                ):
+                    continue
+                try:
+                    source = loaders._resolve_hest_sample_file(
+                        cfg.data.hest_data_dir,
+                        sample_id,
+                        suffix,
+                        required_path_part=required_part,
+                    ).resolve()
+                    stat = source.stat()
+                    source_files.append({
+                        "sample_id": sample_id,
+                        "kind": kind,
+                        "path": str(source),
+                        "size_bytes": int(stat.st_size),
+                        "mtime_ns": int(stat.st_mtime_ns),
+                    })
+                except Exception as exc:
+                    source_files.append({
+                        "sample_id": sample_id,
+                        "kind": kind,
+                        "resolution_error": f"{type(exc).__name__}: {exc}",
+                    })
+        manifest["hest_source_files"] = source_files
     tmp = out / "run_manifest.json.tmp"
     tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True))
     tmp.replace(out / "run_manifest.json")
@@ -1998,7 +2054,7 @@ def inject_multi_sample_n_genes(model_cfg: dict, adatas: list) -> None:
     if model_cfg.get("name") in {"interp_baseline", "spatial_baseline"}:
         return
     params = model_cfg.get("params", {})
-    params.setdefault("n_genes", adatas[0].n_vars)
+    params["n_genes"] = adatas[0].n_vars
 
 
 def _main_multi_sample(cfg) -> None:
@@ -2220,7 +2276,7 @@ def _main_multi_sample(cfg) -> None:
             )
         aggregate = {}
         aggregate_metrics = (
-            "pcc", "rmse", "nonzero_auc", "st_fid", "st_mmd",
+            "pcc", "n_pcc_genes", "rmse", "nonzero_auc", "st_fid", "st_mmd",
             "spatial_domain_plausibility", "predictive_std", "interval90_coverage",
         )
         for mode in list(evaluation_cfg.get("image_modes", ["full"])):
@@ -2243,7 +2299,7 @@ def _main_multi_sample(cfg) -> None:
                 )
             aggregate[str(mode)] = mode_summary
         heldout_summary = {
-            "version": 2,
+            "version": 3,
             "evaluation_scope": "heldout_samples",
             "primary_image_mode": _primary_image_mode(cfg),
             "context_gex_mode": str(evaluation_cfg.get("context_gex_mode", "full")),

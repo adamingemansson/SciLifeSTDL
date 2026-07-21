@@ -102,6 +102,19 @@ def test_max_context_points_none_preserves_prior_behavior():
     print("[max_context_points] OK — absent cap leaves context/query split unchanged")
 
 
+def test_nearest_query_context_cap_keeps_boundary_spots():
+    from src.data.mask_bank import cap_context_mask
+
+    coords = np.column_stack([np.arange(20, dtype=float), np.zeros(20), np.zeros(20)])
+    query = np.zeros(20, dtype=bool)
+    query[9:11] = True
+    context = ~query
+    capped = cap_context_mask(
+        context, 4, 123, coords3d=coords, query_mask=query, selection="nearest_query"
+    )
+    assert set(np.flatnonzero(capped)) == {7, 8, 11, 12}
+
+
 if __name__ == "__main__":
     test_random_dropout_patches_variety()
     test_hold_out_slice_variety()

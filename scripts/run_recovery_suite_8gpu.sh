@@ -569,6 +569,21 @@ case "$STAGE" in
     )
     SEEDS=(10 10 10 10)
     ;;
+  simple_local)
+    CONFIGS=(
+      configs/recovery_suite/129_simple_local_harmonic_k32.yaml
+      configs/recovery_suite/130_simple_local_gex_novae.yaml
+      configs/recovery_suite/131_simple_local_full_novae.yaml
+      configs/recovery_suite/132_simple_local_full_mlp.yaml
+    )
+    NAMES=(
+      missing_tissue_simple_local_harmonic_k32
+      missing_tissue_simple_local_gex_novae_seed10
+      missing_tissue_simple_local_full_novae_seed10
+      missing_tissue_simple_local_full_mlp_seed10
+    )
+    SEEDS=(10 10 10 10)
+    ;;
   *)
     echo "ERROR: unknown recovery STAGE: $STAGE" >&2
     exit 2
@@ -630,7 +645,7 @@ for (( batch_start=0; batch_start<JOB_COUNT; batch_start+=GPU_COUNT )); do
     gpu="${GPU_IDS_ARR[$local_slot]}"
     checkpoint="results/checkpoints/recovery_suite/$name"
     metrics="$checkpoint/audit_test_metrics.json"
-    if [[ "$STAGE" == "wave6_heldout_tk" || "$STAGE" == "wave6_heldout_st" || "$STAGE" == "wave7_st_smoke" || "$STAGE" == "wave7_st_marathon" || "$STAGE" == "verified_exact_st" ]]; then
+    if [[ "$STAGE" == "wave6_heldout_tk" || "$STAGE" == "wave6_heldout_st" || "$STAGE" == "wave7_st_smoke" || "$STAGE" == "wave7_st_marathon" || "$STAGE" == "verified_exact_st" || "$STAGE" == "simple_local" ]]; then
       metrics="$checkpoint/heldout_sample_summary.json"
     fi
     log="$LOG_ROOT/$name.log"
@@ -753,6 +768,8 @@ elif [[ "$STAGE" == "wave7_st_smoke" || "$STAGE" == "wave7_st_marathon" ]]; then
   collect_args+=(--experiment-prefix missing_tissue_wave7_st_)
 elif [[ "$STAGE" == "verified_exact_st" ]]; then
   collect_args+=(--experiment-prefix missing_tissue_verified_exact_)
+elif [[ "$STAGE" == "simple_local" ]]; then
+  collect_args+=(--experiment-prefix missing_tissue_simple_local_)
 fi
 "$PYTHON_BIN" scripts/collect_audit_results.py "${collect_args[@]}"
 

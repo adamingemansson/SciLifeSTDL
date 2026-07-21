@@ -61,7 +61,10 @@ def _resume_signature(cfg, records: list[dict], output_path: Path) -> dict | Non
         default=str,
     )
     return {
-        "version": 1,
+        # Version 2 invalidates partial rows written before truth-only PCC
+        # eligibility and n_pcc_genes were introduced. Config/weight/mask
+        # hashes alone cannot detect a metric-implementation change.
+        "version": 2,
         "output_name": output_path.name,
         "weights_sha256": _sha256_file(weights_path),
         "mask_records_sha256": hashlib.sha256(mask_payload.encode()).hexdigest(),
@@ -204,7 +207,7 @@ def evaluate_model_on_mask_bank(
     model_device = next(model.parameters(), torch.empty(0)).device
     model.eval()
     result: dict[str, Any] = {
-        "version": 2,
+        "version": 3,
         "experiment_name": str(cfg.experiment_name),
         "n_test_masks": len(records),
         "n_samples_per_mask": n_samples,
@@ -222,6 +225,10 @@ def evaluate_model_on_mask_bank(
                 "Unsupervised labels are a diagnostic, not curated cell-type accuracy."
             ),
             "st_fid": "All masks and image modes use the same PCA basis and effective dimensionality.",
+            "pcc": (
+                "Per-gene PCC eligibility is determined by non-constant ground truth. "
+                "A constant prediction for an eligible gene scores 0; n_pcc_genes is reported."
+            ),
         },
     }
 
@@ -318,12 +325,14 @@ def evaluate_model_on_mask_bank(
             pred = pred_t.detach().cpu().numpy()
             target = target_t.detach().cpu().numpy()
 
+            pcc_by_gene = ev.pearson_per_gene(pred, target)
             row = {
                 "mask_index": int(record["index"]),
                 "seed": int(record["seed"]),
                 "n_context": int(context_mask.sum()),
                 "n_query": int(query_mask.sum()),
-                "pcc": float(np.nanmean(ev.pearson_per_gene(pred, target))),
+                "pcc": float(np.nanmean(pcc_by_gene)),
+                "n_pcc_genes": int(np.isfinite(pcc_by_gene).sum()),
                 "rmse": float(ev.rmse(pred, target)),
                 "nonzero_auc": float(ev.nonzero_auc(pred, target)),
                 "predictive_std": float(samples.std(dim=0, unbiased=False).mean().cpu()),

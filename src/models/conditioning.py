@@ -591,6 +591,9 @@ class MLPGeneEncoder(nn.Module):
         return self.net(expression)
 
 
+_NOVAE_MODEL_CACHE: dict[str, object] = {}
+
+
 def precompute_novae_features(adata, checkpoint: str = "prism-oncology/novae-human-0"):
     """Run pretrained Novae (Novae et al. 2025, Nature Methods — graph-based
     ST foundation model, github.com/MICS-Lab/novae) ONCE over a whole
@@ -626,7 +629,15 @@ def precompute_novae_features(adata, checkpoint: str = "prism-oncology/novae-hum
     adata = adata.copy()  # spatial_neighbors/compute_representations mutate in place
     keys_before = set(adata.obsm.keys())
     novae.spatial_neighbors(adata)
-    model = novae.Novae.from_pretrained(checkpoint)
+    # Context-only training evaluates many different observed subgraphs. The
+    # pretrained Novae weights are immutable inference state, so loading a new
+    # checkpoint for every mask is pure overhead and made finite clean-mask
+    # schedules practically unusable. Reuse one model per process/checkpoint;
+    # each call still receives a fresh copied AnnData and rebuilds its graph.
+    model = _NOVAE_MODEL_CACHE.get(checkpoint)
+    if model is None:
+        model = novae.Novae.from_pretrained(checkpoint)
+        _NOVAE_MODEL_CACHE[checkpoint] = model
     model.compute_representations(adata, zero_shot=True)
     new_keys = [k for k in adata.obsm.keys() if k not in keys_before]
     novae_keys = [k for k in new_keys if "novae" in k.lower()] or new_keys

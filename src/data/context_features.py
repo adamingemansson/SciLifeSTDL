@@ -29,23 +29,44 @@ def _adata_feature_signature(adata, feature_fn: FeatureFn) -> str:
 
     The historical cache key used only context barcodes. That could silently
     reuse embeddings after changing the gene panel, preprocessing contract or
-    expression matrix. Per-gene sums are compact but sensitive to those
-    changes, and avoid materialising a sparse matrix as dense.
+    expression matrix or coordinates. Hash the actual sparse/dense matrix,
+    observation order and spatial coordinates. This is intentionally stronger
+    than the historical per-gene-sum fingerprint: two matrices can have
+    identical column sums while assigning expression to different spots.
     """
     x = adata.X
-    gene_sums = np.asarray(x.sum(axis=0)).reshape(-1).astype(np.float64, copy=False)
-    preprocessing = getattr(adata, "uns", {}).get("expression_preprocessing", {})
+    uns = getattr(adata, "uns", {})
+    preprocessing = {
+        "expression_state": uns.get("_scilifestdl_expression_state", {}),
+        "legacy_expression_preprocessing": uns.get("expression_preprocessing", {}),
+    }
     fn_name = f"{getattr(feature_fn, '__module__', '')}.{getattr(feature_fn, '__qualname__', repr(feature_fn))}"
     n_obs = int(getattr(adata, "n_obs", x.shape[0]))
     n_vars = int(getattr(adata, "n_vars", x.shape[1]))
     var_names = getattr(adata, "var_names", [f"column-{i}" for i in range(n_vars)])
     digest = sha256()
+    digest.update(b"context-novae-signature-v2\0")
     digest.update(str((n_obs, n_vars)).encode())
+    digest.update("\n".join(map(str, getattr(adata, "obs_names", []))).encode())
     digest.update("\n".join(map(str, var_names)).encode())
-    digest.update(gene_sums.tobytes())
+    if hasattr(x, "tocsr"):
+        csr = x.tocsr(copy=False)
+        for array in (csr.data, csr.indices, csr.indptr):
+            contiguous = np.ascontiguousarray(array)
+            digest.update(str((contiguous.shape, contiguous.dtype)).encode())
+            digest.update(memoryview(contiguous).cast("B"))
+    else:
+        contiguous = np.ascontiguousarray(np.asarray(x))
+        digest.update(str((contiguous.shape, contiguous.dtype)).encode())
+        digest.update(memoryview(contiguous).cast("B"))
+    spatial = getattr(adata, "obsm", {}).get("spatial")
+    if spatial is not None:
+        spatial = np.ascontiguousarray(np.asarray(spatial))
+        digest.update(str((spatial.shape, spatial.dtype)).encode())
+        digest.update(memoryview(spatial).cast("B"))
     digest.update(json.dumps(preprocessing, sort_keys=True, default=str).encode())
     digest.update(fn_name.encode())
-    return digest.hexdigest()[:20]
+    return digest.hexdigest()[:24]
 
 
 @dataclass

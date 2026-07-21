@@ -130,6 +130,20 @@ def test_random_dropout_patches_shape_switch():
     print("[random_dropout_patches] OK — shape switch produces valid, non-degenerate masks for all 4 modes")
 
 
+def test_spot_spacing_radius_is_coordinate_scale_invariant():
+    grid = np.stack(np.meshgrid(np.arange(20), np.arange(20)), axis=-1).reshape(-1, 2).astype(float)
+    slice_ids = np.asarray(["S"] * len(grid))
+    _, query_a = random_dropout_patches(
+        grid, slice_ids, n_patches=1, radius_range=(3, 3),
+        radius_unit="spot_spacing", seed=4,
+    )
+    _, query_b = random_dropout_patches(
+        grid * 19.0 + 5000.0, slice_ids, n_patches=1, radius_range=(3, 3),
+        radius_unit="spot_spacing", seed=4,
+    )
+    assert np.array_equal(query_a, query_b)
+
+
 def test_mixed_dropout_combines_both_mechanisms():
     coords, slice_ids = _grid(n_side=50)
     _, patches_only = random_dropout_patches(coords, slice_ids, n_patches=2, radius_range=(40, 70),
