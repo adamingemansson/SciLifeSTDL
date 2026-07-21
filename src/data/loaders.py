@@ -12,9 +12,59 @@ An AnnData object `adata` is expected to have, at minimum:
 """
 from __future__ import annotations
 from pathlib import Path
+import re
 
 import anndata as ad
 import numpy as np
+
+
+def _resolve_hest_sample_file(
+    hest_data_dir: str | Path,
+    sample_id: str,
+    suffix: str,
+    required_path_part: str | None = None,
+) -> Path:
+    """Resolve one HEST file without prefix-colliding sample identifiers.
+
+    The historical ``rglob(f"*{sample_id}*")`` lookup allowed ``INT1`` to
+    select ``INT10``--``INT19``. Which file appeared first depended on each
+    server's directory traversal order, so two machines could silently train
+    on different samples under the same configured ID. Prefer the canonical
+    exact filename and otherwise allow a single delimiter-bounded legacy name
+    such as ``TEST_INT1.h5``. Any ambiguity fails loudly.
+    """
+    root = Path(hest_data_dir)
+    candidates = sorted(
+        path for path in root.rglob(f"*{suffix}")
+        if required_path_part is None or required_path_part in path.parts
+    )
+    exact = [path for path in candidates if path.name == f"{sample_id}{suffix}"]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        raise ValueError(
+            f"Multiple exact {sample_id!r} {suffix} files found under {root}: "
+            + ", ".join(map(str, exact))
+        )
+
+    token = re.compile(
+        rf"(?<![A-Za-z0-9]){re.escape(str(sample_id))}(?![A-Za-z0-9])"
+    )
+    bounded = [path for path in candidates if token.search(path.stem)]
+    if len(bounded) == 1:
+        return bounded[0]
+    if len(bounded) > 1:
+        raise ValueError(
+            f"Ambiguous delimiter-bounded files for sample_id={sample_id!r} "
+            f"under {root}: " + ", ".join(map(str, bounded))
+        )
+
+    near = [path for path in candidates if str(sample_id) in path.stem]
+    detail = f" Prefix-only near matches: {', '.join(map(str, near[:10]))}" if near else ""
+    raise FileNotFoundError(
+        f"No unambiguous {suffix} file found for sample_id={sample_id!r} under {root}."
+        + detail
+    )
 
 
 def load_multi_slice(paths: list[str | Path], z_positions: list[float] | None = None
@@ -137,14 +187,11 @@ def load_hest_patches(hest_data_dir: str | Path, sample_id: str
     """
     import h5py
     hest_data_dir = Path(hest_data_dir)
-    matches = [m for m in hest_data_dir.rglob(f"*{sample_id}*.h5") if "patches" in m.parts]
-    if not matches:
-        raise FileNotFoundError(
-            f"No patches/{sample_id}.h5 file found under {hest_data_dir}. "
-            "Re-run the HEST-1k download command in docs/dataset_notes.md — "
-            "the same allow_patterns already covers this file."
-        )
-    with h5py.File(matches[0], "r") as f:
+    patch_path = _resolve_hest_sample_file(
+        hest_data_dir, sample_id, ".h5", required_path_part="patches"
+    )
+    print(f"load_hest_patches: resolved {sample_id} -> {patch_path}")
+    with h5py.File(patch_path, "r") as f:
         patches = f["img"][:]
         raw_barcodes = f["barcode"][:, 0]  # [N, 1] object array -> [N]
         barcodes = np.array([b.decode() if isinstance(b, bytes) else b for b in raw_barcodes])
@@ -156,10 +203,11 @@ def load_hest_patch_barcodes(hest_data_dir: str | Path, sample_id: str) -> np.nd
     """Read only patch barcodes without materializing the large image array."""
     import h5py
     hest_data_dir = Path(hest_data_dir)
-    matches = [m for m in hest_data_dir.rglob(f"*{sample_id}*.h5") if "patches" in m.parts]
-    if not matches:
-        raise FileNotFoundError(f"No patches/{sample_id}.h5 file found under {hest_data_dir}")
-    with h5py.File(matches[0], "r") as f:
+    patch_path = _resolve_hest_sample_file(
+        hest_data_dir, sample_id, ".h5", required_path_part="patches"
+    )
+    print(f"load_hest_patch_barcodes: resolved {sample_id} -> {patch_path}")
+    with h5py.File(patch_path, "r") as f:
         raw = f["barcode"][:, 0]
         return np.array([b.decode() if isinstance(b, bytes) else str(b) for b in raw])
 
@@ -229,13 +277,9 @@ def load_hest_sample(hest_data_dir: str | Path, sample_id: str,
     vocabulary just needs to be built to include "unknown" too, via
     build_organ_tech_vocab, if any sample omits these)."""
     hest_data_dir = Path(hest_data_dir)
-    matches = list(hest_data_dir.rglob(f"*{sample_id}*.h5ad"))
-    if not matches:
-        raise FileNotFoundError(
-            f"No .h5ad file found for sample_id={sample_id!r} under {hest_data_dir}. "
-            "Download it first via HEST-1k's download_hest (docs/dataset_notes.md)."
-        )
-    adata = ad.read_h5ad(matches[0])
+    sample_path = _resolve_hest_sample_file(hest_data_dir, sample_id, ".h5ad")
+    print(f"load_hest_sample: resolved {sample_id} -> {sample_path}")
+    adata = ad.read_h5ad(sample_path)
     # HEST-1k already uses the standard scanpy spatial convention
     # (adata.obsm['spatial']), so no coordinate remapping needed here.
     adata.obs["slice_id"] = sample_id

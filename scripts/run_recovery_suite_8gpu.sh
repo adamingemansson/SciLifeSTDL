@@ -554,6 +554,21 @@ case "$STAGE" in
     )
     SEEDS=(10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10)
     ;;
+  verified_exact_st)
+    CONFIGS=(
+      configs/recovery_suite/125_verified_exact_harmonic_k32.yaml
+      configs/recovery_suite/126_verified_exact_full_k32.yaml
+      configs/recovery_suite/127_verified_exact_gex_only_k32.yaml
+      configs/recovery_suite/128_verified_exact_neither_k32.yaml
+    )
+    NAMES=(
+      missing_tissue_verified_exact_harmonic_k32
+      missing_tissue_verified_exact_full_k32_seed10
+      missing_tissue_verified_exact_gex_only_k32_seed10
+      missing_tissue_verified_exact_neither_k32_seed10
+    )
+    SEEDS=(10 10 10 10)
+    ;;
   *)
     echo "ERROR: unknown recovery STAGE: $STAGE" >&2
     exit 2
@@ -615,7 +630,7 @@ for (( batch_start=0; batch_start<JOB_COUNT; batch_start+=GPU_COUNT )); do
     gpu="${GPU_IDS_ARR[$local_slot]}"
     checkpoint="results/checkpoints/recovery_suite/$name"
     metrics="$checkpoint/audit_test_metrics.json"
-    if [[ "$STAGE" == "wave6_heldout_tk" || "$STAGE" == "wave6_heldout_st" || "$STAGE" == "wave7_st_smoke" || "$STAGE" == "wave7_st_marathon" ]]; then
+    if [[ "$STAGE" == "wave6_heldout_tk" || "$STAGE" == "wave6_heldout_st" || "$STAGE" == "wave7_st_smoke" || "$STAGE" == "wave7_st_marathon" || "$STAGE" == "verified_exact_st" ]]; then
       metrics="$checkpoint/heldout_sample_summary.json"
     fi
     log="$LOG_ROOT/$name.log"
@@ -736,6 +751,8 @@ elif [[ "$STAGE" == "wave6_heldout_st" ]]; then
   collect_args+=(--experiment-prefix missing_tissue_wave6_st_heldout_)
 elif [[ "$STAGE" == "wave7_st_smoke" || "$STAGE" == "wave7_st_marathon" ]]; then
   collect_args+=(--experiment-prefix missing_tissue_wave7_st_)
+elif [[ "$STAGE" == "verified_exact_st" ]]; then
+  collect_args+=(--experiment-prefix missing_tissue_verified_exact_)
 fi
 "$PYTHON_BIN" scripts/collect_audit_results.py "${collect_args[@]}"
 

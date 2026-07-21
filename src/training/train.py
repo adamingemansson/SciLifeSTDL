@@ -13,6 +13,7 @@ Run with: python -m src.training.train --config configs/base_config.yaml
 """
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -1234,22 +1235,43 @@ def get_gigapath_features(cfg, patches: np.ndarray, barcodes: np.ndarray,
 
     sample_id: see _gigapath_cache_path's own docstring."""
     cache_path = _gigapath_cache_path(cfg, sample_id=sample_id)
+    # HEST Visium samples may reuse the same capture-array barcode strings.
+    # Barcode equality alone therefore cannot prove that a cache belongs to
+    # the selected H&E file. Hash the actual patch tensor so caches made by
+    # the historical INT1/INT10 prefix-resolution bug are rejected even when
+    # their barcode arrays happen to be identical.
+    patch_array = np.ascontiguousarray(patches)
+    digest = hashlib.sha256()
+    digest.update(str(patch_array.shape).encode("ascii"))
+    digest.update(str(patch_array.dtype).encode("ascii"))
+    digest.update(memoryview(patch_array).cast("B"))
+    patch_fingerprint = digest.hexdigest()
     if cache_path.exists():
         cached = np.load(cache_path)
-        if np.array_equal(cached["barcodes"], barcodes):
+        cached_fingerprint = (
+            str(cached["patch_fingerprint"].item())
+            if "patch_fingerprint" in cached.files else None
+        )
+        if (np.array_equal(cached["barcodes"], barcodes)
+                and cached_fingerprint == patch_fingerprint):
             print(f"get_gigapath_features: loaded cached features for "
                   f"{cached['features'].shape[0]} spots from {cache_path} "
                   f"(delete this file to force a recompute).")
             return cached["features"]
-        print(f"get_gigapath_features: cache at {cache_path} covers a different "
-              f"barcode set than the current patches file — recomputing.")
+        print(f"get_gigapath_features: cache at {cache_path} does not match "
+              f"the current patch tensor and barcode set — recomputing.")
     from src.models.conditioning import precompute_gigapath_features, _default_device
     print(f"Precomputing Gigapath features for {patches.shape[0]} spots on "
           f"{_default_device()} (one-time cost, cached to {cache_path} "
           f"so future runs skip this step)...")
     features = precompute_gigapath_features(patches)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_savez(cache_path, features=features, barcodes=barcodes)
+    _atomic_savez(
+        cache_path,
+        features=features,
+        barcodes=barcodes,
+        patch_fingerprint=np.asarray(patch_fingerprint),
+    )
     return features
 
 

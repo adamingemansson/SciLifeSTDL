@@ -16,7 +16,7 @@ import numpy as np
 import h5py
 import anndata as ad
 
-from src.data.loaders import load_hest_patches, align_patches_to_adata
+from src.data.loaders import load_hest_patches, load_hest_sample, align_patches_to_adata
 
 
 def test_load_and_align():
@@ -31,10 +31,17 @@ def test_load_and_align():
         img = rng.integers(0, 255, size=(n, 8, 8, 3), dtype=np.uint8)
         coords = rng.integers(0, 1000, size=(n, 2)).astype(np.int32)
 
-        with h5py.File(patches_dir / "TEST_INT1.h5", "w") as f:
+        with h5py.File(patches_dir / "INT1.h5", "w") as f:
             f.create_dataset("img", data=img)
             f.create_dataset("coords", data=coords)
             f.create_dataset("barcode", data=[[b.encode()] for b in barcodes])  # [N, 1], real shape
+
+        # Regression: the old substring lookup could select this file for
+        # sample_id=INT1 depending on filesystem traversal order.
+        with h5py.File(patches_dir / "INT10.h5", "w") as f:
+            f.create_dataset("img", data=np.zeros((3, 8, 8, 3), dtype=np.uint8))
+            f.create_dataset("coords", data=np.zeros((3, 2), dtype=np.int32))
+            f.create_dataset("barcode", data=[[f"wrong_{i}".encode()] for i in range(3)])
 
         loaded_patches, loaded_barcodes = load_hest_patches(tmp_dir, "INT1")
         assert loaded_patches.shape == (n, 8, 8, 3)
@@ -81,6 +88,22 @@ def test_load_and_align():
         print("[align_patches_to_adata] OK — raises when there is zero overlap")
 
 
+def test_exact_hest_expression_sample_resolution():
+    """INT1 must never resolve to the prefix-colliding INT10 sample."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "st"
+        root.mkdir()
+        intended = ad.AnnData(X=np.ones((2, 3), dtype=np.float32))
+        intended.obsm["spatial"] = np.zeros((2, 2), dtype=np.float32)
+        distractor = ad.AnnData(X=np.ones((7, 3), dtype=np.float32))
+        distractor.obsm["spatial"] = np.zeros((7, 2), dtype=np.float32)
+        intended.write_h5ad(root / "INT1.h5ad")
+        distractor.write_h5ad(root / "INT10.h5ad")
+
+        loaded = load_hest_sample(Path(tmp), "INT1")
+        assert loaded.n_obs == 2, "INT1 incorrectly resolved to prefix-colliding INT10"
+
+
 def test_downsample_patches():
     """_downsample_patches (src/training/train.py) — added 2026-07-15 as
     the real fix for CNN-branch training being far slower than expected:
@@ -115,5 +138,6 @@ def test_downsample_patches():
 
 if __name__ == "__main__":
     test_load_and_align()
+    test_exact_hest_expression_sample_resolution()
     test_downsample_patches()
     print("\nAll HEST-1k H&E patch loading smoke tests passed.")
