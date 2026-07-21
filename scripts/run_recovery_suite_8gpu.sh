@@ -407,6 +407,46 @@ case "$STAGE" in
     )
     SEEDS=(10 10 10 10)
     ;;
+  wave6_heldout_tk)
+    CONFIGS=(
+      configs/recovery_suite/84_wave6_tk_heldout_full_k128.yaml
+      configs/recovery_suite/85_wave6_tk_heldout_gex_only_k128.yaml
+      configs/recovery_suite/86_wave6_tk_heldout_he_only_k128.yaml
+      configs/recovery_suite/87_wave6_tk_heldout_neither_k128.yaml
+      configs/recovery_suite/88_wave6_tk_heldout_full_k16.yaml
+      configs/recovery_suite/89_wave6_tk_heldout_full_k32.yaml
+      configs/recovery_suite/90_wave6_tk_heldout_full_k64.yaml
+      configs/recovery_suite/91_wave6_tk_heldout_full_k128_no_spatial_bias.yaml
+      configs/recovery_suite/96_wave6_tk_heldout_harmonic_anchor_k128.yaml
+    )
+    NAMES=(
+      missing_tissue_wave6_tk_heldout_full_k128_seed10
+      missing_tissue_wave6_tk_heldout_gex_only_k128_seed10
+      missing_tissue_wave6_tk_heldout_he_only_k128_seed10
+      missing_tissue_wave6_tk_heldout_neither_k128_seed10
+      missing_tissue_wave6_tk_heldout_full_k16_seed10
+      missing_tissue_wave6_tk_heldout_full_k32_seed10
+      missing_tissue_wave6_tk_heldout_full_k64_seed10
+      missing_tissue_wave6_tk_heldout_full_k128_no_spatial_bias_seed10
+      missing_tissue_wave6_tk_heldout_harmonic_anchor_k128
+    )
+    SEEDS=(10 10 10 10 10 10 10 10 10)
+    ;;
+  wave6_heldout_st)
+    CONFIGS=(
+      configs/recovery_suite/92_wave6_st_heldout_full_k128.yaml
+      configs/recovery_suite/93_wave6_st_heldout_gex_only_k128.yaml
+      configs/recovery_suite/94_wave6_st_heldout_he_only_k128.yaml
+      configs/recovery_suite/95_wave6_st_heldout_neither_k128.yaml
+    )
+    NAMES=(
+      missing_tissue_wave6_st_heldout_full_k128_seed10
+      missing_tissue_wave6_st_heldout_gex_only_k128_seed10
+      missing_tissue_wave6_st_heldout_he_only_k128_seed10
+      missing_tissue_wave6_st_heldout_neither_k128_seed10
+    )
+    SEEDS=(10 10 10 10)
+    ;;
   *)
     echo "ERROR: unknown recovery STAGE: $STAGE" >&2
     exit 2
@@ -468,6 +508,9 @@ for (( batch_start=0; batch_start<JOB_COUNT; batch_start+=GPU_COUNT )); do
     gpu="${GPU_IDS_ARR[$local_slot]}"
     checkpoint="results/checkpoints/recovery_suite/$name"
     metrics="$checkpoint/audit_test_metrics.json"
+    if [[ "$STAGE" == "wave6_heldout_tk" || "$STAGE" == "wave6_heldout_st" ]]; then
+      metrics="$checkpoint/heldout_sample_summary.json"
+    fi
     log="$LOG_ROOT/$name.log"
 
     if [[ "$FRESH" != "1" && -f "$metrics" ]]; then
@@ -496,6 +539,7 @@ for (( batch_start=0; batch_start<JOB_COUNT; batch_start+=GPU_COUNT )); do
         "evaluation.n_test_masks=1"
         "evaluation.n_samples=1"
         "evaluation.mask_bank_path=results/mask_banks/recovery_suite/smoke_${name}.json"
+        "evaluation.mask_bank_dir=results/mask_banks/recovery_suite/smoke_${name}"
         "evaluation.training_mask_bank_path=results/mask_banks/training/recovery_suite/smoke_${name}.json"
       )
     fi
@@ -579,6 +623,10 @@ elif [[ "$STAGE" == "wave5_modalities_tk" ]]; then
   collect_args+=(--experiment-prefix missing_tissue_wave5_tk_)
 elif [[ "$STAGE" == "wave5_modalities_st" ]]; then
   collect_args+=(--experiment-prefix missing_tissue_wave5_st_)
+elif [[ "$STAGE" == "wave6_heldout_tk" ]]; then
+  collect_args+=(--experiment-prefix missing_tissue_wave6_tk_heldout_)
+elif [[ "$STAGE" == "wave6_heldout_st" ]]; then
+  collect_args+=(--experiment-prefix missing_tissue_wave6_st_heldout_)
 fi
 "$PYTHON_BIN" scripts/collect_audit_results.py "${collect_args[@]}"
 

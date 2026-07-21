@@ -76,12 +76,27 @@ def collect(
         heldout = experiment_dir / "heldout_sample_summary.json"
         if heldout.exists():
             payload = json.loads(heldout.read_text())
-            full = payload.get("full") or next(iter(payload.values()))
+            # Version 2 records the intervention contract and all headline
+            # metrics. Keep compatibility with older mode-at-top-level files.
+            modes = payload.get("image_modes", payload)
+            primary_mode = str(payload.get("primary_image_mode", "full"))
+            primary = modes.get(primary_mode) or next(iter(modes.values()))
             rows.append({
                 "experiment_name": experiment_dir.name,
-                "pcc": full.get("pcc_mean"),
-                "rmse": full.get("rmse_mean"),
-                "evaluation_scope": "heldout_samples",
+                "primary_image_mode": primary_mode,
+                "context_gex_mode": payload.get("context_gex_mode", "full"),
+                "modality_ablation": payload.get("modality_ablation", "both"),
+                "pcc": primary.get("pcc_mean"),
+                "rmse": primary.get("rmse_mean"),
+                "nonzero_auc": primary.get("nonzero_auc_mean"),
+                "st_fid": primary.get("st_fid_mean"),
+                "st_mmd": primary.get("st_mmd_mean"),
+                "spatial_domain_plausibility": primary.get("spatial_domain_plausibility_mean"),
+                "predictive_std": primary.get("predictive_std_mean"),
+                "interval90_coverage": primary.get("interval90_coverage_mean"),
+                "n_evaluated_genes": payload.get("n_evaluated_genes"),
+                "n_test_samples": len(payload.get("test_sample_ids", [])) or None,
+                "evaluation_scope": payload.get("evaluation_scope", "heldout_samples"),
             })
 
     fields = sorted({key for row in rows for key in row})

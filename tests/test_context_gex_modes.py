@@ -4,7 +4,11 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from src.training.train import _build_masked_item, _validate_task_contract
+from src.training.train import (
+    _build_masked_item,
+    _validate_task_contract,
+    _validated_sample_groups,
+)
 
 
 class _MaskingCfg:
@@ -103,3 +107,26 @@ def test_missing_tissue_modality_contract_accepts_only_matching_inputs(
     cfg.training.context_gex_mode = "zero" if gex_mode == "full" else "full"
     with pytest.raises(ValueError, match="context_gex_mode"):
         _validate_task_contract(cfg)
+
+
+def test_sample_holdout_contract_is_disjoint_and_complete():
+    cfg = OmegaConf.create(
+        {
+            "data": {
+                "holdout_unit": "sample",
+                "sample_ids": ["A", "B", "C", "D"],
+                "train_sample_ids": ["A", "B"],
+                "validation_sample_ids": ["C"],
+                "test_sample_ids": ["D"],
+            }
+        }
+    )
+    assert _validated_sample_groups(cfg) == (["A", "B"], ["C"], ["D"])
+
+    cfg.data.test_sample_ids = ["B"]
+    with pytest.raises(ValueError, match="overlap"):
+        _validated_sample_groups(cfg)
+
+    cfg.data.test_sample_ids = []
+    with pytest.raises(ValueError, match="non-empty"):
+        _validated_sample_groups(cfg)

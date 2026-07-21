@@ -56,18 +56,73 @@ def _primary_image_mode(cfg) -> str:
     return primary
 
 
+def _validated_sample_groups(cfg) -> tuple[list[str], list[str], list[str]]:
+    """Return disjoint train/validation/test sample IDs or fail closed.
+
+    Different mask seeds on one slide do not create an independent test set:
+    the same spot coordinates and expression targets recur across training.
+    The held-out-sample contract therefore partitions whole samples before
+    any model/data construction and rejects every overlap or undeclared ID.
+    """
+    data = cfg.get("data", {})
+    configured = [str(x) for x in data.get("sample_ids", [])]
+    train = [str(x) for x in data.get("train_sample_ids", configured)]
+    validation = [str(x) for x in data.get("validation_sample_ids", [])]
+    test = [str(x) for x in data.get("test_sample_ids", [])]
+
+    for label, values in (
+        ("data.sample_ids", configured),
+        ("data.train_sample_ids", train),
+        ("data.validation_sample_ids", validation),
+        ("data.test_sample_ids", test),
+    ):
+        if len(values) != len(set(values)):
+            raise ValueError(f"{label} contains duplicate sample IDs")
+
+    groups = {"train": set(train), "validation": set(validation), "test": set(test)}
+    overlaps = {
+        "train/validation": groups["train"] & groups["validation"],
+        "train/test": groups["train"] & groups["test"],
+        "validation/test": groups["validation"] & groups["test"],
+    }
+    bad = {name: sorted(values) for name, values in overlaps.items() if values}
+    if bad:
+        raise ValueError(f"sample holdout groups overlap: {bad}")
+
+    declared = groups["train"] | groups["validation"] | groups["test"]
+    unknown = declared - set(configured)
+    if configured and unknown:
+        raise ValueError(f"sample split references IDs absent from data.sample_ids: {sorted(unknown)}")
+
+    if str(data.get("holdout_unit", "")) == "sample":
+        if not configured:
+            raise ValueError("data.holdout_unit='sample' requires data.sample_ids")
+        if not train or not validation or not test:
+            raise ValueError(
+                "data.holdout_unit='sample' requires non-empty train, validation, and test groups"
+            )
+        unused = set(configured) - declared
+        if unused:
+            raise ValueError(f"data.sample_ids contains unassigned samples: {sorted(unused)}")
+    return train, validation, test
+
+
 def _validate_task_contract(cfg) -> None:
     """Fail before loading data when a named task contradicts its masks.
 
-    ``missing_tissue`` means that context spots retain both H&E and GEX,
-    while query spots inside the held-out region contain neither.  The
-    existing ``target_zero`` image mode implements exactly that contract.
+    ``missing_tissue`` always means query spots inside the held-out region
+    contain neither H&E nor GEX. Context spots normally retain both; explicit
+    modality ablations may remove one or both context modalities while query
+    coordinates remain available.
     """
     contract = str(cfg.get("data", {}).get("task_contract", "") or "")
     if not contract:
         return
     if contract != "missing_tissue":
         raise ValueError(f"unknown data.task_contract {contract!r}")
+
+    if cfg.get("data", {}).get("sample_ids") is not None:
+        _validated_sample_groups(cfg)
 
     training = cfg.get("training", {})
     evaluation = cfg.get("evaluation", {})
@@ -1932,9 +1987,7 @@ def _main_multi_sample(cfg) -> None:
     gene panel is established from training slides only; validation/test
     slides are aligned to it and are never drawn by the training Dataset.
     """
-    train_ids = list(cfg.data.get("train_sample_ids", cfg.data.get("sample_ids", [])))
-    validation_ids = list(cfg.data.get("validation_sample_ids", []))
-    test_ids = list(cfg.data.get("test_sample_ids", []))
+    train_ids, validation_ids, test_ids = _validated_sample_groups(cfg)
     if not train_ids:
         raise ValueError("multi-sample training requires data.train_sample_ids or data.sample_ids")
     # Establish the model vocabulary from training slides only. Validation
@@ -1948,14 +2001,14 @@ def _main_multi_sample(cfg) -> None:
         validation_samples, validation_adatas = load_multi_sample_data(
             cfg, sample_ids=validation_ids, reference_gene_names=gene_names
         )
-    test_samples, test_adatas = [], []
-    if test_ids:
-        test_samples, test_adatas = load_multi_sample_data(
-            cfg, sample_ids=test_ids, reference_gene_names=gene_names
-        )
-    all_ids = [*train_ids, *validation_ids, *test_ids]
-    samples = [*train_loaded_samples, *validation_samples, *test_samples]
-    adatas = [*train_adatas, *validation_adatas, *test_adatas]
+    # Do not even load final-test expression before optimization/model
+    # selection completes. It is unnecessary for construction: the gene
+    # vocabulary and scaling come only from training slides, while validation
+    # slides supply checkpoint selection. Test slides are loaded below only
+    # after the final trained state has been selected and saved.
+    all_ids = [*train_ids, *validation_ids]
+    samples = [*train_loaded_samples, *validation_samples]
+    adatas = [*train_adatas, *validation_adatas]
     by_id = {str(sid): (sample, adata) for sid, sample, adata in zip(all_ids, samples, adatas)}
     train_samples = [by_id[str(sid)][0] for sid in train_ids]
     fit_adatas = train_adatas
@@ -2125,9 +2178,16 @@ def _main_multi_sample(cfg) -> None:
 
     if test_ids:
         from src.evaluation.audit_evaluation import evaluate_model_on_mask_bank
+        test_samples, test_adatas = load_multi_sample_data(
+            cfg, sample_ids=test_ids, reference_gene_names=gene_names
+        )
+        test_by_id = {
+            str(sid): (sample, adata)
+            for sid, sample, adata in zip(test_ids, test_samples, test_adatas)
+        }
         test_results = {}
         for sid in test_ids:
-            sample, adata = by_id[str(sid)]
+            sample, adata = test_by_id[str(sid)]
             bank, bank_path = _sample_bank(str(sid), sample, adata)
             coords3d, expr, slice_ids, images, organ, tech = sample[:6]
             test_results[str(sid)] = evaluate_model_on_mask_bank(
@@ -2137,24 +2197,43 @@ def _main_multi_sample(cfg) -> None:
                 organ=organ, tech=tech,
             )
         aggregate = {}
+        aggregate_metrics = (
+            "pcc", "rmse", "nonzero_auc", "st_fid", "st_mmd",
+            "spatial_domain_plausibility", "predictive_std", "interval90_coverage",
+        )
         for mode in list(evaluation_cfg.get("image_modes", ["full"])):
             mode_rows = []
             for sid, result in test_results.items():
                 summary = result["image_modes"][str(mode)]["summary"]
-                mode_rows.append({
-                    "sample_id": sid,
-                    "pcc": summary["pcc"]["mean"],
-                    "rmse": summary["rmse"]["mean"],
-                })
-            aggregate[str(mode)] = {
-                "per_sample": mode_rows,
-                "pcc_mean": float(np.mean([r["pcc"] for r in mode_rows])),
-                "rmse_mean": float(np.mean([r["rmse"] for r in mode_rows])),
-            }
+                row = {"sample_id": sid}
+                for metric in aggregate_metrics:
+                    value = summary.get(metric, {})
+                    row[metric] = value.get("mean") if isinstance(value, dict) else None
+                mode_rows.append(row)
+            mode_summary = {"per_sample": mode_rows}
+            for metric in aggregate_metrics:
+                values = [
+                    float(row[metric]) for row in mode_rows
+                    if row.get(metric) is not None and np.isfinite(float(row[metric]))
+                ]
+                mode_summary[f"{metric}_mean"] = (
+                    float(np.mean(values)) if values else float("nan")
+                )
+            aggregate[str(mode)] = mode_summary
+        heldout_summary = {
+            "version": 2,
+            "evaluation_scope": "heldout_samples",
+            "primary_image_mode": _primary_image_mode(cfg),
+            "context_gex_mode": str(evaluation_cfg.get("context_gex_mode", "full")),
+            "modality_ablation": str(cfg.data.get("modality_ablation", "both")),
+            "n_evaluated_genes": len(gene_names),
+            "test_sample_ids": test_ids,
+            "image_modes": aggregate,
+        }
         (Path(checkpoint_dir) / "heldout_sample_summary.json").write_text(
-            json.dumps(aggregate, indent=2)
+            json.dumps(heldout_summary, indent=2)
         )
-        primary_mode = _primary_image_mode(cfg)
+        primary_mode = heldout_summary["primary_image_mode"]
         primary = aggregate[primary_mode]
         print(f"held-out-sample primary image mode: {primary_mode}")
         print(f"held-out-sample PCC: {primary['pcc_mean']:.4f}")
