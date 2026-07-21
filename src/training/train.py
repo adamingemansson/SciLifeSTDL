@@ -1668,6 +1668,15 @@ def inject_direct_regression_stats(model_cfg: dict, expressions: list[np.ndarray
         params.setdefault("target_gene_scale", scale.tolist())
 
 
+def inject_transport_gene_scale(model_cfg: dict, expressions: list[np.ndarray]) -> None:
+    """Inject train-only scaling for gene-preserving transport loss."""
+    if model_cfg.get("name") != "context_transport_regressor":
+        return
+    params = model_cfg.get("params", {})
+    if "target_gene_scale" not in params:
+        params["target_gene_scale"] = _pooled_gene_std(expressions).tolist()
+
+
 def inject_coord_scale(model_cfg: dict, coord_scale: float) -> None:
     """RandomFourierFeatures real-scale bug fix (2026-07-17 — see that
     class's own docstring in conditioning.py): auto-derive coord_scale
@@ -1683,7 +1692,7 @@ def inject_coord_scale(model_cfg: dict, coord_scale: float) -> None:
     params = model_cfg.get("params", {})
     context_model_names = {
         "wae_gan", "fm_ot", "vqvae_ar", "harmonic_residual", "residual_fm_ot",
-        "direct_context_regressor",
+        "direct_context_regressor", "context_transport_regressor",
     }
     if (model_cfg.get("name") in context_model_names
             and params.get("context_encoder_type", "builtin") in ("builtin", "storm_lite")
@@ -2151,6 +2160,7 @@ def _main_multi_sample(cfg) -> None:
         inject_expression_preprocessing(model_cfg, fit_adatas[0])
         inject_residual_gene_scale(model_cfg, [sample[1] for sample in train_samples])
         inject_direct_regression_stats(model_cfg, [sample[1] for sample in train_samples])
+        inject_transport_gene_scale(model_cfg, [sample[1] for sample in train_samples])
         if novae_dim is not None:
             if context_encoder_type == "stpath":
                 inject_stpath_novae_dim(model_cfg, novae_dim)
@@ -2415,6 +2425,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     inject_expression_preprocessing(model_cfg, adata)
     inject_residual_gene_scale(model_cfg, [expr])
     inject_direct_regression_stats(model_cfg, [expr])
+    inject_transport_gene_scale(model_cfg, [expr])
     inject_coord_scale(model_cfg, coord_scale)
     if novae_inputs["feature_dim"] is not None:
         if context_encoder_type == "stpath":
@@ -2444,6 +2455,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     inject_expression_preprocessing(unresolved_model_cfg, adata)
     inject_residual_gene_scale(unresolved_model_cfg, [expr])
     inject_direct_regression_stats(unresolved_model_cfg, [expr])
+    inject_transport_gene_scale(unresolved_model_cfg, [expr])
     inject_coord_scale(unresolved_model_cfg, coord_scale)
     if novae_inputs["feature_dim"] is not None:
         if context_encoder_type == "stpath":

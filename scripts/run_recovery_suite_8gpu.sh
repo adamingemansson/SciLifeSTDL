@@ -614,6 +614,21 @@ case "$STAGE" in
     )
     SEEDS=(10 10 10 10)
     ;;
+  transport)
+    CONFIGS=(
+      configs/recovery_suite/141_transport_uniform_k32.yaml
+      configs/recovery_suite/142_transport_geometry_k32.yaml
+      configs/recovery_suite/143_transport_gex_novae_k32.yaml
+      configs/recovery_suite/144_transport_full_mome_k32.yaml
+    )
+    NAMES=(
+      missing_tissue_transport_uniform_k32
+      missing_tissue_transport_geometry_k32_seed10
+      missing_tissue_transport_gex_novae_k32_seed10
+      missing_tissue_transport_full_mome_k32_seed10
+    )
+    SEEDS=(10 10 10 10)
+    ;;
   *)
     echo "ERROR: unknown recovery STAGE: $STAGE" >&2
     exit 2
@@ -675,7 +690,7 @@ for (( batch_start=0; batch_start<JOB_COUNT; batch_start+=GPU_COUNT )); do
     gpu="${GPU_IDS_ARR[$local_slot]}"
     checkpoint="results/checkpoints/recovery_suite/$name"
     metrics="$checkpoint/audit_test_metrics.json"
-    if [[ "$STAGE" == "wave6_heldout_tk" || "$STAGE" == "wave6_heldout_st" || "$STAGE" == "wave7_st_smoke" || "$STAGE" == "wave7_st_marathon" || "$STAGE" == "verified_exact_st" || "$STAGE" == "simple_local" || "$STAGE" == "local_transformer" || "$STAGE" == "direct_stormlite" ]]; then
+    if [[ "$STAGE" == "wave6_heldout_tk" || "$STAGE" == "wave6_heldout_st" || "$STAGE" == "wave7_st_smoke" || "$STAGE" == "wave7_st_marathon" || "$STAGE" == "verified_exact_st" || "$STAGE" == "simple_local" || "$STAGE" == "local_transformer" || "$STAGE" == "direct_stormlite" || "$STAGE" == "transport" ]]; then
       metrics="$checkpoint/heldout_sample_summary.json"
     fi
     log="$LOG_ROOT/$name.log"
@@ -804,6 +819,8 @@ elif [[ "$STAGE" == "local_transformer" ]]; then
   collect_args+=(--experiment-prefix missing_tissue_local_)
 elif [[ "$STAGE" == "direct_stormlite" ]]; then
   collect_args+=(--experiment-prefix missing_tissue_direct_)
+elif [[ "$STAGE" == "transport" ]]; then
+  collect_args+=(--experiment-prefix missing_tissue_transport_)
 fi
 "$PYTHON_BIN" scripts/collect_audit_results.py "${collect_args[@]}"
 

@@ -102,6 +102,93 @@ def test_direct_context_regressor_has_no_harmonic_prediction_path():
     assert context_grad > 0
 
 
+def test_uniform_context_transport_is_exact_gene_preserving_local_mean():
+    item = _item(n_context=8, n_query=3, n_genes=5)
+    model = build_model({
+        "name": "context_transport_regressor",
+        "params": {
+            "n_genes": 5,
+            "conditioning_mode": "uniform",
+            "transport_k": 4,
+            "target_gene_scale": [1.0] * 5,
+        },
+    })
+    out = model.sample(item["context"], item["query"])
+    distances = torch.cdist(
+        item["query"]["coords"][:, :2], item["context"]["coords"][:, :2]
+    )
+    expected_index = torch.topk(distances, k=4, largest=False, sorted=True).indices
+    expected = item["context"]["expression"][expected_index].mean(dim=1)
+    assert torch.equal(out["transport_neighbor_indices"], expected_index)
+    assert torch.allclose(out["transport_weights"].sum(dim=1), torch.ones(3))
+    assert torch.allclose(out["expression"], expected)
+    assert torch.allclose(out["anchor_expression"], expected)
+    assert torch.count_nonzero(out["residual_expression"]) == 0
+    assert not any(parameter.requires_grad for parameter in model.parameters())
+
+
+def test_learned_context_transport_is_convex_and_trainable():
+    item = _item(n_context=10, n_query=4, n_genes=6)
+    model = build_model({
+        "name": "context_transport_regressor",
+        "params": {
+            "n_genes": 6,
+            "conditioning_mode": "geometry",
+            "transport_k": 5,
+            "score_hidden_dim": 12,
+            "target_gene_scale": [0.01, 0.1, 0.2, 0.5, 1.0, 2.0],
+            "target_scale_floor": 0.05,
+        },
+    })
+    out = model.sample(item["context"], item["query"])
+    neighbours = item["context"]["expression"][out["transport_neighbor_indices"]]
+    assert torch.all(out["transport_weights"] >= 0)
+    assert torch.allclose(out["transport_weights"].sum(dim=1), torch.ones(4))
+    assert torch.all(out["expression"] >= neighbours.amin(dim=1) - 1e-6)
+    assert torch.all(out["expression"] <= neighbours.amax(dim=1) + 1e-6)
+    assert torch.allclose(
+        model.target_gene_scale, torch.tensor([0.05, 0.1, 0.2, 0.5, 1.0, 2.0])
+    )
+    assert not hasattr(model, "decoder")
+
+    # The transport geometry is based only on distance/kth-distance. Applying
+    # one shared translation, rotation and scale must not identify a slide or
+    # change the prediction.
+    angle = torch.tensor(0.73)
+    rotation = torch.stack([
+        torch.stack([torch.cos(angle), -torch.sin(angle)]),
+        torch.stack([torch.sin(angle), torch.cos(angle)]),
+    ])
+    transformed = {
+        "context": {
+            "coords": item["context"]["coords"].clone(),
+            "expression": item["context"]["expression"],
+        },
+        "query": {"coords": item["query"]["coords"].clone()},
+    }
+    transformed["context"]["coords"][:, :2] = (
+        item["context"]["coords"][:, :2] @ rotation.T * 7.0 + 123.0
+    )
+    transformed["query"]["coords"][:, :2] = (
+        item["query"]["coords"][:, :2] @ rotation.T * 7.0 + 123.0
+    )
+    transformed_out = model.sample(transformed["context"], transformed["query"])
+    assert torch.equal(
+        transformed_out["transport_neighbor_indices"], out["transport_neighbor_indices"]
+    )
+    assert torch.allclose(transformed_out["expression"], out["expression"], atol=1e-5)
+
+    loss = model.training_step(item, 0)
+    assert torch.isfinite(loss)
+    loss.backward()
+    scorer_grad = sum(
+        parameter.grad.norm()
+        for parameter in model.weight_scorer.parameters()
+        if parameter.grad is not None
+    )
+    assert scorer_grad > 0
+
+
 def test_residual_flow_loads_and_freezes_validated_autoencoder(tmp_path: Path):
     n_genes, latent, hidden = 6, 3, 7
     encoder = nn.Sequential(nn.Linear(n_genes, hidden), nn.ReLU(), nn.Linear(hidden, latent))

@@ -845,6 +845,208 @@ class DirectContextRegressor(BaseGenerativeModel):
         })
 
 
+@register_model("context_transport_regressor")
+class ContextTransportRegressor(BaseGenerativeModel):
+    """Transport observed per-gene values without a gene decoder.
+
+    The direct-regression diagnostic compresses a complete expression profile
+    into one latent vector and then asks a dense output head to reconstruct the
+    whole gene vocabulary.  That can discard gene identity.  This model keeps
+    the raw context expression matrix as the value path: it predicts one set of
+    normalized weights over the ``k`` nearest observed spots and applies those
+    same weights directly to every gene.
+
+    ``conditioning_mode='uniform'`` is a parameter-free local-mean baseline.
+    ``'geometry'`` learns a relative-coordinate kernel.  ``'storm_lite'`` lets
+    a Transformer or MoME representation of surrounding H&E/GEX/Novae modulate
+    that relative-coordinate kernel.  No mode computes harmonic interpolation,
+    sees query expression, or decodes genes from the context embedding.
+    """
+
+    def __init__(
+        self, n_genes: int, coord_dim: int = 3, cond_hidden_dim: int = 256,
+        score_hidden_dim: int = 128, transport_k: int = 32,
+        conditioning_mode: str = "geometry", lr: float = 3e-4,
+        context_encoder_type: str = "storm_lite",
+        image_encoder_type: str = "none", image_feat_dim: int = 64,
+        image_patch_size: int = 256, gene_encoder_type: str = "mlp",
+        gene_feat_dim: int = 256, novae_dim: int | None = None,
+        coord_scale: float = 1.0, storm_lite_n_layers: int = 2,
+        storm_lite_n_heads: int = 4, storm_lite_bias_type: str = "frame_averaging",
+        storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
+        storm_lite_knn_k: int | None = None, storm_lite_gnn_k: int = 8,
+        storm_lite_local_k: int = 32,
+        storm_lite_use_absolute_coords: bool = True,
+        storm_lite_input_already_log1p: bool = True,
+        target_gene_scale: list[float] | None = None,
+        target_scale_floor: float = 0.05,
+        organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
+    ):
+        super().__init__()
+        if conditioning_mode not in {"uniform", "geometry", "storm_lite"}:
+            raise ValueError(
+                "conditioning_mode must be 'uniform', 'geometry', or 'storm_lite'"
+            )
+        if transport_k < 1:
+            raise ValueError("transport_k must be positive")
+        if target_scale_floor <= 0:
+            raise ValueError("target_scale_floor must be positive")
+        self.save_hyperparameters()
+        self.conditioning_mode = conditioning_mode
+        self.transport_k = int(transport_k)
+        self.lr = float(lr)
+
+        scale = torch.ones(n_genes) if target_gene_scale is None else torch.as_tensor(
+            target_gene_scale, dtype=torch.float32
+        )
+        if scale.shape != (n_genes,):
+            raise ValueError(
+                f"target_gene_scale must have shape ({n_genes},), got {tuple(scale.shape)}"
+            )
+        if not torch.isfinite(scale).all():
+            raise ValueError("target_gene_scale contains non-finite values")
+        self.register_buffer("target_gene_scale", scale.clamp_min(float(target_scale_floor)))
+
+        self.context_encoder = None
+        self.geometry_encoder = None
+        self.condition_projection = None
+        self.weight_scorer = None
+        if conditioning_mode == "storm_lite":
+            if context_encoder_type != "storm_lite":
+                raise ValueError(
+                    "conditioning_mode='storm_lite' requires context_encoder_type='storm_lite'"
+                )
+            self.context_encoder = _build_context_encoder(
+                n_genes=n_genes, coord_dim=coord_dim, cond_hidden_dim=cond_hidden_dim,
+                context_encoder_type=context_encoder_type,
+                image_encoder_type=image_encoder_type, image_feat_dim=image_feat_dim,
+                image_patch_size=image_patch_size, gene_encoder_type=gene_encoder_type,
+                gene_feat_dim=gene_feat_dim, novae_dim=novae_dim, coord_scale=coord_scale,
+                storm_lite_n_layers=storm_lite_n_layers,
+                storm_lite_n_heads=storm_lite_n_heads,
+                storm_lite_bias_type=storm_lite_bias_type,
+                storm_lite_fusion_mode=storm_lite_fusion_mode,
+                storm_lite_qk_norm=storm_lite_qk_norm,
+                storm_lite_knn_k=storm_lite_knn_k,
+                storm_lite_gnn_k=storm_lite_gnn_k,
+                storm_lite_local_k=storm_lite_local_k,
+                storm_lite_use_absolute_coords=storm_lite_use_absolute_coords,
+                storm_lite_input_already_log1p=storm_lite_input_already_log1p,
+                organ_vocab=organ_vocab, tech_vocab=tech_vocab,
+            )
+            self.condition_projection = nn.Sequential(
+                nn.LayerNorm(cond_hidden_dim),
+                nn.Linear(cond_hidden_dim, score_hidden_dim),
+            )
+
+        if conditioning_mode != "uniform":
+            # Keep geometry on its own path. In particular, LayerNorm(1)
+            # would map every scalar distance to zero and silently destroy the
+            # geometry-only control.
+            self.geometry_encoder = nn.Sequential(
+                nn.Linear(1, score_hidden_dim),
+                nn.GELU(),
+            )
+            self.weight_scorer = nn.Sequential(
+                nn.LayerNorm(score_hidden_dim),
+                nn.GELU(),
+                nn.Linear(score_hidden_dim, 1),
+            )
+            # Start close to the transparent local-mean anchor while retaining
+            # a nonzero gradient path into the conditioner from update one.
+            nn.init.normal_(self.weight_scorer[-1].weight, mean=0.0, std=1e-2)
+            nn.init.zeros_(self.weight_scorer[-1].bias)
+
+    def _neighbors(self, context, query):
+        context_coords = context["coords"]
+        query_coords = query["coords"]
+        if context_coords.shape[0] < 1 or query_coords.shape[0] < 1:
+            raise ValueError("context transport requires non-empty context and query sets")
+        distances = torch.cdist(query_coords[:, :2], context_coords[:, :2])
+        k = min(self.transport_k, context_coords.shape[0])
+        nearest_distance, nearest_index = torch.topk(
+            distances, k=k, dim=-1, largest=False, sorted=True
+        )
+        local_scale = nearest_distance[:, -1:].clamp_min(1e-6)
+        # Distance/kth-distance is translation, rotation, reflection and
+        # global-scale invariant. Do not reintroduce the absolute-coordinate
+        # shortcut that the matched StormLite configs explicitly disable.
+        geometry = (nearest_distance / local_scale)[..., None]
+        neighbour_expression = context["expression"][nearest_index]
+        return nearest_index, neighbour_expression, geometry
+
+    def sample(self, context, query):
+        nearest_index, neighbour_expression, geometry = self._neighbors(context, query)
+        uniform_weights = torch.full(
+            geometry.shape[:2], 1.0 / geometry.shape[1],
+            device=geometry.device, dtype=geometry.dtype,
+        )
+        if self.conditioning_mode == "uniform":
+            weights = uniform_weights
+        else:
+            score_hidden = self.geometry_encoder(geometry)
+            if self.conditioning_mode == "storm_lite":
+                condition = self._encode_context(context, query)
+                score_hidden = score_hidden + self.condition_projection(condition)[:, None, :]
+            logits = self.weight_scorer(score_hidden).squeeze(-1)
+            weights = torch.softmax(logits, dim=-1)
+
+        expression = torch.sum(weights[..., None] * neighbour_expression, dim=1)
+        local_mean = torch.sum(uniform_weights[..., None] * neighbour_expression, dim=1)
+        return {
+            "coords": query["coords"],
+            "expression": expression,
+            "anchor_expression": local_mean,
+            "residual_expression": expression - local_mean,
+            "transport_weights": weights,
+            "transport_neighbor_indices": nearest_index,
+        }
+
+    def training_step(self, batch, batch_idx):
+        out = self.sample(batch["context"], batch["query"])
+        target = batch["target_expression"]
+        standardized_error = (out["expression"] - target) / self.target_gene_scale
+        loss = standardized_error.square().mean()
+        absolute_mse = nn.functional.mse_loss(out["expression"], target)
+        anchor_mse = nn.functional.mse_loss(out["anchor_expression"], target)
+        correction_rms = out["residual_expression"].square().mean().sqrt()
+        entropy = -(
+            out["transport_weights"]
+            * out["transport_weights"].clamp_min(1e-12).log()
+        ).sum(dim=-1).mean()
+        self.log_dict({
+            "train/loss": loss,
+            "train/absolute_mse": absolute_mse,
+            "train/local_mean_mse": anchor_mse,
+            "train/transport_delta_rms": correction_rms,
+            "train/transport_entropy": entropy,
+        })
+        return loss
+
+    def configure_optimizers(self):
+        parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
+        if not parameters:
+            return None
+        return torch.optim.AdamW(parameters, lr=self.lr)
+
+    def on_after_backward(self) -> None:
+        conditioner_sq = torch.zeros((), device=self.device)
+        if self.context_encoder is not None:
+            for parameter in self.context_encoder.parameters():
+                if parameter.grad is not None:
+                    conditioner_sq = conditioner_sq + parameter.grad.detach().square().sum()
+        scorer_sq = torch.zeros((), device=self.device)
+        for module in (self.geometry_encoder, self.condition_projection, self.weight_scorer):
+            if module is not None:
+                for parameter in module.parameters():
+                    if parameter.grad is not None:
+                        scorer_sq = scorer_sq + parameter.grad.detach().square().sum()
+        self.log_dict({
+            "train/conditioner_grad_norm": conditioner_sq.sqrt(),
+            "train/transport_scorer_grad_norm": scorer_sq.sqrt(),
+        })
+
+
 # ---------------------------------------------------------------------------
 # VAE baseline. Unconditioned placeholder — see docs/architecture_plan.md
 # "Known gaps" for the conditioning encoder this still needs.
