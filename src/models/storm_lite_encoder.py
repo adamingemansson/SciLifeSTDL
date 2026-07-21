@@ -124,6 +124,18 @@ def _knn_additive_mask(coords: torch.Tensor, k: int) -> torch.Tensor:
     return mask
 
 
+def _mome_knn_additive_mask(coords: torch.Tensor, k: int) -> torch.Tensor:
+    """Local mask for MoME's ``[all image, all gene]`` token layout.
+
+    A direct k-NN search over duplicated coordinates keeps an arbitrary mix of
+    the two tied modality tokens and therefore covers only about ``k / 2``
+    unique spots.  Build k-NN over unique spots first and expose both modality
+    tokens for every retained spot.
+    """
+    spot_mask = _knn_additive_mask(coords, k)
+    return spot_mask.repeat(2, 2)
+
+
 
 
 def _knn_edge_index(coords: torch.Tensor, k: int, chunk_size: int = 1024) -> torch.Tensor:
@@ -372,6 +384,7 @@ class StormLiteContextEncoder(nn.Module):
                  bias_type: str = "frame_averaging", relative_bias_hidden_dim: int = 32,
                  fusion_mode: str = "sum", qk_norm: bool = False,
                  knn_k: int | None = None, gnn_k: int = 8, local_k: int = 32,
+                 use_absolute_coords: bool = True,
                  input_already_log1p: bool = True,
                  organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None):
         super().__init__()
@@ -391,6 +404,7 @@ class StormLiteContextEncoder(nn.Module):
         assert knn_k is None or knn_k >= 1, f"knn_k must be >= 1 or None, got {knn_k!r}"
         self.knn_k = knn_k
         self.fusion_mode = fusion_mode
+        self.use_absolute_coords = bool(use_absolute_coords)
         self.gene_encoder_type = gene_encoder_type
         # input_already_log1p (2026-07-19, real audit finding — see
         # _encode_gene): basic_qc_and_normalize (src/data/loaders.py)
@@ -500,7 +514,7 @@ class StormLiteContextEncoder(nn.Module):
         # — safe as a per-call-shared FIXED value here since this class
         # calls coord_encoder ONCE on context+query coords concatenated
         # together (unlike SpatialContextEncoder's separate calls).
-        if fusion_mode != "local_pool":
+        if fusion_mode != "local_pool" and self.use_absolute_coords:
             self.coord_encoder = RandomFourierFeatures(coord_dim, rff_features, rff_sigma, coord_scale)
             self.coord_proj = nn.Linear(2 * rff_features, hidden_dim)
 
@@ -527,7 +541,7 @@ class StormLiteContextEncoder(nn.Module):
         # in BOTH fusion_mode paths below.
         self.img_norm = nn.LayerNorm(hidden_dim)
         self.gene_norm = nn.LayerNorm(hidden_dim)
-        if fusion_mode != "local_pool":
+        if fusion_mode != "local_pool" and self.use_absolute_coords:
             self.coord_norm = nn.LayerNorm(hidden_dim)
 
         self.hidden_dim = hidden_dim
@@ -706,7 +720,15 @@ class StormLiteContextEncoder(nn.Module):
             return self.local_output_proj(pooled)
 
         coords = torch.cat([context_coords, query_coords], dim=0)
-        coord_embed = self.coord_norm(self.coord_proj(self.coord_encoder(coords)))
+        if self.use_absolute_coords:
+            coord_embed = self.coord_norm(self.coord_proj(self.coord_encoder(coords)))
+        else:
+            # Geometry still enters through frame/relative attention bias and
+            # the k-NN mask.  Removing absolute RFF coordinates prevents slide
+            # identity/coordinate origin from becoming an unintended shortcut.
+            coord_embed = torch.zeros(
+                n_total, self.hidden_dim, device=device, dtype=context_expression.dtype
+            )
 
         context_img = self.image_encoder(context_images)
         query_img = self.image_encoder(query_images)
@@ -793,8 +815,7 @@ class StormLiteContextEncoder(nn.Module):
                 coords_doubled = torch.cat([coords, coords], dim=0)
                 bias = self.pos_bias(coords_doubled)
             if self.knn_k is not None:
-                coords_doubled_knn = coords_doubled if self.pos_bias is not None else torch.cat([coords, coords], dim=0)
-                knn_mask = _knn_additive_mask(coords_doubled_knn, self.knn_k)
+                knn_mask = _mome_knn_additive_mask(coords, self.knn_k)
                 bias = knn_mask if bias is None else bias + knn_mask
             for block in self.mome_blocks:
                 tokens = block(tokens, is_image_token, attn_mask=bias)

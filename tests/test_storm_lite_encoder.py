@@ -13,7 +13,8 @@ Run with:
 import torch
 
 from src.models.storm_lite_encoder import (
-    StormLiteContextEncoder, _MoMETransformerBlock, _knn_additive_mask, _knn_adjacency,
+    StormLiteContextEncoder, _MoMETransformerBlock, _knn_additive_mask,
+    _mome_knn_additive_mask, _knn_adjacency,
 )
 from src.models.conditioning import _GIGAPATH_FEAT_DIM, RelativePositionBias
 
@@ -399,6 +400,28 @@ def test_local_pool_ignores_query_images_and_absolute_coordinate_frame():
             context_images, None,
         )
     assert torch.allclose(reference, transformed, atol=2e-5, rtol=2e-5)
+
+
+def test_mome_knn_mask_keeps_both_modalities_for_each_neighbor_spot():
+    coords = torch.tensor([[0.0, 0.0], [1.0, 0.0], [5.0, 0.0]])
+    mask = _mome_knn_additive_mask(coords, k=2)
+    assert mask.shape == (6, 6)
+    # Image and gene query tokens for spot 0 both see image+gene tokens for
+    # spots 0 and 1, rather than an arbitrary two tokens among tied copies.
+    expected = {0, 1, 3, 4}
+    for query_token in (0, 3):
+        assert set(torch.isfinite(mask[query_token]).nonzero().flatten().tolist()) == expected
+
+
+def test_transformer_can_disable_absolute_coordinate_embeddings():
+    encoder = StormLiteContextEncoder(
+        n_genes=8, hidden_dim=16, gene_encoder_type="mlp", fusion_mode="sum",
+        n_transformer_layers=1, n_heads=4, bias_type="frame_averaging",
+        knn_k=4, use_absolute_coords=False,
+    )
+    assert not hasattr(encoder, "coord_encoder")
+    assert not hasattr(encoder, "coord_proj")
+    assert not hasattr(encoder, "coord_norm")
 
 
 def test_storm_lite_fusion_mode_gnn_differs_from_sum_and_mome():
