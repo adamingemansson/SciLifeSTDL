@@ -5,6 +5,7 @@ experiment_name: recovery_wave3_stormlite_control_cap3000
 data:
   source: hest1k
   hest_data_dir: data/raw/hest1k
+  hest_cache_dir: data/cache/hest1k
   sample_id: INT1
   task: intra_slice
   min_genes: 200
@@ -83,7 +84,7 @@ evaluation:
   validation_image_mode: full
   k_neighborhood: 8
   pca_n_components: 50
-  training_mask_bank_path: results/mask_banks/training/recovery_suite/fixed_novae_64_seed700000.json
+  training_mask_bank_path: results/mask_banks/training/recovery_suite/wave3_stormlite_cap3000_30k_seed700000.json
 logging:
   backend: csv
   project: st3d-lundeberg-lab
