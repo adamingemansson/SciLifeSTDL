@@ -1,16 +1,32 @@
 #!/usr/bin/env bash
 # Staged recovery/ablation runner. The legacy filename is retained for
-# compatibility, but server policy now enforces four GPUs and bounded CPU use.
+# compatibility. The default shared-server profile enforces GPUs 0-3; the
+# explicit dedicated8 profile is only for a separate machine allocated in full.
 set -Eeuo pipefail
 
 STAGE="${STAGE:-repair}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 GPU_IDS_CSV="${GPU_IDS:-0,1,2,3}"
 IFS=',' read -r -a GPU_IDS_ARR <<< "$GPU_IDS_CSV"
-if [[ "$GPU_IDS_CSV" != "0,1,2,3" ]]; then
-  echo "ERROR: server allocation is fixed to GPU_IDS=0,1,2,3." >&2
-  exit 2
-fi
+SERVER_PROFILE="${SERVER_PROFILE:-shared4}"
+case "$SERVER_PROFILE" in
+  shared4)
+    if [[ "$GPU_IDS_CSV" != "0,1,2,3" ]]; then
+      echo "ERROR: shared4 allocation is fixed to GPU_IDS=0,1,2,3." >&2
+      exit 2
+    fi
+    ;;
+  dedicated8)
+    if [[ "$GPU_IDS_CSV" != "0,1,2,3,4,5,6,7" ]]; then
+      echo "ERROR: dedicated8 requires GPU_IDS=0,1,2,3,4,5,6,7." >&2
+      exit 2
+    fi
+    ;;
+  *)
+    echo "ERROR: SERVER_PROFILE must be shared4 or dedicated8." >&2
+    exit 2
+    ;;
+esac
 GPU_COUNT="${#GPU_IDS_ARR[@]}"
 
 CPU_THREADS_PER_JOB="${CPU_THREADS_PER_JOB:-4}"
@@ -157,8 +173,31 @@ case "$STAGE" in
     )
     SEEDS=(1 2 0 12 10 10 10 11)
     ;;
+  component40k)
+    CONFIGS=(
+      configs/recovery_suite/20_component40k_warmup_only.yaml
+      configs/recovery_suite/21_component40k_adaln_only.yaml
+      configs/recovery_suite/22_component40k_coord_augment_only.yaml
+      configs/recovery_suite/23_component40k_logit_time_only.yaml
+      configs/recovery_suite/24_component40k_minibatch_ot_only.yaml
+      configs/recovery_suite/25_component40k_lower_lr_only.yaml
+      configs/recovery_suite/26_component40k_boundary_only.yaml
+      configs/recovery_suite/27_component40k_logit_ot_pair.yaml
+    )
+    NAMES=(
+      recovery_component40k_warmup_only_seed10
+      recovery_component40k_adaln_only_seed10
+      recovery_component40k_coord_augment_only_seed10
+      recovery_component40k_logit_time_only_seed10
+      recovery_component40k_minibatch_ot_only_seed10
+      recovery_component40k_lower_lr_only_seed10
+      recovery_component40k_boundary_only_seed10
+      recovery_component40k_logit_ot_pair_seed10
+    )
+    SEEDS=(10 10 10 10 10 10 10 10)
+    ;;
   *)
-    echo "ERROR: STAGE must be repair, controls, ablations or wave3" >&2
+    echo "ERROR: STAGE must be repair, controls, ablations, wave3 or component40k" >&2
     exit 2
     ;;
 esac
@@ -172,7 +211,7 @@ fi
 
 # All context-only Novae jobs consume the same immutable 64-mask schedule.
 # Populate it once before concurrent readers start. The cache is reused safely.
-if [[ "$SMOKETEST" != "1" ]] && [[ "$STAGE" == "repair" || "$STAGE" == "controls" || "$STAGE" == "ablations" || "$STAGE" == "wave3" ]]; then
+if [[ "$SMOKETEST" != "1" ]] && [[ "$STAGE" == "repair" || "$STAGE" == "controls" || "$STAGE" == "ablations" || "$STAGE" == "wave3" || "$STAGE" == "component40k" ]]; then
   echo "Precomputing/reusing the shared context-only Novae mask cache on $GPU_COUNT GPUs..."
   precompute_pids=()
   for slot in "${!GPU_IDS_ARR[@]}"; do

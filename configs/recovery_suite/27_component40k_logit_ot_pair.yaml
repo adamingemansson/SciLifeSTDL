@@ -1,0 +1,92 @@
+# Full 40k interaction: logit-normal time plus minibatch OT, retaining Euler.
+experiment_name: recovery_component40k_logit_ot_pair
+data:
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  hest_cache_dir: data/cache/hest1k
+  sample_id: INT1
+  task: intra_slice
+  min_genes: 200
+  min_cells: 3
+  expression_transform: normalize_log1p
+  expression_target_sum: 10000.0
+  novae_mode: context_only
+  require_image_coverage: true
+  use_images: true
+masking:
+  strategy: random_dropout_patches
+  max_context_points: 3000
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+model:
+  name: fm_ot
+  params:
+    coord_dim: 3
+    cond_hidden_dim: 256
+    latent_dim: 32
+    ae_hidden_dim: 256
+    hidden_dim: 512
+    time_embed_dim: 64
+    n_ode_steps: 50
+    path_type: ot
+    fm_time_sampling: logit_normal
+    fm_coupling: minibatch_ot
+    ode_solver: euler
+    velocity_net_type: mlp
+    recon_weight: 1.0
+    fm_weight: 1.0
+    lr: 0.001
+    warmup_steps: 0
+    decoder_type: panel_invariant
+    decoder_gene_embed_dim: 256
+    decoder_combine_mode: add
+    decoder_mlp_depth: 2
+    context_encoder_type: storm_lite
+    gene_encoder_type: both
+    storm_lite_fusion_mode: mome
+    storm_lite_n_layers: 2
+    storm_lite_n_heads: 4
+    storm_lite_qk_norm: false
+    storm_lite_bias_type: frame_averaging
+training:
+  epochs: 40000
+  seed: 10
+  mask_seed: 700000
+  unique_mask_count: 64
+  ema_decay: 0.999
+  log_every_n_steps: 10
+  log_print_every_n_steps: 1000
+  checkpoint_every_n_steps: 10000
+  num_workers: 0
+  augment_coords: false
+  image_mode: full
+  query_image_dropout_p: 0.0
+  all_image_dropout_p: 0.0
+  gradient_clip_val: 1.0
+  checkpoint_dir: results/checkpoints/recovery_suite/recovery_component40k_logit_ot_pair
+validation:
+  enabled: true
+  every_n_steps: 1000
+  patience_checks: 1000
+  early_stopping_min_steps: 10000
+  min_delta: 0.0001
+  metric: rmse
+  n_samples: 4
+  sampling_seed: 800000
+evaluation:
+  mask_bank_path: results/mask_banks/recovery_suite/INT1_recovery_3000.json
+  n_validation_masks: 4
+  n_test_masks: 8
+  validation_seed: 700000
+  test_seed: 900000
+  sampling_seed: 1200000
+  n_samples: 20
+  image_modes: [full, target_zero, all_zero, shuffled]
+  validation_image_mode: full
+  k_neighborhood: 8
+  pca_n_components: 50
+  training_mask_bank_path: results/mask_banks/training/recovery_suite/fixed_novae_64_seed700000.json
+logging:
+  backend: csv
+  project: st3d-lundeberg-lab
