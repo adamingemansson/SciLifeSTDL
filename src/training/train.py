@@ -69,22 +69,59 @@ def _validate_task_contract(cfg) -> None:
     if contract != "missing_tissue":
         raise ValueError(f"unknown data.task_contract {contract!r}")
 
-    training_mode = str(cfg.get("training", {}).get("image_mode", "full"))
+    training = cfg.get("training", {})
+    evaluation = cfg.get("evaluation", {})
+    ablation = str(cfg.get("data", {}).get("modality_ablation", "both"))
+    expected = {
+        # Every variant still withholds query H&E.  The names describe only
+        # which modalities remain visible in the observed context.
+        "both": ("target_zero", "full"),
+        "gex_only": ("all_zero", "full"),
+        "he_only": ("target_zero", "zero"),
+        "neither": ("all_zero", "zero"),
+        # Training-time modality dropout starts from the complete, valid
+        # missing-tissue input and independently drops context H&E/GEX.
+        "dropout": ("target_zero", "full"),
+    }
+    if ablation not in expected:
+        raise ValueError(
+            f"unknown data.modality_ablation {ablation!r}; expected one of {sorted(expected)}"
+        )
+    expected_image_mode, expected_gex_mode = expected[ablation]
+
+    training_mode = str(training.get("image_mode", "full"))
     validation_mode = str(
-        cfg.get("evaluation", {}).get("validation_image_mode", "full")
+        evaluation.get("validation_image_mode", "full")
     )
     primary_mode = _primary_image_mode(cfg)
+    training_gex_mode = str(training.get("context_gex_mode", "full"))
+    evaluation_gex_mode = str(evaluation.get("context_gex_mode", "full"))
     violations = []
-    if training_mode != "target_zero":
+    if training_mode != expected_image_mode:
         violations.append(f"training.image_mode={training_mode!r}")
-    if validation_mode != "target_zero":
+    if validation_mode != expected_image_mode:
         violations.append(f"evaluation.validation_image_mode={validation_mode!r}")
-    if primary_mode != "target_zero":
+    if primary_mode != expected_image_mode:
         violations.append(f"evaluation.primary_image_mode={primary_mode!r}")
+    if training_gex_mode != expected_gex_mode:
+        violations.append(f"training.context_gex_mode={training_gex_mode!r}")
+    if evaluation_gex_mode != expected_gex_mode:
+        violations.append(f"evaluation.context_gex_mode={evaluation_gex_mode!r}")
+    gex_dropout = float(training.get("context_gex_dropout_p", 0.0))
+    image_dropout = float(training.get("all_image_dropout_p", 0.0))
+    if ablation == "dropout":
+        if not (0.0 < gex_dropout < 1.0):
+            violations.append(f"training.context_gex_dropout_p={gex_dropout!r}")
+        if not (0.0 < image_dropout < 1.0):
+            violations.append(f"training.all_image_dropout_p={image_dropout!r}")
+    elif gex_dropout != 0.0:
+        violations.append(f"training.context_gex_dropout_p={gex_dropout!r}")
     if violations:
         raise ValueError(
-            "data.task_contract='missing_tissue' requires target_zero for "
-            "training, validation, and primary evaluation; got " + ", ".join(violations)
+            "data.task_contract='missing_tissue' with "
+            f"data.modality_ablation={ablation!r} requires context modalities "
+            f"image_mode={expected_image_mode!r}, context_gex_mode={expected_gex_mode!r}; got "
+            + ", ".join(violations)
         )
 
 
@@ -658,6 +695,8 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
                         image_mode: str = "full",
                         query_image_dropout_p: float = 0.0,
                         all_image_dropout_p: float = 0.0,
+                        context_gex_mode: str = "full",
+                        context_gex_dropout_p: float = 0.0,
                         fixed_context_mask: np.ndarray | None = None,
                         fixed_query_mask: np.ndarray | None = None) -> dict:
     """One {context, query, target_expression} training item for a SINGLE
@@ -715,7 +754,17 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
     "which sample" in MultiSampleMaskedContextQueryDataset) so the three
     random choices this pipeline can make per item never correlate through
     a shared seed. False (default) leaves coords3d byte-identical to the
-    original, unaugmented behavior."""
+    original, unaugmented behavior.
+
+    context_gex_mode is the explicit modality intervention used by the
+    missing-tissue ablations. ``zero`` removes BOTH raw context expression
+    and the context-only Novae channel. Zeroing only one would leave the same
+    biological signal available through the other and make an alleged
+    H&E-only result invalid. ``shuffled`` applies one shared row permutation
+    to both GEX-derived channels, preserving their pairing while breaking
+    their association with tissue coordinates. context_gex_dropout_p drops
+    the complete context-GEX modality for a training item and is independent
+    of image dropout."""
     if fixed_context_mask is not None or fixed_query_mask is not None:
         if fixed_context_mask is None or fixed_query_mask is None:
             raise ValueError("fixed_context_mask and fixed_query_mask must be provided together")
@@ -749,6 +798,41 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
         context["novae_features"] = torch.tensor(
             context_novae_features[context_mask], dtype=torch.float32
         )
+
+    context_gex_mode = str(context_gex_mode).lower()
+    if context_gex_mode not in {"full", "zero", "shuffled"}:
+        raise ValueError(
+            "context_gex_mode must be 'full', 'zero', or 'shuffled', "
+            f"got {context_gex_mode!r}"
+        )
+    context_gex_dropout_p = float(context_gex_dropout_p)
+    if not 0.0 <= context_gex_dropout_p <= 1.0:
+        raise ValueError(
+            "context_gex_dropout_p must be in [0, 1], "
+            f"got {context_gex_dropout_p}"
+        )
+    drop_context_gex = (
+        context_gex_mode == "zero"
+        or (
+            context_gex_dropout_p > 0.0
+            and np.random.default_rng(seed + 3).random() < context_gex_dropout_p
+        )
+    )
+    gex_keys = [key for key in ("expression", "novae_features") if key in context]
+    if drop_context_gex:
+        for key in gex_keys:
+            context[key] = torch.zeros_like(context[key])
+    elif context_gex_mode == "shuffled" and context["expression"].shape[0] > 1:
+        permutation = torch.as_tensor(
+            np.random.default_rng(seed + 4).permutation(context["expression"].shape[0]),
+            dtype=torch.long,
+        )
+        for key in gex_keys:
+            if context[key].shape[0] != permutation.numel():
+                raise ValueError(
+                    f"context {key} row count does not match expression for shared GEX shuffle"
+                )
+            context[key] = context[key][permutation]
     query = {"coords": torch.tensor(coords3d[query_mask], dtype=torch.float32)}
     if images is not None:
         c_img, q_img, c_available, q_available = _prepare_images_for_split(
@@ -785,6 +869,8 @@ class MaskedContextQueryDataset(Dataset):
                  image_mode: str = "full",
                  query_image_dropout_p: float = 0.0,
                  all_image_dropout_p: float = 0.0,
+                 context_gex_mode: str = "full",
+                 context_gex_dropout_p: float = 0.0,
                  seed_schedule: list[int] | None = None):
         self.coords3d = coords3d
         self.expr = expr
@@ -816,6 +902,8 @@ class MaskedContextQueryDataset(Dataset):
         self.image_mode = image_mode
         self.query_image_dropout_p = float(query_image_dropout_p)
         self.all_image_dropout_p = float(all_image_dropout_p)
+        self.context_gex_mode = str(context_gex_mode)
+        self.context_gex_dropout_p = float(context_gex_dropout_p)
         # whole-sample metadata (2026-07-16, multi-sample follow-up) — see
         # _build_masked_item's organ/tech docstring
         self.organ = organ
@@ -840,6 +928,8 @@ class MaskedContextQueryDataset(Dataset):
             image_mode=self.image_mode,
             query_image_dropout_p=self.query_image_dropout_p,
             all_image_dropout_p=self.all_image_dropout_p,
+            context_gex_mode=self.context_gex_mode,
+            context_gex_dropout_p=self.context_gex_dropout_p,
         )
 
 
@@ -894,6 +984,7 @@ class MultiSampleMaskedContextQueryDataset(Dataset):
     def __init__(self, samples: list[tuple], masking_cfg, n_items: int, base_seed: int = 0,
                  augment: bool = False, image_mode: str = "full",
                  query_image_dropout_p: float = 0.0, all_image_dropout_p: float = 0.0,
+                 context_gex_mode: str = "full", context_gex_dropout_p: float = 0.0,
                  seed_schedule: list[int] | None = None):
         assert samples, "samples must be non-empty"
         self.samples = samples
@@ -905,6 +996,8 @@ class MultiSampleMaskedContextQueryDataset(Dataset):
         self.image_mode = image_mode
         self.query_image_dropout_p = float(query_image_dropout_p)
         self.all_image_dropout_p = float(all_image_dropout_p)
+        self.context_gex_mode = str(context_gex_mode)
+        self.context_gex_dropout_p = float(context_gex_dropout_p)
 
     def __len__(self):
         return self.n_items
@@ -935,6 +1028,8 @@ class MultiSampleMaskedContextQueryDataset(Dataset):
             image_mode=self.image_mode,
             query_image_dropout_p=self.query_image_dropout_p,
             all_image_dropout_p=self.all_image_dropout_p,
+            context_gex_mode=self.context_gex_mode,
+            context_gex_dropout_p=self.context_gex_dropout_p,
         )
 
 
@@ -1226,7 +1321,9 @@ def _training_seed_bank_for_config(cfg, obs_names) -> tuple[dict, Path]:
 
 def _fixed_items_from_bank(cfg, adata, coords3d, expr, slice_ids, images, bank, split,
                            novae_inputs: dict, organ=None, tech=None) -> list[dict]:
-    image_mode = str(cfg.get("evaluation", {}).get("validation_image_mode", "full"))
+    evaluation = cfg.get("evaluation", {})
+    image_mode = str(evaluation.get("validation_image_mode", "full"))
+    context_gex_mode = str(evaluation.get("context_gex_mode", "full"))
     items = []
     for record in split_records(bank, split):
         context_mask, query_mask = record_masks(record, adata.obs_names)
@@ -1237,6 +1334,7 @@ def _fixed_items_from_bank(cfg, adata, coords3d, expr, slice_ids, images, bank, 
             context_gene_feature_provider=novae_inputs.get("context_gene_feature_provider"),
             context_novae_feature_provider=novae_inputs.get("context_novae_feature_provider"),
             organ=organ, tech=tech, augment=False, image_mode=image_mode,
+            context_gex_mode=context_gex_mode,
             fixed_context_mask=context_mask, fixed_query_mask=query_mask,
         ))
     return items
@@ -1971,6 +2069,7 @@ def _main_multi_sample(cfg) -> None:
                     coords3d, expr, slice_ids, cfg.masking, images, int(record["seed"]),
                     **ni, organ=organ, tech=tech, augment=False,
                     image_mode=str(evaluation_cfg.get("validation_image_mode", "full")),
+                    context_gex_mode=str(evaluation_cfg.get("context_gex_mode", "full")),
                     fixed_context_mask=context_mask, fixed_query_mask=query_mask,
                 ))
         validation_callback = FixedMaskValidationCallback(
@@ -1999,6 +2098,8 @@ def _main_multi_sample(cfg) -> None:
             image_mode=str(cfg.training.get("image_mode", "full")),
             query_image_dropout_p=float(cfg.training.get("query_image_dropout_p", 0.0)),
             all_image_dropout_p=float(cfg.training.get("all_image_dropout_p", 0.0)),
+            context_gex_mode=str(cfg.training.get("context_gex_mode", "full")),
+            context_gex_dropout_p=float(cfg.training.get("context_gex_dropout_p", 0.0)),
             seed_schedule=training_bank["seeds"],
         )
         trainer = pl.Trainer(
@@ -2179,6 +2280,8 @@ def main(cfg_path: str, overrides: list[str] | None = None):
             image_mode=str(cfg.training.get("image_mode", "full")),
             query_image_dropout_p=float(cfg.training.get("query_image_dropout_p", 0.0)),
             all_image_dropout_p=float(cfg.training.get("all_image_dropout_p", 0.0)),
+            context_gex_mode=str(cfg.training.get("context_gex_mode", "full")),
+            context_gex_dropout_p=float(cfg.training.get("context_gex_dropout_p", 0.0)),
             seed_schedule=training_bank["seeds"],
         )
         dataloader = make_dataloader(dataset, cfg)

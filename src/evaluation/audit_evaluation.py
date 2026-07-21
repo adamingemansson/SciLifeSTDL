@@ -175,6 +175,7 @@ def evaluate_model_on_mask_bank(
     sampling_seed = int(evaluation.get("sampling_seed", 1_200_000))
     image_modes = list(evaluation.get("image_modes", ["full", "target_zero", "all_zero", "shuffled"]))
     primary_image_mode = str(evaluation.get("primary_image_mode", "full"))
+    context_gex_mode = str(evaluation.get("context_gex_mode", "full"))
     if primary_image_mode not in {str(mode) for mode in image_modes}:
         raise ValueError(
             f"evaluation.primary_image_mode={primary_image_mode!r} is not present in "
@@ -211,6 +212,8 @@ def evaluate_model_on_mask_bank(
         "effective_pca_components": effective_pca,
         "n_evaluated_genes": int(metric_expr.shape[1]),
         "primary_image_mode": primary_image_mode,
+        "context_gex_mode": context_gex_mode,
+        "modality_ablation": str(cfg.get("data", {}).get("modality_ablation", "both")),
         "image_modes": {},
         "spatial_domain_label_source": domain_label_source,
         "metric_notes": {
@@ -229,6 +232,11 @@ def evaluate_model_on_mask_bank(
             if partial.get("signature") == signature and isinstance(partial.get("result"), dict):
                 result = partial["result"]
                 result.setdefault("primary_image_mode", primary_image_mode)
+                result.setdefault("context_gex_mode", context_gex_mode)
+                result.setdefault(
+                    "modality_ablation",
+                    str(cfg.get("data", {}).get("modality_ablation", "both")),
+                )
                 completed = sum(
                     len(mode.get("per_mask", []))
                     for mode in result.get("image_modes", {}).values()
@@ -290,6 +298,7 @@ def evaluate_model_on_mask_bank(
                 context_gene_feature_provider=novae_inputs.get("context_gene_feature_provider"),
                 context_novae_feature_provider=novae_inputs.get("context_novae_feature_provider"),
                 organ=organ, tech=tech, augment=False, image_mode=str(image_mode),
+                context_gex_mode=context_gex_mode,
                 fixed_context_mask=context_mask, fixed_query_mask=query_mask,
             )
             item_device = move_to_device(item, model_device)

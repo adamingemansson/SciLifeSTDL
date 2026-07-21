@@ -31,6 +31,8 @@ def _primary_summary(metrics: dict) -> dict:
     return {
         "experiment_name": metrics.get("experiment_name"),
         "primary_image_mode": primary_mode,
+        "context_gex_mode": metrics.get("context_gex_mode", "full"),
+        "modality_ablation": metrics.get("modality_ablation", "both"),
         "pcc": mean("pcc"),
         "rmse": mean("rmse"),
         "nonzero_auc": mean("nonzero_auc"),

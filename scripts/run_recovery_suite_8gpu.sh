@@ -369,8 +369,46 @@ case "$STAGE" in
     )
     SEEDS=(10 10 10 10 10 10 10 10)
     ;;
+  wave5_modalities_tk)
+    CONFIGS=(
+      configs/recovery_suite/72_wave5_tk_gex_only.yaml
+      configs/recovery_suite/73_wave5_tk_he_only.yaml
+      configs/recovery_suite/74_wave5_tk_neither.yaml
+      configs/recovery_suite/75_wave5_tk_modality_dropout.yaml
+      configs/recovery_suite/76_wave5_tk_k128_mlp_only.yaml
+      configs/recovery_suite/77_wave5_tk_k128_novae_only.yaml
+      configs/recovery_suite/78_wave5_tk_k128_no_spatial_bias.yaml
+      configs/recovery_suite/79_wave5_tk_harmonic_anchor_k128.yaml
+    )
+    NAMES=(
+      missing_tissue_wave5_tk_gex_only_seed10
+      missing_tissue_wave5_tk_he_only_seed10
+      missing_tissue_wave5_tk_neither_seed10
+      missing_tissue_wave5_tk_modality_dropout_seed10
+      missing_tissue_wave5_tk_k128_mlp_only_seed10
+      missing_tissue_wave5_tk_k128_novae_only_seed10
+      missing_tissue_wave5_tk_k128_no_spatial_bias_seed10
+      missing_tissue_wave5_tk_harmonic_anchor_k128
+    )
+    SEEDS=(10 10 10 10 10 10 10 10)
+    ;;
+  wave5_modalities_st)
+    CONFIGS=(
+      configs/recovery_suite/80_wave5_st_full.yaml
+      configs/recovery_suite/81_wave5_st_gex_only.yaml
+      configs/recovery_suite/82_wave5_st_he_only.yaml
+      configs/recovery_suite/83_wave5_st_neither.yaml
+    )
+    NAMES=(
+      missing_tissue_wave5_st_full_seed10
+      missing_tissue_wave5_st_gex_only_seed10
+      missing_tissue_wave5_st_he_only_seed10
+      missing_tissue_wave5_st_neither_seed10
+    )
+    SEEDS=(10 10 10 10)
+    ;;
   *)
-    echo "ERROR: STAGE must be repair, controls, ablations, wave3, component40k, missing_tissue, missing_tissue_controls, wave4_hr, wave4_fm, wave4b_hr, wave4c_controls or wave4d_hr" >&2
+    echo "ERROR: unknown recovery STAGE: $STAGE" >&2
     exit 2
     ;;
 esac
@@ -384,7 +422,7 @@ fi
 
 # All context-only Novae jobs consume the same immutable 64-mask schedule.
 # Populate it once before concurrent readers start. The cache is reused safely.
-if [[ "$SMOKETEST" != "1" ]] && [[ "$STAGE" == "repair" || "$STAGE" == "controls" || "$STAGE" == "ablations" || "$STAGE" == "wave3" || "$STAGE" == "component40k" || "$STAGE" == "missing_tissue" || "$STAGE" == "missing_tissue_controls" || "$STAGE" == "wave4_hr" || "$STAGE" == "wave4_fm" || "$STAGE" == "wave4b_hr" || "$STAGE" == "wave4c_controls" || "$STAGE" == "wave4d_hr" ]]; then
+if [[ "$SMOKETEST" != "1" ]] && [[ "$STAGE" == "repair" || "$STAGE" == "controls" || "$STAGE" == "ablations" || "$STAGE" == "wave3" || "$STAGE" == "component40k" || "$STAGE" == "missing_tissue" || "$STAGE" == "missing_tissue_controls" || "$STAGE" == "wave4_hr" || "$STAGE" == "wave4_fm" || "$STAGE" == "wave4b_hr" || "$STAGE" == "wave4c_controls" || "$STAGE" == "wave4d_hr" || "$STAGE" == "wave5_modalities_tk" || "$STAGE" == "wave5_modalities_st" ]]; then
   echo "Precomputing/reusing the shared context-only Novae mask cache on $GPU_COUNT GPUs..."
   precompute_pids=()
   for slot in "${!GPU_IDS_ARR[@]}"; do
@@ -537,6 +575,10 @@ elif [[ "$STAGE" == "wave4c_controls" ]]; then
   collect_args+=(--experiment-prefix missing_tissue_wave4c_)
 elif [[ "$STAGE" == "wave4d_hr" ]]; then
   collect_args+=(--experiment-prefix missing_tissue_wave4d_hr_)
+elif [[ "$STAGE" == "wave5_modalities_tk" ]]; then
+  collect_args+=(--experiment-prefix missing_tissue_wave5_tk_)
+elif [[ "$STAGE" == "wave5_modalities_st" ]]; then
+  collect_args+=(--experiment-prefix missing_tissue_wave5_st_)
 fi
 "$PYTHON_BIN" scripts/collect_audit_results.py "${collect_args[@]}"
 
