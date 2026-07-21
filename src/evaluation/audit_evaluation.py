@@ -1,7 +1,9 @@
 """Reproducible mask-bank evaluation for missing-tissue experiments."""
 from __future__ import annotations
 
+import hashlib
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,66 @@ from src.data.mask_bank import record_masks, split_records
 from src.evaluation import metrics as ev
 from src.evaluation.run_comparison import _fid_n_components
 from src.training.validation import move_to_device, predictive_samples
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_config(value: Any) -> Any:
+    """Convert OmegaConf/plain config values into stable JSON data."""
+    try:
+        from omegaconf import OmegaConf
+        if OmegaConf.is_config(value):
+            return OmegaConf.to_container(value, resolve=True)
+    except Exception:
+        pass
+    return value
+
+
+def _resume_signature(cfg, records: list[dict], output_path: Path) -> dict | None:
+    """Fingerprint everything required to safely reuse partial audit rows.
+
+    A saved trainable-weights file is mandatory. Without it, two distinct
+    in-memory models could share the same config/output path and stale rows
+    would be indistinguishable, so resumption fails closed.
+    """
+    checkpoint_dir = cfg.get("training", {}).get("checkpoint_dir")
+    if not checkpoint_dir:
+        return None
+    weights_path = Path(str(checkpoint_dir)) / "trainable_weights.pt"
+    if not weights_path.is_file():
+        return None
+    mask_payload = json.dumps(records, sort_keys=True, separators=(",", ":"), default=str)
+    config_payload = json.dumps(
+        {
+            "data": _canonical_config(cfg.get("data", {})),
+            "masking": _canonical_config(cfg.get("masking", {})),
+            "model": _canonical_config(cfg.get("model", {})),
+            "evaluation": _canonical_config(cfg.get("evaluation", {})),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return {
+        "version": 1,
+        "output_name": output_path.name,
+        "weights_sha256": _sha256_file(weights_path),
+        "mask_records_sha256": hashlib.sha256(mask_payload.encode()).hexdigest(),
+        "config_sha256": hashlib.sha256(config_payload.encode()).hexdigest(),
+    }
+
+
+def _atomic_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, allow_nan=True))
+    tmp.replace(path)
 
 
 def _target_for_model(model, target: torch.Tensor) -> torch.Tensor:
@@ -102,6 +164,9 @@ def evaluate_model_on_mask_bank(
     """
     from src.training.train import _build_masked_item
 
+    output_path = Path(output_path)
+    partial_path = output_path.with_suffix(output_path.suffix + ".partial")
+    evaluation_started = time.monotonic()
     evaluation = cfg.get("evaluation", {})
     records = split_records(bank, "test")
     if not records:
@@ -111,6 +176,13 @@ def evaluate_model_on_mask_bank(
     image_modes = list(evaluation.get("image_modes", ["full", "target_zero", "all_zero", "shuffled"]))
     k = int(evaluation.get("k_neighborhood", 8))
     requested_pca = int(evaluation.get("pca_n_components", 50))
+    total_cells = len(records) * len(image_modes)
+    total_draws = total_cells * n_samples
+    print(
+        f"audit evaluation started: {len(records)} masks x {len(image_modes)} image modes "
+        f"x {n_samples} samples = {total_draws} stochastic draws",
+        flush=True,
+    )
     decoder_idx = getattr(model, "_decoder_target_col_idx", None)
     if decoder_idx is None:
         metric_expr = expr
@@ -142,6 +214,34 @@ def evaluate_model_on_mask_bank(
         },
     }
 
+    signature = _resume_signature(cfg, records, output_path)
+    if signature is not None and partial_path.is_file():
+        try:
+            partial = json.loads(partial_path.read_text())
+            if partial.get("signature") == signature and isinstance(partial.get("result"), dict):
+                result = partial["result"]
+                completed = sum(
+                    len(mode.get("per_mask", []))
+                    for mode in result.get("image_modes", {}).values()
+                )
+                print(
+                    f"audit evaluation resuming {completed}/{total_cells} completed mask-mode cells "
+                    f"from {partial_path}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"audit evaluation ignoring stale partial file with a different signature: "
+                    f"{partial_path}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                f"audit evaluation ignoring unreadable partial file {partial_path}: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
     domain_classifiers = {}
     if domain_labels is not None:
         from src.evaluation.cell_type_classifier import SpatialDomainPlausibilityClassifier
@@ -156,8 +256,23 @@ def evaluate_model_on_mask_bank(
                 print(f"spatial-domain classifier fit failed for mask {record['index']}: {exc}")
 
     for mode_index, image_mode in enumerate(image_modes):
-        per_mask = []
+        mode_key = str(image_mode)
+        existing_mode = result.get("image_modes", {}).get(mode_key, {})
+        per_mask = list(existing_mode.get("per_mask", []))
+        completed_keys = {
+            (int(row["mask_index"]), int(row["seed"]))
+            for row in per_mask
+            if "mask_index" in row and "seed" in row
+        }
+        print(
+            f"audit evaluation mode {mode_index + 1}/{len(image_modes)}: {mode_key} "
+            f"({len(completed_keys)}/{len(records)} masks already complete)",
+            flush=True,
+        )
         for i, record in enumerate(records):
+            record_key = (int(record["index"]), int(record["seed"]))
+            if record_key in completed_keys:
+                continue
             context_mask, query_mask = record_masks(record, adata.obs_names)
             item = _build_masked_item(
                 coords3d, expr, slice_ids, cfg.masking, images, int(record["seed"]),
@@ -222,15 +337,39 @@ def evaluate_model_on_mask_bank(
             else:
                 row["spatial_domain_plausibility"] = float("nan")
             per_mask.append(row)
+            completed_keys.add(record_key)
 
-        result["image_modes"][str(image_mode)] = {
+            result.setdefault("image_modes", {})[mode_key] = {
+                "summary": _mean_and_std(per_mask),
+                "per_mask": per_mask,
+            }
+            if signature is not None:
+                _atomic_json(
+                    partial_path,
+                    {"signature": signature, "result": result},
+                )
+            completed_cells = sum(
+                len(mode.get("per_mask", []))
+                for mode in result.get("image_modes", {}).values()
+            )
+            elapsed = time.monotonic() - evaluation_started
+            print(
+                f"audit evaluation progress: {completed_cells}/{total_cells} cells; "
+                f"mode={mode_key} mask={i + 1}/{len(records)} "
+                f"pcc={row['pcc']:.4f} rmse={row['rmse']:.4f} elapsed={elapsed / 60:.1f}m",
+                flush=True,
+            )
+
+        result["image_modes"][mode_key] = {
             "summary": _mean_and_std(per_mask),
             "per_mask": per_mask,
         }
 
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = output_path.with_suffix(output_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(result, indent=2, allow_nan=True))
-    tmp.replace(output_path)
+    _atomic_json(output_path, result)
+    try:
+        partial_path.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"audit evaluation warning: could not remove {partial_path}: {exc}", flush=True)
+    elapsed = time.monotonic() - evaluation_started
+    print(f"audit evaluation complete in {elapsed / 60:.1f}m: {output_path}", flush=True)
     return result

@@ -9,6 +9,7 @@ Run with: python -m tests.test_fm_ot
 import torch
 
 from src.models.registry import FlowMatchingOT
+from src.training.validation import predictive_samples
 
 
 def _make_batch(n_context, n_query, n_genes, coord_dim):
@@ -31,6 +32,40 @@ def test_sample():
     assert out["expression"].shape == (20, 50), out["expression"].shape
     assert torch.isfinite(out["expression"]).all()
     print(f"[sample] OK — output shape {tuple(out['expression'].shape)}")
+
+
+def test_predictive_sampling_reuses_flow_conditioning_without_changing_draws():
+    torch.manual_seed(0)
+    model = FlowMatchingOT(
+        n_genes=12, coord_dim=3, cond_hidden_dim=16,
+        hidden_dim=32, time_embed_dim=8, n_ode_steps=2,
+    ).eval()
+    batch = _make_batch(n_context=10, n_query=4, n_genes=12, coord_dim=3)
+
+    # Reproduce predictive_samples' old one-shot loop under the same isolated
+    # RNG seed. The cached path must be numerically identical in eval mode.
+    with torch.random.fork_rng():
+        torch.manual_seed(123)
+        expected = torch.stack([
+            model.sample(batch["context"], batch["query"])["expression"]
+            for _ in range(3)
+        ])
+
+    encode_calls = 0
+    original_encode = model._encode_context
+
+    def counted_encode(context, query):
+        nonlocal encode_calls
+        encode_calls += 1
+        return original_encode(context, query)
+
+    model._encode_context = counted_encode
+    actual = predictive_samples(
+        model, batch["context"], batch["query"], n_samples=3, seed=123
+    )
+
+    assert encode_calls == 1
+    assert torch.equal(actual, expected)
 
 
 def test_training_step_updates_weights():

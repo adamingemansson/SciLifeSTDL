@@ -1369,9 +1369,25 @@ class FlowMatchingOT(BaseGenerativeModel):
             return self.decoder(h, gene_names=self._decoder_gene_names, tech=tech)
         return self.decoder(h, tech=tech)
 
-    def sample(self, context, query):
+    def prepare_sampling_conditioning(self, context, query) -> dict:
+        """Encode deterministic context once for repeated stochastic draws.
+
+        Audit evaluation and fixed-mask validation draw many flow samples for
+        the same context/query item.  Re-running a large frozen conditioner
+        (especially STPath) for every noise draw is mathematically redundant
+        in eval mode and was the reason final evaluation appeared to hang.
+        The returned object deliberately retains context/query as well as the
+        encoded tensor so subclasses such as ResidualFlowMatchingOT can reuse
+        their deterministic anchor without changing their public output.
+        """
+        return {
+            "context": context,
+            "query": query,
+            "conditioning": self._encode_context(context, query),
+        }
+
+    def _sample_from_conditioning(self, c: torch.Tensor, query: dict) -> dict:
         n = query["coords"].shape[0]
-        c = self._encode_context(context, query)
 
         if self.path_type == "ot":
             z = torch.randn(n, self.latent_dim, device=self.device)
@@ -1415,6 +1431,18 @@ class FlowMatchingOT(BaseGenerativeModel):
 
         expr_gen = self._decode(torch.cat([z, c], dim=-1), tech=query.get("tech"))
         return {"coords": query["coords"], "expression": expr_gen}
+
+    def sample_from_prepared_conditioning(self, prepared: dict) -> dict:
+        """Draw once from a value returned by prepare_sampling_conditioning."""
+        return self._sample_from_conditioning(
+            prepared["conditioning"], prepared["query"]
+        )
+
+    def sample(self, context, query):
+        # Preserve the public one-shot API. Repeated evaluation calls use the
+        # explicit prepare/sample_from_prepared pair through predictive_samples.
+        c = self._encode_context(context, query)
+        return self._sample_from_conditioning(c, query)
 
     def training_step(self, batch, batch_idx):
         context, query = batch["context"], batch["query"]
@@ -1594,13 +1622,22 @@ class ResidualFlowMatchingOT(FlowMatchingOT):
         base = self.pretrained_ae_decoder(h[:, :self.latent_dim])
         return base + conditional
 
-    def sample(self, context, query):
-        residual = super().sample(context, query)
-        anchor = self._harmonic_anchor(context, query)
+    def prepare_sampling_conditioning(self, context, query) -> dict:
+        prepared = super().prepare_sampling_conditioning(context, query)
+        prepared["anchor"] = self._harmonic_anchor(context, query)
+        return prepared
+
+    def sample_from_prepared_conditioning(self, prepared: dict) -> dict:
+        residual = super().sample_from_prepared_conditioning(prepared)
+        anchor = prepared["anchor"]
         residual_expression = residual["expression"]
         expression = anchor + residual_expression
-        return {"coords": query["coords"], "expression": expression,
+        return {"coords": prepared["query"]["coords"], "expression": expression,
                 "anchor_expression": anchor, "residual_expression": residual_expression}
+
+    def sample(self, context, query):
+        prepared = self.prepare_sampling_conditioning(context, query)
+        return self.sample_from_prepared_conditioning(prepared)
 
     def training_step(self, batch, batch_idx):
         context, query = batch["context"], batch["query"]

@@ -24,15 +24,28 @@ def move_to_device(value: Any, device: torch.device):
 
 def predictive_samples(model, context: dict, query: dict, n_samples: int,
                        seed: int = 0) -> torch.Tensor:
-    """Return ``[S, N, G]`` samples with deterministic RNG isolation."""
+    """Return ``[S, N, G]`` samples with deterministic RNG isolation.
+
+    Models may expose ``prepare_sampling_conditioning`` and
+    ``sample_from_prepared_conditioning`` to cache deterministic conditioning
+    across draws.  FlowMatchingOT uses this to avoid running STPath/StormLite
+    once per Monte-Carlo sample.  The fast path is eval-only: callers that
+    intentionally sample while the model is in training mode retain the old
+    one-shot behavior, including any stochastic conditioner layers.
+    """
     outputs = []
     devices = [model.device] if model.device.type == "cuda" else []
     with torch.random.fork_rng(devices=devices):
         torch.manual_seed(int(seed))
         if model.device.type == "cuda":
             torch.cuda.manual_seed_all(int(seed))
+        prepare = getattr(model, "prepare_sampling_conditioning", None)
+        sample_prepared = getattr(model, "sample_from_prepared_conditioning", None)
+        use_prepared = not model.training and callable(prepare) and callable(sample_prepared)
+        prepared = prepare(context, query) if use_prepared else None
         for _ in range(max(1, int(n_samples))):
-            outputs.append(model.sample(context, query)["expression"])
+            output = sample_prepared(prepared) if use_prepared else model.sample(context, query)
+            outputs.append(output["expression"])
     return torch.stack(outputs, dim=0)
 
 

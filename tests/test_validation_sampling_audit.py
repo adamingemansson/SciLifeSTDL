@@ -1,7 +1,7 @@
 import torch
 import pytest
 
-from src.training.validation import FixedMaskValidationCallback
+from src.training.validation import FixedMaskValidationCallback, predictive_samples
 
 
 class _StochasticModel(torch.nn.Module):
@@ -18,6 +18,37 @@ class _StochasticModel(torch.nn.Module):
         return {"expression": torch.randn(n, 2, device=self.device) + self.anchor}
 
 
+class _PreparedStochasticModel(torch.nn.Module):
+    """Tiny model exercising the optional cached-conditioning protocol."""
+
+    def __init__(self):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.tensor(2.0))
+        self.prepare_calls = 0
+        self.prepared_sample_calls = 0
+        self.one_shot_calls = 0
+
+    @property
+    def device(self):
+        return self.anchor.device
+
+    def prepare_sampling_conditioning(self, context, query):
+        self.prepare_calls += 1
+        return {"n": query["coords"].shape[0], "offset": self.anchor}
+
+    def sample_from_prepared_conditioning(self, prepared):
+        self.prepared_sample_calls += 1
+        return {
+            "expression": torch.randn(prepared["n"], 2, device=self.device)
+            + prepared["offset"]
+        }
+
+    def sample(self, context, query):
+        self.one_shot_calls += 1
+        n = query["coords"].shape[0]
+        return {"expression": torch.randn(n, 2, device=self.device) + self.anchor}
+
+
 def test_fixed_validation_uses_identical_monte_carlo_draws_across_steps():
     item = {
         "context": {"coords": torch.zeros(3, 3), "expression": torch.zeros(3, 2)},
@@ -29,6 +60,33 @@ def test_fixed_validation_uses_identical_monte_carlo_draws_across_steps():
     first = callback._score(model, step=100)
     second = callback._score(model, step=200)
     assert first == second
+
+
+def test_predictive_samples_prepares_eval_conditioning_once():
+    model = _PreparedStochasticModel().eval()
+    context = {"coords": torch.zeros(3, 3)}
+    query = {"coords": torch.zeros(4, 3)}
+
+    first = predictive_samples(model, context, query, n_samples=5, seed=123)
+    second = predictive_samples(model, context, query, n_samples=5, seed=123)
+
+    assert first.shape == (5, 4, 2)
+    assert torch.equal(first, second)
+    assert model.prepare_calls == 2  # once per predictive_samples invocation
+    assert model.prepared_sample_calls == 10
+    assert model.one_shot_calls == 0
+
+
+def test_predictive_samples_does_not_cache_in_training_mode():
+    model = _PreparedStochasticModel().train()
+    context = {"coords": torch.zeros(3, 3)}
+    query = {"coords": torch.zeros(4, 3)}
+
+    predictive_samples(model, context, query, n_samples=3, seed=123)
+
+    assert model.prepare_calls == 0
+    assert model.prepared_sample_calls == 0
+    assert model.one_shot_calls == 3
 
 
 def test_early_stopping_patience_does_not_accumulate_before_min_steps():
