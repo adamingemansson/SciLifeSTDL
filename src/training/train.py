@@ -43,6 +43,51 @@ from src.models.registry import build_model
 from src.evaluation import metrics as ev
 
 
+def _primary_image_mode(cfg) -> str:
+    """Return the image condition that defines the task's headline metrics."""
+    evaluation = cfg.get("evaluation", {})
+    modes = [str(mode) for mode in evaluation.get("image_modes", ["full"])]
+    primary = str(evaluation.get("primary_image_mode", "full"))
+    if primary not in modes:
+        raise ValueError(
+            f"evaluation.primary_image_mode={primary!r} is not present in "
+            f"evaluation.image_modes={modes!r}"
+        )
+    return primary
+
+
+def _validate_task_contract(cfg) -> None:
+    """Fail before loading data when a named task contradicts its masks.
+
+    ``missing_tissue`` means that context spots retain both H&E and GEX,
+    while query spots inside the held-out region contain neither.  The
+    existing ``target_zero`` image mode implements exactly that contract.
+    """
+    contract = str(cfg.get("data", {}).get("task_contract", "") or "")
+    if not contract:
+        return
+    if contract != "missing_tissue":
+        raise ValueError(f"unknown data.task_contract {contract!r}")
+
+    training_mode = str(cfg.get("training", {}).get("image_mode", "full"))
+    validation_mode = str(
+        cfg.get("evaluation", {}).get("validation_image_mode", "full")
+    )
+    primary_mode = _primary_image_mode(cfg)
+    violations = []
+    if training_mode != "target_zero":
+        violations.append(f"training.image_mode={training_mode!r}")
+    if validation_mode != "target_zero":
+        violations.append(f"evaluation.validation_image_mode={validation_mode!r}")
+    if primary_mode != "target_zero":
+        violations.append(f"evaluation.primary_image_mode={primary_mode!r}")
+    if violations:
+        raise ValueError(
+            "data.task_contract='missing_tissue' requires target_zero for "
+            "training, validation, and primary evaluation; got " + ", ".join(violations)
+        )
+
+
 def _is_frozen_backbone_module(module: torch.nn.Module) -> bool:
     """True iff every parameter this module owns (recursively) is frozen
     (requires_grad=False) AND it owns at least one parameter at all — the
@@ -2008,9 +2053,11 @@ def _main_multi_sample(cfg) -> None:
         (Path(checkpoint_dir) / "heldout_sample_summary.json").write_text(
             json.dumps(aggregate, indent=2)
         )
-        full = aggregate.get("full", next(iter(aggregate.values())))
-        print(f"held-out-sample PCC: {full['pcc_mean']:.4f}")
-        print(f"held-out-sample RMSE: {full['rmse_mean']:.4f}")
+        primary_mode = _primary_image_mode(cfg)
+        primary = aggregate[primary_mode]
+        print(f"held-out-sample primary image mode: {primary_mode}")
+        print(f"held-out-sample PCC: {primary['pcc_mean']:.4f}")
+        print(f"held-out-sample RMSE: {primary['rmse_mean']:.4f}")
     else:
         print("WARNING: no data.test_sample_ids configured; no held-out-sample test was run.")
 
@@ -2023,6 +2070,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
         # 18 task #19 configs actually run before committing to full-length
         # training on each)
         cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
+    _validate_task_contract(cfg)
     torch.manual_seed(cfg.training.seed)
     # 2026-07-16: free speedup on Ampere+ GPUs (A100 etc, Tensor Cores) -
     # PyTorch defaults FP32 matmuls to full precision even where TF32
@@ -2216,9 +2264,11 @@ def main(cfg_path: str, overrides: list[str] | None = None):
         output_path=Path(checkpoint_dir) / "audit_test_metrics.json",
         organ=organ, tech=tech,
     )
-    full_summary = metrics["image_modes"].get("full", next(iter(metrics["image_modes"].values())))["summary"]
-    print(f"test-bank mean PCC: {full_summary['pcc']['mean']:.4f} ± {full_summary['pcc']['std']:.4f}")
-    print(f"test-bank RMSE: {full_summary['rmse']['mean']:.4f} ± {full_summary['rmse']['std']:.4f}")
+    primary_mode = str(metrics["primary_image_mode"])
+    primary_summary = metrics["image_modes"][primary_mode]["summary"]
+    print(f"test-bank primary image mode: {primary_mode}")
+    print(f"test-bank mean PCC: {primary_summary['pcc']['mean']:.4f} ± {primary_summary['pcc']['std']:.4f}")
+    print(f"test-bank RMSE: {primary_summary['rmse']['mean']:.4f} ± {primary_summary['rmse']['std']:.4f}")
 
 
 if __name__ == "__main__":

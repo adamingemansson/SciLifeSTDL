@@ -174,6 +174,12 @@ def evaluate_model_on_mask_bank(
     n_samples = max(1, int(evaluation.get("n_samples", 20)))
     sampling_seed = int(evaluation.get("sampling_seed", 1_200_000))
     image_modes = list(evaluation.get("image_modes", ["full", "target_zero", "all_zero", "shuffled"]))
+    primary_image_mode = str(evaluation.get("primary_image_mode", "full"))
+    if primary_image_mode not in {str(mode) for mode in image_modes}:
+        raise ValueError(
+            f"evaluation.primary_image_mode={primary_image_mode!r} is not present in "
+            f"evaluation.image_modes={image_modes!r}"
+        )
     k = int(evaluation.get("k_neighborhood", 8))
     requested_pca = int(evaluation.get("pca_n_components", 50))
     total_cells = len(records) * len(image_modes)
@@ -203,6 +209,7 @@ def evaluate_model_on_mask_bank(
         "n_samples_per_mask": n_samples,
         "requested_pca_components": requested_pca,
         "effective_pca_components": effective_pca,
+        "primary_image_mode": primary_image_mode,
         "image_modes": {},
         "spatial_domain_label_source": domain_label_source,
         "metric_notes": {
@@ -220,6 +227,7 @@ def evaluate_model_on_mask_bank(
             partial = json.loads(partial_path.read_text())
             if partial.get("signature") == signature and isinstance(partial.get("result"), dict):
                 result = partial["result"]
+                result.setdefault("primary_image_mode", primary_image_mode)
                 completed = sum(
                     len(mode.get("per_mask", []))
                     for mode in result.get("image_modes", {}).values()

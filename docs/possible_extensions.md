@@ -6,6 +6,41 @@ revisiting later — either as stretch goals or as a prerequisite step that
 got scoped out for now. Not verified to the same depth as
 `docs/literature_review.md` unless noted.
 
+## Bidirectional follow-up: predict morphology embeddings from GEX
+
+**Proposed 2026-07-21; follow-up, not part of the current recovery waves.**
+
+Test the reverse cross-modal direction before attempting pixel-level H&E
+generation: use observed surrounding GEX plus coordinates to predict the
+frozen GigaPath embedding of the H&E patch at a held-out query location.
+This asks whether transcriptomic context contains recoverable local
+morphology while avoiding stain/style noise and the severe ambiguity of
+generating raw pixels.
+
+The current evidence does **not** show that surrounding GEX matters more than
+H&E for GEX reconstruction. In the audited flagship, correct query H&E gave
+PCC 0.1735, shuffling it reduced PCC to 0.0860, and removing query H&E while
+retaining surrounding GEX reduced PCC to approximately zero. The harmonic
+GEX-only anchor reached PCC 0.0411. The motivation for this follow-up is
+therefore to measure the information in the reverse direction, not to assume
+that GEX already dominates morphology.
+
+Suggested staged test:
+
+1. Freeze GigaPath and train a small GEX/coordinate-conditioned head to
+   predict its real query-patch embedding. Query H&E must be completely
+   withheld from the input.
+2. Evaluate cosine similarity, correct-patch retrieval (Recall@k), and
+   tissue/spatial-domain prediction from the generated embeddings. Reuse
+   fixed mask banks and add held-out-slide evaluation before interpreting
+   the result biologically.
+3. If the reverse prediction carries real signal, test a shared
+   morphomolecular latent or bidirectional consistency loss alongside the
+   existing H&E-to-GEX objective.
+4. Treat raw H&E image generation as a later visualization/stretch goal only
+   if embedding prediction succeeds; generated pixels are much harder to
+   validate and may be visually plausible but biologically false.
+
 ## Text/label-conditioned tissue generation ("Track C")
 
 Supervisor-suggested direction, set aside for now to avoid overcomplicating

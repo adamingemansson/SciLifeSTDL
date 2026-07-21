@@ -196,8 +196,31 @@ case "$STAGE" in
     )
     SEEDS=(10 10 10 10 10 10 10 10)
     ;;
+  missing_tissue)
+    CONFIGS=(
+      configs/recovery_suite/28_missing_tissue_reference.yaml
+      configs/recovery_suite/29_missing_tissue_optimized.yaml
+      configs/recovery_suite/30_missing_tissue_latent64.yaml
+      configs/recovery_suite/31_missing_tissue_latent128.yaml
+      configs/recovery_suite/32_missing_tissue_transformer_large.yaml
+      configs/recovery_suite/33_missing_tissue_flow_large.yaml
+      configs/recovery_suite/34_missing_tissue_decoder_large.yaml
+      configs/recovery_suite/35_missing_tissue_knn32.yaml
+    )
+    NAMES=(
+      missing_tissue_reference_seed10
+      missing_tissue_optimized_seed10
+      missing_tissue_latent64_seed10
+      missing_tissue_latent128_seed10
+      missing_tissue_transformer_large_seed10
+      missing_tissue_flow_large_seed10
+      missing_tissue_decoder_large_seed10
+      missing_tissue_knn32_seed10
+    )
+    SEEDS=(10 10 10 10 10 10 10 10)
+    ;;
   *)
-    echo "ERROR: STAGE must be repair, controls, ablations, wave3 or component40k" >&2
+    echo "ERROR: STAGE must be repair, controls, ablations, wave3, component40k or missing_tissue" >&2
     exit 2
     ;;
 esac
@@ -211,7 +234,7 @@ fi
 
 # All context-only Novae jobs consume the same immutable 64-mask schedule.
 # Populate it once before concurrent readers start. The cache is reused safely.
-if [[ "$SMOKETEST" != "1" ]] && [[ "$STAGE" == "repair" || "$STAGE" == "controls" || "$STAGE" == "ablations" || "$STAGE" == "wave3" || "$STAGE" == "component40k" ]]; then
+if [[ "$SMOKETEST" != "1" ]] && [[ "$STAGE" == "repair" || "$STAGE" == "controls" || "$STAGE" == "ablations" || "$STAGE" == "wave3" || "$STAGE" == "component40k" || "$STAGE" == "missing_tissue" ]]; then
   echo "Precomputing/reusing the shared context-only Novae mask cache on $GPU_COUNT GPUs..."
   precompute_pids=()
   for slot in "${!GPU_IDS_ARR[@]}"; do
@@ -345,9 +368,14 @@ if [[ "$STAGE" == "repair" && "$SMOKETEST" != "1" ]]; then
   "$PYTHON_BIN" scripts/check_recovery_gate.py
 fi
 
-"$PYTHON_BIN" scripts/collect_audit_results.py \
-  --checkpoint-root results/checkpoints/recovery_suite \
-  --output-dir "reports/recovery_suite/${STAGE}_${RUN_ID}" \
+collect_args=(
+  --checkpoint-root results/checkpoints/recovery_suite
+  --output-dir "reports/recovery_suite/${STAGE}_${RUN_ID}"
   --log-root "$LOG_ROOT"
+)
+if [[ "$STAGE" == "missing_tissue" ]]; then
+  collect_args+=(--experiment-prefix missing_tissue_)
+fi
+"$PYTHON_BIN" scripts/collect_audit_results.py "${collect_args[@]}"
 
 echo "Stage $STAGE completed. Review reports/recovery_suite/${STAGE}_${RUN_ID}/summary.csv"
