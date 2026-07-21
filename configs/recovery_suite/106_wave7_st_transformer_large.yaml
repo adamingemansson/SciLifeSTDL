@@ -1,0 +1,110 @@
+# Wave 7 st-a100 held-out-sample marathon: four-layer 512-wide Transformer.
+experiment_name: missing_tissue_wave7_st_transformer_large_seed10
+data:
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  hest_cache_dir: data/cache/hest1k
+  sample_id: INT1
+  sample_ids: [INT1, INT2, INT3, INT4, INT5, INT6, INT7, INT8]
+  train_sample_ids: [INT1, INT2, INT3, INT4, INT5, INT6]
+  validation_sample_ids: [INT7]
+  test_sample_ids: [INT8]
+  holdout_unit: sample
+  task: intra_slice
+  task_contract: missing_tissue
+  modality_ablation: both
+  min_genes: 200
+  min_cells: 3
+  expression_transform: normalize_log1p
+  expression_target_sum: 10000.0
+  novae_mode: disabled
+  require_image_coverage: true
+  use_images: true
+  organ_by_sample:
+    INT1: Kidney
+    INT2: Kidney
+    INT3: Kidney
+    INT4: Kidney
+    INT5: Kidney
+    INT6: Kidney
+    INT7: Kidney
+    INT8: Kidney
+  tech_by_sample:
+    INT1: Visium
+    INT2: Visium
+    INT3: Visium
+    INT4: Visium
+    INT5: Visium
+    INT6: Visium
+    INT7: Visium
+    INT8: Visium
+masking:
+  strategy: random_dropout_patches
+  max_context_points: 768
+  params:
+    n_patches: 3
+    radius_range: [250, 450]
+model:
+  name: harmonic_residual
+  params:
+    coord_dim: 3
+    cond_hidden_dim: 512
+    hidden_dim: 512
+    harmonic_k: 128
+    harmonic_ridge: 0.0001
+    residual_init_std: 0.001
+    residual_scale_floor: 0.05
+    lr: 0.0003
+    context_encoder_type: storm_lite
+    gene_encoder_type: mlp
+    storm_lite_fusion_mode: mome
+    storm_lite_n_layers: 4
+    storm_lite_n_heads: 8
+    storm_lite_qk_norm: false
+    storm_lite_bias_type: frame_averaging
+training:
+  epochs: 10000
+  seed: 10
+  mask_seed: 700000
+  unique_mask_count: 64
+  ema_decay: 0.999
+  log_every_n_steps: 10
+  log_print_every_n_steps: 1000
+  checkpoint_every_n_steps: 5000
+  num_workers: 0
+  augment_coords: true
+  image_mode: target_zero
+  query_image_dropout_p: 0.0
+  all_image_dropout_p: 0
+  context_gex_mode: full
+  context_gex_dropout_p: 0
+  gradient_clip_val: 1.0
+  checkpoint_dir: results/checkpoints/recovery_suite/missing_tissue_wave7_st_transformer_large_seed10
+validation:
+  enabled: true
+  every_n_steps: 1000
+  patience_checks: 1000
+  early_stopping_min_steps: 10000
+  require_anchor_improvement: false
+  min_delta: 0.0001
+  metric: rmse
+  n_samples: 1
+  sampling_seed: 800000
+evaluation:
+  mask_bank_dir: results/mask_banks/recovery_suite/wave7_st_folda
+  n_validation_masks: 4
+  n_test_masks: 8
+  validation_seed: 710000
+  test_seed: 910000
+  sampling_seed: 1210000
+  n_samples: 1
+  primary_image_mode: target_zero
+  image_modes: [target_zero, all_zero]
+  validation_image_mode: target_zero
+  context_gex_mode: full
+  k_neighborhood: 8
+  pca_n_components: 50
+  training_mask_bank_path: results/mask_banks/training/recovery_suite/missing_tissue_wave7_st_folda_10k_64_seed700000.json
+logging:
+  backend: csv
+  project: st3d-lundeberg-lab

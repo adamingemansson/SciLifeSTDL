@@ -447,6 +447,113 @@ case "$STAGE" in
     )
     SEEDS=(10 10 10 10)
     ;;
+  wave7_st_smoke)
+    # Three quick batches cover every distinct implementation path. Scalar-only
+    # variants are exercised by the same constructors in the full marathon.
+    CONFIGS=(
+      configs/recovery_suite/92_wave6_st_heldout_full_k128.yaml
+      configs/recovery_suite/116_wave7_st_modality_dropout.yaml
+      configs/recovery_suite/117_wave7_st_foldb_full.yaml
+      configs/recovery_suite/104_wave7_st_gnn_k8.yaml
+      configs/recovery_suite/102_wave7_st_relative_position.yaml
+      configs/recovery_suite/108_wave7_st_fusion_concat.yaml
+      configs/recovery_suite/107_wave7_st_qk_norm.yaml
+      configs/recovery_suite/106_wave7_st_transformer_large.yaml
+      configs/recovery_suite/121_wave7_st_fm_builtin.yaml
+      configs/recovery_suite/122_wave7_st_fm_stormlite.yaml
+      configs/recovery_suite/123_wave7_st_fm_stpath_pretrained.yaml
+      configs/recovery_suite/124_wave7_st_fm_stpath_scratch.yaml
+    )
+    NAMES=(
+      missing_tissue_wave7_st_core_full_k128_seed10
+      missing_tissue_wave7_st_modality_dropout_seed10
+      missing_tissue_wave7_st_foldb_full_seed10
+      missing_tissue_wave7_st_gnn_k8_seed10
+      missing_tissue_wave7_st_relative_position_seed10
+      missing_tissue_wave7_st_fusion_concat_seed10
+      missing_tissue_wave7_st_qk_norm_seed10
+      missing_tissue_wave7_st_transformer_large_seed10
+      missing_tissue_wave7_st_fm_builtin_seed10
+      missing_tissue_wave7_st_fm_stormlite_seed10
+      missing_tissue_wave7_st_fm_stpath_pretrained_seed10
+      missing_tissue_wave7_st_fm_stpath_scratch_seed10
+    )
+    SEEDS=(10 10 10 10 10 10 10 10 10 10 10 10)
+    ;;
+  wave7_st_marathon)
+    # Eight sequential batches on four GPUs: core modalities, neighbourhood,
+    # spatial/fusion, capacity, context budget, optimization robustness, a
+    # second held-out patient direction, and matched FM/context encoders.
+    CONFIGS=(
+      configs/recovery_suite/92_wave6_st_heldout_full_k128.yaml
+      configs/recovery_suite/93_wave6_st_heldout_gex_only_k128.yaml
+      configs/recovery_suite/94_wave6_st_heldout_he_only_k128.yaml
+      configs/recovery_suite/95_wave6_st_heldout_neither_k128.yaml
+      configs/recovery_suite/97_wave7_st_full_k8.yaml
+      configs/recovery_suite/98_wave7_st_full_k16.yaml
+      configs/recovery_suite/99_wave7_st_full_k32.yaml
+      configs/recovery_suite/100_wave7_st_full_k64.yaml
+      configs/recovery_suite/101_wave7_st_no_spatial_bias.yaml
+      configs/recovery_suite/102_wave7_st_relative_position.yaml
+      configs/recovery_suite/103_wave7_st_fusion_sum.yaml
+      configs/recovery_suite/104_wave7_st_gnn_k8.yaml
+      configs/recovery_suite/105_wave7_st_transformer_1layer.yaml
+      configs/recovery_suite/106_wave7_st_transformer_large.yaml
+      configs/recovery_suite/107_wave7_st_qk_norm.yaml
+      configs/recovery_suite/108_wave7_st_fusion_concat.yaml
+      configs/recovery_suite/109_wave7_st_context384.yaml
+      configs/recovery_suite/110_wave7_st_context512.yaml
+      configs/recovery_suite/111_wave7_st_context1024.yaml
+      configs/recovery_suite/112_wave7_st_context1536.yaml
+      configs/recovery_suite/113_wave7_st_no_coord_augment.yaml
+      configs/recovery_suite/114_wave7_st_lr1e4.yaml
+      configs/recovery_suite/115_wave7_st_lr1e3.yaml
+      configs/recovery_suite/116_wave7_st_modality_dropout.yaml
+      configs/recovery_suite/117_wave7_st_foldb_full.yaml
+      configs/recovery_suite/118_wave7_st_foldb_gex_only.yaml
+      configs/recovery_suite/119_wave7_st_foldb_he_only.yaml
+      configs/recovery_suite/120_wave7_st_foldb_neither.yaml
+      configs/recovery_suite/121_wave7_st_fm_builtin.yaml
+      configs/recovery_suite/122_wave7_st_fm_stormlite.yaml
+      configs/recovery_suite/123_wave7_st_fm_stpath_pretrained.yaml
+      configs/recovery_suite/124_wave7_st_fm_stpath_scratch.yaml
+    )
+    NAMES=(
+      missing_tissue_wave7_st_core_full_k128_seed10
+      missing_tissue_wave7_st_core_gex_only_k128_seed10
+      missing_tissue_wave7_st_core_he_only_k128_seed10
+      missing_tissue_wave7_st_core_neither_k128_seed10
+      missing_tissue_wave7_st_full_k8_seed10
+      missing_tissue_wave7_st_full_k16_seed10
+      missing_tissue_wave7_st_full_k32_seed10
+      missing_tissue_wave7_st_full_k64_seed10
+      missing_tissue_wave7_st_no_spatial_bias_seed10
+      missing_tissue_wave7_st_relative_position_seed10
+      missing_tissue_wave7_st_fusion_sum_seed10
+      missing_tissue_wave7_st_gnn_k8_seed10
+      missing_tissue_wave7_st_transformer_1layer_seed10
+      missing_tissue_wave7_st_transformer_large_seed10
+      missing_tissue_wave7_st_qk_norm_seed10
+      missing_tissue_wave7_st_fusion_concat_seed10
+      missing_tissue_wave7_st_context384_seed10
+      missing_tissue_wave7_st_context512_seed10
+      missing_tissue_wave7_st_context1024_seed10
+      missing_tissue_wave7_st_context1536_seed10
+      missing_tissue_wave7_st_no_coord_augment_seed10
+      missing_tissue_wave7_st_lr1e4_seed10
+      missing_tissue_wave7_st_lr1e3_seed10
+      missing_tissue_wave7_st_modality_dropout_seed10
+      missing_tissue_wave7_st_foldb_full_seed10
+      missing_tissue_wave7_st_foldb_gex_only_seed10
+      missing_tissue_wave7_st_foldb_he_only_seed10
+      missing_tissue_wave7_st_foldb_neither_seed10
+      missing_tissue_wave7_st_fm_builtin_seed10
+      missing_tissue_wave7_st_fm_stormlite_seed10
+      missing_tissue_wave7_st_fm_stpath_pretrained_seed10
+      missing_tissue_wave7_st_fm_stpath_scratch_seed10
+    )
+    SEEDS=(10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10)
+    ;;
   *)
     echo "ERROR: unknown recovery STAGE: $STAGE" >&2
     exit 2
@@ -508,7 +615,7 @@ for (( batch_start=0; batch_start<JOB_COUNT; batch_start+=GPU_COUNT )); do
     gpu="${GPU_IDS_ARR[$local_slot]}"
     checkpoint="results/checkpoints/recovery_suite/$name"
     metrics="$checkpoint/audit_test_metrics.json"
-    if [[ "$STAGE" == "wave6_heldout_tk" || "$STAGE" == "wave6_heldout_st" ]]; then
+    if [[ "$STAGE" == "wave6_heldout_tk" || "$STAGE" == "wave6_heldout_st" || "$STAGE" == "wave7_st_smoke" || "$STAGE" == "wave7_st_marathon" ]]; then
       metrics="$checkpoint/heldout_sample_summary.json"
     fi
     log="$LOG_ROOT/$name.log"
@@ -627,6 +734,8 @@ elif [[ "$STAGE" == "wave6_heldout_tk" ]]; then
   collect_args+=(--experiment-prefix missing_tissue_wave6_tk_heldout_)
 elif [[ "$STAGE" == "wave6_heldout_st" ]]; then
   collect_args+=(--experiment-prefix missing_tissue_wave6_st_heldout_)
+elif [[ "$STAGE" == "wave7_st_smoke" || "$STAGE" == "wave7_st_marathon" ]]; then
+  collect_args+=(--experiment-prefix missing_tissue_wave7_st_)
 fi
 "$PYTHON_BIN" scripts/collect_audit_results.py "${collect_args[@]}"
 
