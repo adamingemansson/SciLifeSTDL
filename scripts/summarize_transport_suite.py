@@ -14,6 +14,8 @@ Two phases share one CSV, distinguished by the ``phase`` column:
 Run after (or during, for a partial view) scripts/run_transport_suite_4gpu.sh;
 rows for runs that haven't finished yet are still written, marked status="not_run".
 """
+# (no functional change -- this line exists only to verify GITHUB_PUSH_PAT-based
+# push access from a resumed session; safe to remove on the next real edit.)
 from __future__ import annotations
 
 import argparse
