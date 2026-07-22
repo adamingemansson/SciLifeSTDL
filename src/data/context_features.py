@@ -150,6 +150,11 @@ class ContextOnlyNovaeProvider:
 
 def model_uses_novae(model_params: dict) -> bool:
     """Return whether a model configuration requests any Novae-derived input."""
+    # HierarchicalMissingTissueRegressor keeps raw GEX and adds Novae as a
+    # separate observed-domain channel; it intentionally has no legacy
+    # context_encoder_type/gene_encoder_type switch.
+    if "use_novae" in model_params:
+        return bool(model_params.get("use_novae"))
     encoder = model_params.get("context_encoder_type", "builtin")
     if encoder == "builtin":
         return model_params.get("gene_encoder_type") == "novae"

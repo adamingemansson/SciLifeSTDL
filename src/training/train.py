@@ -36,6 +36,11 @@ from omegaconf import OmegaConf
 from src.data import loaders, masking
 from src.data.augmentation import augment_coords_xy
 from src.data.context_features import ContextOnlyNovaeProvider, model_uses_novae, novae_input_mode
+from src.data.slide_context import (
+    load_slide_context,
+    nonoverlapping_context_patch_mask,
+    visible_slide_context,
+)
 from src.data.mask_bank import (
     cap_context_mask, ensure_mask_bank, ensure_training_seed_bank, record_masks, split_records,
 )
@@ -843,7 +848,10 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
                         context_gex_dropout_p: float = 0.0,
                         fixed_context_mask: np.ndarray | None = None,
                         fixed_query_mask: np.ndarray | None = None,
-                        excluded_training_mask: np.ndarray | None = None) -> dict:
+                        excluded_training_mask: np.ndarray | None = None,
+                        slide_context: dict | None = None,
+                        strict_broken_region: bool = False,
+                        query_patch_size: float = 224.0) -> dict:
     """One {context, query, target_expression} training item for a SINGLE
     sample's data. Factored out of MaskedContextQueryDataset.__getitem__
     (2026-07-15) so MultiSampleMaskedContextQueryDataset below can reuse
@@ -910,6 +918,11 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
     their association with tissue coordinates. context_gex_dropout_p drops
     the complete context-GEX modality for a training item and is independent
     of image dropout."""
+    if slide_context is not None and augment:
+        raise ValueError(
+            "mask-specific WSI slide context cannot be combined with coordinate augmentation; "
+            "the WSI tile coordinates would no longer align with the augmented spot coordinates"
+        )
     if fixed_context_mask is not None or fixed_query_mask is not None:
         if fixed_context_mask is None or fixed_query_mask is None:
             raise ValueError("fixed_context_mask and fixed_query_mask must be provided together")
@@ -990,6 +1003,31 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
         )
         context["images"], query["images"] = c_img, q_img
         context["image_available"], query["image_available"] = c_available, q_available
+        if strict_broken_region and image_mode == "target_zero":
+            # A broken region removes pixels, not merely the query-centred
+            # patches.  Exclude any observed patch whose footprint overlaps
+            # a missing query footprint, otherwise boundary patches leak part
+            # of the supposedly absent H&E into the model.
+            safe = torch.as_tensor(
+                nonoverlapping_context_patch_mask(
+                    coords3d[context_mask], coords3d[query_mask], query_patch_size
+                ),
+                dtype=torch.bool,
+            )
+            context["image_available"] &= safe
+            context["images"] = context["images"].clone()
+            context["images"][~context["image_available"]] = 0
+
+    slide = visible_slide_context(
+        slide_context, coords3d[query_mask], image_mode, query_patch_size
+    )
+    context["slide_available"] = bool(slide["available"])
+    if slide["available"]:
+        context["slide_images"] = torch.tensor(slide["features"], dtype=torch.float32)
+        context["slide_coords"] = torch.tensor(slide["coords"], dtype=torch.float32)
+        context["slide_context_id"] = str(slide["context_id"])
+        context["slide_n_total"] = int(slide["n_total"])
+        context["slide_n_visible"] = int(slide["n_visible"])
     if organ is not None:
         context["organ"] = organ
         query["organ"] = organ
@@ -1021,7 +1059,10 @@ class MaskedContextQueryDataset(Dataset):
                  context_gex_mode: str = "full",
                  context_gex_dropout_p: float = 0.0,
                  excluded_training_mask: np.ndarray | None = None,
-                 seed_schedule: list[int] | None = None):
+                 seed_schedule: list[int] | None = None,
+                 slide_context: dict | None = None,
+                 strict_broken_region: bool = False,
+                 query_patch_size: float = 224.0):
         self.coords3d = coords3d
         self.expr = expr
         self.slice_ids = slice_ids
@@ -1054,6 +1095,9 @@ class MaskedContextQueryDataset(Dataset):
         self.all_image_dropout_p = float(all_image_dropout_p)
         self.context_gex_mode = str(context_gex_mode)
         self.context_gex_dropout_p = float(context_gex_dropout_p)
+        self.slide_context = slide_context
+        self.strict_broken_region = bool(strict_broken_region)
+        self.query_patch_size = float(query_patch_size)
         self.excluded_training_mask = (
             None if excluded_training_mask is None
             else np.asarray(excluded_training_mask, dtype=bool).copy()
@@ -1085,6 +1129,9 @@ class MaskedContextQueryDataset(Dataset):
             context_gex_mode=self.context_gex_mode,
             context_gex_dropout_p=self.context_gex_dropout_p,
             excluded_training_mask=self.excluded_training_mask,
+            slide_context=self.slide_context,
+            strict_broken_region=self.strict_broken_region,
+            query_patch_size=self.query_patch_size,
         )
 
 
@@ -1140,7 +1187,9 @@ class MultiSampleMaskedContextQueryDataset(Dataset):
                  augment: bool = False, image_mode: str = "full",
                  query_image_dropout_p: float = 0.0, all_image_dropout_p: float = 0.0,
                  context_gex_mode: str = "full", context_gex_dropout_p: float = 0.0,
-                 seed_schedule: list[int] | None = None):
+                 seed_schedule: list[int] | None = None,
+                 strict_broken_region: bool = False,
+                 query_patch_size: float = 224.0):
         assert samples, "samples must be non-empty"
         self.samples = samples
         self.masking_cfg = masking_cfg
@@ -1153,6 +1202,8 @@ class MultiSampleMaskedContextQueryDataset(Dataset):
         self.all_image_dropout_p = float(all_image_dropout_p)
         self.context_gex_mode = str(context_gex_mode)
         self.context_gex_dropout_p = float(context_gex_dropout_p)
+        self.strict_broken_region = bool(strict_broken_region)
+        self.query_patch_size = float(query_patch_size)
 
     def __len__(self):
         return self.n_items
@@ -1168,11 +1219,14 @@ class MultiSampleMaskedContextQueryDataset(Dataset):
             # Backwards-compatible tuple form used by older configs/tests:
             # providers were added later and default to absent.
             sample = (*sample, None, None)
-        if len(sample) != 10:
-            raise ValueError(f"multi-sample tuple must have 8 or 10 entries, got {len(sample)}")
+        if len(sample) == 10:
+            sample = (*sample, None)
+        if len(sample) != 11:
+            raise ValueError(f"multi-sample tuple must have 8, 10, or 11 entries, got {len(sample)}")
         (coords3d, expr, slice_ids, images, organ, tech,
          context_gene_features, context_novae_features,
-         context_gene_feature_provider, context_novae_feature_provider) = sample
+         context_gene_feature_provider, context_novae_feature_provider,
+         slide_context) = sample
         return _build_masked_item(
             coords3d, expr, slice_ids, self.masking_cfg, images, seed + 1,
             context_gene_features=context_gene_features,
@@ -1185,6 +1239,9 @@ class MultiSampleMaskedContextQueryDataset(Dataset):
             all_image_dropout_p=self.all_image_dropout_p,
             context_gex_mode=self.context_gex_mode,
             context_gex_dropout_p=self.context_gex_dropout_p,
+            slide_context=slide_context,
+            strict_broken_region=self.strict_broken_region,
+            query_patch_size=self.query_patch_size,
         )
 
 
@@ -1433,7 +1490,12 @@ def prepare_novae_inputs(cfg, adata, model_params: dict, coords3d: np.ndarray,
     mode = novae_input_mode(cfg, dict(model_params))
     result["mode"] = mode
     encoder = model_params.get("context_encoder_type", "builtin")
-    is_builtin_replacement = encoder == "builtin"
+    # The hierarchical model consumes raw expression AND Novae.  Only the
+    # legacy builtin encoder's explicit gene_encoder_type=novae mode replaces
+    # raw expression with Novae features.
+    is_builtin_replacement = (
+        encoder == "builtin" and "use_novae" not in model_params
+    )
     if mode == "unsafe_full_graph":
         features = get_novae_features(cfg, adata, sample_id=sample_id)
         key = "context_gene_features" if is_builtin_replacement else "context_novae_features"
@@ -1570,7 +1632,8 @@ def _training_seed_bank_for_config(cfg, obs_names) -> tuple[dict, Path]:
 
 
 def _fixed_items_from_bank(cfg, adata, coords3d, expr, slice_ids, images, bank, split,
-                           novae_inputs: dict, organ=None, tech=None) -> list[dict]:
+                           novae_inputs: dict, organ=None, tech=None,
+                           slide_context=None) -> list[dict]:
     evaluation = cfg.get("evaluation", {})
     image_mode = str(evaluation.get("validation_image_mode", "full"))
     context_gex_mode = str(evaluation.get("context_gex_mode", "full"))
@@ -1586,6 +1649,9 @@ def _fixed_items_from_bank(cfg, adata, coords3d, expr, slice_ids, images, bank, 
             organ=organ, tech=tech, augment=False, image_mode=image_mode,
             context_gex_mode=context_gex_mode,
             fixed_context_mask=context_mask, fixed_query_mask=query_mask,
+            slide_context=slide_context,
+            strict_broken_region=bool(cfg.data.get("strict_broken_region", False)),
+            query_patch_size=float(cfg.data.get("query_patch_size_fullres", 224.0)),
         ))
     return items
 
@@ -1593,7 +1659,7 @@ def _fixed_items_from_bank(cfg, adata, coords3d, expr, slice_ids, images, bank, 
 def _fixed_training_seed_item(
     cfg, adata, coords3d, expr, slice_ids, images, training_bank,
     novae_inputs: dict, excluded_training_mask: np.ndarray | None,
-    checkpoint_dir: str | Path, organ=None, tech=None,
+    checkpoint_dir: str | Path, organ=None, tech=None, slide_context=None,
 ) -> dict:
     """Build and audit the exact repeated mask used by an overfit gate.
 
@@ -1639,6 +1705,9 @@ def _fixed_training_seed_item(
         image_mode=str(cfg.training.get("image_mode", "full")),
         context_gex_mode=str(cfg.training.get("context_gex_mode", "full")),
         fixed_context_mask=context_mask, fixed_query_mask=query_mask,
+        slide_context=slide_context,
+        strict_broken_region=bool(cfg.data.get("strict_broken_region", False)),
+        query_patch_size=float(cfg.data.get("query_patch_size_fullres", 224.0)),
     )
 
 
@@ -1783,7 +1852,10 @@ def inject_novae_dim(model_cfg: dict, novae_dim: int) -> None:
     exclusive per model so there's no risk of conflating them. Mutates
     model_cfg["params"] in place; no-op for every other config."""
     params = model_cfg.get("params", {})
-    if params.get("gene_encoder_type") in ("novae", "both", "tokenizer_novae") and "novae_dim" not in params:
+    if (
+        params.get("gene_encoder_type") in ("novae", "both", "tokenizer_novae")
+        or bool(params.get("use_novae", False))
+    ) and "novae_dim" not in params:
         params["novae_dim"] = novae_dim
 
 
@@ -1864,7 +1936,9 @@ def inject_residual_gene_scale(model_cfg: dict, expressions: list[np.ndarray]) -
 
 def inject_direct_regression_stats(model_cfg: dict, expressions: list[np.ndarray]) -> None:
     """Inject training-only target normalization for direct context regression."""
-    if model_cfg.get("name") != "direct_context_regressor":
+    if model_cfg.get("name") not in {
+        "direct_context_regressor", "hierarchical_missing_tissue_regressor",
+    }:
         return
     params = model_cfg.get("params", {})
     if "target_gene_mean" not in params or "target_gene_scale" not in params:
@@ -1976,6 +2050,7 @@ def _load_images(cfg, adata, sample_id: str | None = None):
     uses_frozen_gigapath = (
         model_params.get("image_encoder_type") == "gigapath"
         or model_params.get("context_encoder_type") in ("stpath", "storm_lite")
+        or cfg.model.get("name") == "hierarchical_missing_tissue_regressor"
     )
     if uses_frozen_gigapath:
         features = get_gigapath_features(cfg, patches, barcodes, sample_id=sid)
@@ -2144,10 +2219,14 @@ def load_multi_sample_data(
         novae_inputs = prepare_novae_inputs(
             cfg, adata, model_params, coords3d, slice_ids, sample_id=str(sample_id)
         )
+        slide_context = load_slide_context(
+            cfg, str(sample_id), images, coords3d
+        )
         samples.append((
             coords3d, expr, slice_ids, images, organ, tech,
             novae_inputs["context_gene_features"], novae_inputs["context_novae_features"],
             novae_inputs["context_gene_feature_provider"], novae_inputs["context_novae_feature_provider"],
+            slide_context,
         ))
         updated_adatas.append(adata)
     return samples, updated_adatas
@@ -2458,6 +2537,9 @@ def _main_multi_sample(cfg) -> None:
                     image_mode=str(evaluation_cfg.get("validation_image_mode", "full")),
                     context_gex_mode=str(evaluation_cfg.get("context_gex_mode", "full")),
                     fixed_context_mask=context_mask, fixed_query_mask=query_mask,
+                    slide_context=sample[10],
+                    strict_broken_region=bool(cfg.data.get("strict_broken_region", False)),
+                    query_patch_size=float(cfg.data.get("query_patch_size_fullres", 224.0)),
                 ))
         validation_callback = FixedMaskValidationCallback(
             validation_items,
@@ -2488,6 +2570,8 @@ def _main_multi_sample(cfg) -> None:
             context_gex_mode=str(cfg.training.get("context_gex_mode", "full")),
             context_gex_dropout_p=float(cfg.training.get("context_gex_dropout_p", 0.0)),
             seed_schedule=training_bank["seeds"],
+            strict_broken_region=bool(cfg.data.get("strict_broken_region", False)),
+            query_patch_size=float(cfg.data.get("query_patch_size_fullres", 224.0)),
         )
         trainer = pl.Trainer(
             max_epochs=1,
@@ -2529,6 +2613,7 @@ def _main_multi_sample(cfg) -> None:
                 _novae_dict(sample),
                 output_path=Path(checkpoint_dir) / f"audit_test_metrics_{sid}.json",
                 organ=organ, tech=tech,
+                slide_context=sample[10],
             )
         aggregate = {}
         aggregate_metrics = (
@@ -2610,6 +2695,9 @@ def main(cfg_path: str, overrides: list[str] | None = None):
         return
 
     adata, coords3d, expr, slice_ids, images = _load_data(cfg)
+    slide_context = load_slide_context(
+        cfg, str(cfg.data.get("sample_id", "sample")), images, coords3d
+    )
 
     # A same-slide diagnostic must reserve evaluation targets before *any*
     # learned-model statistic is derived. Besides excluding these rows from
@@ -2724,6 +2812,9 @@ def main(cfg_path: str, overrides: list[str] | None = None):
             context_gex_dropout_p=float(cfg.training.get("context_gex_dropout_p", 0.0)),
             excluded_training_mask=training_excluded_mask,
             seed_schedule=training_bank["seeds"],
+            slide_context=slide_context,
+            strict_broken_region=bool(cfg.data.get("strict_broken_region", False)),
+            query_patch_size=float(cfg.data.get("query_patch_size_fullres", 224.0)),
         )
         dataloader = make_dataloader(dataset, cfg)
         # .get() with the same default every real config's own YAML comment
@@ -2740,12 +2831,12 @@ def main(cfg_path: str, overrides: list[str] | None = None):
                 validation_items = [_fixed_training_seed_item(
                     cfg, adata, coords3d, expr, slice_ids, images, training_bank,
                     novae_inputs, training_excluded_mask, checkpoint_dir,
-                    organ=organ, tech=tech,
+                    organ=organ, tech=tech, slide_context=slide_context,
                 )]
             else:
                 validation_items = _fixed_items_from_bank(
                     cfg, adata, coords3d, expr, slice_ids, images, bank, "validation",
-                    novae_inputs, organ=organ, tech=tech,
+                    novae_inputs, organ=organ, tech=tech, slide_context=slide_context,
                 )
             validation_callback = FixedMaskValidationCallback(
                 validation_items,
@@ -2818,6 +2909,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
         model, cfg, adata, coords3d, expr, slice_ids, images, bank, novae_inputs,
         output_path=Path(checkpoint_dir) / "audit_test_metrics.json",
         organ=organ, tech=tech,
+        slide_context=slide_context,
     )
     primary_mode = str(metrics["primary_image_mode"])
     primary_summary = metrics["image_modes"][primary_mode]["summary"]

@@ -713,6 +713,151 @@ class HarmonicResidualModel(BaseGenerativeModel):
         })
 
 
+@register_model("hierarchical_missing_tissue_regressor")
+class HierarchicalMissingTissueRegressor(BaseGenerativeModel):
+    """Deterministic first-stage model for a physically missing tissue hole.
+
+    A frozen, mask-aware GigaPath LongNet supplies global WSI morphology.
+    Observed spot H&E, raw GEX and context-only Novae supply local evidence.
+    Missing queries cross-attend only to observed tokens; neither query H&E
+    nor query GEX is ever consumed.  This is intentionally a regression head
+    before reintroducing flow matching: the conditioning architecture must
+    first demonstrate genuine held-out predictive signal.
+    """
+
+    def __init__(
+        self,
+        n_genes: int,
+        novae_dim: int | None = None,
+        hidden_dim: int = 256,
+        decoder_hidden_dim: int = 512,
+        n_heads: int = 4,
+        context_layers: int = 2,
+        cross_layers: int = 2,
+        query_layers: int = 1,
+        local_k: int = 64,
+        dropout: float = 0.1,
+        use_novae: bool = True,
+        use_local_images: bool = True,
+        use_slide_context: bool = True,
+        gene_encoder_type: str = "weighted_linear",
+        slide_checkpoint_path: str | None = None,
+        slide_output_dim: int = 768,
+        target_gene_mean: list[float] | None = None,
+        target_gene_scale: list[float] | None = None,
+        target_scale_floor: float = 0.05,
+        correlation_loss_weight: float = 0.25,
+        lr: float = 3e-4,
+        weight_decay: float = 1e-2,
+    ):
+        super().__init__()
+        from src.models.hierarchical_slide import HierarchicalMissingTissueEncoder
+
+        if target_scale_floor <= 0:
+            raise ValueError("target_scale_floor must be positive")
+        if correlation_loss_weight < 0:
+            raise ValueError("correlation_loss_weight must be non-negative")
+        self.save_hyperparameters()
+        self.context_encoder = HierarchicalMissingTissueEncoder(
+            n_genes=n_genes,
+            novae_dim=novae_dim,
+            hidden_dim=hidden_dim,
+            n_heads=n_heads,
+            context_layers=context_layers,
+            cross_layers=cross_layers,
+            query_layers=query_layers,
+            local_k=local_k,
+            dropout=dropout,
+            use_novae=use_novae,
+            use_local_images=use_local_images,
+            use_slide_context=use_slide_context,
+            gene_encoder_type=gene_encoder_type,
+            slide_checkpoint_path=slide_checkpoint_path,
+            slide_output_dim=slide_output_dim,
+        )
+        self.decoder = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, decoder_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(decoder_hidden_dim, n_genes),
+        )
+        mean = torch.zeros(n_genes) if target_gene_mean is None else torch.as_tensor(
+            target_gene_mean, dtype=torch.float32
+        )
+        scale = torch.ones(n_genes) if target_gene_scale is None else torch.as_tensor(
+            target_gene_scale, dtype=torch.float32
+        )
+        if mean.shape != (n_genes,) or scale.shape != (n_genes,):
+            raise ValueError(
+                f"target gene statistics must both be ({n_genes},), got "
+                f"mean={tuple(mean.shape)}, scale={tuple(scale.shape)}"
+            )
+        if not torch.isfinite(mean).all() or not torch.isfinite(scale).all():
+            raise ValueError("target gene statistics contain non-finite values")
+        self.register_buffer("target_gene_mean", mean)
+        self.register_buffer("target_gene_scale", scale.clamp_min(float(target_scale_floor)))
+        self.correlation_loss_weight = float(correlation_loss_weight)
+        self.lr = float(lr)
+        self.weight_decay = float(weight_decay)
+
+    @staticmethod
+    def _mean_per_gene_correlation(prediction: torch.Tensor,
+                                   target: torch.Tensor) -> torch.Tensor:
+        pred_centered = prediction - prediction.mean(dim=0, keepdim=True)
+        target_centered = target - target.mean(dim=0, keepdim=True)
+        target_ss = target_centered.square().sum(dim=0)
+        eligible = target_ss > 1e-8
+        if not bool(eligible.any()):
+            return prediction.new_zeros(())
+        numerator = (pred_centered * target_centered).sum(dim=0)
+        pred_ss = pred_centered.square().sum(dim=0)
+        denominator = torch.sqrt((pred_ss * target_ss).clamp_min(1e-8))
+        return (numerator[eligible] / denominator[eligible]).mean()
+
+    def sample(self, context, query):
+        hidden = self.context_encoder(context, query)
+        standardized = self.decoder(hidden)
+        mean = self.target_gene_mean.unsqueeze(0).expand_as(standardized)
+        expression = mean + standardized * self.target_gene_scale
+        return {
+            "coords": query["coords"],
+            "expression": expression,
+            "anchor_expression": mean,
+            "residual_expression": expression - mean,
+            "standardized_expression": standardized,
+        }
+
+    def training_step(self, batch, batch_idx):
+        out = self.sample(batch["context"], batch["query"])
+        target = batch["target_expression"]
+        standardized_target = (
+            target - self.target_gene_mean
+        ) / self.target_gene_scale
+        standardized_mse = nn.functional.mse_loss(
+            out["standardized_expression"], standardized_target
+        )
+        absolute_mse = nn.functional.mse_loss(out["expression"], target)
+        mean_baseline_mse = nn.functional.mse_loss(out["anchor_expression"], target)
+        pcc = self._mean_per_gene_correlation(out["expression"], target)
+        loss = standardized_mse + self.correlation_loss_weight * (1.0 - pcc)
+        self.log_dict({
+            "train/loss": loss,
+            "train/standardized_mse": standardized_mse,
+            "train/absolute_mse": absolute_mse,
+            "train/mean_baseline_mse": mean_baseline_mse,
+            "train/per_gene_pcc": pcc,
+            "train/prediction_delta_rms": out["residual_expression"].square().mean().sqrt(),
+        })
+        return loss
+
+    def configure_optimizers(self):
+        parameters = [p for p in self.parameters() if p.requires_grad]
+        return torch.optim.AdamW(
+            parameters, lr=self.lr, weight_decay=self.weight_decay
+        )
+
+
 @register_model("direct_context_regressor")
 class DirectContextRegressor(BaseGenerativeModel):
     """Predict absolute query expression directly from learned context.

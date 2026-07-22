@@ -157,6 +157,7 @@ def evaluate_model_on_mask_bank(
     output_path: str | Path,
     organ: str | None = None,
     tech: str | None = None,
+    slide_context: dict | None = None,
 ) -> dict[str, Any]:
     """Evaluate predictive means and uncertainty on untouched test masks.
 
@@ -307,6 +308,9 @@ def evaluate_model_on_mask_bank(
                 organ=organ, tech=tech, augment=False, image_mode=str(image_mode),
                 context_gex_mode=context_gex_mode,
                 fixed_context_mask=context_mask, fixed_query_mask=query_mask,
+                slide_context=slide_context,
+                strict_broken_region=bool(cfg.get("data", {}).get("strict_broken_region", False)),
+                query_patch_size=float(cfg.get("data", {}).get("query_patch_size_fullres", 224.0)),
             )
             item_device = move_to_device(item, model_device)
             with torch.inference_mode():
