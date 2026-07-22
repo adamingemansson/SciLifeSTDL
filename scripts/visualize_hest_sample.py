@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 import anndata as ad
+import h5py
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import numpy as np
@@ -95,6 +96,21 @@ def _mask_arrays(record: dict, obs_names) -> tuple[np.ndarray, np.ndarray]:
     return context, query
 
 
+def _patch_coverage(path: Path, obs_names) -> tuple[np.ndarray, int, int]:
+    """Read only patch barcodes; never materialize the large image tensor."""
+    with h5py.File(path, "r") as handle:
+        raw = np.asarray(handle["barcode"][:, 0])
+        n_patch_rows = int(handle["img"].shape[0])
+    barcodes = {
+        value.decode() if isinstance(value, bytes) else str(value)
+        for value in raw
+    }
+    names = np.asarray(list(map(str, obs_names)))
+    covered = np.asarray([name in barcodes for name in names])
+    extra = len(barcodes - set(names.tolist()))
+    return covered, n_patch_rows, extra
+
+
 def _style_axis(axis, image: np.ndarray, title: str) -> None:
     axis.imshow(image, origin="upper")
     axis.set_title(title)
@@ -113,6 +129,10 @@ def main() -> None:
     parser.add_argument("--mask-bank", type=Path)
     parser.add_argument("--mask-split", choices=("validation", "test"), default="test")
     parser.add_argument("--mask-index", type=int, default=0)
+    parser.add_argument(
+        "--patch-file", type=Path,
+        help="Optional patch H5; defaults to DATA_ROOT/patches/SAMPLE.h5 when present",
+    )
     parser.add_argument("--point-size", type=float, default=9.0)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--show", action="store_true")
@@ -145,6 +165,13 @@ def main() -> None:
         )
 
     values, value_label = _gene_values(adata, args.gene)
+    patch_path = args.patch_file or root / "patches" / f"{args.sample_id}.h5"
+    patch_covered = None
+    n_patch_rows = patch_extra = None
+    if patch_path.is_file():
+        patch_covered, n_patch_rows, patch_extra = _patch_coverage(
+            patch_path, adata.obs_names
+        )
     context = query = None
     record = None
     if args.mask_bank is not None:
@@ -153,10 +180,21 @@ def main() -> None:
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 7), constrained_layout=True)
     _style_axis(axes[0], image, f"{args.sample_id}: H&E and measured spots")
+    display_covered = (
+        patch_covered if patch_covered is not None
+        else np.ones(adata.n_obs, dtype=bool)
+    )
     axes[0].scatter(
-        coords[:, 0], coords[:, 1], s=args.point_size,
+        coords[display_covered, 0], coords[display_covered, 1], s=args.point_size,
         facecolors="none", edgecolors="#00d4ff", linewidths=0.55, alpha=0.8,
     )
+    if patch_covered is not None and (~patch_covered).any():
+        axes[0].scatter(
+            coords[~patch_covered, 0], coords[~patch_covered, 1],
+            s=args.point_size * 1.8, c="#ff3b30", marker="x", linewidths=0.8,
+            label=f"no extracted patch ({(~patch_covered).sum()})",
+        )
+        axes[0].legend(loc="lower right", framealpha=0.85)
 
     if record is None:
         second_title = f"{args.sample_id}: {value_label}"
@@ -209,6 +247,11 @@ def main() -> None:
     print(f"coordinate x range fullres: [{coords_fullres[:, 0].min():.1f}, {coords_fullres[:, 0].max():.1f}]")
     print(f"coordinate y range fullres: [{coords_fullres[:, 1].min():.1f}, {coords_fullres[:, 1].max():.1f}]")
     print(f"spots inside embedded image: {inside.sum()}/{adata.n_obs}")
+    if patch_covered is not None:
+        print(f"patch H5: {patch_path}")
+        print(f"patch rows: {n_patch_rows}")
+        print(f"AnnData spots with extracted patches: {patch_covered.sum()}/{adata.n_obs}")
+        print(f"patch barcodes absent from AnnData: {patch_extra}")
     if record is not None:
         print(f"mask: {args.mask_split}[{args.mask_index}], context={context.sum()}, query={query.sum()}")
     print(f"saved: {output.resolve()}")
