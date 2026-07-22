@@ -14,6 +14,7 @@ MPP would make image positions and missing-region masks incomparable.
 from __future__ import annotations
 
 import argparse
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -38,12 +39,52 @@ def _resolve_wsi(root: Path, sample_id: str) -> Path:
     return files[0]
 
 
+def _property_float(value) -> float | None:
+    """Parse decimal or TIFF rational property values without guessing."""
+    if value is None:
+        return None
+    try:
+        return float(Fraction(str(value).strip()))
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def _resolution_unit_um(value) -> float | None:
+    """Return microns per TIFF resolution unit."""
+    normalized = str(value).strip().lower()
+    if normalized in {"2", "inch", "inches"}:
+        return 25_400.0
+    if normalized in {"3", "centimeter", "centimeters", "cm"}:
+        return 10_000.0
+    return None
+
+
 def _slide_mpp(slide) -> tuple[float, float]:
     properties = slide.properties
     x_keys = ("tiffslide.mpp-x", "openslide.mpp-x")
     y_keys = ("tiffslide.mpp-y", "openslide.mpp-y")
     x = next((properties.get(key) for key in x_keys if properties.get(key)), None)
     y = next((properties.get(key) for key in y_keys if properties.get(key)), None)
+    # OpenSlide's generic-TIFF backend exposes the source TIFF resolution
+    # even when it does not synthesize openslide.mpp-x/y.  HEST's TIFFs use
+    # pixels/cm (for example INT1 is 21889.4 px/cm), so this is still explicit
+    # slide metadata rather than an inferred/default scale.
+    if x is None or y is None:
+        unit_um = _resolution_unit_um(
+            properties.get("tiff.ResolutionUnit")
+            or properties.get("tiffslide.resolution-unit")
+        )
+        x_resolution = _property_float(
+            properties.get("tiff.XResolution")
+            or properties.get("tiffslide.x-resolution")
+        )
+        y_resolution = _property_float(
+            properties.get("tiff.YResolution")
+            or properties.get("tiffslide.y-resolution")
+        )
+        if unit_um is not None and x_resolution and y_resolution:
+            x = unit_um / x_resolution
+            y = unit_um / y_resolution
     if x is None or y is None:
         raise ValueError(
             "WSI has no explicit microns-per-pixel metadata; refusing to guess slide scale"
@@ -54,6 +95,50 @@ def _slide_mpp(slide) -> tuple[float, float]:
     if abs(mpp_x - mpp_y) / max(mpp_x, mpp_y) > 0.02:
         raise ValueError(f"anisotropic WSI pixels are not supported: ({mpp_x}, {mpp_y})")
     return mpp_x, mpp_y
+
+
+def _open_slide(path: Path):
+    """Open a WSI with independent backends and validate lazy metadata.
+
+    HEST's plain pyramidal tiled TIFFs can trigger ``incompatible keyframe``
+    in tifffile's shaped-series inference through TiffSlide.  OpenSlide has a
+    dedicated generic tiled-TIFF backend and does not use that inference.
+    Keep TiffSlide as a fallback for formats that it handles successfully.
+    """
+    errors: list[str] = []
+    slide = None
+    try:
+        import openslide
+
+        slide = openslide.OpenSlide(str(path))
+        # Force lazy failures here so a broken backend is never returned.
+        _ = slide.dimensions
+        _ = slide.properties
+        return slide, "openslide"
+    except Exception as exc:
+        errors.append(f"OpenSlide: {type(exc).__name__}: {exc}")
+        if slide is not None:
+            slide.close()
+
+    slide = None
+    try:
+        import tiffslide
+
+        slide = tiffslide.TiffSlide(str(path))
+        _ = slide.dimensions
+        _ = slide.properties
+        return slide, "tiffslide"
+    except Exception as exc:
+        errors.append(f"TiffSlide: {type(exc).__name__}: {exc}")
+        if slide is not None:
+            slide.close()
+
+    detail = "\n  - ".join(errors)
+    raise RuntimeError(
+        f"no WSI backend could open {path}:\n  - {detail}\n"
+        "For HEST pyramidal TIFFs install the official OpenSlide backend with "
+        "`python3 -m pip install openslide-bin openslide-python`."
+    )
 
 
 def _is_tissue(tile: np.ndarray, min_tissue_fraction: float) -> bool:
@@ -105,34 +190,33 @@ def _encode_batches(records, batch_size: int, device: str):
 
 def build_cache(cfg, sample_id: str, batch_size: int, target_mpp: float,
                 min_tissue_fraction: float, device: str) -> Path:
-    try:
-        import tiffslide
-    except Exception as exc:
-        raise ImportError("dense WSI caching requires tiffslide") from exc
-
     root = Path(str(cfg.data.hest_data_dir))
     wsi_path = _resolve_wsi(root, sample_id)
-    slide = tiffslide.TiffSlide(str(wsi_path))
-    mpp_x, mpp_y = _slide_mpp(slide)
-    source_span = int(round(256 * target_mpp / ((mpp_x + mpp_y) / 2.0)))
-    if source_span < 32:
-        raise ValueError(f"invalid source tile span {source_span} for {wsi_path}")
-    virtual_dimensions = np.asarray(slide.dimensions) * np.asarray(
-        [mpp_x / target_mpp, mpp_y / target_mpp]
-    )
-    if np.any(virtual_dimensions >= 256_000):
-        raise ValueError(
-            f"{sample_id} virtual dimensions {virtual_dimensions.tolist()} exceed "
-            "GigaPath LongNet's 1000x1000 positional grid at 256px per tile"
+    slide, backend = _open_slide(wsi_path)
+    try:
+        mpp_x, mpp_y = _slide_mpp(slide)
+        dimensions = tuple(map(int, slide.dimensions))
+        source_span = int(round(256 * target_mpp / ((mpp_x + mpp_y) / 2.0)))
+        if source_span < 32:
+            raise ValueError(f"invalid source tile span {source_span} for {wsi_path}")
+        virtual_dimensions = np.asarray(dimensions) * np.asarray(
+            [mpp_x / target_mpp, mpp_y / target_mpp]
         )
-    print(
-        f"{sample_id}: {wsi_path} dimensions={slide.dimensions} "
-        f"mpp=({mpp_x:.4f},{mpp_y:.4f}) level0_span={source_span}",
-        flush=True,
-    )
-    level0_coords, features = _encode_batches(
-        _tile_grid(slide, source_span, 256, min_tissue_fraction), batch_size, device
-    )
+        if np.any(virtual_dimensions >= 256_000):
+            raise ValueError(
+                f"{sample_id} virtual dimensions {virtual_dimensions.tolist()} exceed "
+                "GigaPath LongNet's 1000x1000 positional grid at 256px per tile"
+            )
+        print(
+            f"{sample_id}: {wsi_path} reader={backend} dimensions={dimensions} "
+            f"mpp=({mpp_x:.4f},{mpp_y:.4f}) level0_span={source_span}",
+            flush=True,
+        )
+        level0_coords, features = _encode_batches(
+            _tile_grid(slide, source_span, 256, min_tissue_fraction), batch_size, device
+        )
+    finally:
+        slide.close()
     # LongNet bins positions by its 256-pixel tile size.  Express positions
     # in the target-MPP frame even when the source WSI has a different MPP.
     coords = level0_coords * np.asarray([mpp_x / target_mpp, mpp_y / target_mpp])
@@ -157,12 +241,35 @@ def build_cache(cfg, sample_id: str, batch_size: int, target_mpp: float,
             coords_are_centers=np.asarray(False),
             target_mpp=np.asarray(target_mpp, dtype=np.float32),
             source_mpp=np.asarray([mpp_x, mpp_y], dtype=np.float32),
-            wsi_dimensions=np.asarray(slide.dimensions, dtype=np.int64),
+            wsi_dimensions=np.asarray(dimensions, dtype=np.int64),
             wsi_path=np.asarray(str(wsi_path)),
         )
     temporary.replace(output)
     print(f"{sample_id}: wrote {features.shape[0]} tiles to {output}", flush=True)
     return output
+
+
+def probe_slide(cfg, sample_id: str) -> None:
+    """Cheap reader/metadata/pixel-access check before launching GPU workers."""
+    root = Path(str(cfg.data.hest_data_dir))
+    wsi_path = _resolve_wsi(root, sample_id)
+    slide, backend = _open_slide(wsi_path)
+    try:
+        dimensions = tuple(map(int, slide.dimensions))
+        mpp_x, mpp_y = _slide_mpp(slide)
+        probe_size = tuple(min(256, value) for value in dimensions)
+        region = slide.read_region((0, 0), 0, probe_size).convert("RGB")
+        if region.size != probe_size:
+            raise RuntimeError(
+                f"WSI reader returned probe size {region.size}, expected {probe_size}"
+            )
+    finally:
+        slide.close()
+    print(
+        f"WSI probe ready: {sample_id} reader={backend} dimensions={dimensions} "
+        f"mpp=({mpp_x:.4f},{mpp_y:.4f}) path={wsi_path}",
+        flush=True,
+    )
 
 
 def main() -> None:
@@ -173,6 +280,7 @@ def main() -> None:
     parser.add_argument("--target-mpp", type=float, default=0.5)
     parser.add_argument("--min-tissue-fraction", type=float, default=0.10)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--probe-only", action="store_true")
     args = parser.parse_args()
     if args.target_mpp <= 0 or not 0 <= args.min_tissue_fraction <= 1:
         raise ValueError("target-mpp must be positive and min-tissue-fraction must be in [0,1]")
@@ -181,10 +289,13 @@ def main() -> None:
     if not ids:
         ids = [str(cfg.data.sample_id)]
     for sample_id in ids:
-        build_cache(
-            cfg, str(sample_id), args.batch_size, args.target_mpp,
-            args.min_tissue_fraction, args.device,
-        )
+        if args.probe_only:
+            probe_slide(cfg, str(sample_id))
+        else:
+            build_cache(
+                cfg, str(sample_id), args.batch_size, args.target_mpp,
+                args.min_tissue_fraction, args.device,
+            )
 
 
 if __name__ == "__main__":

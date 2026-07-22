@@ -61,6 +61,22 @@ magnitude without restricting evaluation to HVGs.
 All runs share samples, mask seeds, target holes, optimizer, decoder, and
 20,000 training draws.
 
+## WSI runtime
+
+The HEST images used here are generic pyramidal tiled TIFFs. Dense WSI
+precomputation uses OpenSlide's dedicated generic-TIFF backend; TiffSlide is
+retained only as a fallback for other supported slide formats. Install the
+official Python binding and bundled library in the training environment:
+
+```bash
+python3 -m pip install openslide-bin openslide-python
+```
+
+The launcher first opens INT1, reads its explicit TIFF resolution and one
+pixel region, and only then starts GPU workers. MPP is never guessed. Cache
+files are written to a temporary path and atomically renamed after all tile
+features have been encoded.
+
 ## Primary references
 
 - Prov-GigaPath: <https://www.nature.com/articles/s41586-024-07441-w>

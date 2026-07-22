@@ -37,6 +37,14 @@ if [[ -z "${GIGAPATH_SLIDE_CHECKPOINT:-}" || ! -f "$GIGAPATH_SLIDE_CHECKPOINT" ]
   echo "ERROR: export GIGAPATH_SLIDE_CHECKPOINT=/absolute/path/to/slide_encoder.pth" >&2
   exit 2
 fi
+if ! "$PYTHON_BIN" -c 'import openslide; print("OpenSlide WSI backend ready")'; then
+  echo "ERROR: HEST pyramidal TIFF reading requires OpenSlide." >&2
+  echo "Install it in this environment with:" >&2
+  echo "  python3 -m pip install openslide-bin openslide-python" >&2
+  exit 2
+fi
+"$PYTHON_BIN" scripts/precompute_gigapath_wsi_tiles.py --config "$CONFIG" \
+  --sample-id "${SAMPLES[0]}" --probe-only
 
 echo "===== Dense mask-aware WSI tile caches ====="
 pids=()
