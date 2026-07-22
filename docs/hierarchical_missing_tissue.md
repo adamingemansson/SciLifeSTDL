@@ -122,6 +122,24 @@ smoke or full jobs. FlashAttention 2.5.8 is the version pinned by the official
 Prov-GigaPath environment; build concurrency is capped here to avoid excessive
 CPU and RAM use on a shared server.
 
+## Gene-value-preserving transport (hierarchical_gene_transport_regressor)
+
+Held-out results above showed the dense `256 -> 512 -> G` decoder loses to
+exact IDW/harmonic interpolation: routing thousands of exact observed gene
+values through one 256D bottleneck before decoding back out discards
+gene-specific spatial structure a six-slide cohort cannot re-learn from
+scratch. `hierarchical_gene_transport_regressor`
+(`src/models/registry.py`) keeps `HierarchicalMissingTissueEncoder` as the
+conditioner but predicts a weighted combination of untouched observed
+full-gene vectors instead: an IDW anchor blended with a learned multi-head,
+per-gene-gated transport (`sigmoid(blend_logit)` starts near 0.05, so
+training begins close to plain IDW), plus an optional zero-initialized
+low-rank residual. See `HierarchicalMissingTissueEncoder.forward_with_neighbors()`
+for the exact query/neighbor contract this model consumes, and
+`configs/recovery_suite/165-185_transport_*.yaml` +
+`scripts/run_transport_suite_4gpu.sh` for the matched 20-run capacity-gate
+and held-out ablation suite (O01-O04, C01-C16, harmonic k128 control).
+
 ## Primary references
 
 - Prov-GigaPath: <https://www.nature.com/articles/s41586-024-07441-w>

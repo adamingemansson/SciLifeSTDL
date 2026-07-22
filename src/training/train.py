@@ -1951,6 +1951,7 @@ def inject_transport_gene_scale(model_cfg: dict, expressions: list[np.ndarray]) 
     """Inject train-only scaling for gene-preserving transport loss."""
     if model_cfg.get("name") not in {
         "context_transport_regressor", "gene_aware_transport_regressor",
+        "hierarchical_gene_transport_regressor",
     }:
         return
     params = model_cfg.get("params", {})
@@ -2050,7 +2051,9 @@ def _load_images(cfg, adata, sample_id: str | None = None):
     uses_frozen_gigapath = (
         model_params.get("image_encoder_type") == "gigapath"
         or model_params.get("context_encoder_type") in ("stpath", "storm_lite")
-        or cfg.model.get("name") == "hierarchical_missing_tissue_regressor"
+        or cfg.model.get("name") in (
+            "hierarchical_missing_tissue_regressor", "hierarchical_gene_transport_regressor",
+        )
     )
     if uses_frozen_gigapath:
         features = get_gigapath_features(cfg, patches, barcodes, sample_id=sid)

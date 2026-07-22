@@ -1484,6 +1484,401 @@ class GeneAwareContextTransportRegressor(BaseGenerativeModel):
         })
 
 
+@register_model("hierarchical_gene_transport_regressor")
+class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
+    """Gene-value-preserving transport on top of the hierarchical encoder.
+
+    docs/hierarchical_missing_tissue.md's held-out results showed
+    ``HierarchicalMissingTissueRegressor``'s dense ``256 -> 512 -> G`` decoder
+    loses to exact IDW/harmonic interpolation (PCC 0.0308 vs harmonic's
+    0.0340). The diagnosis: routing ~16k exact observed gene values through
+    one 256D bottleneck before decoding back out to ~16k genes discards
+    precisely the gene-specific spatial structure a six-slide CCRCC cohort
+    cannot re-learn from scratch. This model keeps
+    ``HierarchicalMissingTissueEncoder`` (frozen GigaPath local/slide
+    context, context-only Novae, STPath-style weighted-linear GEX) as the
+    *conditioner* deciding which observed spots matter, but the output stays
+    a weighted combination of untouched observed full-gene vectors, never a
+    dense gene decoder:
+
+        prediction(q,g) = sum_j alpha(q,j,g) * observed_expression(j,g) + residual(q,g)
+
+    ``alpha`` is a per-gene mixture over ``transport_heads`` separate convex
+    neighbor distributions (same factorization as
+    ``GeneAwareContextTransportRegressor`` above — an explicit
+    ``[n_genes, transport_heads]`` gate table, never a direct learned
+    ``[query, gene, neighbor]`` tensor), scored from
+    ``HierarchicalMissingTissueEncoder.forward_with_neighbors()``'s query
+    state, each candidate neighbor's already-fused multimodal token
+    (local/global H&E and Novae already baked in), and the encoder's own
+    relative geometry — reusing that forward pass instead of a second,
+    redundant k-NN search.
+
+    The candidate transport is blended with an inverse-distance-weighted
+    (IDW) anchor rather than trusted outright from step one:
+
+        prediction_transport = anchor + sigmoid(blend_logit) * (candidate - anchor)
+
+    ``blend_logit`` is initialized per-gene so ``sigmoid(blend_logit) ~ 0.05``
+    — early training stays close to plain IDW (a reasonable prior, since IDW
+    and harmonic both already beat the dense decoder) while keeping a live
+    gradient path into the learned transport from the first step. An
+    optional rank-``residual_rank`` factorized residual
+    (``query_factor(q) . gene_embedding[g]``, scaled by the training-only
+    per-gene scale) can add a small per-query-per-gene correction on top; its
+    query projection is zero-initialized so it contributes exactly nothing
+    until training earns it, and it is explicitly not a second dense
+    ``256 -> G`` decoder or a free per-gene bias.
+
+    ``conditioning_mode='geometry'`` disables ``neighbor_hidden``/
+    ``query_hidden`` from the transport *scoring* path (pure relative-
+    geometry kernel, still spatially adaptive) without touching the encoder
+    itself or the gene gate — an isolated ablation of whether multimodal
+    information changes *which* neighbor gets weight, independent of
+    ``use_query_gate`` (does the per-gene gate depend on the query at all)
+    and ``gene_gate_mode='shared'`` (one gate for every gene vs. one per
+    gene) so the 20-run suite's C07/C08/C09 controls can be set
+    independently of each other and of C05's full-richness baseline.
+    """
+
+    def __init__(
+        self,
+        n_genes: int,
+        novae_dim: int | None = None,
+        hidden_dim: int = 256,
+        n_heads: int = 4,
+        context_layers: int = 2,
+        cross_layers: int = 2,
+        query_layers: int = 1,
+        local_k: int = 128,
+        dropout: float = 0.1,
+        use_novae: bool = True,
+        use_local_images: bool = True,
+        use_slide_context: bool = True,
+        gene_encoder_type: str = "weighted_linear",
+        fusion_mode: str = "concat",
+        slide_checkpoint_path: str | None = None,
+        slide_output_dim: int = 768,
+        score_hidden_dim: int = 128,
+        transport_heads: int = 8,
+        transport_temperature: float = 1.0,
+        idw_power: float = 2.0,
+        conditioning_mode: str = "hierarchical",
+        gene_gate_mode: str = "per_gene",
+        use_query_gate: bool = True,
+        use_query_gene_gate: bool = False,
+        query_gene_gate_rank: int = 16,
+        use_residual: bool = False,
+        residual_rank: int = 32,
+        blend_logit_init: float = -2.9444389791664403,  # logit(0.05)
+        correlation_loss_weight: float = 0.25,
+        transport_reg_weight: float = 1e-3,
+        residual_penalty_weight: float = 1e-3,
+        target_gene_scale: list[float] | None = None,
+        target_scale_floor: float = 0.05,
+        lr: float = 1e-3,
+        conditioner_lr: float = 3e-4,
+        weight_decay: float = 1e-2,
+    ):
+        super().__init__()
+        from src.models.hierarchical_slide import HierarchicalMissingTissueEncoder
+
+        if conditioning_mode not in {"hierarchical", "geometry"}:
+            raise ValueError("conditioning_mode must be 'hierarchical' or 'geometry'")
+        if gene_gate_mode not in {"per_gene", "shared"}:
+            raise ValueError("gene_gate_mode must be 'per_gene' or 'shared'")
+        if transport_heads < 1:
+            raise ValueError("transport_heads must be positive")
+        if local_k < 1:
+            raise ValueError("local_k must be positive")
+        if target_scale_floor <= 0 or transport_temperature <= 0 or idw_power <= 0:
+            raise ValueError(
+                "target_scale_floor, transport_temperature and idw_power must be positive"
+            )
+        if correlation_loss_weight < 0 or transport_reg_weight < 0 or residual_penalty_weight < 0:
+            raise ValueError("loss weights must be non-negative")
+        if use_residual and residual_rank < 1:
+            raise ValueError("residual_rank must be positive when use_residual=True")
+        self.save_hyperparameters()
+
+        self.n_genes = int(n_genes)
+        self.context_encoder = HierarchicalMissingTissueEncoder(
+            n_genes=n_genes, novae_dim=novae_dim, hidden_dim=hidden_dim,
+            n_heads=n_heads, context_layers=context_layers, cross_layers=cross_layers,
+            query_layers=query_layers, local_k=local_k, dropout=dropout,
+            use_novae=use_novae, use_local_images=use_local_images,
+            use_slide_context=use_slide_context, gene_encoder_type=gene_encoder_type,
+            fusion_mode=fusion_mode, slide_checkpoint_path=slide_checkpoint_path,
+            slide_output_dim=slide_output_dim,
+        )
+
+        self.conditioning_mode = str(conditioning_mode)
+        self.gene_gate_mode = str(gene_gate_mode)
+        self.use_query_gate = bool(use_query_gate)
+        self.use_query_gene_gate = bool(use_query_gene_gate)
+        self.use_residual = bool(use_residual)
+        self.transport_heads = int(transport_heads)
+        self.transport_temperature = float(transport_temperature)
+        self.idw_power = float(idw_power)
+        self.correlation_loss_weight = float(correlation_loss_weight)
+        self.transport_reg_weight = float(transport_reg_weight)
+        self.residual_penalty_weight = float(residual_penalty_weight)
+        self.lr = float(lr)
+        self.conditioner_lr = float(conditioner_lr)
+        self.weight_decay = float(weight_decay)
+
+        scale = torch.ones(n_genes) if target_gene_scale is None else torch.as_tensor(
+            target_gene_scale, dtype=torch.float32
+        )
+        if scale.shape != (n_genes,):
+            raise ValueError(
+                f"target_gene_scale must have shape ({n_genes},), got {tuple(scale.shape)}"
+            )
+        if not torch.isfinite(scale).all():
+            raise ValueError("target_gene_scale contains non-finite values")
+        self.register_buffer("target_gene_scale", scale.clamp_min(float(target_scale_floor)))
+
+        # Transport scorer: relative geometry (3D, straight from
+        # forward_with_neighbors) + optionally the neighbor's own fused
+        # multimodal token and the query state -> one logit per head.
+        self.geometry_encoder = nn.Sequential(
+            nn.Linear(3, score_hidden_dim), nn.GELU(),
+            nn.Linear(score_hidden_dim, score_hidden_dim),
+        )
+        self.head_embedding = nn.Parameter(
+            torch.randn(self.transport_heads, score_hidden_dim) * 0.02
+        )
+        self.head_score_vector = nn.Parameter(
+            torch.randn(self.transport_heads, score_hidden_dim) * 0.02
+        )
+        self.score_norm = nn.LayerNorm(score_hidden_dim)
+        self.neighbor_projection = None
+        self.query_score_projection = None
+        if self.conditioning_mode == "hierarchical":
+            self.neighbor_projection = nn.Linear(hidden_dim, score_hidden_dim)
+            self.query_score_projection = nn.Linear(hidden_dim, score_hidden_dim)
+
+        gate_genes = 1 if self.gene_gate_mode == "shared" else n_genes
+        # A full [genes, heads] table is small (~0.5 MB for 16k genes and 8
+        # heads) and directly auditable — see ContextTransportRegressor's own
+        # docstring for why this project avoids a dense gene decoder here too.
+        self.gene_head_logits = nn.Parameter(torch.zeros(gate_genes, self.transport_heads))
+        self.query_gate_projection = (
+            nn.Linear(hidden_dim, self.transport_heads) if self.use_query_gate else None
+        )
+        self.query_gene_gate_query = None
+        self.query_gene_gate_table = None
+        if self.use_query_gene_gate:
+            self.query_gene_gate_query = nn.Linear(hidden_dim, query_gene_gate_rank)
+            self.query_gene_gate_table = nn.Parameter(
+                torch.randn(n_genes, query_gene_gate_rank, self.transport_heads) * 0.02
+            )
+
+        self.blend_logit = nn.Parameter(torch.full((n_genes,), float(blend_logit_init)))
+
+        self.residual_rank = int(residual_rank) if use_residual else 0
+        self.residual_query_projection = None
+        self.residual_gene_embedding = None
+        if self.use_residual:
+            self.residual_query_projection = nn.Linear(hidden_dim, self.residual_rank)
+            # "initialize the final query projection to exactly zero" — the
+            # residual contributes nothing until training moves this weight.
+            nn.init.zeros_(self.residual_query_projection.weight)
+            nn.init.zeros_(self.residual_query_projection.bias)
+            self.residual_gene_embedding = nn.Parameter(
+                torch.randn(n_genes, self.residual_rank) * (1.0 / math.sqrt(self.residual_rank))
+            )
+
+    @staticmethod
+    def _mean_per_gene_correlation(prediction: torch.Tensor,
+                                   target: torch.Tensor) -> torch.Tensor:
+        pred_centered = prediction - prediction.mean(dim=0, keepdim=True)
+        target_centered = target - target.mean(dim=0, keepdim=True)
+        target_ss = target_centered.square().sum(dim=0)
+        eligible = target_ss > 1e-8
+        if not bool(eligible.any()):
+            return prediction.new_zeros(())
+        numerator = (pred_centered * target_centered).sum(dim=0)
+        pred_ss = pred_centered.square().sum(dim=0)
+        denominator = torch.sqrt((pred_ss * target_ss).clamp_min(1e-8))
+        return (numerator[eligible] / denominator[eligible]).mean()
+
+    def _idw_anchor(self, neighbor_distances: torch.Tensor,
+                     neighbour_expression: torch.Tensor):
+        """Non-learned inverse-distance-weighted interpolation — the
+        per-step anchor the handoff requires in place of full graph-harmonic
+        interpolation (too expensive to run every training step)."""
+        weights = 1.0 / neighbor_distances.clamp_min(1e-6).pow(self.idw_power)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        anchor = torch.sum(weights[..., None] * neighbour_expression, dim=1)
+        return anchor, weights
+
+    def sample(self, context, query):
+        encoded = self.context_encoder.forward_with_neighbors(context, query)
+        query_hidden = encoded["query_hidden"]            # [Nq, H]
+        neighbor_hidden = encoded["neighbor_hidden"]        # [Nq, k, H]
+        neighbor_indices = encoded["neighbor_indices"]      # [Nq, k]
+        neighbor_distances = encoded["neighbor_distances"]  # [Nq, k]
+        relative_geometry = encoded["relative_geometry"]    # [Nq, k, 3]
+        n_query, k = neighbor_indices.shape
+
+        neighbour_expression = context["expression"][neighbor_indices]  # [Nq, k, G]
+        anchor_expression, idw_weights = self._idw_anchor(neighbor_distances, neighbour_expression)
+
+        hidden = self.geometry_encoder(relative_geometry)[:, :, None, :]  # [Nq,k,1,S]
+        hidden = hidden + self.head_embedding[None, None, :, :]           # [1,1,H,S]
+        if self.conditioning_mode == "hierarchical":
+            hidden = hidden + self.neighbor_projection(neighbor_hidden)[:, :, None, :]
+            hidden = hidden + self.query_score_projection(query_hidden)[:, None, None, :]
+        hidden = torch.nn.functional.gelu(self.score_norm(hidden))
+        logits = torch.einsum("qkhd,hd->qkh", hidden, self.head_score_vector)
+        head_weights = torch.softmax(
+            logits.transpose(1, 2) / self.transport_temperature, dim=-1
+        )  # [Nq, heads, k]
+        head_expression = torch.einsum(
+            "qhk,qkg->qhg", head_weights, neighbour_expression
+        )  # [Nq, heads, G]
+
+        base_gate = (
+            self.gene_head_logits.expand(self.n_genes, -1)
+            if self.gene_gate_mode == "shared" else self.gene_head_logits
+        )
+        gate_logits = base_gate[None, :, :].expand(n_query, -1, -1)  # [Nq, G, heads]
+        if self.query_gate_projection is not None:
+            gate_logits = gate_logits + self.query_gate_projection(query_hidden)[:, None, :]
+        if self.query_gene_gate_table is not None:
+            query_low = self.query_gene_gate_query(query_hidden)  # [Nq, rank]
+            gate_logits = gate_logits + torch.einsum(
+                "qr,grh->qgh", query_low, self.query_gene_gate_table
+            )
+        gene_gates = torch.softmax(gate_logits, dim=-1)  # [Nq, G, heads]
+        candidate = torch.einsum("qhg,qgh->qg", head_expression, gene_gates)
+
+        blend = torch.sigmoid(self.blend_logit)[None, :]  # [1, G]
+        transport = anchor_expression + blend * (candidate - anchor_expression)
+
+        residual = torch.zeros_like(transport)
+        if self.use_residual:
+            query_factor = self.residual_query_projection(query_hidden)  # [Nq, rank]
+            residual = torch.einsum(
+                "qr,gr->qg", query_factor, self.residual_gene_embedding
+            ) * self.target_gene_scale[None, :]
+
+        expression = transport + residual
+        head_entropy = -(
+            head_weights * head_weights.clamp_min(1e-12).log()
+        ).sum(dim=-1).mean()
+        gate_entropy = -(
+            gene_gates * gene_gates.clamp_min(1e-12).log()
+        ).sum(dim=-1).mean()
+
+        return {
+            "coords": query["coords"],
+            "expression": expression,
+            "anchor_expression": anchor_expression,
+            "residual_expression": expression - anchor_expression,
+            "transport_expression": transport,
+            "factorized_residual": residual,
+            "transport_head_entropy": head_entropy,
+            "gene_gate_entropy": gate_entropy,
+            "idw_weights": idw_weights,
+        }
+
+    def training_step(self, batch, batch_idx):
+        out = self.sample(batch["context"], batch["query"])
+        target = batch["target_expression"]
+        standardized_error = (out["expression"] - target) / self.target_gene_scale
+        standardized_mse = standardized_error.square().mean()
+        absolute_mse = nn.functional.mse_loss(out["expression"], target)
+        anchor_mse = nn.functional.mse_loss(out["anchor_expression"], target)
+        spatial_correlation = self._mean_per_gene_correlation(out["expression"], target)
+        correlation_loss = 1.0 - spatial_correlation
+
+        # "small transport regularization" (handoff, exact form unspecified):
+        # a negative-entropy bonus that keeps the multi-head neighbor
+        # distribution soft rather than collapsing onto a single observed
+        # spot before the gene gates have learned anything real. This is our
+        # own interpretation, not an independently specified formula.
+        transport_regularization = -out["transport_head_entropy"]
+        standardized_residual = out["factorized_residual"] / self.target_gene_scale
+        residual_penalty = standardized_residual.square().mean()
+
+        loss = (
+            standardized_mse
+            + self.correlation_loss_weight * correlation_loss
+            + self.transport_reg_weight * transport_regularization
+            + self.residual_penalty_weight * residual_penalty
+        )
+
+        transport_delta_rms = (
+            out["transport_expression"] - out["anchor_expression"]
+        ).square().mean().sqrt()
+        factorized_residual_rms = out["factorized_residual"].square().mean().sqrt()
+        prediction_delta_rms = out["residual_expression"].square().mean().sqrt()
+
+        self.log_dict({
+            "train/loss": loss,
+            "train/standardized_mse": standardized_mse,
+            "train/absolute_mse": absolute_mse,
+            "train/anchor_mse": anchor_mse,
+            "train/per_gene_pcc": spatial_correlation,
+            "train/transport_delta_rms": transport_delta_rms,
+            "train/factorized_residual_rms": factorized_residual_rms,
+            "train/prediction_delta_rms": prediction_delta_rms,
+            "train/transport_head_entropy": out["transport_head_entropy"],
+            "train/gene_gate_entropy": out["gene_gate_entropy"],
+        })
+        return loss
+
+    def configure_optimizers(self):
+        encoder_params = [p for p in self.context_encoder.parameters() if p.requires_grad]
+        encoder_ids = {id(p) for p in encoder_params}
+        other_params = [
+            p for p in self.parameters() if p.requires_grad and id(p) not in encoder_ids
+        ]
+        groups = []
+        if other_params:
+            groups.append({"params": other_params, "lr": self.lr})
+        if encoder_params:
+            groups.append({"params": encoder_params, "lr": self.conditioner_lr})
+        if not groups:
+            return None
+        return torch.optim.AdamW(groups, weight_decay=self.weight_decay)
+
+    def on_after_backward(self) -> None:
+        encoder_params = list(self.context_encoder.parameters())
+        encoder_ids = {id(p) for p in encoder_params}
+        encoder_sq = torch.zeros((), device=self.device)
+        for parameter in encoder_params:
+            if parameter.grad is not None:
+                encoder_sq = encoder_sq + parameter.grad.detach().square().sum()
+
+        residual_params = []
+        if self.residual_query_projection is not None:
+            residual_params.extend(self.residual_query_projection.parameters())
+        if self.residual_gene_embedding is not None:
+            residual_params.append(self.residual_gene_embedding)
+        residual_ids = {id(p) for p in residual_params}
+        residual_sq = torch.zeros((), device=self.device)
+        for parameter in residual_params:
+            if parameter.grad is not None:
+                residual_sq = residual_sq + parameter.grad.detach().square().sum()
+
+        transport_sq = torch.zeros((), device=self.device)
+        for parameter in self.parameters():
+            if parameter.grad is None:
+                continue
+            if id(parameter) in encoder_ids or id(parameter) in residual_ids:
+                continue
+            transport_sq = transport_sq + parameter.grad.detach().square().sum()
+
+        self.log_dict({
+            "train/hierarchical_encoder_grad_norm": encoder_sq.sqrt(),
+            "train/transport_grad_norm": transport_sq.sqrt(),
+            "train/factorized_residual_grad_norm": residual_sq.sqrt(),
+        })
+
+
 # ---------------------------------------------------------------------------
 # VAE baseline. Unconditioned placeholder — see docs/architecture_plan.md
 # "Known gaps" for the conditioning encoder this still needs.
