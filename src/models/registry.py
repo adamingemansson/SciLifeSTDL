@@ -1197,9 +1197,12 @@ class GeneAwareContextTransportRegressor(BaseGenerativeModel):
         if not bool(eligible.any()):
             return prediction.new_zeros(())
         numerator = (pred_centered * target_centered).sum(dim=0)
-        denominator = torch.sqrt(
-            pred_centered.square().sum(dim=0) * target_ss
-        ).clamp_min(1e-8)
+        # Clamp the squared product *before* sqrt.  Clamping only after
+        # sqrt leaves autograd evaluating sqrt'(0)=inf for a gene whose
+        # initial prediction is constant; the following zero numerator can
+        # then produce NaN gradients on the very first optimizer step.
+        pred_ss = pred_centered.square().sum(dim=0)
+        denominator = torch.sqrt((pred_ss * target_ss).clamp_min(1e-8))
         return (numerator[eligible] / denominator[eligible]).mean()
 
     def sample(self, context, query):

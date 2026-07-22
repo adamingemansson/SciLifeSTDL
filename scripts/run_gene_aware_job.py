@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 from pathlib import Path
 import shlex
@@ -73,6 +74,19 @@ def main() -> None:
     if not artifact.is_file():
         print(f"FAILED: {entry.name} exited zero but did not create {artifact}", file=sys.stderr)
         raise SystemExit(3)
+    if str(entry.stage) == "overfit":
+        gate = json.loads(artifact.read_text())
+        required = ("anchor_score", "best_score", "correction_rms")
+        invalid = [
+            key for key in required
+            if gate.get(key) is None or not math.isfinite(float(gate[key]))
+        ]
+        if invalid:
+            print(
+                f"FAILED: {entry.name} created a non-finite capacity gate: {invalid}",
+                file=sys.stderr,
+            )
+            raise SystemExit(4)
     print(f"DONE: {entry.name}", flush=True)
 
 

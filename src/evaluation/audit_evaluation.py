@@ -320,6 +320,15 @@ def evaluate_model_on_mask_bank(
                 )
             target_t = _target_for_model(model, item_device["target_expression"])
             pred_t = samples.mean(dim=0)
+            if not torch.isfinite(samples).all():
+                raise FloatingPointError(
+                    f"audit prediction contains non-finite values for image mode "
+                    f"{mode_key!r}, mask index {record['index']}; metrics were not written"
+                )
+            if not torch.isfinite(target_t).all():
+                raise FloatingPointError(
+                    f"audit target contains non-finite values for mask index {record['index']}"
+                )
             lower = torch.quantile(samples, 0.05, dim=0)
             upper = torch.quantile(samples, 0.95, dim=0)
             pred = pred_t.detach().cpu().numpy()

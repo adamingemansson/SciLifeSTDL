@@ -136,9 +136,19 @@ class FixedMaskValidationCallback(pl.Callback):
                 target_c = target - target.mean(dim=0, keepdim=True)
                 denom = torch.sqrt((pred_c**2).sum(0) * (target_c**2).sum(0)).clamp_min(1e-8)
                 value = ((pred_c * target_c).sum(0) / denom).nanmean().item()
+            if not np.isfinite(value):
+                raise FloatingPointError(
+                    f"fixed-mask validation produced non-finite {self.metric} "
+                    f"for item {i}; refusing to save or promote corrupted weights"
+                )
             values.append(value)
         model.train(was_training)
-        return float(np.mean(values))
+        score = float(np.mean(values))
+        if not np.isfinite(score):
+            raise FloatingPointError(
+                f"fixed-mask validation produced non-finite mean {self.metric}"
+            )
+        return score
 
     @torch.no_grad()
     def _score_anchor(self, model: torch.nn.Module) -> float | None:

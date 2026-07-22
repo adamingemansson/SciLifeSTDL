@@ -246,6 +246,36 @@ def test_gene_aware_transport_is_convex_gene_specific_and_trainable():
     assert torch.allclose(original_prediction, transformed_prediction, atol=2e-5)
 
 
+def test_gene_aware_transport_correlation_has_finite_constant_prediction_gradients():
+    """The PCC objective must be differentiable at zero predicted variance."""
+    item = _item(n_context=10, n_query=5, n_genes=6)
+    # Convex transport of identical context rows is exactly constant across
+    # every query, reproducing the first-step failure seen by the smoke suite.
+    item["context"]["expression"] = torch.rand(1, 6).expand(10, -1).clone()
+    model = build_model({
+        "name": "gene_aware_transport_regressor",
+        "params": {
+            "n_genes": 6,
+            "conditioning_mode": "geometry",
+            "transport_k": 5,
+            "transport_heads": 4,
+            "score_hidden_dim": 16,
+            "target_gene_scale": [0.1] * 6,
+            "correlation_loss_weight": 0.25,
+        },
+    })
+    loss = model.training_step(item, 0)
+    assert torch.isfinite(loss)
+    loss.backward()
+    gradients = [
+        parameter.grad
+        for parameter in model.parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    assert gradients
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+
 def test_residual_flow_loads_and_freezes_validated_autoencoder(tmp_path: Path):
     n_genes, latent, hidden = 6, 3, 7
     encoder = nn.Sequential(nn.Linear(n_genes, hidden), nn.ReLU(), nn.Linear(hidden, latent))
