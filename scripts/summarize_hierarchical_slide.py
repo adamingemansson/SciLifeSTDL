@@ -13,6 +13,7 @@ RUNS = (
     "hierarchical_no_slide_seed10",
     "hierarchical_no_novae_seed10",
     "hierarchical_he_only_seed10",
+    "hierarchical_harmonic_k128",
 )
 
 

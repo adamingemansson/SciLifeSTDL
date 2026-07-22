@@ -93,6 +93,10 @@ fi
 
 echo "===== Four matched 20k held-out-sample runs ====="
 run_batch full 0
+echo "===== Exact-mask non-learned harmonic control ====="
+CUDA_VISIBLE_DEVICES=1 "$PYTHON_BIN" -m src.training.train \
+  --config configs/recovery_suite/156_hierarchical_harmonic_control.yaml \
+  >"$LOG_ROOT/full_hierarchical_harmonic_k128.log" 2>&1
 "$PYTHON_BIN" scripts/summarize_hierarchical_slide.py \
   --output "$REPORT_ROOT/summary.csv"
 echo "Hierarchical suite complete: $REPORT_ROOT/summary.csv"

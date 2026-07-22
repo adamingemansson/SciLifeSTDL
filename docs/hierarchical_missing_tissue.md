@@ -50,6 +50,7 @@ architecture must beat held-out controls before adding a stochastic generator.
 | no slide | local H&E + raw GEX + Novae | does LongNet add real value? |
 | no Novae | slide/local H&E + raw GEX | does Novae add value beyond raw GEX? |
 | H&E only | slide/local H&E | how much is predictable without observed GEX? |
+| harmonic k128 | observed GEX only | non-learned exact-mask baseline |
 
 All runs share samples, mask seeds, target holes, optimizer, decoder, and
 20,000 training draws.
