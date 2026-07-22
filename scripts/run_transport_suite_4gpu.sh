@@ -46,11 +46,21 @@ QUEUE_3=(167 171 175 179 183)  # O03 C03 C07 C11 C15
 QUEUE_4=(168 172 176 180 184)  # O04 C04 C08 C12 C16
 QUEUES=(QUEUE_1 QUEUE_2 QUEUE_3 QUEUE_4)
 
+# CONFIG_NAME must be each config's real internal experiment_name (also its
+# checkpoint_dir basename), NOT the config filename -- the generator used two
+# different naming schemes (165_transport_o01_....yaml on disk vs.
+# experiment_name: transport_capacity_o01_... inside it) and reading the
+# filename here silently checked a path that never existed, misreading a
+# real completed capacity gate as "failed" (real incident, 2026-07-22).
 declare -A CONFIG_PATH
 declare -A CONFIG_NAME
-for f in configs/recovery_suite/1[6-8][0-9]_transport_*.yaml; do
+for f in configs/recovery_suite/16[5-9]_transport_*.yaml configs/recovery_suite/17[0-9]_transport_*.yaml configs/recovery_suite/18[0-4]_transport_*.yaml; do
   number="$(basename "$f" | cut -d_ -f1)"
-  name="$(basename "$f" .yaml)"
+  name="$(awk -F': ' '/^experiment_name:/ {print $2; exit}' "$f")"
+  if [[ -z "$name" ]]; then
+    echo "ERROR: could not read experiment_name from $f" >&2
+    exit 2
+  fi
   CONFIG_PATH["$number"]="$f"
   CONFIG_NAME["$number"]="$name"
 done
