@@ -56,10 +56,32 @@ magnitude without restricting evaluation to HVGs.
 | no slide | local H&E + raw GEX + Novae | does LongNet add real value? |
 | no Novae | slide/local H&E + raw GEX | does Novae add value beyond raw GEX? |
 | H&E only | slide/local H&E | how much is predictable without observed GEX? |
+| global H&E only | slide H&E | does LongNet carry useful morphology by itself? |
+| local H&E only | local spot H&E | does local morphology work without global context? |
+| raw GEX only | raw GEX | learned spatial GEX control without Novae or H&E |
+| raw GEX + Novae | raw GEX + Novae | does Novae improve expression-only context? |
 | harmonic k128 | observed GEX only | non-learned exact-mask baseline |
 
 All runs share samples, mask seeds, target holes, optimizer, decoder, and
 20,000 training draws.
+
+## Gene evaluation contract
+
+Every learned model is trained against and predicts the complete shared gene
+panel. HVGs do not replace its inputs, targets, loss, or decoder. Evaluation
+reports the full-panel PCC/RMSE plus four prespecified views of those same full
+predictions:
+
+- the fixed HEST-Bench CCRCC top-50 panel used by STPath, for a like-for-like
+  benchmark comparison;
+- top 50, 100 and 250 genes ranked by variance across the six training samples
+  after the configured normalization/log1p transform.
+
+INT7 and INT8 expression never participates in the train-variance ranking.
+The fixed STPath panel is explicitly labelled as an external benchmark panel,
+not a leakage-safe model-selection panel. Full-panel metrics remain the main
+task result; subset metrics diagnose whether useful variable-gene structure is
+being learned but diluted by thousands of sparse or locally constant genes.
 
 ## WSI runtime
 

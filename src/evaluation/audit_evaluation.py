@@ -35,7 +35,12 @@ def _canonical_config(value: Any) -> Any:
     return value
 
 
-def _resume_signature(cfg, records: list[dict], output_path: Path) -> dict | None:
+def _resume_signature(
+    cfg,
+    records: list[dict],
+    output_path: Path,
+    gene_panels: dict[str, list[str]] | None = None,
+) -> dict | None:
     """Fingerprint everything required to safely reuse partial audit rows.
 
     A saved trainable-weights file is mandatory. Without it, two distinct
@@ -55,16 +60,17 @@ def _resume_signature(cfg, records: list[dict], output_path: Path) -> dict | Non
             "masking": _canonical_config(cfg.get("masking", {})),
             "model": _canonical_config(cfg.get("model", {})),
             "evaluation": _canonical_config(cfg.get("evaluation", {})),
+            "gene_panels": gene_panels or {},
         },
         sort_keys=True,
         separators=(",", ":"),
         default=str,
     )
     return {
-        # Version 2 invalidates partial rows written before truth-only PCC
-        # eligibility and n_pcc_genes were introduced. Config/weight/mask
-        # hashes alone cannot detect a metric-implementation change.
-        "version": 2,
+        # Version 3 also fingerprints the resolved evaluation-only gene
+        # panels. Config/weight/mask hashes alone cannot detect train-derived
+        # panel membership passed in by the multi-sample training path.
+        "version": 3,
         "output_name": output_path.name,
         "weights_sha256": _sha256_file(weights_path),
         "mask_records_sha256": hashlib.sha256(mask_payload.encode()).hexdigest(),
@@ -96,6 +102,45 @@ def _mean_and_std(rows: list[dict[str, float]]) -> dict[str, dict[str, float]]:
             "n": int(finite.size),
         }
     return out
+
+
+def _resolve_gene_panels(
+    gene_names: list[str],
+    gene_panels: dict[str, list[str]] | None,
+) -> tuple[dict[str, np.ndarray], dict[str, dict[str, Any]]]:
+    """Map prespecified gene-name panels onto the model output columns.
+
+    Panels are evaluation views only: they never alter the model vocabulary,
+    targets, loss, or decoder. Missing names are recorded rather than silently
+    changing the requested panel size. Panel names are restricted to stable
+    metric-key characters because they become JSON field suffixes.
+    """
+    import re
+
+    name_to_idx = {str(name): idx for idx, name in enumerate(gene_names)}
+    indices: dict[str, np.ndarray] = {}
+    metadata: dict[str, dict[str, Any]] = {}
+    for raw_name, raw_genes in (gene_panels or {}).items():
+        panel_name = str(raw_name)
+        if not re.fullmatch(r"[A-Za-z0-9_]+", panel_name):
+            raise ValueError(
+                f"gene panel name {panel_name!r} must contain only letters, digits and underscores"
+            )
+        requested = list(dict.fromkeys(str(gene) for gene in raw_genes))
+        present = [gene for gene in requested if gene in name_to_idx]
+        missing = [gene for gene in requested if gene not in name_to_idx]
+        if not present:
+            raise ValueError(
+                f"gene panel {panel_name!r} has no genes in the model output vocabulary"
+            )
+        indices[panel_name] = np.asarray([name_to_idx[gene] for gene in present], dtype=np.int64)
+        metadata[panel_name] = {
+            "requested_count": len(requested),
+            "evaluated_count": len(present),
+            "genes": present,
+            "missing_genes": missing,
+        }
+    return indices, metadata
 
 
 def _fixed_pca(records, obs_names, coords3d, expr, requested_components: int, k: int):
@@ -158,6 +203,7 @@ def evaluate_model_on_mask_bank(
     organ: str | None = None,
     tech: str | None = None,
     slide_context: dict | None = None,
+    gene_panels: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """Evaluate predictive means and uncertainty on untouched test masks.
 
@@ -197,9 +243,12 @@ def evaluate_model_on_mask_bank(
     decoder_idx = getattr(model, "_decoder_target_col_idx", None)
     if decoder_idx is None:
         metric_expr = expr
+        metric_gene_names = [str(name) for name in adata.var_names]
     else:
         idx_np = decoder_idx.detach().cpu().numpy()
         metric_expr = expr[:, idx_np]
+        metric_gene_names = [str(adata.var_names[idx]) for idx in idx_np]
+    panel_indices, panel_metadata = _resolve_gene_panels(metric_gene_names, gene_panels)
     pca, effective_pca = _fixed_pca(
         records, adata.obs_names, coords3d, metric_expr, requested_pca, k
     )
@@ -215,6 +264,7 @@ def evaluate_model_on_mask_bank(
         "requested_pca_components": requested_pca,
         "effective_pca_components": effective_pca,
         "n_evaluated_genes": int(metric_expr.shape[1]),
+        "gene_panels": panel_metadata,
         "primary_image_mode": primary_image_mode,
         "context_gex_mode": context_gex_mode,
         "modality_ablation": str(cfg.get("data", {}).get("modality_ablation", "both")),
@@ -230,10 +280,14 @@ def evaluate_model_on_mask_bank(
                 "Per-gene PCC eligibility is determined by non-constant ground truth. "
                 "A constant prediction for an eligible gene scores 0; n_pcc_genes is reported."
             ),
+            "gene_panels": (
+                "Evaluation-only slices of the full model output. They do not alter training, "
+                "the loss, input genes, or decoder genes."
+            ),
         },
     }
 
-    signature = _resume_signature(cfg, records, output_path)
+    signature = _resume_signature(cfg, records, output_path, gene_panels=gene_panels)
     if signature is not None and partial_path.is_file():
         try:
             partial = json.loads(partial_path.read_text())
@@ -352,6 +406,13 @@ def evaluate_model_on_mask_bank(
                 "interval90_coverage": float(((target_t >= lower) & (target_t <= upper)).float().mean().cpu()),
                 "interval90_width": float((upper - lower).mean().cpu()),
             }
+            for panel_name, panel_idx in panel_indices.items():
+                panel_pred = pred[:, panel_idx]
+                panel_target = target[:, panel_idx]
+                panel_pcc = ev.pearson_per_gene(panel_pred, panel_target)
+                row[f"pcc_{panel_name}"] = float(np.nanmean(panel_pcc))
+                row[f"n_pcc_genes_{panel_name}"] = int(np.isfinite(panel_pcc).sum())
+                row[f"rmse_{panel_name}"] = float(ev.rmse(panel_pred, panel_target))
 
             if pca is not None:
                 query_coords = coords3d[query_mask]

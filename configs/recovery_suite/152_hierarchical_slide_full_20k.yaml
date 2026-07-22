@@ -97,6 +97,8 @@ evaluation:
   context_gex_mode: full
   k_neighborhood: 8
   pca_n_components: 50
+  fixed_gene_panel_paths: {stpath_hest_bench_ccrcc_50: resources/evaluation/hest_bench/CCRCC_var_50genes.json}
+  train_variance_gene_panel_sizes: [50, 100, 250]
   training_mask_bank_path: results/mask_banks/training/recovery_suite/hierarchical_slide_full_20k_256_seed760000.json
 logging:
   backend: csv

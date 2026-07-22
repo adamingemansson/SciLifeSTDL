@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Four matched 20k-step jobs on the first four configured GPUs.
+# Eight matched 20k-step jobs, batched over 4-8 configured GPUs.
 set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -16,12 +16,20 @@ CONFIGS=(
   configs/recovery_suite/153_hierarchical_no_slide_20k.yaml
   configs/recovery_suite/154_hierarchical_no_novae_20k.yaml
   configs/recovery_suite/155_hierarchical_he_only_20k.yaml
+  configs/recovery_suite/157_hierarchical_global_he_only_20k.yaml
+  configs/recovery_suite/158_hierarchical_local_he_only_20k.yaml
+  configs/recovery_suite/159_hierarchical_raw_gex_only_20k.yaml
+  configs/recovery_suite/160_hierarchical_gex_novae_only_20k.yaml
 )
 NAMES=(
   hierarchical_slide_full_seed10
   hierarchical_no_slide_seed10
   hierarchical_no_novae_seed10
   hierarchical_he_only_seed10
+  hierarchical_global_he_only_seed10
+  hierarchical_local_he_only_seed10
+  hierarchical_raw_gex_only_seed10
+  hierarchical_gex_novae_only_seed10
 )
 LOG_ROOT="logs/recovery_suite/hierarchical_slide_${RUN_ID}"
 REPORT_ROOT="reports/recovery_suite/hierarchical_slide_${RUN_ID}"
@@ -33,6 +41,9 @@ export MKL_NUM_THREADS="$CPU_THREADS_PER_JOB"
 export OPENBLAS_NUM_THREADS="$CPU_THREADS_PER_JOB"
 export NUMEXPR_NUM_THREADS="$CPU_THREADS_PER_JOB"
 mkdir -p "$LOG_ROOT" "$REPORT_ROOT"
+
+echo "===== Static fail-closed audit of all hierarchical configs ====="
+"$PYTHON_BIN" scripts/check_hierarchical_slide_configs.py
 
 if (( ${#GPUS[@]} < 4 || ${#GPUS[@]} > 8 )); then
   echo "ERROR: GPU_IDS must provide between 4 and 8 comma-separated devices." >&2
@@ -72,35 +83,44 @@ fi
 
 run_batch() {
   local phase="$1" smoke="$2"
-  local pids=() i
-  for i in 0 1 2 3; do
-    local command=(
-      "$PYTHON_BIN" -m src.training.train --config "${CONFIGS[$i]}"
-    )
-    if [[ "$smoke" == "1" ]]; then
-      command+=(--override
-        "experiment_name=${NAMES[$i]}_smoke_${RUN_ID}"
-        training.epochs=1 training.unique_mask_count=1
-        training.checkpoint_every_n_steps=0 training.log_print_every_n_steps=1
-        "training.checkpoint_dir=results/checkpoints/recovery_suite/smoke/${RUN_ID}/${NAMES[$i]}"
-        validation.every_n_steps=1 validation.early_stopping_min_steps=1
-        validation.patience_checks=1000 validation.require_anchor_improvement=false
-        evaluation.n_validation_masks=1 evaluation.n_test_masks=1 evaluation.n_samples=1
-        "evaluation.mask_bank_dir=results/mask_banks/recovery_suite/smoke_hierarchical_${RUN_ID}"
-        "evaluation.training_mask_bank_path=results/mask_banks/training/recovery_suite/smoke_${RUN_ID}_${NAMES[$i]}.json"
-      )
+  local batch_start batch_end i slot pid failed
+  for ((batch_start=0; batch_start<${#CONFIGS[@]}; batch_start+=${#GPUS[@]})); do
+    batch_end=$((batch_start + ${#GPUS[@]}))
+    if (( batch_end > ${#CONFIGS[@]} )); then
+      batch_end=${#CONFIGS[@]}
     fi
-    echo "GPU ${GPUS[$i]} -> ${NAMES[$i]} ($phase)"
-    CUDA_VISIBLE_DEVICES="${GPUS[$i]}" "${command[@]}" \
-      >"$LOG_ROOT/${phase}_${NAMES[$i]}.log" 2>&1 &
-    pids+=("$!")
+    echo "Starting $phase jobs $((batch_start + 1))-$batch_end/${#CONFIGS[@]}"
+    local pids=()
+    for ((i=batch_start; i<batch_end; i++)); do
+      slot=$((i - batch_start))
+      local command=(
+        "$PYTHON_BIN" -m src.training.train --config "${CONFIGS[$i]}"
+      )
+      if [[ "$smoke" == "1" ]]; then
+        command+=(--override
+          "experiment_name=${NAMES[$i]}_smoke_${RUN_ID}"
+          training.epochs=1 training.unique_mask_count=1
+          training.checkpoint_every_n_steps=0 training.log_print_every_n_steps=1
+          "training.checkpoint_dir=results/checkpoints/recovery_suite/smoke/${RUN_ID}/${NAMES[$i]}"
+          validation.every_n_steps=1 validation.early_stopping_min_steps=1
+          validation.patience_checks=1000 validation.require_anchor_improvement=false
+          evaluation.n_validation_masks=1 evaluation.n_test_masks=1 evaluation.n_samples=1
+          "evaluation.mask_bank_dir=results/mask_banks/recovery_suite/smoke_hierarchical_${RUN_ID}"
+          "evaluation.training_mask_bank_path=results/mask_banks/training/recovery_suite/smoke_${RUN_ID}_${NAMES[$i]}.json"
+        )
+      fi
+      echo "GPU ${GPUS[$slot]} -> ${NAMES[$i]} ($phase)"
+      CUDA_VISIBLE_DEVICES="${GPUS[$slot]}" "${command[@]}" \
+        >"$LOG_ROOT/${phase}_${NAMES[$i]}.log" 2>&1 &
+      pids+=("$!")
+    done
+    failed=0
+    for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+    if (( failed )); then
+      echo "ERROR: $phase failed; inspect $LOG_ROOT/${phase}_*.log" >&2
+      return 1
+    fi
   done
-  local failed=0 pid
-  for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
-  if (( failed )); then
-    echo "ERROR: $phase failed; inspect $LOG_ROOT/${phase}_*.log" >&2
-    return 1
-  fi
 }
 
 if [[ "$SKIP_SMOKE" != "1" ]]; then
@@ -112,25 +132,13 @@ if [[ "$SMOKE_ONLY" == "1" ]]; then
   exit 0
 fi
 
-echo "===== Four matched 20k held-out-sample runs ====="
+echo "===== Eight matched 20k held-out-sample runs ====="
 failed=0
-harmonic_pid=""
-if (( ${#GPUS[@]} >= 5 )); then
-  echo "GPU ${GPUS[4]} -> hierarchical_harmonic_k128 (full control)"
-  CUDA_VISIBLE_DEVICES="${GPUS[4]}" "$PYTHON_BIN" -m src.training.train \
-    --config configs/recovery_suite/156_hierarchical_harmonic_control.yaml \
-    >"$LOG_ROOT/full_hierarchical_harmonic_k128.log" 2>&1 &
-  harmonic_pid="$!"
-fi
 run_batch full 0 || failed=1
-if [[ -n "$harmonic_pid" ]]; then
-  wait "$harmonic_pid" || failed=1
-else
-  echo "===== Exact-mask non-learned harmonic control ====="
-  CUDA_VISIBLE_DEVICES="${GPUS[0]}" "$PYTHON_BIN" -m src.training.train \
-    --config configs/recovery_suite/156_hierarchical_harmonic_control.yaml \
-    >"$LOG_ROOT/full_hierarchical_harmonic_k128.log" 2>&1 || failed=1
-fi
+echo "===== Exact-mask non-learned harmonic control ====="
+CUDA_VISIBLE_DEVICES="${GPUS[0]}" "$PYTHON_BIN" -m src.training.train \
+  --config configs/recovery_suite/156_hierarchical_harmonic_control.yaml \
+  >"$LOG_ROOT/full_hierarchical_harmonic_k128.log" 2>&1 || failed=1
 if (( failed )); then
   echo "ERROR: at least one full job failed; inspect $LOG_ROOT/full_*.log" >&2
   exit 1

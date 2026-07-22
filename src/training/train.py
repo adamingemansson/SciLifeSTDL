@@ -2390,6 +2390,68 @@ def inject_multi_sample_n_genes(model_cfg: dict, adatas: list) -> None:
     params["n_genes"] = adatas[0].n_vars
 
 
+def _resolved_evaluation_gene_panels(
+    cfg,
+    train_samples: list[tuple],
+    gene_names: list[str],
+) -> dict[str, list[str]]:
+    """Build evaluation-only gene panels without touching held-out targets.
+
+    Fixed comparison panels are read from versioned JSON files. Diagnostic
+    variance panels are ranked using normalized/log1p expression from training
+    samples only. The returned names merely slice predictions during metric
+    calculation; the model still trains and predicts the complete shared gene
+    vocabulary.
+    """
+    evaluation = cfg.get("evaluation", {})
+    panels: dict[str, list[str]] = {}
+
+    fixed_paths = evaluation.get("fixed_gene_panel_paths", {})
+    for panel_name, raw_path in fixed_paths.items():
+        path = Path(str(raw_path))
+        if not path.is_file():
+            raise FileNotFoundError(f"fixed evaluation gene panel is missing: {path}")
+        payload = json.loads(path.read_text())
+        genes = payload.get("genes") if isinstance(payload, dict) else payload
+        if not isinstance(genes, list) or not genes:
+            raise ValueError(f"fixed evaluation gene panel must contain a non-empty gene list: {path}")
+        panels[str(panel_name)] = list(dict.fromkeys(str(gene) for gene in genes))
+
+    requested_sizes = sorted({
+        int(size) for size in evaluation.get("train_variance_gene_panel_sizes", [])
+    })
+    if requested_sizes:
+        if requested_sizes[0] <= 0:
+            raise ValueError("evaluation.train_variance_gene_panel_sizes must be positive")
+        if requested_sizes[-1] > len(gene_names):
+            raise ValueError(
+                "evaluation train-variance panel exceeds the full shared gene vocabulary: "
+                f"{requested_sizes[-1]} > {len(gene_names)}"
+            )
+        # Accumulate moments in float64 to avoid concatenating every training
+        # spot and to make the ranking deterministic across machines.
+        count = 0
+        total = np.zeros(len(gene_names), dtype=np.float64)
+        total_sq = np.zeros(len(gene_names), dtype=np.float64)
+        for sample in train_samples:
+            expression = np.asarray(sample[1], dtype=np.float64)
+            if expression.ndim != 2 or expression.shape[1] != len(gene_names):
+                raise ValueError("training expression does not match the shared gene vocabulary")
+            count += expression.shape[0]
+            total += expression.sum(axis=0)
+            total_sq += np.square(expression).sum(axis=0)
+        if count < 2:
+            raise ValueError("at least two training spots are required to rank variable genes")
+        variance = np.maximum(total_sq / count - np.square(total / count), 0.0)
+        # Stable sort makes ties deterministic in the already-fixed shared
+        # vocabulary order.
+        ranked = np.argsort(-variance, kind="stable")
+        for size in requested_sizes:
+            panels[f"train_variance_top{size}"] = [gene_names[idx] for idx in ranked[:size]]
+
+    return panels
+
+
 def _main_multi_sample(cfg) -> None:
     """Train on explicit samples and validate/test on held-out samples.
 
@@ -2422,6 +2484,9 @@ def _main_multi_sample(cfg) -> None:
     adatas = [*train_adatas, *validation_adatas]
     by_id = {str(sid): (sample, adata) for sid, sample, adata in zip(all_ids, samples, adatas)}
     train_samples = [by_id[str(sid)][0] for sid in train_ids]
+    evaluation_gene_panels = _resolved_evaluation_gene_panels(
+        cfg, train_samples, gene_names
+    )
     fit_adatas = train_adatas
     augment = bool(cfg.training.get("augment_coords", False))
     coord_scale = float(np.mean([sample[0][:, :2].std() for sample in train_samples]))
@@ -2481,6 +2546,13 @@ def _main_multi_sample(cfg) -> None:
     }
     Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
     (Path(checkpoint_dir) / "sample_split.json").write_text(json.dumps(split_manifest, indent=2))
+    (Path(checkpoint_dir) / "evaluation_gene_panels.json").write_text(
+        json.dumps({
+            "selection_scope": "training_samples_only_or_fixed_external_panel",
+            "training_and_output_vocabulary": "full_shared_gene_panel",
+            "panels": evaluation_gene_panels,
+        }, indent=2)
+    )
 
     evaluation_cfg = cfg.get("evaluation", {})
     mask_bank_dir = Path(evaluation_cfg.get("mask_bank_dir", "results/mask_banks"))
@@ -2614,11 +2686,21 @@ def _main_multi_sample(cfg) -> None:
                 output_path=Path(checkpoint_dir) / f"audit_test_metrics_{sid}.json",
                 organ=organ, tech=tech,
                 slide_context=sample[10],
+                gene_panels=evaluation_gene_panels,
             )
         aggregate = {}
         aggregate_metrics = (
             "pcc", "n_pcc_genes", "rmse", "nonzero_auc", "st_fid", "st_mmd",
             "spatial_domain_plausibility", "predictive_std", "interval90_coverage",
+            *(
+                metric
+                for panel_name in evaluation_gene_panels
+                for metric in (
+                    f"pcc_{panel_name}",
+                    f"n_pcc_genes_{panel_name}",
+                    f"rmse_{panel_name}",
+                )
+            ),
         )
         for mode in list(evaluation_cfg.get("image_modes", ["full"])):
             mode_rows = []
@@ -2646,6 +2728,7 @@ def _main_multi_sample(cfg) -> None:
             "context_gex_mode": str(evaluation_cfg.get("context_gex_mode", "full")),
             "modality_ablation": str(cfg.data.get("modality_ablation", "both")),
             "n_evaluated_genes": len(gene_names),
+            "gene_panels": next(iter(test_results.values())).get("gene_panels", {}),
             "test_sample_ids": test_ids,
             "image_modes": aggregate,
         }
@@ -2657,6 +2740,13 @@ def _main_multi_sample(cfg) -> None:
         print(f"held-out-sample primary image mode: {primary_mode}")
         print(f"held-out-sample PCC: {primary['pcc_mean']:.4f}")
         print(f"held-out-sample RMSE: {primary['rmse_mean']:.4f}")
+        for panel_name in evaluation_gene_panels:
+            evaluated = heldout_summary["gene_panels"][panel_name]["evaluated_count"]
+            print(
+                f"held-out-sample {panel_name} (n={evaluated}) "
+                f"PCC: {primary[f'pcc_{panel_name}_mean']:.4f} "
+                f"RMSE: {primary[f'rmse_{panel_name}_mean']:.4f}"
+            )
     else:
         print("WARNING: no data.test_sample_ids configured; no held-out-sample test was run.")
 

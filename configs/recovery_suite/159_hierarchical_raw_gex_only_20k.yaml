@@ -1,5 +1,6 @@
-# Non-learned control on the exact same held-out sample, spot cohort and holes.
-experiment_name: hierarchical_harmonic_k128
+# Raw-GEX control: expression-weighted full-panel input without Novae or H&E.
+# Images remain loaded only to preserve the exact aligned spot cohort.
+experiment_name: hierarchical_raw_gex_only_seed10
 data:
   source: hest1k
   hest_data_dir: data/raw/hest1k
@@ -21,8 +22,6 @@ data:
   expression_target_sum: 10000.0
   novae_mode: disabled
   require_image_coverage: true
-  # Load image coverage even though the baseline ignores pixel features so
-  # its spot cohort and held-out holes exactly match the learned runs.
   use_images: true
   organ_by_sample: {INT1: Kidney, INT2: Kidney, INT3: Kidney, INT4: Kidney, INT5: Kidney, INT6: Kidney, INT7: Kidney, INT8: Kidney}
   tech_by_sample: {INT1: Visium, INT2: Visium, INT3: Visium, INT4: Visium, INT5: Visium, INT6: Visium, INT7: Visium, INT8: Visium}
@@ -32,14 +31,32 @@ masking:
   context_selection: nearest_query
   params: {n_patches: 1, radius_range: [3.0, 6.0], radius_unit: spot_spacing, shape: mixed}
 model:
-  name: spatial_baseline
-  params: {mode: harmonic, k: 128, ridge: 0.0001}
+  name: hierarchical_missing_tissue_regressor
+  params:
+    hidden_dim: 256
+    decoder_hidden_dim: 512
+    n_heads: 4
+    context_layers: 2
+    cross_layers: 2
+    query_layers: 1
+    local_k: 64
+    dropout: 0.1
+    use_novae: false
+    use_local_images: false
+    use_slide_context: false
+    gene_encoder_type: weighted_linear
+    target_scale_floor: 0.05
+    correlation_loss_weight: 0.25
+    lr: 0.0003
+    weight_decay: 0.01
 training:
-  epochs: 1
+  epochs: 20000
   seed: 10
   mask_seed: 760000
-  unique_mask_count: 1
+  unique_mask_count: 256
   log_every_n_steps: 10
+  log_print_every_n_steps: 500
+  checkpoint_every_n_steps: 10000
   num_workers: 0
   augment_coords: false
   image_mode: all_zero
@@ -47,8 +64,9 @@ training:
   query_image_dropout_p: 0.0
   all_image_dropout_p: 0.0
   context_gex_dropout_p: 0.0
-  checkpoint_dir: results/checkpoints/recovery_suite/hierarchical_harmonic_k128
-validation: {enabled: false}
+  gradient_clip_val: 1.0
+  checkpoint_dir: results/checkpoints/recovery_suite/hierarchical_raw_gex_only_seed10
+validation: {enabled: true, every_n_steps: 1000, patience_checks: 1000, early_stopping_min_steps: 20000, require_anchor_improvement: false, min_delta: 0.0001, metric: rmse, n_samples: 1, sampling_seed: 860000}
 evaluation:
   mask_bank_dir: results/mask_banks/recovery_suite/hierarchical_slide_v1
   n_validation_masks: 8
@@ -65,5 +83,5 @@ evaluation:
   pca_n_components: 50
   fixed_gene_panel_paths: {stpath_hest_bench_ccrcc_50: resources/evaluation/hest_bench/CCRCC_var_50genes.json}
   train_variance_gene_panel_sizes: [50, 100, 250]
-  training_mask_bank_path: results/mask_banks/training/recovery_suite/hierarchical_harmonic_aligned_1_seed760000.json
+  training_mask_bank_path: results/mask_banks/training/recovery_suite/hierarchical_raw_gex_only_20k_256_seed760000.json
 logging: {backend: csv, project: st3d-lundeberg-lab}

@@ -42,5 +42,9 @@ def test_resume_signature_changes_with_weights_masks_and_config(tmp_path):
     changed_cfg["evaluation"]["n_samples"] = 4
     assert _resume_signature(changed_cfg, records, output) != original
 
+    assert _resume_signature(
+        cfg, records, output, gene_panels={"train_variance_top50": ["A", "B"]}
+    ) != original
+
     torch.save({"weight": torch.tensor([2.0])}, weights)
     assert _resume_signature(cfg, records, output) != original
