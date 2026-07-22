@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Four matched 20k-step jobs on the allocated st-a100 GPUs 1,2,3,5.
+# Four matched 20k-step jobs on the first four configured GPUs.
 set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -9,7 +9,8 @@ CPU_THREADS_PER_JOB="${CPU_THREADS_PER_JOB:-2}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 SMOKE_ONLY="${SMOKE_ONLY:-0}"
 SKIP_SMOKE="${SKIP_SMOKE:-0}"
-GPUS=(1 2 3 5)
+GPU_IDS_CSV="${GPU_IDS:-1,2,3,5}"
+IFS=',' read -r -a GPUS <<< "$GPU_IDS_CSV"
 CONFIGS=(
   configs/recovery_suite/152_hierarchical_slide_full_20k.yaml
   configs/recovery_suite/153_hierarchical_no_slide_20k.yaml
@@ -33,13 +34,26 @@ export OPENBLAS_NUM_THREADS="$CPU_THREADS_PER_JOB"
 export NUMEXPR_NUM_THREADS="$CPU_THREADS_PER_JOB"
 mkdir -p "$LOG_ROOT" "$REPORT_ROOT"
 
+if (( ${#GPUS[@]} < 4 || ${#GPUS[@]} > 8 )); then
+  echo "ERROR: GPU_IDS must provide between 4 and 8 comma-separated devices." >&2
+  exit 2
+fi
+declare -A seen_gpus=()
+for gpu in "${GPUS[@]}"; do
+  if ! [[ "$gpu" =~ ^[0-9]+$ ]] || [[ -n "${seen_gpus[$gpu]:-}" ]]; then
+    echo "ERROR: GPU_IDS contains an invalid or duplicate device: $GPU_IDS_CSV" >&2
+    exit 2
+  fi
+  seen_gpus[$gpu]=1
+done
+
 if [[ -z "${GIGAPATH_SLIDE_CHECKPOINT:-}" || ! -f "$GIGAPATH_SLIDE_CHECKPOINT" ]]; then
   echo "ERROR: GIGAPATH_SLIDE_CHECKPOINT is missing or not a file." >&2
   exit 2
 fi
 for sid in INT1 INT2 INT3 INT4 INT5 INT6 INT7 INT8; do
   test -f "data/cache/hest1k/gigapath_slide_cache/${sid}.npz" || {
-    echo "ERROR: missing dense WSI cache for $sid; run precompute_hierarchical_slide_4gpu.sh" >&2
+    echo "ERROR: missing dense WSI cache for $sid; run a hierarchical precompute launcher" >&2
     exit 2
   }
 done
@@ -92,11 +106,28 @@ if [[ "$SMOKE_ONLY" == "1" ]]; then
 fi
 
 echo "===== Four matched 20k held-out-sample runs ====="
-run_batch full 0
-echo "===== Exact-mask non-learned harmonic control ====="
-CUDA_VISIBLE_DEVICES=1 "$PYTHON_BIN" -m src.training.train \
-  --config configs/recovery_suite/156_hierarchical_harmonic_control.yaml \
-  >"$LOG_ROOT/full_hierarchical_harmonic_k128.log" 2>&1
+failed=0
+harmonic_pid=""
+if (( ${#GPUS[@]} >= 5 )); then
+  echo "GPU ${GPUS[4]} -> hierarchical_harmonic_k128 (full control)"
+  CUDA_VISIBLE_DEVICES="${GPUS[4]}" "$PYTHON_BIN" -m src.training.train \
+    --config configs/recovery_suite/156_hierarchical_harmonic_control.yaml \
+    >"$LOG_ROOT/full_hierarchical_harmonic_k128.log" 2>&1 &
+  harmonic_pid="$!"
+fi
+run_batch full 0 || failed=1
+if [[ -n "$harmonic_pid" ]]; then
+  wait "$harmonic_pid" || failed=1
+else
+  echo "===== Exact-mask non-learned harmonic control ====="
+  CUDA_VISIBLE_DEVICES="${GPUS[0]}" "$PYTHON_BIN" -m src.training.train \
+    --config configs/recovery_suite/156_hierarchical_harmonic_control.yaml \
+    >"$LOG_ROOT/full_hierarchical_harmonic_k128.log" 2>&1 || failed=1
+fi
+if (( failed )); then
+  echo "ERROR: at least one full job failed; inspect $LOG_ROOT/full_*.log" >&2
+  exit 1
+fi
 "$PYTHON_BIN" scripts/summarize_hierarchical_slide.py \
   --output "$REPORT_ROOT/summary.csv"
 echo "Hierarchical suite complete: $REPORT_ROOT/summary.csv"

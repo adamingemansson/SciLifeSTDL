@@ -42,6 +42,12 @@ ST spot coordinates do not align with the cached WSI.
 Flow matching is deliberately excluded from this first gate. The conditioning
 architecture must beat held-out controls before adding a stochastic generator.
 
+The weighted-linear GEX encoder is likewise a STPath-faithful baseline, not a
+claim that it is the best final representation. A follow-up should compare it
+under identical masks against (1) a residual nonlinear full-panel encoder and
+(2) a gene-token/set encoder that retains gene identity and expression
+magnitude without restricting evaluation to HVGs.
+
 ## First matched runs
 
 | Run | Visible inputs | Question |

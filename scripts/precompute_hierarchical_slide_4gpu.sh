@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build dense WSI and leakage-safe Novae caches on the allocated st-a100 GPUs.
+# Build dense WSI and leakage-safe Novae caches on configurable GPUs.
 set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -7,7 +7,8 @@ cd "$REPO_ROOT"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 CPU_THREADS_PER_JOB="${CPU_THREADS_PER_JOB:-2}"
 CONFIG="configs/recovery_suite/152_hierarchical_slide_full_20k.yaml"
-GPUS=(1 2 3 5)
+GPU_IDS_CSV="${GPU_IDS:-1,2,3,5}"
+IFS=',' read -r -a GPUS <<< "$GPU_IDS_CSV"
 SAMPLES=(INT1 INT2 INT3 INT4 INT5 INT6 INT7 INT8)
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 LOG_ROOT="logs/recovery_suite/hierarchical_precompute_${RUN_ID}"
@@ -19,6 +20,19 @@ export OPENBLAS_NUM_THREADS="$CPU_THREADS_PER_JOB"
 export NUMEXPR_NUM_THREADS="$CPU_THREADS_PER_JOB"
 mkdir -p "$LOG_ROOT"
 
+if (( ${#GPUS[@]} < 1 || ${#GPUS[@]} > 8 )); then
+  echo "ERROR: GPU_IDS must contain between 1 and 8 comma-separated devices." >&2
+  exit 2
+fi
+declare -A seen_gpus=()
+for gpu in "${GPUS[@]}"; do
+  if ! [[ "$gpu" =~ ^[0-9]+$ ]] || [[ -n "${seen_gpus[$gpu]:-}" ]]; then
+    echo "ERROR: GPU_IDS contains an invalid or duplicate device: $GPU_IDS_CSV" >&2
+    exit 2
+  fi
+  seen_gpus[$gpu]=1
+done
+
 if [[ -z "${GIGAPATH_SLIDE_CHECKPOINT:-}" || ! -f "$GIGAPATH_SLIDE_CHECKPOINT" ]]; then
   echo "ERROR: export GIGAPATH_SLIDE_CHECKPOINT=/absolute/path/to/slide_encoder.pth" >&2
   exit 2
@@ -26,12 +40,16 @@ fi
 
 echo "===== Dense mask-aware WSI tile caches ====="
 pids=()
-for slot in 0 1 2 3; do
-  first="${SAMPLES[$((2 * slot))]}"
-  second="${SAMPLES[$((2 * slot + 1))]}"
-  CUDA_VISIBLE_DEVICES="${GPUS[$slot]}" "$PYTHON_BIN" \
-    scripts/precompute_gigapath_wsi_tiles.py --config "$CONFIG" \
-    --sample-id "$first" --sample-id "$second" --device cuda \
+run_wsi_slot() {
+  local slot="$1" gpu="$2" sample_index
+  for ((sample_index=slot; sample_index<${#SAMPLES[@]}; sample_index+=${#GPUS[@]})); do
+    CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" \
+      scripts/precompute_gigapath_wsi_tiles.py --config "$CONFIG" \
+      --sample-id "${SAMPLES[$sample_index]}" --device cuda
+  done
+}
+for ((slot=0; slot<${#GPUS[@]}; slot++)); do
+  run_wsi_slot "$slot" "${GPUS[$slot]}" \
     >"$LOG_ROOT/wsi_gpu${GPUS[$slot]}.log" 2>&1 &
   pids+=("$!")
 done
@@ -43,15 +61,15 @@ if (( failed )); then
 fi
 
 echo "===== Spot-aligned frozen GigaPath caches ====="
-CUDA_VISIBLE_DEVICES=1 "$PYTHON_BIN" scripts/precompute_gigapath_samples.py \
+CUDA_VISIBLE_DEVICES="${GPUS[0]}" "$PYTHON_BIN" scripts/precompute_gigapath_samples.py \
   --config "$CONFIG" >"$LOG_ROOT/spot_gigapath.log" 2>&1
 
 echo "===== Context-only Novae caches (queries physically absent from graphs) ====="
 pids=()
-for shard in 0 1 2 3; do
+for ((shard=0; shard<${#GPUS[@]}; shard++)); do
   CUDA_VISIBLE_DEVICES="${GPUS[$shard]}" "$PYTHON_BIN" \
     scripts/precompute_context_novae_cache.py --config "$CONFIG" \
-    --shard-index "$shard" --num-shards 4 \
+    --shard-index "$shard" --num-shards "${#GPUS[@]}" \
     >"$LOG_ROOT/novae_shard${shard}.log" 2>&1 &
   pids+=("$!")
 done
