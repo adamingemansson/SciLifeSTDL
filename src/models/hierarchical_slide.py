@@ -80,6 +80,20 @@ class FrozenGigaPathSlideEncoder(nn.Module):
                 "Install https://github.com/prov-gigapath/prov-gigapath in the "
                 "training environment."
             ) from exc
+        # GigaPath's vendored DilatedAttention asserts that FlashAttention is
+        # active, and its A100 path sets the callable to None when the optional
+        # compiled package is absent.  Detect that state while constructing the
+        # model rather than failing deep inside the first validation forward.
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7:
+            from gigapath.torchscale.component.flash_attention import flash_attn_func
+
+            if flash_attn_func is None:
+                raise ImportError(
+                    "Prov-GigaPath LongNet requires FlashAttention on A100-class GPUs, "
+                    "but its CUDA kernel is unavailable. Install the upstream-pinned "
+                    "dependency with `MAX_JOBS=4 python3 -m pip install "
+                    "flash-attn==2.5.8 --no-build-isolation`, then start a new Python process."
+                )
 
         self.model = slide_encoder.create_model(
             str(path), model_arch, int(tile_feature_dim)

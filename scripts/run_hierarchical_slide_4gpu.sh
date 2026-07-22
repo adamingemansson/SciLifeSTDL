@@ -51,6 +51,13 @@ if [[ -z "${GIGAPATH_SLIDE_CHECKPOINT:-}" || ! -f "$GIGAPATH_SLIDE_CHECKPOINT" ]
   echo "ERROR: GIGAPATH_SLIDE_CHECKPOINT is missing or not a file." >&2
   exit 2
 fi
+if ! CUDA_VISIBLE_DEVICES="${GPUS[0]}" "$PYTHON_BIN" -c \
+  'import torch; from gigapath.torchscale.component.flash_attention import flash_attn_func; assert torch.cuda.is_available() and flash_attn_func is not None'; then
+  echo "ERROR: GigaPath LongNet's FlashAttention CUDA kernel is unavailable." >&2
+  echo "Install its upstream-pinned dependency with limited build parallelism:" >&2
+  echo "  MAX_JOBS=4 python3 -m pip install flash-attn==2.5.8 --no-build-isolation" >&2
+  exit 2
+fi
 for sid in INT1 INT2 INT3 INT4 INT5 INT6 INT7 INT8; do
   test -f "data/cache/hest1k/gigapath_slide_cache/${sid}.npz" || {
     echo "ERROR: missing dense WSI cache for $sid; run a hierarchical precompute launcher" >&2

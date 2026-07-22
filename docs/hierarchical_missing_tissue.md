@@ -70,12 +70,17 @@ official Python binding and bundled library in the training environment:
 
 ```bash
 python3 -m pip install openslide-bin openslide-python
+MAX_JOBS=4 python3 -m pip install flash-attn==2.5.8 --no-build-isolation
 ```
 
 The launcher first opens INT1, reads its explicit TIFF resolution and one
 pixel region, and only then starts GPU workers. MPP is never guessed. Cache
 files are written to a temporary path and atomically renamed after all tile
-features have been encoded.
+features have been encoded. The training launcher also verifies that
+GigaPath's compiled FlashAttention callable is available before starting any
+smoke or full jobs. FlashAttention 2.5.8 is the version pinned by the official
+Prov-GigaPath environment; build concurrency is capped here to avoid excessive
+CPU and RAM use on a shared server.
 
 ## Primary references
 
