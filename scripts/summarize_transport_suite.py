@@ -10,6 +10,9 @@ Two phases share one CSV, distinguished by the ``phase`` column:
     ``heldout_sample_summary.json`` (train.py's own final report), mirroring
     scripts/summarize_hierarchical_slide.py's column layout exactly so the
     two suites stay directly comparable.
+
+Run after (or during, for a partial view) scripts/run_transport_suite_4gpu.sh;
+rows for runs that haven't finished yet are still written, marked status="not_run".
 """
 from __future__ import annotations
 
