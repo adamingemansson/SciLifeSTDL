@@ -55,6 +55,16 @@ def main():
     parser.add_argument("--tech-type", default="Visium")
     parser.add_argument("--heldout-fraction", type=float, default=0.15)
     parser.add_argument("--heldout-seed", type=int, default=20260720)  # matches the 8-job batch
+    parser.add_argument("--top-hvg", type=int, default=50,
+                         help="Restrict PCC/RMSE to the top-N highly-variable genes after "
+                              "log1p normalization -- matches STFlow's real published "
+                              "evaluation convention (and most of this literature: STNet, "
+                              "HisToGene, BLEEP, etc. all evaluate this way, not averaged "
+                              "over the whole panel). Most of a ~16,500-gene panel is "
+                              "lowly-expressed/near-constant across spots -- averaging PCC "
+                              "over ALL of them dilutes whatever real signal exists in the "
+                              "genes that actually vary spatially. Set to 0 to disable and "
+                              "evaluate the full panel instead (the original behavior).")
     args = parser.parse_args()
 
     gene_voc_path = os.environ.get("STPATH_GENE_VOC_PATH")
@@ -120,23 +130,41 @@ def main():
     # target: our real expression, log1p'd (matching STPath's own ge_tokens convention,
     # see forward()'s "expr = torch.log1p(context_expression)[:, self._valid_gene_pos]"),
     # restricted to the same valid_gene_pos columns predict_raw_expression already returns
+    valid_gene_names = [gene_names[i] for i in encoder._valid_gene_pos]
     target = np.log1p(expr[query_mask][:, encoder._valid_gene_pos])
 
-    pcc = np.nanmean(ev.pearson_per_gene(raw_pred, target))
-    rmse = ev.rmse(raw_pred, target)
+    eval_pred, eval_target, n_genes_used = raw_pred, target, len(valid_gene_names)
+    if args.top_hvg > 0:
+        import scanpy as sc
+        hvg_adata = adata.copy()
+        sc.pp.highly_variable_genes(hvg_adata, n_top_genes=min(args.top_hvg, adata.n_vars))
+        hvg_names = set(hvg_adata.var_names[hvg_adata.var["highly_variable"]].tolist())
+        # restrict to whichever of the top-N HVGs ALSO had a match in STPath's own
+        # vocabulary (valid_gene_names) -- can't score a gene STPath never predicted
+        keep_idx = [i for i, g in enumerate(valid_gene_names) if g in hvg_names]
+        print(f"  top-{args.top_hvg} HVGs: {len(keep_idx)}/{args.top_hvg} also matched "
+              f"STPath's vocabulary (the rest of the {args.top_hvg} weren't in "
+              f"_valid_gene_pos, see the 'symbols not in the tokenizer' warning above)")
+        eval_pred, eval_target, n_genes_used = raw_pred[:, keep_idx], target[:, keep_idx], len(keep_idx)
+
+    pcc = np.nanmean(ev.pearson_per_gene(eval_pred, eval_target))
+    rmse = ev.rmse(eval_pred, eval_target)
     print("")
-    print("=== RAW STPath inference (no training on our data at all) ===")
+    hvg_label = f"top-{args.top_hvg} HVGs" if args.top_hvg > 0 else "full panel"
+    print(f"=== RAW STPath inference (no training on our data at all) -- {hvg_label} ===")
     print(f"mean PCC:  {pcc:.4f}")
     print(f"RMSE:      {rmse:.4f}")
-    print(f"n_query:   {query_mask.sum()} spots, {len(encoder._valid_gene_pos)} genes")
+    print(f"n_query:   {query_mask.sum()} spots, {n_genes_used} genes")
     print("")
     print("Compare directly against the held-out generalization batch's numbers "
-          "(same split, same spots): standard-eval PCC ~0.25-0.45 (memorized), "
-          "held-out PCC ~0.02 (our own trained models on unseen spots). If this raw "
-          "STPath number is meaningfully above ~0.02, STPath's own pretrained in-context "
-          "mechanism IS doing real work that our wrapping pipeline currently discards "
-          "or fails to exploit. If it's ALSO near zero, the bottleneck may be more "
-          "fundamental (data/task mismatch, not just our own decoder).")
+          "(same split, same spots, though THOSE were full-panel PCC, not HVG-restricted --"
+          " re-run that batch's eval with the same HVG restriction for a truly fair "
+          "comparison): standard-eval PCC ~0.25-0.45 (memorized, full-panel), held-out "
+          "PCC ~0.02 (our own trained models on unseen spots, full-panel). If this raw "
+          "STPath HVG number is meaningfully above ~0.02, STPath's own pretrained "
+          "in-context mechanism IS doing real work our wrapping pipeline discards or "
+          "fails to exploit. If it's ALSO near zero, the bottleneck is more fundamental "
+          "than just gene selection.")
 
 
 if __name__ == "__main__":
