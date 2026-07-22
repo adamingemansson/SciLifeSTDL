@@ -162,11 +162,19 @@ run_one() {
       "training.checkpoint_dir=results/checkpoints/recovery_suite/smoke/${RUN_ID}/${name}"
       validation.every_n_steps=1 validation.early_stopping_min_steps=1
       validation.patience_checks=1000 validation.require_anchor_improvement=false
+      # training_mask_bank_path is keyed by n_items=cfg.training.epochs
+      # (see ensure_training_seed_bank / _training_seed_bank_for_config).
+      # Smoke overrides epochs to 1; without its own bank path here, a
+      # capacity-gate smoke run (O01-O04, evaluation disabled, no other
+      # bank-path override below) writes a real 1-item bank to the SAME
+      # path the real 3000-step run then tries to reuse -- a genuine
+      # n_items mismatch the bank's own staleness guard correctly rejects.
+      # Applies to every smoke run, not just held-out ones.
+      "evaluation.training_mask_bank_path=results/mask_banks/training/recovery_suite/smoke_${RUN_ID}_${name}.json"
     )
     if [[ "$number" -ge 169 ]]; then
       command+=(evaluation.n_validation_masks=1 evaluation.n_test_masks=1 evaluation.n_samples=1
-        "evaluation.mask_bank_dir=results/mask_banks/recovery_suite/smoke_transport_${RUN_ID}"
-        "evaluation.training_mask_bank_path=results/mask_banks/training/recovery_suite/smoke_${RUN_ID}_${name}.json")
+        "evaluation.mask_bank_dir=results/mask_banks/recovery_suite/smoke_transport_${RUN_ID}")
     fi
     echo "GPU $gpu -> $name (smoke)"
     CUDA_VISIBLE_DEVICES="$gpu" "${command[@]}" >"$LOG_ROOT/smoke_${name}.log" 2>&1
