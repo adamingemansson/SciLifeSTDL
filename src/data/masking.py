@@ -245,3 +245,33 @@ def mixed_dropout(coords_xy: np.ndarray, slice_ids: np.ndarray,
     query_mask = patch_query | sparse_query
     context_mask = ~query_mask
     return context_mask, query_mask
+
+
+def held_out_mask(n_points: int, heldout_fraction: float, seed: int) -> np.ndarray:
+    """2026-07-20, genuine held-out-spot generalization test — see
+    docs/results_log.md's 2026-07-20 entry on the "does the model just
+    memorize query spots it saw as training targets" concern (raised via
+    independent review, verified as mechanistically plausible: every
+    training step gives a query spot's REAL coordinates and REAL H&E
+    image as input while training the network to output that spot's
+    real expression, and since masking is redrawn randomly every step
+    across thousands of steps on the SAME slide, most/all spots get used
+    as a supervised training TARGET many times before the model is ever
+    scored on them at eval time — the model could be recalling a
+    memorized (spot identity -> expression) association rather than
+    genuinely reconstructing from context).
+
+    Returns a FIXED (seeded, deterministic — same seed always returns the
+    same mask for the same n_points) boolean mask marking ~heldout_fraction
+    of all points as "held out". Callers must ensure held-out spots are
+    NEVER placed in a training query/mask set (see
+    make_context_query_split's heldout_mask param in train.py) for the
+    entire duration of training, then evaluate held-out spots as a
+    dedicated, separate query set at the end — see
+    evaluate_heldout_generalization in train.py. Random scatter (not a
+    contiguous spatial region) — a genuinely stronger test would hold out
+    a whole spatially contiguous region instead, but scatter already
+    tests the core claim (does the model recall spot-level identity) and
+    is simpler to reason about."""
+    rng = np.random.default_rng(seed)
+    return rng.random(n_points) < heldout_fraction

@@ -456,12 +456,22 @@ def load_pretrained_weights_into(model, checkpoint_dir: str) -> dict:
             "skipped_missing_from_checkpoint": skipped_missing}
 
 
-def make_context_query_split(coords3d: np.ndarray, slice_ids: np.ndarray, masking_cfg, seed: int):
+def make_context_query_split(coords3d: np.ndarray, slice_ids: np.ndarray, masking_cfg, seed: int,
+                              heldout_mask: np.ndarray | None = None):
     """One random context/query mask draw. Factored out of
     MaskedContextQueryDataset so anything that needs the raw boolean masks
     directly (e.g. src/evaluation/run_comparison.py, task #15, which needs
     to index the source AnnData the same way) doesn't have to duplicate
-    the strategy branching logic."""
+    the strategy branching logic.
+
+    heldout_mask (2026-07-20, held-out-spot generalization test — see
+    masking.held_out_mask's own docstring): when set, ANY held-out spot
+    that this draw's strategy placed in the query set gets reassigned
+    back to context instead — held-out spots must NEVER be a supervised
+    training TARGET, for the entire training run, so the model has no
+    opportunity to memorize their specific (coordinates/image ->
+    expression) association. None (default) is a true no-op, byte-for-
+    byte unchanged behavior for every existing config."""
     strategy = masking_cfg.strategy
     if strategy == "hold_out_slice":
         rng = np.random.default_rng(seed)
@@ -490,6 +500,10 @@ def make_context_query_split(coords3d: np.ndarray, slice_ids: np.ndarray, maskin
         )
     else:
         raise ValueError(f"Unknown masking strategy {strategy}")
+    if heldout_mask is not None:
+        reclaimed = query_mask & heldout_mask
+        query_mask = query_mask & ~heldout_mask
+        context_mask = context_mask | reclaimed
     return context_mask, query_mask
 
 
@@ -541,7 +555,8 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
                         context_gene_features: np.ndarray | None = None,
                         context_novae_features: np.ndarray | None = None,
                         organ: str | None = None, tech: str | None = None,
-                        augment: bool = False) -> dict:
+                        augment: bool = False,
+                        heldout_mask: np.ndarray | None = None) -> dict:
     """One {context, query, target_expression} training item for a SINGLE
     sample's data. Factored out of MaskedContextQueryDataset.__getitem__
     (2026-07-15) so MultiSampleMaskedContextQueryDataset below can reuse
@@ -600,7 +615,9 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
     original, unaugmented behavior."""
     if augment:
         coords3d = augment_coords_xy(coords3d, seed=seed + 2)
-    context_mask, query_mask = make_context_query_split(coords3d, slice_ids, masking_cfg, seed)
+    context_mask, query_mask = make_context_query_split(
+        coords3d, slice_ids, masking_cfg, seed, heldout_mask=heldout_mask
+    )
     context_mask = _cap_context_mask(context_mask, getattr(masking_cfg, "max_context_points", None), seed)
     context_expr_source = expr if context_gene_features is None else context_gene_features
     context = {
@@ -637,13 +654,18 @@ class MaskedContextQueryDataset(Dataset):
                  context_gene_features: np.ndarray | None = None,
                  context_novae_features: np.ndarray | None = None,
                  organ: str | None = None, tech: str | None = None,
-                 augment: bool = False):
+                 augment: bool = False,
+                 heldout_mask: np.ndarray | None = None):
         self.coords3d = coords3d
         self.expr = expr
         self.slice_ids = slice_ids
         self.masking_cfg = masking_cfg
         self.n_items = n_items
         self.base_seed = base_seed
+        # held-out-spot generalization test (2026-07-20) — see
+        # masking.held_out_mask's own docstring. None (default) is a true
+        # no-op, byte-for-byte unchanged behavior for every existing config.
+        self.heldout_mask = heldout_mask
         # optional per-spot image data (task #17/#18/#20), already aligned
         # to coords3d/expr's row order by the caller — either raw H&E
         # patches [N, H, W, 3] uint8 (image_encoder_type "cnn") or
@@ -681,6 +703,7 @@ class MaskedContextQueryDataset(Dataset):
             context_gene_features=self.context_gene_features,
             context_novae_features=self.context_novae_features,
             organ=self.organ, tech=self.tech, augment=self.augment,
+            heldout_mask=self.heldout_mask,
         )
 
 
@@ -1592,6 +1615,81 @@ def _main_multi_sample(cfg) -> None:
     print(f"RMSE: {ev.rmse(pred, target_expression):.4f}")
 
 
+def evaluate_heldout_generalization(model, cfg, adata, coords3d: np.ndarray, expr: np.ndarray,
+                                     images: np.ndarray | None, heldout_mask: np.ndarray,
+                                     organ: str | None, tech: str | None) -> dict:
+    """2026-07-20, genuine held-out-spot generalization test (see
+    masking.held_out_mask's own docstring for the full motivation: does
+    the model just recall spots it saw as supervised training targets
+    many times, rather than genuinely reconstructing from context?).
+
+    Unlike the "standard" end-of-training eval above (a fresh random
+    masking draw over the WHOLE sample -- fresh hole PLACEMENT, but not
+    spots the model hasn't already been trained to predict many times
+    over), this evaluates on `heldout_mask` spots specifically -- spots
+    that make_context_query_split's heldout_mask reassignment (see its
+    own docstring) guarantees were NEVER placed in a training query set,
+    for the entire training run, PROVIDED the caller trained this exact
+    model with the SAME heldout_mask threaded through its training
+    dataset (see main()'s wiring below). If this function is called with
+    a model that was NOT trained that way, its result is meaningless --
+    every held-out spot may already have been a training target.
+
+    query_mask = heldout_mask (ALL held-out spots, not a geometric hole --
+    deterministic, not a fresh random draw), context_mask = everything
+    else. Uses get_novae_features_context_only for Novae features (the
+    2026-07-20 leak fix, see docs/results_log.md) so this comparison
+    isn't ALSO confounded by graph-level Novae leakage on top of the
+    query-spot-memorization question this function exists to isolate.
+
+    Returns {"pcc": float, "rmse": float, "n_heldout": int}."""
+    context_mask = ~heldout_mask
+    query_mask = heldout_mask
+
+    model_params = cfg.model.get("params", {})
+    context_encoder_type = model_params.get("context_encoder_type", "builtin")
+    gene_encoder_type = model_params.get("gene_encoder_type")
+    stpath_new_gene_encoder_type = model_params.get("stpath_new_gene_encoder_type")
+    needs_novae = (
+        (context_encoder_type == "builtin" and gene_encoder_type == "novae")
+        or (context_encoder_type == "stpath" and stpath_new_gene_encoder_type in ("novae", "both"))
+        or (context_encoder_type == "storm_lite" and gene_encoder_type in ("novae", "both", "tokenizer_novae"))
+    )
+    novae_features = get_novae_features_context_only(cfg, adata, context_mask) if needs_novae else None
+
+    context_expr_source = expr if (context_encoder_type == "builtin" and gene_encoder_type == "novae"
+                                    and novae_features is not None) else expr
+    # NOTE: builtin+"novae" REPLACES context["expression"] with Novae features
+    # (see _build_masked_item's context_gene_features docstring); every other
+    # Novae-using path is ADDITIVE (context["novae_features"], real expr stays).
+    if context_encoder_type == "builtin" and gene_encoder_type == "novae" and novae_features is not None:
+        context_expr_source = novae_features
+
+    context = {
+        "coords": torch.tensor(coords3d[context_mask], dtype=torch.float32),
+        "expression": torch.tensor(context_expr_source[context_mask], dtype=torch.float32),
+    }
+    if novae_features is not None and not (context_encoder_type == "builtin" and gene_encoder_type == "novae"):
+        context["novae_features"] = torch.tensor(novae_features[context_mask], dtype=torch.float32)
+    query = {"coords": torch.tensor(coords3d[query_mask], dtype=torch.float32)}
+    if images is not None:
+        context["images"] = _images_tensor(images, context_mask)
+        query["images"] = _images_tensor(images, query_mask)
+    if organ is not None:
+        context["organ"], query["organ"] = organ, organ
+    if tech is not None:
+        context["tech"], query["tech"] = tech, tech
+
+    target_expression = expr[query_mask]
+    model.eval()
+    with torch.no_grad():
+        output = model.sample(context, query)
+    pred = output["expression"].detach().cpu().numpy()
+    pcc = float(np.nanmean(ev.pearson_per_gene(pred, target_expression)))
+    rmse = float(ev.rmse(pred, target_expression))
+    return {"pcc": pcc, "rmse": rmse, "n_heldout": int(query_mask.sum())}
+
+
 def main(cfg_path: str, overrides: list[str] | None = None):
     cfg = OmegaConf.load(cfg_path)
     if overrides:
@@ -1705,6 +1803,17 @@ def main(cfg_path: str, overrides: list[str] | None = None):
         else:
             inject_stpath_novae_dim(unresolved_model_cfg, context_novae_features.shape[1])
 
+    # heldout_mask (2026-07-20, genuine held-out-spot generalization test —
+    # see masking.held_out_mask's own docstring). Computed ONCE, deterministic
+    # given masking.heldout_seed, so it's identical for the training dataset
+    # below and evaluate_heldout_generalization at the end. Opt-in via
+    # masking.heldout_fraction — unset (default None) is a true no-op.
+    heldout_fraction = cfg.masking.get("heldout_fraction")
+    heldout_mask = (
+        masking.held_out_mask(coords3d.shape[0], heldout_fraction, cfg.masking.get("heldout_seed", 12345))
+        if heldout_fraction else None
+    )
+
     # Train (skipped entirely for parameter-free baselines like interp_baseline) --
     augment = cfg.training.get("augment_coords", False)
     # organ/tech (2026-07-17, real bug fix — see
@@ -1722,6 +1831,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
             context_novae_features=context_novae_features,
             organ=organ, tech=tech,
             augment=augment,
+            heldout_mask=heldout_mask,
         )
         dataloader = make_dataloader(dataset, cfg)
         # .get() with the same default every real config's own YAML comment
@@ -1767,7 +1877,10 @@ def main(cfg_path: str, overrides: list[str] | None = None):
         if saved_path is not None:
             print(f"Saved trained model (weights + config + gene names) to {saved_path.parent}")
 
-    # Evaluate on a held-out masking draw not seen during training -----------
+    # STANDARD eval: a fresh masking draw, hole PLACEMENT never seen during
+    # training, but NOT spots the model has never been trained to predict --
+    # heldout_mask=heldout_mask keeps this comparable/fair (its query never
+    # draws from the held-out pool either) when the held-out test is active. --
     eval_item = MaskedContextQueryDataset(
         coords3d, expr, slice_ids, cfg.masking,
         n_items=1, base_seed=cfg.training.seed + cfg.training.epochs + 1, images=images,
@@ -1775,6 +1888,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
         context_novae_features=context_novae_features,
         organ=organ, tech=tech,
         augment=augment,
+        heldout_mask=heldout_mask,
     )[0]
     context, query = eval_item["context"], eval_item["query"]
     target_expression = eval_item["target_expression"].numpy()
@@ -1786,6 +1900,20 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     pcc = ev.pearson_per_gene(pred, target_expression)
     print(f"mean PCC: {np.nanmean(pcc):.4f}")
     print(f"RMSE: {ev.rmse(pred, target_expression):.4f}")
+
+    # GENUINE held-out-spot eval (2026-07-20) -- see
+    # evaluate_heldout_generalization's own docstring. Only meaningful
+    # because heldout_mask (if set) was ALSO threaded through the training
+    # dataset above, so these spots were structurally never a training target.
+    if heldout_mask is not None:
+        heldout_result = evaluate_heldout_generalization(
+            model, cfg, adata, coords3d, expr, images, heldout_mask, organ, tech,
+        )
+        print(f"HELD-OUT mean PCC: {heldout_result['pcc']:.4f} "
+              f"(n={heldout_result['n_heldout']} spots, never a training target)")
+        print(f"HELD-OUT RMSE: {heldout_result['rmse']:.4f}")
+        print(f"Standard-vs-held-out PCC gap: {np.nanmean(pcc) - heldout_result['pcc']:.4f} "
+              f"(large positive gap = evidence of query-spot memorization inflating the standard number)")
 
 
 if __name__ == "__main__":
