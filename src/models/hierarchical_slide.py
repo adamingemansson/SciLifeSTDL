@@ -254,6 +254,7 @@ class HierarchicalMissingTissueEncoder(nn.Module):
         use_local_images: bool = True,
         use_slide_context: bool = True,
         gene_encoder_type: str = "weighted_linear",
+        fusion_mode: str = "concat",
         slide_checkpoint_path: str | None = None,
         slide_output_dim: int = 768,
     ):
@@ -264,12 +265,15 @@ class HierarchicalMissingTissueEncoder(nn.Module):
             raise ValueError("use_novae=True requires the real context-only Novae dimension")
         if use_slide_context and not slide_checkpoint_path:
             raise ValueError("use_slide_context=True requires slide_checkpoint_path")
+        if fusion_mode not in {"concat", "gated_experts"}:
+            raise ValueError("fusion_mode must be 'concat' or 'gated_experts'")
 
         self.hidden_dim = int(hidden_dim)
         self.local_k = int(local_k)
         self.use_novae = bool(use_novae)
         self.use_local_images = bool(use_local_images)
         self.use_slide_context = bool(use_slide_context)
+        self.fusion_mode = str(fusion_mode)
 
         self.image_encoder = GigapathPatchEncoder(hidden_dim) if use_local_images else None
         if gene_encoder_type == "weighted_linear":
@@ -280,11 +284,31 @@ class HierarchicalMissingTissueEncoder(nn.Module):
             raise ValueError("gene_encoder_type must be 'weighted_linear' or 'mlp'")
         self.novae_encoder = NovaeGeneEncoder(int(novae_dim), hidden_dim) if use_novae else None
         modality_count = 1 + int(use_local_images) + int(use_novae)
-        self.context_fusion = nn.Sequential(
-            nn.Linear(modality_count * hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-        )
+        if fusion_mode == "concat":
+            # Keep the original module and parameter names byte-for-byte for
+            # compatibility with every already-trained hierarchical model.
+            self.context_fusion = nn.Sequential(
+                nn.Linear(modality_count * hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+            )
+            self.modality_experts = None
+            self.modality_gate = None
+        else:
+            # A deliberately small mixture of modality experts.  Each
+            # observed modality remains a separate 256-D token until this
+            # point; a per-spot softmax chooses how much of each transformed
+            # expert to retain.  This is an auditable alternative to blind
+            # concatenation, not a claim to reproduce STORM's full MoME.
+            self.context_fusion = None
+            self.modality_experts = nn.ModuleList([
+                nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.GELU())
+                for _ in range(modality_count)
+            ])
+            self.modality_gate = nn.Sequential(
+                nn.LayerNorm(modality_count * hidden_dim),
+                nn.Linear(modality_count * hidden_dim, modality_count),
+            )
         self.relative_coord = nn.Sequential(
             nn.Linear(3, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim)
         )
@@ -354,7 +378,26 @@ class HierarchicalMissingTissueEncoder(nn.Module):
         )
         return self.slide_projection(raw)
 
-    def forward(self, context: dict, query: dict) -> torch.Tensor:
+    def _fuse_modalities(self, modalities: list[torch.Tensor]) -> torch.Tensor:
+        concatenated = torch.cat(modalities, dim=-1)
+        if self.fusion_mode == "concat":
+            return self.context_fusion(concatenated)
+        expert_outputs = torch.stack([
+            expert(value) for expert, value in zip(self.modality_experts, modalities)
+        ], dim=1)
+        gates = torch.softmax(self.modality_gate(concatenated), dim=-1)
+        return torch.sum(expert_outputs * gates[..., None], dim=1)
+
+    def forward_with_neighbors(self, context: dict, query: dict) -> dict[str, torch.Tensor]:
+        """Return query states plus the exact observed tokens they attended.
+
+        The original hierarchical regressor only needed the final query
+        state.  Gene-preserving transport additionally needs to compare each
+        query against each candidate observed neighbor.  Returning those
+        already-computed tokens avoids a second encoder pass and, crucially,
+        lets H&E/Novae affect *which neighbor* supplies expression rather than
+        merely changing one global query vector.
+        """
         context_coords = context["coords"]
         query_coords = query["coords"]
         if context_coords.shape[0] < 1 or query_coords.shape[0] < 1:
@@ -378,7 +421,7 @@ class HierarchicalMissingTissueEncoder(nn.Module):
         context_coord = self.normalized_coord(normalized[: context_coords.shape[0]])
         query_coord = self.normalized_coord(normalized[context_coords.shape[0] :])
         slide = self._slide_token(context)
-        observed = self.context_fusion(torch.cat(modalities, dim=-1)) + context_coord + slide
+        observed = self._fuse_modalities(modalities) + context_coord + slide
         observed = self.context_transformer(observed.unsqueeze(0)).squeeze(0)
 
         distance = torch.cdist(query_coords[:, :2], context_coords[:, :2])
@@ -400,4 +443,13 @@ class HierarchicalMissingTissueEncoder(nn.Module):
             query_hidden = block(query_hidden, neighbor)
         if self.query_transformer is not None:
             query_hidden = self.query_transformer(query_hidden.unsqueeze(0)).squeeze(0)
-        return query_hidden
+        return {
+            "query_hidden": query_hidden,
+            "neighbor_hidden": neighbor,
+            "neighbor_indices": nearest_index,
+            "neighbor_distances": nearest_distance,
+            "relative_geometry": relative,
+        }
+
+    def forward(self, context: dict, query: dict) -> torch.Tensor:
+        return self.forward_with_neighbors(context, query)["query_hidden"]
