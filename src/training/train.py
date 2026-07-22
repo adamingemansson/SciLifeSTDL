@@ -132,6 +132,22 @@ def _validate_task_contract(cfg) -> None:
 
     training = cfg.get("training", {})
     evaluation = cfg.get("evaluation", {})
+    validation = cfg.get("validation", {})
+    validation_mask_source = str(validation.get("mask_source", "evaluation"))
+    if validation_mask_source not in {"evaluation", "training_seed"}:
+        raise ValueError(
+            "validation.mask_source must be 'evaluation' or 'training_seed'"
+        )
+    if validation_mask_source == "training_seed":
+        if cfg.get("data", {}).get("sample_ids") is not None:
+            raise ValueError(
+                "validation.mask_source='training_seed' is currently restricted to "
+                "single-sample overfit diagnostics"
+            )
+        if bool(training.get("augment_coords", False)):
+            raise ValueError(
+                "training-seed validation requires training.augment_coords=false"
+            )
     ablation = str(cfg.get("data", {}).get("modality_ablation", "both"))
     expected = {
         # Every variant still withholds query H&E.  The names describe only
@@ -1574,6 +1590,58 @@ def _fixed_items_from_bank(cfg, adata, coords3d, expr, slice_ids, images, bank, 
     return items
 
 
+def _fixed_training_seed_item(
+    cfg, adata, coords3d, expr, slice_ids, images, training_bank,
+    novae_inputs: dict, excluded_training_mask: np.ndarray | None,
+    checkpoint_dir: str | Path, organ=None, tech=None,
+) -> dict:
+    """Build and audit the exact repeated mask used by an overfit gate.
+
+    This item is generated through the same exclusion-aware training splitter
+    and first seed consumed by ``MaskedContextQueryDataset``. It is therefore a
+    real training example, never a validation/test mask disguised as one.
+    """
+    seeds = [int(seed) for seed in training_bank.get("seeds", [])]
+    if not seeds:
+        raise ValueError("training seed bank is empty")
+    seed = seeds[0]
+    context_mask, query_mask = make_training_context_query_split(
+        coords3d, slice_ids, cfg.masking, seed,
+        excluded_training_mask=excluded_training_mask,
+    )
+    names = np.asarray([str(name) for name in adata.obs_names])
+    manifest = {
+        "version": 1,
+        "purpose": "training_mask_overfit_gate",
+        "seed": seed,
+        "n_context": int(context_mask.sum()),
+        "n_query": int(query_mask.sum()),
+        "context_obs_names": names[context_mask].tolist(),
+        "query_obs_names": names[query_mask].tolist(),
+    }
+    manifest_path = Path(checkpoint_dir) / "overfit_training_mask.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = manifest_path.with_name(f"{manifest_path.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    os.replace(tmp, manifest_path)
+    print(
+        f"overfit gate uses immutable training seed {seed}: "
+        f"{int(context_mask.sum())} context / {int(query_mask.sum())} query spots; "
+        f"audit: {manifest_path}"
+    )
+    return _build_masked_item(
+        coords3d, expr, slice_ids, cfg.masking, images, seed,
+        context_gene_features=novae_inputs.get("context_gene_features"),
+        context_novae_features=novae_inputs.get("context_novae_features"),
+        context_gene_feature_provider=novae_inputs.get("context_gene_feature_provider"),
+        context_novae_feature_provider=novae_inputs.get("context_novae_feature_provider"),
+        organ=organ, tech=tech, augment=False,
+        image_mode=str(cfg.training.get("image_mode", "full")),
+        context_gex_mode=str(cfg.training.get("context_gex_mode", "full")),
+        fixed_context_mask=context_mask, fixed_query_mask=query_mask,
+    )
+
+
 def build_experiment_logger(cfg, checkpoint_dir: str):
     logging_cfg = cfg.get("logging", {})
     backend = str(logging_cfg.get("backend", "csv")).lower()
@@ -1807,7 +1875,9 @@ def inject_direct_regression_stats(model_cfg: dict, expressions: list[np.ndarray
 
 def inject_transport_gene_scale(model_cfg: dict, expressions: list[np.ndarray]) -> None:
     """Inject train-only scaling for gene-preserving transport loss."""
-    if model_cfg.get("name") != "context_transport_regressor":
+    if model_cfg.get("name") not in {
+        "context_transport_regressor", "gene_aware_transport_regressor",
+    }:
         return
     params = model_cfg.get("params", {})
     if "target_gene_scale" not in params:
@@ -1830,6 +1900,7 @@ def inject_coord_scale(model_cfg: dict, coord_scale: float) -> None:
     context_model_names = {
         "wae_gan", "fm_ot", "vqvae_ar", "harmonic_residual", "residual_fm_ot",
         "direct_context_regressor", "context_transport_regressor",
+        "gene_aware_transport_regressor",
     }
     if (model_cfg.get("name") in context_model_names
             and params.get("context_encoder_type", "builtin") in ("builtin", "storm_lite")
@@ -2665,10 +2736,17 @@ def main(cfg_path: str, overrides: list[str] | None = None):
         callbacks = []
         validation_cfg = cfg.get("validation", {})
         if bool(validation_cfg.get("enabled", True)):
-            validation_items = _fixed_items_from_bank(
-                cfg, adata, coords3d, expr, slice_ids, images, bank, "validation",
-                novae_inputs, organ=organ, tech=tech,
-            )
+            if str(validation_cfg.get("mask_source", "evaluation")) == "training_seed":
+                validation_items = [_fixed_training_seed_item(
+                    cfg, adata, coords3d, expr, slice_ids, images, training_bank,
+                    novae_inputs, training_excluded_mask, checkpoint_dir,
+                    organ=organ, tech=tech,
+                )]
+            else:
+                validation_items = _fixed_items_from_bank(
+                    cfg, adata, coords3d, expr, slice_ids, images, bank, "validation",
+                    novae_inputs, organ=organ, tech=tech,
+                )
             validation_callback = FixedMaskValidationCallback(
                 validation_items,
                 every_n_steps=int(validation_cfg.get("every_n_steps", 1000)),
@@ -2728,6 +2806,10 @@ def main(cfg_path: str, overrides: list[str] | None = None):
             print(f"Saved trained model (weights + config + gene names) to {saved_path.parent}")
         if validation_callback is not None:
             validation_callback.raise_if_quality_gate_failed()
+
+    if not bool(cfg.get("evaluation", {}).get("enabled", True)):
+        print("final audit evaluation disabled for this diagnostic run")
+        return
 
     # Full untouched-test-bank evaluation: predictive mean, uncertainty,
     # fixed-dimensional ST-FID/ST-MMD and explicit image-availability modes.

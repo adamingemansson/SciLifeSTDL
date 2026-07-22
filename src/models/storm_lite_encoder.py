@@ -730,8 +730,20 @@ class StormLiteContextEncoder(nn.Module):
                 n_total, self.hidden_dim, device=device, dtype=context_expression.dtype
             )
 
-        context_img = self.image_encoder(context_images)
-        query_img = self.image_encoder(query_images)
+        # Explicit modality ablations do not load image tensors at all.  The
+        # historical non-local path unconditionally called the GigaPath
+        # projection and therefore crashed on legitimate GEX-only runs with
+        # ``None.dim()``.  Treat an absent tensor exactly like an entirely
+        # unavailable image mask: every spot receives the learned missing
+        # token and no H&E information enters the model.
+        context_img = (
+            self.missing_image_token[None, :].expand(n_context, -1)
+            if context_images is None else self.image_encoder(context_images)
+        )
+        query_img = (
+            self.missing_image_token[None, :].expand(n_query, -1)
+            if query_images is None else self.image_encoder(query_images)
+        )
         # Preserve a zero-gradient graph edge in full-image batches. This
         # keeps distributed/gradient-accounting code from treating the
         # missing-modality token as an unused parameter, while its value still

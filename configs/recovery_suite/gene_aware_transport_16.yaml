@@ -1,0 +1,52 @@
+# Four jobs per st-a100 GPU: one capacity gate, then three held-out jobs.
+profiles:
+  geometry:
+    data: {modality_ablation: gex_only, novae_mode: disabled, use_images: false}
+    model: {params: {conditioning_mode: geometry, gene_encoder_type: mlp}}
+    training: {image_mode: all_zero}
+    evaluation: {primary_image_mode: all_zero, image_modes: [all_zero], validation_image_mode: all_zero}
+  gex_mlp:
+    data: {modality_ablation: gex_only, novae_mode: disabled, use_images: false}
+    model: {params: {conditioning_mode: storm_lite, gene_encoder_type: mlp}}
+    training: {image_mode: all_zero}
+    evaluation: {primary_image_mode: all_zero, image_modes: [all_zero], validation_image_mode: all_zero}
+  gex_novae:
+    data: {modality_ablation: gex_only, novae_mode: context_only, use_images: false}
+    model: {params: {conditioning_mode: storm_lite, gene_encoder_type: novae}}
+    training: {image_mode: all_zero}
+    evaluation: {primary_image_mode: all_zero, image_modes: [all_zero], validation_image_mode: all_zero}
+  gex_both:
+    data: {modality_ablation: gex_only, novae_mode: context_only, use_images: false}
+    model: {params: {conditioning_mode: storm_lite, gene_encoder_type: both}}
+    training: {image_mode: all_zero}
+    evaluation: {primary_image_mode: all_zero, image_modes: [all_zero], validation_image_mode: all_zero}
+  full_both: {}
+  full_k32:
+    model: {params: {transport_k: 32}}
+  full_heads16:
+    model: {params: {transport_heads: 16}}
+  full_no_corr:
+    model: {params: {correlation_loss_weight: 0.0}}
+
+runs:
+  # Phase 1: the same legitimate, exclusion-safe INT7 training hole.
+  - {id: O01, stage: overfit, slot: 0, scope: overfit_int7, family: geometry, profile: geometry, base_config: configs/recovery_suite/151_gene_aware_overfit_int7.yaml, name: geneaware_overfit_geometry_h8_k64, seed: 10, overrides: {}}
+  - {id: O02, stage: overfit, slot: 1, scope: overfit_int7, family: gex_both, profile: gex_both, base_config: configs/recovery_suite/151_gene_aware_overfit_int7.yaml, name: geneaware_overfit_gex_both_h8_k64, seed: 10, overrides: {}}
+  - {id: O03, stage: overfit, slot: 2, scope: overfit_int7, family: full_both, profile: full_both, base_config: configs/recovery_suite/151_gene_aware_overfit_int7.yaml, name: geneaware_overfit_full_h8_k64, seed: 10, overrides: {}}
+  - {id: O04, stage: overfit, slot: 3, scope: overfit_int7, family: capacity, profile: full_heads16, base_config: configs/recovery_suite/151_gene_aware_overfit_int7.yaml, name: geneaware_overfit_full_h16_k64, seed: 10, overrides: {}}
+
+  # Phase 2A: held-out sample INT8, with INT7 used only for validation.
+  - {id: C01, stage: heldout, slot: 0, scope: cross, family: geometry, profile: geometry, base_config: configs/recovery_suite/148_gene_aware_cross_10k.yaml, name: geneaware_cross_geometry_h8_k64, seed: 10, overrides: {}}
+  - {id: C02, stage: heldout, slot: 1, scope: cross, family: encoder, profile: gex_mlp, base_config: configs/recovery_suite/148_gene_aware_cross_10k.yaml, name: geneaware_cross_gex_mlp_h8_k64, seed: 10, overrides: {}}
+  - {id: C03, stage: heldout, slot: 2, scope: cross, family: encoder, profile: gex_novae, base_config: configs/recovery_suite/148_gene_aware_cross_10k.yaml, name: geneaware_cross_gex_novae_h8_k64, seed: 10, overrides: {}}
+  - {id: C04, stage: heldout, slot: 3, scope: cross, family: encoder, profile: gex_both, base_config: configs/recovery_suite/148_gene_aware_cross_10k.yaml, name: geneaware_cross_gex_both_h8_k64, seed: 10, overrides: {}}
+  - {id: C05, stage: heldout, slot: 0, scope: cross, family: full, profile: full_both, base_config: configs/recovery_suite/148_gene_aware_cross_10k.yaml, name: geneaware_cross_full_h8_k64, seed: 10, overrides: {}}
+  - {id: C06, stage: heldout, slot: 1, scope: cross, family: neighborhood, profile: full_k32, base_config: configs/recovery_suite/148_gene_aware_cross_10k.yaml, name: geneaware_cross_full_h8_k32, seed: 10, overrides: {}}
+  - {id: C07, stage: heldout, slot: 2, scope: cross, family: capacity, profile: full_heads16, base_config: configs/recovery_suite/148_gene_aware_cross_10k.yaml, name: geneaware_cross_full_h16_k64, seed: 10, overrides: {}}
+  - {id: C08, stage: heldout, slot: 3, scope: cross, family: loss, profile: full_no_corr, base_config: configs/recovery_suite/148_gene_aware_cross_10k.yaml, name: geneaware_cross_full_h8_k64_no_corr, seed: 10, overrides: {}}
+
+  # Phase 2B: within-slide diagnostics; all final query spots remain excluded.
+  - {id: S701, stage: heldout, slot: 0, scope: single_int7, family: modality, profile: gex_both, base_config: configs/recovery_suite/149_gene_aware_single_int7_10k.yaml, name: geneaware_single_int7_gex_h8_k64, seed: 10, overrides: {}}
+  - {id: S702, stage: heldout, slot: 1, scope: single_int7, family: modality, profile: full_both, base_config: configs/recovery_suite/149_gene_aware_single_int7_10k.yaml, name: geneaware_single_int7_full_h8_k64, seed: 10, overrides: {}}
+  - {id: S801, stage: heldout, slot: 2, scope: single_int8, family: modality, profile: gex_both, base_config: configs/recovery_suite/150_gene_aware_single_int8_10k.yaml, name: geneaware_single_int8_gex_h8_k64, seed: 10, overrides: {}}
+  - {id: S802, stage: heldout, slot: 3, scope: single_int8, family: modality, profile: full_both, base_config: configs/recovery_suite/150_gene_aware_single_int8_10k.yaml, name: geneaware_single_int8_full_h8_k64, seed: 10, overrides: {}}

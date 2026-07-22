@@ -162,6 +162,32 @@ def test_storm_lite_fusion_mode_sum_vs_mome_differ():
     print("[StormLiteContextEncoder] OK — fusion_mode='sum' vs 'mome' produce genuinely different output")
 
 
+def test_storm_lite_mome_accepts_explicit_no_image_modality():
+    """GEX-only arms pass no image tensors, not fake image features."""
+    torch.manual_seed(7)
+    n_context, n_query, n_genes, hidden_dim = 9, 4, 13, 16
+    encoder = StormLiteContextEncoder(
+        n_genes=n_genes,
+        hidden_dim=hidden_dim,
+        gene_encoder_type="mlp",
+        fusion_mode="mome",
+        use_absolute_coords=False,
+        knn_k=4,
+    )
+    output = encoder(
+        torch.rand(n_context, 3),
+        torch.rand(n_context, n_genes),
+        torch.rand(n_query, 3),
+        None,
+        None,
+    )
+    assert output.shape == (n_query, hidden_dim)
+    assert torch.isfinite(output).all()
+    output.square().mean().backward()
+    assert encoder.missing_image_token.grad is not None
+    assert torch.isfinite(encoder.missing_image_token.grad).all()
+
+
 def test_relative_position_bias():
     torch.manual_seed(0)
     n, coord_dim = 8, 3

@@ -1047,6 +1047,295 @@ class ContextTransportRegressor(BaseGenerativeModel):
         })
 
 
+@register_model("gene_aware_transport_regressor")
+class GeneAwareContextTransportRegressor(BaseGenerativeModel):
+    """Low-rank gene-aware transport over observed context expression.
+
+    ``ContextTransportRegressor`` applies one spatial neighbor distribution to
+    every gene. The overnight diagnostic showed that this collapses to a local
+    mean: genes with genuinely different spatial patterns cannot choose
+    different context evidence. This model keeps the same leakage-safe,
+    gene-identity-preserving value path but predicts ``transport_heads``
+    separate convex neighbor distributions. Every gene learns a simplex gate
+    over those heads; StormLite additionally supplies a query-specific gate
+    offset. The final prediction is therefore still a convex combination of
+    observed values for each gene, not a dense gene decoder, while distinct
+    genes can use distinct spatial kernels.
+
+    Geometry is translation/rotation/reflection/global-scale invariant. Query
+    expression is never an input, and missing query H&E remains controlled by
+    the training/evaluation image mode outside this class.
+    """
+
+    def __init__(
+        self, n_genes: int, coord_dim: int = 3, cond_hidden_dim: int = 256,
+        score_hidden_dim: int = 128, transport_k: int = 64,
+        transport_heads: int = 8, conditioning_mode: str = "geometry",
+        lr: float = 1e-3, conditioner_lr: float = 3e-4,
+        correlation_loss_weight: float = 0.0,
+        absolute_loss_weight: float = 0.0, transport_temperature: float = 1.0,
+        context_encoder_type: str = "storm_lite",
+        image_encoder_type: str = "none", image_feat_dim: int = 64,
+        image_patch_size: int = 256, gene_encoder_type: str = "mlp",
+        gene_feat_dim: int = 256, novae_dim: int | None = None,
+        coord_scale: float = 1.0, storm_lite_n_layers: int = 2,
+        storm_lite_n_heads: int = 4,
+        storm_lite_bias_type: str = "frame_averaging",
+        storm_lite_fusion_mode: str = "sum", storm_lite_qk_norm: bool = False,
+        storm_lite_knn_k: int | None = None, storm_lite_gnn_k: int = 8,
+        storm_lite_local_k: int = 32,
+        storm_lite_use_absolute_coords: bool = True,
+        storm_lite_input_already_log1p: bool = True,
+        target_gene_scale: list[float] | None = None,
+        target_scale_floor: float = 0.05,
+        organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
+    ):
+        super().__init__()
+        if conditioning_mode not in {"geometry", "storm_lite"}:
+            raise ValueError("conditioning_mode must be 'geometry' or 'storm_lite'")
+        if transport_k < 1 or transport_heads < 2:
+            raise ValueError("transport_k must be positive and transport_heads must be at least 2")
+        if target_scale_floor <= 0 or transport_temperature <= 0:
+            raise ValueError("target_scale_floor and transport_temperature must be positive")
+        if correlation_loss_weight < 0 or absolute_loss_weight < 0:
+            raise ValueError("loss weights must be non-negative")
+        self.save_hyperparameters()
+        self.conditioning_mode = str(conditioning_mode)
+        self.transport_k = int(transport_k)
+        self.transport_heads = int(transport_heads)
+        self.transport_temperature = float(transport_temperature)
+        self.correlation_loss_weight = float(correlation_loss_weight)
+        self.absolute_loss_weight = float(absolute_loss_weight)
+        self.lr = float(lr)
+        self.conditioner_lr = float(conditioner_lr)
+
+        scale = torch.ones(n_genes) if target_gene_scale is None else torch.as_tensor(
+            target_gene_scale, dtype=torch.float32
+        )
+        if scale.shape != (n_genes,):
+            raise ValueError(
+                f"target_gene_scale must have shape ({n_genes},), got {tuple(scale.shape)}"
+            )
+        if not torch.isfinite(scale).all():
+            raise ValueError("target_gene_scale contains non-finite values")
+        self.register_buffer("target_gene_scale", scale.clamp_min(float(target_scale_floor)))
+
+        self.geometry_encoder = nn.Sequential(
+            nn.Linear(1, score_hidden_dim),
+            nn.GELU(),
+            nn.Linear(score_hidden_dim, score_hidden_dim),
+        )
+        self.head_embedding = nn.Parameter(
+            torch.randn(self.transport_heads, score_hidden_dim) * 0.02
+        )
+        self.head_score_vector = nn.Parameter(
+            torch.randn(self.transport_heads, score_hidden_dim) * 0.02
+        )
+        self.score_norm = nn.LayerNorm(score_hidden_dim)
+        # A full G x H matrix is small (~0.5 MB for 16k genes and 8 heads),
+        # directly auditable, and importantly gives every gene its own spatial
+        # mixture without introducing a dense GEX decoder.
+        self.gene_head_logits = nn.Parameter(torch.zeros(n_genes, self.transport_heads))
+
+        self.context_encoder = None
+        self.condition_score_projection = None
+        self.condition_gate_projection = None
+        if self.conditioning_mode == "storm_lite":
+            if context_encoder_type != "storm_lite":
+                raise ValueError(
+                    "conditioning_mode='storm_lite' requires context_encoder_type='storm_lite'"
+                )
+            self.context_encoder = _build_context_encoder(
+                n_genes=n_genes, coord_dim=coord_dim, cond_hidden_dim=cond_hidden_dim,
+                context_encoder_type=context_encoder_type,
+                image_encoder_type=image_encoder_type, image_feat_dim=image_feat_dim,
+                image_patch_size=image_patch_size, gene_encoder_type=gene_encoder_type,
+                gene_feat_dim=gene_feat_dim, novae_dim=novae_dim, coord_scale=coord_scale,
+                storm_lite_n_layers=storm_lite_n_layers,
+                storm_lite_n_heads=storm_lite_n_heads,
+                storm_lite_bias_type=storm_lite_bias_type,
+                storm_lite_fusion_mode=storm_lite_fusion_mode,
+                storm_lite_qk_norm=storm_lite_qk_norm,
+                storm_lite_knn_k=storm_lite_knn_k,
+                storm_lite_gnn_k=storm_lite_gnn_k,
+                storm_lite_local_k=storm_lite_local_k,
+                storm_lite_use_absolute_coords=storm_lite_use_absolute_coords,
+                storm_lite_input_already_log1p=storm_lite_input_already_log1p,
+                organ_vocab=organ_vocab, tech_vocab=tech_vocab,
+            )
+            self.condition_score_projection = nn.Sequential(
+                nn.LayerNorm(cond_hidden_dim),
+                nn.Linear(cond_hidden_dim, self.transport_heads * score_hidden_dim),
+            )
+            self.condition_gate_projection = nn.Sequential(
+                nn.LayerNorm(cond_hidden_dim),
+                nn.Linear(cond_hidden_dim, self.transport_heads),
+            )
+
+    def _neighbors(self, context: dict, query: dict):
+        context_coords = context["coords"]
+        query_coords = query["coords"]
+        if context_coords.shape[0] < 1 or query_coords.shape[0] < 1:
+            raise ValueError("gene-aware transport requires non-empty context and query sets")
+        distances = torch.cdist(query_coords[:, :2], context_coords[:, :2])
+        k = min(self.transport_k, context_coords.shape[0])
+        nearest_distance, nearest_index = torch.topk(
+            distances, k=k, dim=-1, largest=False, sorted=True
+        )
+        local_scale = nearest_distance[:, -1:].clamp_min(1e-6)
+        geometry = (nearest_distance / local_scale)[..., None]
+        neighbour_expression = context["expression"][nearest_index]
+        return nearest_index, neighbour_expression, geometry
+
+    @staticmethod
+    def _mean_per_gene_correlation(prediction: torch.Tensor,
+                                   target: torch.Tensor) -> torch.Tensor:
+        pred_centered = prediction - prediction.mean(dim=0, keepdim=True)
+        target_centered = target - target.mean(dim=0, keepdim=True)
+        target_ss = target_centered.square().sum(dim=0)
+        eligible = target_ss > 1e-8
+        if not bool(eligible.any()):
+            return prediction.new_zeros(())
+        numerator = (pred_centered * target_centered).sum(dim=0)
+        denominator = torch.sqrt(
+            pred_centered.square().sum(dim=0) * target_ss
+        ).clamp_min(1e-8)
+        return (numerator[eligible] / denominator[eligible]).mean()
+
+    def sample(self, context, query):
+        nearest_index, neighbour_expression, geometry = self._neighbors(context, query)
+        n_query, k = geometry.shape[:2]
+        geometric = self.geometry_encoder(geometry)[:, :, None, :]
+        hidden = geometric + self.head_embedding[None, None, :, :]
+
+        condition = None
+        if self.conditioning_mode == "storm_lite":
+            condition = self._encode_context(context, query)
+            condition_score = self.condition_score_projection(condition).reshape(
+                n_query, self.transport_heads, -1
+            )
+            hidden = hidden + condition_score[:, None, :, :]
+        hidden = torch.nn.functional.gelu(self.score_norm(hidden))
+        logits = torch.einsum("qkhd,hd->qkh", hidden, self.head_score_vector)
+        head_weights = torch.softmax(
+            logits.transpose(1, 2) / self.transport_temperature, dim=-1
+        )  # [query, head, neighbour]
+        head_expression = torch.einsum(
+            "qhk,qkg->qhg", head_weights, neighbour_expression
+        )
+
+        if condition is None:
+            gene_gates = torch.softmax(self.gene_head_logits, dim=-1)
+            expression = torch.einsum("qhg,gh->qg", head_expression, gene_gates)
+            gate_entropy = -(
+                gene_gates * gene_gates.clamp_min(1e-12).log()
+            ).sum(dim=-1).mean()
+        else:
+            query_gate = self.condition_gate_projection(condition)
+            gene_gates = torch.softmax(
+                self.gene_head_logits[None, :, :] + query_gate[:, None, :], dim=-1
+            )
+            expression = torch.einsum("qhg,qgh->qg", head_expression, gene_gates)
+            gate_entropy = -(
+                gene_gates * gene_gates.clamp_min(1e-12).log()
+            ).sum(dim=-1).mean()
+
+        uniform_weights = torch.full(
+            (n_query, k), 1.0 / k, device=geometry.device, dtype=geometry.dtype
+        )
+        local_mean = torch.sum(
+            uniform_weights[..., None] * neighbour_expression, dim=1
+        )
+        head_entropy = -(
+            head_weights * head_weights.clamp_min(1e-12).log()
+        ).sum(dim=-1).mean()
+        return {
+            "coords": query["coords"],
+            "expression": expression,
+            "anchor_expression": local_mean,
+            "residual_expression": expression - local_mean,
+            "transport_weights": head_weights,
+            "transport_neighbor_indices": nearest_index,
+            "transport_head_entropy": head_entropy,
+            "gene_gate_entropy": gate_entropy,
+        }
+
+    def training_step(self, batch, batch_idx):
+        out = self.sample(batch["context"], batch["query"])
+        target = batch["target_expression"]
+        standardized_mse = (
+            (out["expression"] - target) / self.target_gene_scale
+        ).square().mean()
+        absolute_mse = nn.functional.mse_loss(out["expression"], target)
+        anchor_mse = nn.functional.mse_loss(out["anchor_expression"], target)
+        spatial_correlation = self._mean_per_gene_correlation(out["expression"], target)
+        correlation_loss = 1.0 - spatial_correlation
+        loss = (
+            standardized_mse
+            + self.absolute_loss_weight * absolute_mse
+            + self.correlation_loss_weight * correlation_loss
+        )
+        correction_rms = out["residual_expression"].square().mean().sqrt()
+        self.log_dict({
+            "train/loss": loss,
+            "train/standardized_mse": standardized_mse,
+            "train/absolute_mse": absolute_mse,
+            "train/local_mean_mse": anchor_mse,
+            "train/per_gene_pcc": spatial_correlation,
+            "train/transport_delta_rms": correction_rms,
+            "train/transport_head_entropy": out["transport_head_entropy"],
+            "train/gene_gate_entropy": out["gene_gate_entropy"],
+        })
+        return loss
+
+    def configure_optimizers(self):
+        if self.context_encoder is None:
+            return torch.optim.AdamW(self.parameters(), lr=self.lr)
+        conditioner = [
+            parameter for parameter in self.context_encoder.parameters()
+            if parameter.requires_grad
+        ]
+        conditioner_ids = {id(parameter) for parameter in conditioner}
+        transport = [
+            parameter for parameter in self.parameters()
+            if parameter.requires_grad and id(parameter) not in conditioner_ids
+        ]
+        return torch.optim.AdamW([
+            {"params": transport, "lr": self.lr},
+            {"params": conditioner, "lr": self.conditioner_lr},
+        ])
+
+    def on_after_backward(self) -> None:
+        conditioner_sq = torch.zeros((), device=self.device)
+        if self.context_encoder is not None:
+            for parameter in self.context_encoder.parameters():
+                if parameter.grad is not None:
+                    conditioner_sq = conditioner_sq + parameter.grad.detach().square().sum()
+        scorer_sq = torch.zeros((), device=self.device)
+        scorer_modules = (
+            self.geometry_encoder, self.condition_score_projection,
+            self.condition_gate_projection, self.score_norm,
+        )
+        for module in scorer_modules:
+            if module is not None:
+                for parameter in module.parameters():
+                    if parameter.grad is not None:
+                        scorer_sq = scorer_sq + parameter.grad.detach().square().sum()
+        for parameter in (self.head_embedding, self.head_score_vector):
+            if parameter.grad is not None:
+                scorer_sq = scorer_sq + parameter.grad.detach().square().sum()
+        gate_grad = (
+            self.gene_head_logits.grad.detach().square().sum().sqrt()
+            if self.gene_head_logits.grad is not None
+            else torch.zeros((), device=self.device)
+        )
+        self.log_dict({
+            "train/conditioner_grad_norm": conditioner_sq.sqrt(),
+            "train/transport_scorer_grad_norm": scorer_sq.sqrt(),
+            "train/gene_gate_grad_norm": gate_grad,
+        })
+
+
 # ---------------------------------------------------------------------------
 # VAE baseline. Unconditioned placeholder — see docs/architecture_plan.md
 # "Known gaps" for the conditioning encoder this still needs.

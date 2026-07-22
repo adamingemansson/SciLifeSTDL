@@ -189,6 +189,63 @@ def test_learned_context_transport_is_convex_and_trainable():
     assert scorer_grad > 0
 
 
+def test_gene_aware_transport_is_convex_gene_specific_and_trainable():
+    item = _item(n_context=12, n_query=5, n_genes=7)
+    model = build_model({
+        "name": "gene_aware_transport_regressor",
+        "params": {
+            "n_genes": 7,
+            "conditioning_mode": "geometry",
+            "transport_k": 6,
+            "transport_heads": 4,
+            "score_hidden_dim": 16,
+            "target_gene_scale": [0.1] * 7,
+            "correlation_loss_weight": 0.25,
+        },
+    })
+    out = model.sample(item["context"], item["query"])
+    neighbours = item["context"]["expression"][out["transport_neighbor_indices"]]
+    assert out["transport_weights"].shape == (5, 4, 6)
+    assert torch.all(out["transport_weights"] >= 0)
+    assert torch.allclose(
+        out["transport_weights"].sum(dim=-1), torch.ones(5, 4), atol=1e-6
+    )
+    assert torch.all(out["expression"] >= neighbours.amin(dim=1) - 1e-6)
+    assert torch.all(out["expression"] <= neighbours.amax(dim=1) + 1e-6)
+    assert out["expression"].shape == item["target_expression"].shape
+    assert not hasattr(model, "decoder")
+
+    loss = model.training_step(item, 0)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert model.head_score_vector.grad is not None
+    assert model.head_score_vector.grad.norm() > 0
+    assert model.gene_head_logits.grad is not None
+    assert model.gene_head_logits.grad.norm() > 0
+
+    # Geometry-only transport is based on normalized pairwise distances, so
+    # changing coordinate origin, orientation, reflection, or global units
+    # must not change a prediction.
+    transformed = _item(n_context=12, n_query=5, n_genes=7)
+    transformed["context"]["expression"] = item["context"]["expression"].clone()
+    angle = torch.tensor(0.73)
+    rotation = torch.tensor([
+        [torch.cos(angle), -torch.sin(angle)],
+        [torch.sin(angle), torch.cos(angle)],
+    ])
+    for split in ("context", "query"):
+        coords = item[split]["coords"].clone()
+        coords[:, 0] = -coords[:, 0]
+        coords[:, :2] = (coords[:, :2] @ rotation.T) * 17.0 + torch.tensor([91.0, -43.0])
+        transformed[split]["coords"] = coords
+    with torch.no_grad():
+        original_prediction = model.sample(item["context"], item["query"])["expression"]
+        transformed_prediction = model.sample(
+            transformed["context"], transformed["query"]
+        )["expression"]
+    assert torch.allclose(original_prediction, transformed_prediction, atol=2e-5)
+
+
 def test_residual_flow_loads_and_freezes_validated_autoencoder(tmp_path: Path):
     n_genes, latent, hidden = 6, 3, 7
     encoder = nn.Sequential(nn.Linear(n_genes, hidden), nn.ReLU(), nn.Linear(hidden, latent))

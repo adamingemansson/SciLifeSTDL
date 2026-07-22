@@ -130,3 +130,28 @@ def test_sample_holdout_contract_is_disjoint_and_complete():
     cfg.data.test_sample_ids = []
     with pytest.raises(ValueError, match="non-empty"):
         _validated_sample_groups(cfg)
+
+
+def test_training_seed_validation_is_single_sample_only():
+    cfg = OmegaConf.create({
+        "data": {"task_contract": "missing_tissue", "modality_ablation": "both"},
+        "training": {
+            "image_mode": "target_zero", "context_gex_mode": "full",
+            "context_gex_dropout_p": 0.0, "all_image_dropout_p": 0.0,
+            "augment_coords": False,
+        },
+        "validation": {"mask_source": "training_seed"},
+        "evaluation": {
+            "validation_image_mode": "target_zero",
+            "primary_image_mode": "target_zero",
+            "image_modes": ["target_zero"], "context_gex_mode": "full",
+        },
+    })
+    _validate_task_contract(cfg)
+    cfg.data.sample_ids = ["A", "B", "C"]
+    cfg.data.train_sample_ids = ["A"]
+    cfg.data.validation_sample_ids = ["B"]
+    cfg.data.test_sample_ids = ["C"]
+    cfg.data.holdout_unit = "sample"
+    with pytest.raises(ValueError, match="single-sample overfit"):
+        _validate_task_contract(cfg)
