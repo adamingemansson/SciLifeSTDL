@@ -29,6 +29,28 @@ bundled gene vocabulary file (symbol2ensembl.json in that repo) — see
 src/models/stpath_encoder.py's own module docstring for the full setup.
 Set the three env vars below or edit the paths directly.
 
+RAW-COUNTS FIX (2026-07-20, from a real research pass into STPath's actual
+repo — stpath/data/normalize_utils.py, stpath/app/pipeline/inference.py):
+STPath expects RAW counts for context expression (it applies torch.log1p
+internally) and ground truth is np.log1p(RAW counts), with NO
+normalize_total anywhere in its own pipeline. This project's own
+load_adata/basic_qc_and_normalize (src/data/loaders.py) applies
+sc.pp.normalize_total(target_sum=1e4) + sc.pp.log1p IN PLACE and never
+preserves raw counts — feeding that output into STPath would silently
+double-transform + library-size-normalize data STPath was never trained
+to expect. This script loads raw counts directly (bypassing
+basic_qc_and_normalize's normalization steps, keeping only its QC
+filtering) specifically for this reason — see _load_raw_counts_adata below.
+
+Also per that same research: STPath's own repo reports its bundled ccRCC
+kidney demo (INT2, i.e. the SAME organ/technology as our INT1) gets
+zero-shot PCC=0.156, in-context (5% context) PCC=0.245 on top-50 HVGs —
+the paper itself states "STPath currently struggles... CCRCC... scarcity
+of relevant data in the pretraining set." So a low number here may
+reflect a genuine, documented STPath weakness on this exact organ, not
+necessarily a bug. Sanity check: rerun with --sample-id INT2 if available
+locally and compare against those two reference numbers directly.
+
 Usage:
   STPATH_GENE_VOC_PATH=/path/to/symbol2ensembl.json \
   STPATH_MODEL_WEIGHT_PATH=/path/to/stpath_weights.pt \
@@ -40,11 +62,26 @@ import os
 import numpy as np
 import torch
 
-from src.training.train import load_adata, get_gigapath_features, _images_tensor
+from src.data import loaders as data_loaders
+from src.training.train import get_gigapath_features, _images_tensor
 from src.data import masking
 from src.data.loaders import load_hest_patches, align_patches_to_adata
 from src.evaluation import metrics as ev
 from omegaconf import OmegaConf
+
+
+def _load_raw_counts_adata(cfg):
+    """Same QC filtering as basic_qc_and_normalize (src/data/loaders.py),
+    WITHOUT normalize_total/log1p — STPath expects raw counts as input
+    (it applies its own internal log1p, no total-count normalization at
+    all, see this module's own docstring). basic_qc_and_normalize
+    normalizes in place and never preserves raw counts, so this can't
+    reuse it directly -- duplicates just the two QC filter calls."""
+    import scanpy as sc
+    adata = data_loaders.load_hest_sample(cfg.data.hest_data_dir, cfg.data.sample_id)
+    sc.pp.filter_cells(adata, min_genes=cfg.data.min_genes)
+    sc.pp.filter_genes(adata, min_cells=cfg.data.min_cells)
+    return adata
 
 
 def main():
@@ -80,8 +117,9 @@ def main():
             "sample_id": args.sample_id, "min_genes": 200, "min_cells": 3,
         },
     })
-    print(f"Loading {args.sample_id}...")
-    adata = load_adata(cfg)
+    print(f"Loading {args.sample_id} (RAW counts -- see this script's own module docstring "
+          f"for why, NOT this project's usual normalize_total+log1p pipeline)...")
+    adata = _load_raw_counts_adata(cfg)
     print(f"  {adata.n_obs} spots, {adata.n_vars} genes (before H&E-patch alignment)")
 
     print("Loading H&E patches + Gigapath features...")
@@ -136,7 +174,14 @@ def main():
     eval_pred, eval_target, n_genes_used = raw_pred, target, len(valid_gene_names)
     if args.top_hvg > 0:
         import scanpy as sc
+        # sc.pp.highly_variable_genes' default flavor ("seurat") expects
+        # LOGARITHMIZED input -- adata here is raw counts (see this script's
+        # own raw-counts fix above), so log1p a COPY first. Matches STPath's
+        # own "log1pv2" convention (log1p of raw counts, no normalize_total)
+        # for internal consistency with how STPath itself was evaluated,
+        # not this project's usual normalize_total+log1p pipeline.
         hvg_adata = adata.copy()
+        sc.pp.log1p(hvg_adata)
         sc.pp.highly_variable_genes(hvg_adata, n_top_genes=min(args.top_hvg, adata.n_vars))
         hvg_names = set(hvg_adata.var_names[hvg_adata.var["highly_variable"]].tolist())
         # restrict to whichever of the top-N HVGs ALSO had a match in STPath's own
