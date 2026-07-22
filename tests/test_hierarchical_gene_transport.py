@@ -205,6 +205,45 @@ def test_gradients_are_bucketed_into_the_three_mandated_groups():
           "positive and non-overlapping")
 
 
+def test_entropy_regularization_is_off_by_default():
+    """2026-07-22 20-run suite: with transport_reg_weight=1e-3,
+    transport_head_entropy sat at ~ln(128)=4.852 (the true maximum) for the
+    ENTIRE 20k-step run on every config -- the neighbor-weighting mechanism
+    never learned to specialize, plausibly explaining why every richness
+    axis (Novae, H&E, extra heads, richer gates) failed to help. The default
+    weight must be exactly 0.0 so the entropy term never enters the loss
+    unless a caller explicitly re-enables it."""
+    model = _build()
+    assert model.transport_reg_weight == 0.0
+
+    context, query = _context_query(n_context=6)
+    target = torch.rand(2, 6)
+    batch = {"context": context, "query": query, "target_expression": target}
+
+    out = model.sample(context, query)
+    standardized_error = (out["expression"] - target) / model.target_gene_scale
+    standardized_mse = standardized_error.square().mean()
+    correlation = model._mean_per_gene_correlation(out["expression"], target)
+    correlation_loss = 1.0 - correlation
+    standardized_residual = out["factorized_residual"] / model.target_gene_scale
+    residual_penalty = standardized_residual.square().mean()
+    expected_loss = (
+        standardized_mse
+        + model.correlation_loss_weight * correlation_loss
+        + model.residual_penalty_weight * residual_penalty
+    )
+
+    logged = {}
+    model.log_dict = lambda values, **kwargs: logged.update(values)  # type: ignore[assignment]
+    actual_loss = model.training_step(batch, 0)
+    assert torch.allclose(actual_loss, expected_loss, atol=1e-6), (
+        "loss must not include any entropy-regularization contribution when "
+        "transport_reg_weight=0.0, regardless of transport_head_entropy's value"
+    )
+    print("[hierarchical_gene_transport] OK — entropy regularization defaults to off "
+          "and contributes nothing to the loss unless explicitly re-enabled")
+
+
 def test_all_thirteen_mandated_metrics_are_logged():
     model = _build(use_residual=True, residual_rank=4)
     context, query = _context_query(n_context=6)
@@ -243,5 +282,6 @@ if __name__ == "__main__":
     test_single_transport_head_is_allowed()
     test_geometry_conditioning_mode_ignores_multimodal_tokens()
     test_gradients_are_bucketed_into_the_three_mandated_groups()
+    test_entropy_regularization_is_off_by_default()
     test_all_thirteen_mandated_metrics_are_logged()
     print("\nAll hierarchical_gene_transport_regressor tests passed.")

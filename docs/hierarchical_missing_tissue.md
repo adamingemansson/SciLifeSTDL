@@ -140,6 +140,28 @@ for the exact query/neighbor contract this model consumes, and
 `scripts/run_transport_suite_4gpu.sh` for the matched 20-run capacity-gate
 and held-out ablation suite (O01-O04, C01-C16, harmonic k128 control).
 
+**Suite 1 result (2026-07-22)**: only the simplest configs beat harmonic --
+raw-GEX-only (C01, full-panel PCC 0.0399, top-50 HVG PCC 0.3135) and GEX+Novae
+(C02) cleared harmonic (0.0386 / 0.2882) on every full-panel and
+variance-selected metric; every richness axis tested (Novae vs. not, H&E vs.
+not, multimodal neighbor scoring vs. geometry-only, richer gene gates, more
+transport heads) made things *worse*, not better, and the primary
+"everything on" config C05 lost to harmonic (0.0330 PCC). Root cause,
+diagnosed from the training logs themselves: `transport_head_entropy` sat at
+~4.81-4.85 (`ln(128)=4.852`, the true maximum for k=128 neighbors) for the
+*entire* 20k-step run on every single config -- the multi-head
+neighbor-weighting mechanism never learned to specialize at all, which would
+explain why no amount of extra conditioning signal could ever get expressed
+in the output. The likely cause was `transport_reg_weight`'s own entropy
+term (our invented interpretation of the handoff's unspecified "small
+transport regularization" -- see `HierarchicalGeneTransportRegressor.
+training_step`'s docstring), which explicitly rewards staying uniform.
+Fixed by defaulting `transport_reg_weight` to `0.0` (was `1e-3`); the
+identical ablation grid was rerun as suite 2 --
+`configs/recovery_suite/186-206_transport_*_v2.yaml` +
+`scripts/run_transport_suite_v2_4gpu.sh` (`summarize_transport_suite_v2.py`
+also prints a direct per-run v1-vs-v2 PCC delta).
+
 ## Primary references
 
 - Prov-GigaPath: <https://www.nature.com/articles/s41586-024-07441-w>

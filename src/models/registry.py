@@ -1572,7 +1572,7 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
         residual_rank: int = 32,
         blend_logit_init: float = -2.9444389791664403,  # logit(0.05)
         correlation_loss_weight: float = 0.25,
-        transport_reg_weight: float = 1e-3,
+        transport_reg_weight: float = 0.0,
         residual_penalty_weight: float = 1e-3,
         target_gene_scale: list[float] | None = None,
         target_scale_floor: float = 0.05,
@@ -1795,10 +1795,18 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
         correlation_loss = 1.0 - spatial_correlation
 
         # "small transport regularization" (handoff, exact form unspecified):
-        # a negative-entropy bonus that keeps the multi-head neighbor
-        # distribution soft rather than collapsing onto a single observed
-        # spot before the gene gates have learned anything real. This is our
-        # own interpretation, not an independently specified formula.
+        # originally a negative-entropy bonus rewarding a soft multi-head
+        # neighbor distribution. 2026-07-22 20-run suite evidence: with
+        # transport_reg_weight=1e-3, transport_head_entropy sat at ~4.81-4.85
+        # (ln(128)=4.852, the true maximum for k=128) for the ENTIRE 20k-step
+        # run on every config -- the neighbor-weighting mechanism never
+        # learned to specialize at all. That plausibly explains why every
+        # richness axis (Novae, H&E, extra heads, richer gates) failed to
+        # help: a near-uniform selector can't express extra information
+        # regardless of how much is available to it. Defaulting the weight
+        # to 0.0 (see __init__) and keeping the term itself only so it can
+        # be re-tested at a much smaller value if a soft prior is ever
+        # actually wanted -- not applied by default.
         transport_regularization = -out["transport_head_entropy"]
         standardized_residual = out["factorized_residual"] / self.target_gene_scale
         residual_penalty = standardized_residual.square().mean()

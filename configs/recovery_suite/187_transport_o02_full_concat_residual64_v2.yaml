@@ -1,0 +1,112 @@
+# Capacity gate v2: full transport, concat fusion, rank-64 factorized residual.
+# Capacity gate: repeat one legitimate INT7 training hole; final test is disabled.
+experiment_name: transport_capacity_o02_full_concat_residual64_v2
+data:
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  hest_cache_dir: data/cache/hest1k
+  slide_context_source: dense_wsi_cache
+  slide_context_cache_dir: data/cache/hest1k/gigapath_slide_cache
+  strict_broken_region: true
+  query_patch_size_fullres: 224.0
+  sample_id: INT7
+  holdout_unit: spot
+  task: intra_slice
+  task_contract: missing_tissue
+  modality_ablation: both
+  min_genes: 200
+  min_cells: 3
+  expression_transform: normalize_log1p
+  expression_target_sum: 10000.0
+  novae_mode: context_only
+  require_image_coverage: true
+  use_images: true
+  organ: Kidney
+  tech: Visium
+masking:
+  strategy: random_dropout_patches
+  max_context_points: 3000
+  context_selection: nearest_query
+  params: {n_patches: 1, radius_range: [3.0, 6.0], radius_unit: spot_spacing, shape: mixed}
+model:
+  name: hierarchical_gene_transport_regressor
+  params:
+    hidden_dim: 256
+    n_heads: 4
+    context_layers: 2
+    cross_layers: 2
+    query_layers: 1
+    local_k: 128
+    dropout: 0.1
+    use_novae: true
+    use_local_images: true
+    use_slide_context: true
+    gene_encoder_type: weighted_linear
+    fusion_mode: concat
+    slide_checkpoint_path: ${oc.env:GIGAPATH_SLIDE_CHECKPOINT}
+    slide_output_dim: 768
+    score_hidden_dim: 128
+    transport_heads: 8
+    transport_temperature: 1.0
+    idw_power: 2.0
+    conditioning_mode: hierarchical
+    gene_gate_mode: per_gene
+    use_query_gate: true
+    use_query_gene_gate: false
+    use_residual: true
+    residual_rank: 64
+    correlation_loss_weight: 0.25
+    transport_reg_weight: 0.0
+    residual_penalty_weight: 0.001
+    target_scale_floor: 0.05
+    lr: 0.001
+    conditioner_lr: 0.0003
+    weight_decay: 0.01
+training:
+  epochs: 3000
+  seed: 10
+  mask_seed: 760000
+  unique_mask_count: 1
+  exclude_evaluation_query_spots: true
+  log_every_n_steps: 10
+  log_print_every_n_steps: 250
+  checkpoint_every_n_steps: 0
+  num_workers: 0
+  augment_coords: false
+  image_mode: target_zero
+  context_gex_mode: full
+  query_image_dropout_p: 0.0
+  all_image_dropout_p: 0.0
+  context_gex_dropout_p: 0.0
+  gradient_clip_val: 1.0
+  checkpoint_dir: results/checkpoints/recovery_suite/transport_capacity_o02_full_concat_residual64_v2
+validation:
+  enabled: true
+  mask_source: training_seed
+  every_n_steps: 250
+  patience_checks: 1000
+  early_stopping_min_steps: 3000
+  require_anchor_improvement: false
+  anchor_min_delta: 0.002
+  min_correction_rms: 0.005
+  min_delta: 0.0001
+  metric: rmse
+  n_samples: 1
+  sampling_seed: 867000
+evaluation:
+  enabled: false
+  mask_bank_path: results/mask_banks/recovery_suite/transport_capacity_o02_full_concat_residual64_v2_v1.json
+  n_validation_masks: 4
+  n_test_masks: 8
+  validation_seed: 747000
+  test_seed: 947000
+  sampling_seed: 1267000
+  n_samples: 1
+  primary_image_mode: target_zero
+  image_modes: [target_zero, all_zero]
+  validation_image_mode: target_zero
+  context_gex_mode: full
+  k_neighborhood: 8
+  pca_n_components: 50
+  training_mask_bank_path: results/mask_banks/training/recovery_suite/transport_capacity_o02_full_concat_residual64_v2_3k_one_seed760000.json
+logging: {backend: csv, project: st3d-lundeberg-lab}
