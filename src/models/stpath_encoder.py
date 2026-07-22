@@ -480,3 +480,81 @@ class STPathContextEncoder(nn.Module):
                 )
         x = self.embedding_norm(x[n_context:])  # query positions only; trainable
         return self.proj(x)  # trainable
+
+    def predict_raw_expression(self, context_coords: torch.Tensor, context_expression: torch.Tensor,
+                                query_coords: torch.Tensor, context_images: torch.Tensor,
+                                query_images: torch.Tensor) -> torch.Tensor:
+        """2026-07-20 diagnostic: STPath's OWN native gene-expression
+        prediction, completely bypassing this project's own generative
+        pipeline (no FM-OT, no custom decoder, no velocity_net) — the
+        "raw STPath inference, disconnected from our implementation" test.
+
+        forward() above discards prediction_head's first return value
+        (`_, x = self.model.prediction_head(...)`), keeping only the
+        pre-head hidden state `x` to feed OUR OWN decoder. This method
+        keeps that FIRST value instead — STPath's own real prediction
+        head's output, exactly what STPathInference.inference() would
+        return, just computed directly here to reuse the SAME
+        already-verified token-construction code as forward() rather
+        than depending on STPathInference's own class API (not directly
+        re-inspected this session — see this module's own header for how
+        forward()'s token construction was originally verified against
+        STPath's real source).
+
+        Token construction is IDENTICAL to forward() (same coords
+        rescaling, same context/query gene-token masking, same organ/tech
+        tokens) — only the return value differs. Decodes STPath's
+        prediction back to OUR gene panel via the same _context_gene_ids/
+        _valid_gene_pos alignment forward()'s INPUT side already uses (the
+        one-hot input at token position _context_gene_ids[i] represents
+        our gene i; reading the model's own output at that same token
+        position is the natural, consistent way to decode its prediction
+        for that gene).
+
+        Returns [N_query, len(_valid_gene_pos)] — predictions for however
+        many of our genes had a match in STPath's own vocabulary (not
+        every gene we have may be in STPath's vocabulary — see
+        _valid_gene_pos, built at construction from symbol2id). Always
+        runs under torch.no_grad() — this is a pure inference diagnostic,
+        never used for training."""
+        n_context = context_coords.shape[0]
+        n_query = query_coords.shape[0]
+        device = context_coords.device
+
+        coords = torch.cat([context_coords[:, :2], query_coords[:, :2]], dim=0)
+        coords = coords.clone()
+        coords[:, 0] -= coords[:, 0].min()
+        coords[:, 1] -= coords[:, 1].min()
+        coords = self._rescale_coords(coords)
+
+        img_feats = torch.cat([
+            self._gigapath_features(context_images), self._gigapath_features(query_images),
+        ], dim=0)
+
+        n_total = n_context + n_query
+        ge_tokens = self.tokenizer.ge_tokenizer.mask_token.float().to(device).repeat(n_total, 1)
+        expr = torch.log1p(context_expression)[:, self._valid_gene_pos]
+        context_one_hot = self.tokenizer.ge_tokenizer.convert_gene_exp_to_one_hot_tensor(
+            self.tokenizer.ge_tokenizer.n_tokens, expr, self._context_gene_ids.to(device)
+        )
+        ge_tokens[:n_context] = context_one_hot
+
+        organ = self.tokenizer.organ_tokenizer.encode(self.organ_type, align_first=True)
+        organ_ids = torch.full((n_total,), organ, dtype=torch.long, device=device)
+        tech = self.tokenizer.tech_tokenizer.encode(self.tech_type, align_first=True)
+        tech_ids = torch.full((n_total,), tech, dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            raw_pred, _ = self.model.prediction_head(
+                img_tokens=img_feats,
+                coords=coords,
+                ge_tokens=ge_tokens,
+                batch_idx=torch.zeros(n_total, dtype=torch.long, device=device),
+                tech_tokens=tech_ids,
+                organ_tokens=organ_ids,
+                return_all=True,
+            )
+        # raw_pred: [n_total, n_vocab_tokens] (STPath's own full vocabulary
+        # width) -- slice to query rows, then to OUR genes' token positions
+        query_pred = raw_pred[n_context:]  # [n_query, n_vocab_tokens]
+        return query_pred[:, self._context_gene_ids.to(device)]  # [n_query, len(_valid_gene_pos)]
