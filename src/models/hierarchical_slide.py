@@ -159,35 +159,45 @@ class FrozenGigaPathSlideEncoder(nn.Module):
         if cached is not None:
             return cached.to(device=tile_features.device, dtype=tile_features.dtype)
 
-        model_features = tile_features
-        if tile_features.device.type == "cuda":
-            # LongNet's positional buffer is FP32 in the released checkpoint.
-            # Autocasting only the linear operations is insufficient because
-            # adding that buffer can promote the token stream back to FP32,
-            # which FlashAttention rejects.  The slide model is frozen, so
-            # keep the complete inference module (parameters and buffers) and
-            # its image-token input explicitly in FP16 on CUDA. Coordinates
-            # remain FP32 because they are used only for discrete position
-            # indexing before attention.
-            parameter = next(self.model.parameters())
-            if parameter.device != tile_features.device or parameter.dtype != torch.float16:
-                self.model.to(device=tile_features.device, dtype=torch.float16)
-            model_features = tile_features.to(dtype=torch.float16)
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "Prov-GigaPath LongNet slide inference requires CUDA FlashAttention"
+            )
+        caller_device = tile_features.device
+        caller_dtype = tile_features.dtype
+        slide_device = (
+            caller_device
+            if caller_device.type == "cuda"
+            else torch.device("cuda", torch.cuda.current_device())
+        )
+        # LongNet's positional buffer is FP32 in the released checkpoint.
+        # Autocasting only the linear operations is insufficient because
+        # adding that buffer can promote the token stream back to FP32, which
+        # FlashAttention rejects. Keep the complete frozen inference module
+        # (parameters and buffers) and its image-token input explicitly in
+        # FP16 on CUDA.  Audit evaluation may place the surrounding learned
+        # model back on CPU after Lightning teardown, so the slide encoder has
+        # its own device boundary and returns only its compact vector.
+        parameter = next(self.model.parameters())
+        if parameter.device != slide_device or parameter.dtype != torch.float16:
+            self.model.to(device=slide_device, dtype=torch.float16)
+        model_features = tile_features.to(device=slide_device, dtype=torch.float16)
+        model_coords = tile_coords.to(device=slide_device, dtype=torch.float32)
 
         # This mirrors the official Prov-GigaPath inference pipeline, which
         # runs LongNet under CUDA autocast.  It materially reduces WSI-token
         # memory while the returned vector is converted back to the local
         # trainable path's dtype before projection.
         with torch.no_grad(), torch.autocast(
-            device_type=tile_features.device.type,
+            device_type=slide_device.type,
             dtype=torch.float16,
-            enabled=tile_features.device.type == "cuda",
+            enabled=True,
         ):
             output = self.model(
-                model_features.unsqueeze(0), tile_coords.unsqueeze(0)
+                model_features.unsqueeze(0), model_coords.unsqueeze(0)
             )
             embedding = self._extract_last_embedding(output).squeeze(0)
-        embedding = embedding.to(dtype=tile_features.dtype)
+        embedding = embedding.to(device=caller_device, dtype=caller_dtype)
         if embedding.shape != (self.output_dim,):
             raise RuntimeError(
                 f"GigaPath slide embedding must be [{self.output_dim}], got {tuple(embedding.shape)}"
