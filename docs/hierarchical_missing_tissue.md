@@ -83,6 +83,24 @@ not a leakage-safe model-selection panel. Full-panel metrics remain the main
 task result; subset metrics diagnose whether useful variable-gene structure is
 being learned but diluted by thousands of sparse or locally constant genes.
 
+## Parallel exact-mask controls
+
+A separate four-GPU suite fills interaction and negative-control gaps without
+duplicating the primary eight DGX runs:
+
+| Control | Visible inputs | Purpose |
+|---|---|---|
+| coordinate only | query/context coordinates | detect spatial-grid shortcuts |
+| local H&E + raw GEX | local morphology and observed expression | smallest learned multimodal model |
+| global H&E + raw GEX | LongNet slide context and observed expression | isolate global morphology/GEX interaction |
+| official STPath | released STPath head, local H&E and context GEX | exact-mask external benchmark stress test |
+
+The official STPath control is evaluated only on genes supported by its
+released vocabulary; the report records both that actual count and the full
+shared training-panel size. Target-zero H&E remains out of distribution for
+released STPath, so this is a task-matched stress test rather than a recreation
+of the paper's standard image-to-expression benchmark.
+
 ## WSI runtime
 
 The HEST images used here are generic pyramidal tiled TIFFs. Dense WSI

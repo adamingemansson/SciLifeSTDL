@@ -2727,7 +2727,12 @@ def _main_multi_sample(cfg) -> None:
             "primary_image_mode": _primary_image_mode(cfg),
             "context_gex_mode": str(evaluation_cfg.get("context_gex_mode", "full")),
             "modality_ablation": str(cfg.data.get("modality_ablation", "both")),
-            "n_evaluated_genes": len(gene_names),
+            # Frozen external baselines such as official STPath may emit only
+            # the genes represented by their released vocabulary.
+            "n_evaluated_genes": int(
+                next(iter(test_results.values()))["n_evaluated_genes"]
+            ),
+            "n_shared_training_genes": len(gene_names),
             "gene_panels": next(iter(test_results.values())).get("gene_panels", {}),
             "test_sample_ids": test_ids,
             "image_modes": aggregate,
