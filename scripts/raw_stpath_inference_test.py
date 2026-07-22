@@ -72,16 +72,24 @@ def main():
     })
     print(f"Loading {args.sample_id}...")
     adata = load_adata(cfg)
-    coords3d = np.stack([adata.obsm["spatial"][:, 0], adata.obsm["spatial"][:, 1],
-                          np.zeros(adata.n_obs)], axis=1).astype("float32")
-    expr = np.asarray(adata.X.todense() if hasattr(adata.X, "todense") else adata.X, dtype="float32")
-    gene_names = adata.var_names.tolist()
-    print(f"  {adata.n_obs} spots, {len(gene_names)} genes")
+    print(f"  {adata.n_obs} spots, {adata.n_vars} genes (before H&E-patch alignment)")
 
     print("Loading H&E patches + Gigapath features...")
     patches, barcodes = load_hest_patches(args.hest_data_dir, args.sample_id)
     features = get_gigapath_features(cfg, patches, barcodes)
-    _, gigapath_images = align_patches_to_adata(adata, features, barcodes)
+    # align_patches_to_adata drops spots with no matching H&E patch (a normal
+    # partial gap in HEST-1k's own patch extraction) and returns a FILTERED
+    # adata -- everything downstream (coords, expr, heldout_mask) must be
+    # derived from THIS adata, not the original, or masks/arrays end up
+    # different lengths (real bug hit on the first run of this script: a
+    # 1080 vs 1031 shape mismatch in _images_tensor).
+    adata, gigapath_images = align_patches_to_adata(adata, features, barcodes)
+
+    coords3d = np.stack([adata.obsm["spatial"][:, 0], adata.obsm["spatial"][:, 1],
+                          np.zeros(adata.n_obs)], axis=1).astype("float32")
+    expr = np.asarray(adata.X.todense() if hasattr(adata.X, "todense") else adata.X, dtype="float32")
+    gene_names = adata.var_names.tolist()
+    print(f"  {adata.n_obs} spots after alignment, {len(gene_names)} genes")
 
     heldout = masking.held_out_mask(adata.n_obs, args.heldout_fraction, args.heldout_seed)
     context_mask, query_mask = ~heldout, heldout
