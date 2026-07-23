@@ -244,6 +244,34 @@ def test_entropy_regularization_is_off_by_default():
           "and contributes nothing to the loss unless explicitly re-enabled")
 
 
+def test_tokenized_gene_encoder_runs_and_stays_finite():
+    """gene_encoder_type='tokenized' (round-4 wiring of the existing
+    TokenizedGeneEncoder, previously only used by StormLiteContextEncoder)
+    must produce the same [Nq, n_genes] output contract as the default
+    weighted_linear/mlp encoders."""
+    full_names = [f"g{i}" for i in range(6)]
+    model = _build(
+        gene_encoder_type="tokenized",
+        tokenized_gene_names=full_names[:4],
+        tokenized_full_gene_names=full_names,
+    ).eval()
+    context, query = _context_query()
+    with torch.inference_mode():
+        out = model.sample(context, query)
+    assert out["expression"].shape == (2, 6)
+    assert torch.isfinite(out["expression"]).all()
+    print("[hierarchical_gene_transport] OK — gene_encoder_type='tokenized' runs and stays finite")
+
+
+def test_tokenized_gene_encoder_requires_gene_names():
+    try:
+        _build(gene_encoder_type="tokenized")
+        assert False, "expected ValueError for missing tokenized_gene_names"
+    except ValueError as exc:
+        assert "tokenized_gene_names" in str(exc)
+    print("[hierarchical_gene_transport] OK — gene_encoder_type='tokenized' fails closed without gene names")
+
+
 def test_global_candidate_off_by_default():
     model = _build()
     assert model.use_global_candidate is False
@@ -347,6 +375,8 @@ if __name__ == "__main__":
     test_geometry_conditioning_mode_ignores_multimodal_tokens()
     test_gradients_are_bucketed_into_the_three_mandated_groups()
     test_entropy_regularization_is_off_by_default()
+    test_tokenized_gene_encoder_runs_and_stays_finite()
+    test_tokenized_gene_encoder_requires_gene_names()
     test_global_candidate_off_by_default()
     test_global_candidate_runs_and_stays_finite()
     test_global_candidate_does_not_change_idw_anchor()

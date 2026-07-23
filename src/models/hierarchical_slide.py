@@ -18,7 +18,9 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from src.models.conditioning import GigapathPatchEncoder, MLPGeneEncoder, NovaeGeneEncoder
+from src.models.conditioning import (
+    GigapathPatchEncoder, MLPGeneEncoder, NovaeGeneEncoder, TokenizedGeneEncoder,
+)
 
 
 class WeightedGeneExpressionEncoder(nn.Module):
@@ -254,6 +256,10 @@ class HierarchicalMissingTissueEncoder(nn.Module):
         use_local_images: bool = True,
         use_slide_context: bool = True,
         gene_encoder_type: str = "weighted_linear",
+        tokenized_gene_names: list[str] | None = None,
+        tokenized_full_gene_names: list[str] | None = None,
+        tokenized_pool_layers: int = 1,
+        tokenized_pool_heads: int = 4,
         fusion_mode: str = "concat",
         slide_checkpoint_path: str | None = None,
         slide_output_dim: int = 768,
@@ -280,8 +286,26 @@ class HierarchicalMissingTissueEncoder(nn.Module):
             self.gene_encoder = WeightedGeneExpressionEncoder(n_genes, hidden_dim)
         elif gene_encoder_type == "mlp":
             self.gene_encoder = MLPGeneEncoder(n_genes, hidden_dim)
+        elif gene_encoder_type == "tokenized":
+            if not tokenized_gene_names or not tokenized_full_gene_names:
+                raise ValueError(
+                    "gene_encoder_type='tokenized' requires tokenized_gene_names "
+                    "(the HVG-reduced panel actually tokenized, <= "
+                    f"{TokenizedGeneEncoder.MAX_SAFE_PANEL_SIZE} genes) and "
+                    "tokenized_full_gene_names (the full training panel's column "
+                    "order, used to slice out the selected genes every forward "
+                    "pass) -- see train.py's inject_tokenized_gene_names for how "
+                    "these are normally auto-derived from the loaded AnnData."
+                )
+            self.gene_encoder = TokenizedGeneEncoder(
+                gene_names=tokenized_gene_names,
+                full_gene_names=tokenized_full_gene_names,
+                feat_dim=hidden_dim,
+                n_pool_layers=int(tokenized_pool_layers),
+                n_pool_heads=int(tokenized_pool_heads),
+            )
         else:
-            raise ValueError("gene_encoder_type must be 'weighted_linear' or 'mlp'")
+            raise ValueError("gene_encoder_type must be 'weighted_linear', 'mlp' or 'tokenized'")
         self.novae_encoder = NovaeGeneEncoder(int(novae_dim), hidden_dim) if use_novae else None
         modality_count = 1 + int(use_local_images) + int(use_novae)
         if fusion_mode == "concat":

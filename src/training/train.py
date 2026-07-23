@@ -2353,6 +2353,38 @@ def inject_storm_lite_tokenizer_gene_names(model_cfg: dict, adata) -> None:
         )
 
 
+def inject_tokenized_gene_names(model_cfg: dict, adata) -> None:
+    """If gene_encoder_type is "tokenized" (2026-07-23 round-4 architecture
+    matrix — wires TokenizedGeneEncoder into HierarchicalMissingTissueEncoder/
+    hierarchical_gene_transport_regressor, previously only used by
+    StormLiteContextEncoder), auto-derive tokenized_gene_names via the same
+    HVG-selection technique inject_storm_lite_tokenizer_gene_names already
+    uses for that model's own "tokenizer"/"tokenizer_novae" options — same
+    MAX_SAFE_PANEL_SIZE-guarded self-attention-over-gene-tokens cost profile.
+    tokenized_full_gene_names is always the full training panel
+    (adata.var_names), needed to align the selected genes' columns in
+    context["expression"] every forward pass.
+
+    Kept as its own function (not folded into
+    inject_storm_lite_tokenizer_gene_names) because the two encoders use
+    different param names for the same underlying purpose — same
+    one-function-per-injected-param convention as
+    inject_stpath_gene_names/inject_decoder_gene_names. No-op for every
+    config that doesn't set gene_encoder_type="tokenized"."""
+    params = model_cfg.get("params", {})
+    if params.get("gene_encoder_type") != "tokenized":
+        return
+    params.setdefault("tokenized_full_gene_names", adata.var_names.tolist())
+    if "tokenized_gene_names" not in params:
+        import scanpy as sc
+        n_target = min(512, adata.n_vars)
+        hvg_adata = adata.copy()
+        sc.pp.highly_variable_genes(hvg_adata, n_top_genes=n_target)
+        params["tokenized_gene_names"] = (
+            hvg_adata.var_names[hvg_adata.var["highly_variable"]].tolist()
+        )
+
+
 def inject_single_sample_n_genes(model_cfg: dict, adata) -> None:
     """Single-sample n_genes has always been a MANUALLY hardcoded config
     value (e.g. "n_genes: 16570  # INT1 after QC"), unlike every other
@@ -2512,6 +2544,7 @@ def _main_multi_sample(cfg) -> None:
         inject_pretrained_autoencoder_gene_names(model_cfg, fit_adatas[0])
         inject_stpath_gene_names(model_cfg, fit_adatas[0])
         inject_storm_lite_tokenizer_gene_names(model_cfg, fit_adatas[0])
+        inject_tokenized_gene_names(model_cfg, fit_adatas[0])
         inject_expression_preprocessing(model_cfg, fit_adatas[0])
         inject_residual_gene_scale(model_cfg, [sample[1] for sample in train_samples])
         inject_direct_regression_stats(model_cfg, [sample[1] for sample in train_samples])
@@ -2831,6 +2864,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     inject_stpath_gene_names(model_cfg, adata)
     inject_decoder_gene_names(model_cfg, adata)
     inject_storm_lite_tokenizer_gene_names(model_cfg, adata)
+    inject_tokenized_gene_names(model_cfg, adata)
     inject_expression_preprocessing(model_cfg, adata)
     inject_residual_gene_scale(model_cfg, [training_expr])
     inject_direct_regression_stats(model_cfg, [training_expr])
@@ -2861,6 +2895,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     inject_stpath_gene_names(unresolved_model_cfg, adata)
     inject_decoder_gene_names(unresolved_model_cfg, adata)
     inject_storm_lite_tokenizer_gene_names(unresolved_model_cfg, adata)
+    inject_tokenized_gene_names(unresolved_model_cfg, adata)
     inject_expression_preprocessing(unresolved_model_cfg, adata)
     inject_residual_gene_scale(unresolved_model_cfg, [training_expr])
     inject_direct_regression_stats(unresolved_model_cfg, [training_expr])
