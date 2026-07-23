@@ -124,8 +124,19 @@ this round lands -- real coverage, not padding.
    code path (precompute script + model wiring) defensively now; flag the
    dependency install requirement clearly; configs 230-235 wait on
    confirmation that install succeeded on st-a100 before launch.
-4. **10k-step 4-GPU runner** for 220-229 (and 230-235 once unblocked),
-   same smoke-test-first pattern as `run_transport_extra_diagnostics_4gpu.sh`.
+4. **10k-step 4-GPU runner for 220-229** -- DONE.
+   `scripts/run_transport_round4_4gpu.sh` (same
+   smoke-test-first/preflight-check pattern as
+   `run_transport_extra_diagnostics_4gpu.sh`, but no inter-config
+   dependencies within this batch since every config shares an EXISTING
+   sibling's eval masks, not a new one from this round) +
+   `scripts/summarize_transport_round4.py`. Verified: all 10 configs
+   parse, all model params accepted by the constructor, no
+   experiment_name/checkpoint_dir/training_mask_bank_path collisions
+   against each other or the rest of `configs/recovery_suite/`, all at
+   `training.epochs: 10000`, bash syntax and the embedded YAML sanity
+   check both verified directly. 230-235 (niche candidate) will get added
+   to both scripts once item 3 lands.
 
 ## GPU/time budget
 
