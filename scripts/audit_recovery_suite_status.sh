@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot status audit for the whole 207-251 recovery_suite run (smallhole/
+# One-shot status audit for the whole 207-253 recovery_suite run (smallhole/
 # k-sweep diagnostics through today's gene-encoder/candidate-mechanism/
 # image-encoder matrix). For each config, reports exactly one of:
 #   COMPLETED  -- results/checkpoints/recovery_suite/<name>/heldout_sample_summary.json exists
@@ -17,7 +17,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 RUNNING_PROCS="$(ps -eo pid,args | grep -E 'src\.training\.train' | grep -v grep || true)"
 
 declare -a NUMBERS
-for f in configs/recovery_suite/2[0-4][0-9]_transport_*.yaml configs/recovery_suite/25[01]_transport_*.yaml; do
+for f in configs/recovery_suite/2[0-4][0-9]_transport_*.yaml configs/recovery_suite/25[0-3]_transport_*.yaml; do
   [ -e "$f" ] || continue
   number="$(basename "$f" | cut -d_ -f1)"
   case "$number" in
@@ -72,7 +72,7 @@ except Exception as e:
 done
 
 echo
-echo "Summary: $completed completed, $running running, $missing missing (out of ${#NUMBERS[@]} total, 207-251)."
+echo "Summary: $completed completed, $running running, $missing missing (out of ${#NUMBERS[@]} total, 207-253)."
 if (( missing > 0 )); then
   echo
   echo "Missing configs (copy/paste-ready, fill in a free GPU index for each --"

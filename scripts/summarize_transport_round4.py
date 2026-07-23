@@ -62,6 +62,15 @@ RUNS = (
     ("reference", "transport_c05_all_modalities_concat_k256_v2_20k"),
     ("reference", "transport_harmonic_k256_v2"),
     ("reference", "transport_c05_global_candidate_v2_20k"),
+    # Superseded 10k niche-candidate results (230/231/232's ORIGINAL
+    # experiment_name, before they were rerun at 20k under a renamed
+    # _v2_20k identity above) -- kept here on purpose so the 10k-vs-20k
+    # schedule comparison this rerun was explicitly for is actually
+    # visible, not silently dropped once the config files themselves
+    # moved on to the new name.
+    ("niche_10k_vs_20k", "transport_c05_niche_candidate_v2_10k"),
+    ("niche_10k_vs_20k", "transport_c05_niche_candidate_geometry_v2_10k"),
+    ("niche_10k_vs_20k", "transport_c05_niche_candidate_smallhole_v2_10k"),
 )
 
 
