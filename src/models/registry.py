@@ -1619,6 +1619,21 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
     distinct from the global candidate's 3x so the two remain distinguishable
     if a config ever stacks both) rather than a fabricated position, since a
     niche mean is not any single real spot.
+
+    ``local_image_encoder_type`` (2026-07-23, "general vs. histology-
+    pretrained image encoder" axis) swaps ONLY the local per-spot tile
+    encoder between ``"gigapath"`` (default, Prov-GigaPath, pretrained on
+    real-world histology) and ``"dinov2"`` (DINOv2, pretrained entirely on
+    natural images, never histology -- see
+    ``src/models/conditioning.py``'s ``DINOv2PatchEncoder`` docstring for
+    the motivating evidence: Wang et al. 2025's *Nat. Commun.* benchmark
+    found all 11 SGE-from-H&E methods it tested use general/ImageNet-
+    pretrained-or-from-scratch image backbones, none use a histology-
+    specific foundation model, and its best overall performer used a
+    general ResNet feature extractor). ``use_slide_context``'s whole-WSI
+    LongNet aggregator stays Gigapath-only regardless of this setting --
+    DINOv2 has no equivalent long-context slide aggregator, so this is
+    deliberately a single-axis (local tile encoder only) comparison.
     """
 
     def __init__(
@@ -1634,6 +1649,7 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
         dropout: float = 0.1,
         use_novae: bool = True,
         use_local_images: bool = True,
+        local_image_encoder_type: str = "gigapath",
         use_slide_context: bool = True,
         gene_encoder_type: str = "weighted_linear",
         tokenized_gene_names: list[str] | None = None,
@@ -1707,6 +1723,7 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
             n_heads=n_heads, context_layers=context_layers, cross_layers=cross_layers,
             query_layers=query_layers, local_k=local_k, dropout=dropout,
             use_novae=use_novae, use_local_images=use_local_images,
+            local_image_encoder_type=local_image_encoder_type,
             use_slide_context=use_slide_context, gene_encoder_type=gene_encoder_type,
             tokenized_gene_names=tokenized_gene_names,
             tokenized_full_gene_names=tokenized_full_gene_names,

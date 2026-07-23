@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 
 from src.models.conditioning import (
-    GigapathPatchEncoder, MLPGeneEncoder, NovaeGeneEncoder, TokenizedGeneEncoder,
+    DINOv2PatchEncoder, GigapathPatchEncoder, MLPGeneEncoder, NovaeGeneEncoder, TokenizedGeneEncoder,
 )
 
 
@@ -254,6 +254,7 @@ class HierarchicalMissingTissueEncoder(nn.Module):
         dropout: float = 0.1,
         use_novae: bool = True,
         use_local_images: bool = True,
+        local_image_encoder_type: str = "gigapath",
         use_slide_context: bool = True,
         gene_encoder_type: str = "weighted_linear",
         tokenized_gene_names: list[str] | None = None,
@@ -273,15 +274,32 @@ class HierarchicalMissingTissueEncoder(nn.Module):
             raise ValueError("use_slide_context=True requires slide_checkpoint_path")
         if fusion_mode not in {"concat", "gated_experts"}:
             raise ValueError("fusion_mode must be 'concat' or 'gated_experts'")
+        if local_image_encoder_type not in {"gigapath", "dinov2"}:
+            raise ValueError("local_image_encoder_type must be 'gigapath' or 'dinov2'")
 
         self.hidden_dim = int(hidden_dim)
         self.local_k = int(local_k)
         self.use_novae = bool(use_novae)
         self.use_local_images = bool(use_local_images)
+        self.local_image_encoder_type = str(local_image_encoder_type)
         self.use_slide_context = bool(use_slide_context)
         self.fusion_mode = str(fusion_mode)
 
-        self.image_encoder = GigapathPatchEncoder(hidden_dim) if use_local_images else None
+        # local_image_encoder_type (2026-07-23, "general vs. histology-
+        # pretrained image encoder" axis -- see DINOv2PatchEncoder's own
+        # docstring for the motivating evidence): only swaps the LOCAL
+        # per-spot tile encoder. use_slide_context's whole-WSI aggregator
+        # (FrozenGigaPathSlideEncoder, LongNet) stays Gigapath-only either
+        # way -- DINOv2 has no equivalent long-context slide-level
+        # aggregator, so a clean single-axis comparison only touches the
+        # per-tile encoder this class already treats as swappable.
+        if use_local_images:
+            self.image_encoder = (
+                DINOv2PatchEncoder(hidden_dim) if self.local_image_encoder_type == "dinov2"
+                else GigapathPatchEncoder(hidden_dim)
+            )
+        else:
+            self.image_encoder = None
         if gene_encoder_type == "weighted_linear":
             self.gene_encoder = WeightedGeneExpressionEncoder(n_genes, hidden_dim)
         elif gene_encoder_type == "mlp":

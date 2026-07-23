@@ -16,6 +16,7 @@ import math
 
 import torch
 
+from src.models.conditioning import _DINOV2_FEAT_DIM
 from src.models.registry import build_model
 
 
@@ -203,6 +204,60 @@ def test_gradients_are_bucketed_into_the_three_mandated_groups():
     assert float(logged["train/factorized_residual_grad_norm"]) > 0.0
     print("[hierarchical_gene_transport] OK — encoder/transport/residual grad norms are finite, "
           "positive and non-overlapping")
+
+
+def test_local_image_encoder_type_rejects_unknown_value():
+    try:
+        _build(use_local_images=True, local_image_encoder_type="resnet50")
+        raise AssertionError("expected a ValueError for an unknown local_image_encoder_type")
+    except ValueError as exc:
+        assert "local_image_encoder_type" in str(exc)
+    print("[hierarchical_gene_transport] OK — local_image_encoder_type fails closed on an unknown value")
+
+
+def test_local_image_encoder_type_defaults_to_gigapath():
+    model = _build(use_local_images=True)
+    assert model.context_encoder.local_image_encoder_type == "gigapath"
+    print("[hierarchical_gene_transport] OK — local_image_encoder_type defaults to 'gigapath'")
+
+
+def test_local_image_encoder_type_dinov2_runs_and_stays_finite():
+    """The 'general, not trained on histology' image-encoder axis (Wang
+    et al. 2025's Nat. Commun. benchmark motivates this -- see
+    DINOv2PatchEncoder's own docstring). Only the precomputed-feature fast
+    path is testable without a real network fetch of DINOv2's weights --
+    this is also the ONLY path real training ever uses (see
+    precompute_dinov2_features's own docstring)."""
+    model = _build(
+        use_local_images=True, local_image_encoder_type="dinov2", use_novae=False,
+    ).eval()
+    context, query = _context_query(n_context=6)
+    context["images"] = torch.rand(6, _DINOV2_FEAT_DIM)
+    context["image_available"] = torch.ones(6, dtype=torch.bool)
+    with torch.inference_mode():
+        out = model.sample(context, query)
+    assert out["expression"].shape == (2, 6)
+    assert torch.isfinite(out["expression"]).all()
+    print("[hierarchical_gene_transport] OK — local_image_encoder_type='dinov2' runs and stays finite")
+
+
+def test_local_image_encoder_type_dinov2_trains_with_real_gradient():
+    model = _build(
+        use_local_images=True, local_image_encoder_type="dinov2", use_novae=False,
+    )
+    context, query = _context_query(n_context=6)
+    context["images"] = torch.rand(6, _DINOV2_FEAT_DIM)
+    context["image_available"] = torch.ones(6, dtype=torch.bool)
+    target = torch.rand(2, 6)
+    batch = {"context": context, "query": query, "target_expression": target}
+    loss = model.training_step(batch, 0)
+    loss.backward()
+    image_encoder = model.context_encoder.image_encoder
+    assert image_encoder.proj.weight.grad is not None
+    assert torch.isfinite(image_encoder.proj.weight.grad).all()
+    assert float(image_encoder.proj.weight.grad.abs().sum()) > 0.0
+    print("[hierarchical_gene_transport] OK — local_image_encoder_type='dinov2' receives real, "
+          "finite gradient on its trainable projection head")
 
 
 def test_entropy_regularization_is_off_by_default():
@@ -753,6 +808,10 @@ if __name__ == "__main__":
     test_single_transport_head_is_allowed()
     test_geometry_conditioning_mode_ignores_multimodal_tokens()
     test_gradients_are_bucketed_into_the_three_mandated_groups()
+    test_local_image_encoder_type_rejects_unknown_value()
+    test_local_image_encoder_type_defaults_to_gigapath()
+    test_local_image_encoder_type_dinov2_runs_and_stays_finite()
+    test_local_image_encoder_type_dinov2_trains_with_real_gradient()
     test_entropy_regularization_is_off_by_default()
     test_tokenized_gene_encoder_runs_and_stays_finite()
     test_tokenized_gene_encoder_requires_gene_names()

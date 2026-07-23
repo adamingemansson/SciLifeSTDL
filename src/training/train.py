@@ -1467,6 +1467,58 @@ def get_gigapath_features(cfg, patches: np.ndarray, barcodes: np.ndarray,
     return features
 
 
+def _dinov2_cache_path(cfg, sample_id: str | None = None) -> Path:
+    """Where precomputed DINOv2 features for this sample get cached across
+    runs -- mirrors _gigapath_cache_path exactly, separate cache directory
+    so a config using local_image_encoder_type="dinov2" never accidentally
+    reads/writes the same cache file a "gigapath" config uses (different
+    feature dim, would otherwise corrupt or falsely-hit the wrong cache)."""
+    sid = sample_id if sample_id is not None else cfg.data.sample_id
+    return _cache_root(cfg) / "dinov2_cache" / f"{sid}.npz"
+
+
+def get_dinov2_features(cfg, patches: np.ndarray, barcodes: np.ndarray,
+                         sample_id: str | None = None) -> np.ndarray:
+    """Load cached DINOv2 features for these patches (see
+    _dinov2_cache_path) if available, else compute + cache them. Mirrors
+    get_gigapath_features exactly -- see that function's own docstring for
+    the caching/fingerprinting reasoning, identical here."""
+    cache_path = _dinov2_cache_path(cfg, sample_id=sample_id)
+    patch_array = np.ascontiguousarray(patches)
+    digest = hashlib.sha256()
+    digest.update(str(patch_array.shape).encode("ascii"))
+    digest.update(str(patch_array.dtype).encode("ascii"))
+    digest.update(memoryview(patch_array).cast("B"))
+    patch_fingerprint = digest.hexdigest()
+    if cache_path.exists():
+        cached = np.load(cache_path)
+        cached_fingerprint = (
+            str(cached["patch_fingerprint"].item())
+            if "patch_fingerprint" in cached.files else None
+        )
+        if (np.array_equal(cached["barcodes"], barcodes)
+                and cached_fingerprint == patch_fingerprint):
+            print(f"get_dinov2_features: loaded cached features for "
+                  f"{cached['features'].shape[0]} spots from {cache_path} "
+                  f"(delete this file to force a recompute).")
+            return cached["features"]
+        print(f"get_dinov2_features: cache at {cache_path} does not match "
+              f"the current patch tensor and barcode set — recomputing.")
+    from src.models.conditioning import precompute_dinov2_features, _default_device
+    print(f"Precomputing DINOv2 features for {patches.shape[0]} spots on "
+          f"{_default_device()} (one-time cost, cached to {cache_path} "
+          f"so future runs skip this step)...")
+    features = precompute_dinov2_features(patches)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_savez(
+        cache_path,
+        features=features,
+        barcodes=barcodes,
+        patch_fingerprint=np.asarray(patch_fingerprint),
+    )
+    return features
+
+
 def _novae_cache_path(cfg, sample_id: str | None = None) -> Path:
     """Where precomputed Novae features for this sample get cached across
     runs — same reasoning as _gigapath_cache_path (Novae's forward pass
@@ -2098,7 +2150,15 @@ def _load_images(cfg, adata, sample_id: str | None = None):
     can't be cached, but the array IS downsampled once here (see
     _downsample_patches) rather than kept at the native 224x224, since
     that resolution reduction is what actually made image_patch_size do
-    something (see this function's real fix below)."""
+    something (see this function's real fix below).
+
+    local_image_encoder_type="dinov2" (2026-07-23, only meaningful on
+    hierarchical_missing_tissue_regressor/hierarchical_gene_transport_
+    regressor -- the only model families with this param) routes to
+    get_dinov2_features instead of get_gigapath_features -- same
+    precompute-once-cache-to-disk reasoning, separate cache directory
+    (_dinov2_cache_path) so it can never collide with a "gigapath" config's
+    cache."""
     sid = sample_id if sample_id is not None else cfg.data.sample_id
     if not cfg.data.get("use_images", False):
         if cfg.data.get("require_image_coverage", False):
@@ -2108,14 +2168,25 @@ def _load_images(cfg, adata, sample_id: str | None = None):
     patches, barcodes = loaders.load_hest_patches(cfg.data.hest_data_dir, sid)
 
     model_params = cfg.model.get("params", {})
+    is_hierarchical_transport_family = cfg.model.get("name") in (
+        "hierarchical_missing_tissue_regressor", "hierarchical_gene_transport_regressor",
+    )
+    uses_frozen_dinov2 = (
+        is_hierarchical_transport_family
+        and model_params.get("local_image_encoder_type") == "dinov2"
+    )
     uses_frozen_gigapath = (
-        model_params.get("image_encoder_type") == "gigapath"
-        or model_params.get("context_encoder_type") in ("stpath", "storm_lite")
-        or cfg.model.get("name") in (
-            "hierarchical_missing_tissue_regressor", "hierarchical_gene_transport_regressor",
+        not uses_frozen_dinov2
+        and (
+            model_params.get("image_encoder_type") == "gigapath"
+            or model_params.get("context_encoder_type") in ("stpath", "storm_lite")
+            or is_hierarchical_transport_family
         )
     )
-    if uses_frozen_gigapath:
+    if uses_frozen_dinov2:
+        features = get_dinov2_features(cfg, patches, barcodes, sample_id=sid)
+        adata, images = loaders.align_patches_to_adata(adata, features, barcodes)
+    elif uses_frozen_gigapath:
         features = get_gigapath_features(cfg, patches, barcodes, sample_id=sid)
         adata, images = loaders.align_patches_to_adata(adata, features, barcodes)
     else:

@@ -549,6 +549,119 @@ class GigapathPatchEncoder(nn.Module):
         return self.proj(self.embedding_norm(x))
 
 
+def _load_dinov2_tile_encoder(model_name: str = "vit_large_patch14_dinov2.lvd142m"):
+    """Shared loader for a frozen DINOv2 tile encoder (Oquab et al. 2024,
+    TMLR, "DINOv2: Learning Robust Visual Features without Supervision") --
+    the general-purpose counterpart to _load_gigapath_tile_encoder above.
+
+    Unlike prov-gigapath/prov-gigapath, DINOv2's timm weights are PUBLIC on
+    HuggingFace (no gated-repo license approval needed) -- the only new
+    requirement is `pip install timm` (already needed for Gigapath, so not
+    a new dependency if Gigapath configs already run on this machine).
+    DINOv2 was pretrained entirely on natural images (LVD-142M), never on
+    histology -- motivated by Wang et al. 2025 (Nat. Commun., "Benchmarking
+    the translational potential of spatial gene expression prediction from
+    histology"), whose own Table 1 shows all 11 benchmarked SGE-from-H&E
+    methods use general/ImageNet-pretrained-or-from-scratch backbones
+    (DenseNet121, ResNet50, VGG16, ConvMixer, plain ViT/HViT) -- NONE use a
+    histology-specific pretrained foundation model like Gigapath/UNI -- and
+    the best overall performer (EGNv2, PCC 0.28 across all 11) uses a
+    general ResNet-based feature extractor. That doesn't prove a general
+    encoder helps THIS project's different task (real neighbor expression
+    always available, not image-only), but it's real evidence "general"
+    is a legitimate axis to actually test rather than assume histology-
+    specific pretraining is always better."""
+    import timm
+    tile_encoder = timm.create_model(model_name, pretrained=True, num_classes=0)
+    tile_encoder.eval()
+    for p in tile_encoder.parameters():
+        p.requires_grad_(False)
+    return tile_encoder
+
+
+# DINOv2 ViT-L/14's real CLS-token output dim (timm's num_classes=0 pooled
+# output) -- same "probe once via a real forward pass, hardcode as a named
+# constant, cross-check lazily" reasoning as _GIGAPATH_FEAT_DIM above (see
+# that constant's own comment for the exact HuggingFace-hang failure mode
+# this avoids repeating).
+_DINOV2_FEAT_DIM = 1024
+
+
+def _dinov2_preprocess_and_encode(tile_encoder, patches: torch.Tensor) -> torch.Tensor:
+    """DINOv2's own documented preprocessing (resize to a multiple of its
+    14x14 patch size, ImageNet normalize) + a forward pass through the
+    frozen tile encoder. patches: [B, 3, H, W] float in [0, 1]. Mirrors
+    _gigapath_preprocess_and_encode's structure; 224x224 (16x16 patch
+    tokens at patch size 14) is DINOv2's own standard evaluation
+    resolution."""
+    device = patches.device
+    x = nn.functional.interpolate(
+        patches.cpu(), size=224, mode="bicubic", align_corners=False
+    ).to(device)
+    x = (x - _IMAGENET_MEAN.to(device)) / _IMAGENET_STD.to(device)
+    with torch.no_grad():
+        return tile_encoder(x)
+
+
+def precompute_dinov2_features(images, batch_size: int = 16, device: str | None = None):
+    """Run DINOv2's frozen tile encoder ONCE over a whole dataset's spot
+    patches and cache the result -- mirrors precompute_gigapath_features
+    exactly, same "frozen model's output never changes, precompute don't
+    recompute per training step" reasoning.
+
+    images: [N, H, W, 3] uint8. Returns [N, dinov2_dim] float32 numpy array."""
+    import numpy as np
+    if device is None:
+        device = _default_device()
+    tile_encoder = _load_dinov2_tile_encoder().to(device)
+    n = images.shape[0]
+    all_feats = []
+    with torch.no_grad():
+        for start in range(0, n, batch_size):
+            chunk = images[start:start + batch_size]
+            patches_t = torch.tensor(chunk, dtype=torch.float32).permute(0, 3, 1, 2).to(device) / 255.0
+            feats = _dinov2_preprocess_and_encode(tile_encoder, patches_t)
+            all_feats.append(feats.cpu().numpy())
+    return np.concatenate(all_feats, axis=0)
+
+
+class DINOv2PatchEncoder(nn.Module):
+    """Wraps a frozen DINOv2 tile encoder as a GENERAL, non-histology-
+    pretrained alternative to GigapathPatchEncoder above -- same RAE
+    ("frozen big representation + small trainable projection head")
+    pattern, same forward() dispatch-on-tensor-rank contract (raw patches
+    [B,3,H,W] for smoke tests / one-off calls; precomputed
+    [B, dinov2_dim] features for real training, via
+    precompute_dinov2_features), so it's a drop-in swap wherever
+    GigapathPatchEncoder is used. See _load_dinov2_tile_encoder's own
+    docstring for the motivating evidence (Wang et al. 2025) and why this
+    axis is worth testing directly rather than assumed."""
+
+    def __init__(self, feat_dim: int = 64):
+        super().__init__()
+        self.embedding_norm = nn.LayerNorm(_DINOV2_FEAT_DIM)
+        self.proj = nn.Linear(_DINOV2_FEAT_DIM, feat_dim)
+        self.tile_encoder = None
+
+    def _ensure_tile_encoder(self, device: torch.device) -> nn.Module:
+        if self.tile_encoder is None:
+            tile_encoder = _load_dinov2_tile_encoder().to(device)
+            with torch.no_grad():
+                real_dim = tile_encoder(torch.zeros(1, 3, 224, 224, device=device)).shape[-1]
+            assert real_dim == _DINOV2_FEAT_DIM, (
+                f"DINOv2's real tile-encoder output dim ({real_dim}) doesn't match "
+                f"the hardcoded _DINOV2_FEAT_DIM ({_DINOV2_FEAT_DIM}) — update the constant"
+            )
+            self.tile_encoder = tile_encoder
+        return self.tile_encoder
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 4:  # raw patches - encode from scratch (uncached path)
+            tile_encoder = self._ensure_tile_encoder(x.device)
+            x = _dinov2_preprocess_and_encode(tile_encoder, x)
+        return self.proj(self.embedding_norm(x))
+
+
 class MLPGeneEncoder(nn.Module):
     """
     Nonlinear replacement for feeding the raw n_genes expression vector
