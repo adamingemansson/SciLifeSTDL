@@ -24,6 +24,7 @@
 #   bash scripts/run_transport_round4_4gpu.sh
 #   GPU_IDS=1,2,3,5 SMOKE_ONLY=1 bash scripts/run_transport_round4_4gpu.sh
 #   SKIP_SMOKE=1 bash scripts/run_transport_round4_4gpu.sh
+#   ALLOW_EXISTING_TRANSPORT_JOBS=1 bash scripts/run_transport_round4_4gpu.sh  # share GPUs with already-running light jobs
 set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -156,9 +157,15 @@ for sid in INT1 INT2 INT3 INT4 INT5 INT6 INT7 INT8; do
   }
 done
 if pgrep -af -- 'src.training.train.*transport_' >"$LOG_ROOT/existing_processes.txt"; then
-  echo "ERROR: transport jobs already exist (some other suite/diagnostic is running):" >&2
-  cat "$LOG_ROOT/existing_processes.txt" >&2
-  exit 2
+  if [[ "${ALLOW_EXISTING_TRANSPORT_JOBS:-0}" == "1" ]]; then
+    echo "WARNING: transport jobs already exist, proceeding anyway (ALLOW_EXISTING_TRANSPORT_JOBS=1):" >&2
+    cat "$LOG_ROOT/existing_processes.txt" >&2
+  else
+    echo "ERROR: transport jobs already exist (some other suite/diagnostic is running):" >&2
+    cat "$LOG_ROOT/existing_processes.txt" >&2
+    echo "  If these are known-light jobs and you want to share GPUs with them, rerun with ALLOW_EXISTING_TRANSPORT_JOBS=1." >&2
+    exit 2
+  fi
 fi
 
 job_is_done() {
