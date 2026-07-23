@@ -112,7 +112,7 @@ evaluation:
   pca_n_components: 50
   fixed_gene_panel_paths: {stpath_hest_bench_ccrcc_50: resources/evaluation/hest_bench/CCRCC_var_50genes.json}
   train_variance_gene_panel_sizes: [50, 100, 250]
-  training_mask_bank_path: results/mask_banks/training/recovery_suite/transport_c05_dinov2_v2_10k_256_seed760000.json
+  training_mask_bank_path: results/mask_banks/training/recovery_suite/transport_c05_dinov2_v2_20k_256_seed760000.json
 logging:
   backend: csv
   project: st3d-lundeberg-lab
