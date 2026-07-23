@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Summarize the round-4 gene-encoder x candidate-mechanism matrix
-(220-235 -- see experimental/PLAN.md). Direct held-out runs (no O0X-style
-capacity gates), reuses summarize_transport_suite_v2.py's own
+"""Summarize the round-4 gene-encoder x candidate-mechanism matrix (220-245,
+one combined batch -- see experimental/PLAN.md). Direct held-out runs (no
+O0X-style capacity gates), reuses summarize_transport_suite_v2.py's own
 _heldout_row parsing of heldout_sample_summary.json, scoped to
 experiment_names that aren't in that script's own hardcoded HELDOUT_RUNS
-list. Includes 194/206/215's own rows as reference points since every
-config in this round shares one of their evaluation.mask_bank_dir values.
+list. Includes 194/206/209/210/211/212/215's own rows as reference points
+since every config in this round shares one of their
+evaluation.mask_bank_dir values.
 """
 from __future__ import annotations
 
@@ -26,6 +27,16 @@ RUNS = (
     ("gene_x_retrieval", "transport_c05_gene_tokenized_retrieval_v2_10k"),
     ("gene_x_global", "transport_c05_gene_mlp_global_v2_10k"),
     ("gene_x_global", "transport_c05_gene_tokenized_global_v2_10k"),
+    ("gene_x_geometry", "transport_c05_gene_mlp_geometry_v2_10k"),
+    ("gene_x_geometry", "transport_c05_gene_tokenized_geometry_v2_10k"),
+    ("gene_x_smallhole", "transport_c05_gene_mlp_smallhole_v2_10k"),
+    ("gene_x_smallhole", "transport_c05_gene_tokenized_smallhole_v2_10k"),
+    ("gene_x_k256", "transport_c05_gene_mlp_k256_v2_10k"),
+    ("gene_x_k256", "transport_c05_gene_tokenized_k256_v2_10k"),
+    ("retrieval_combo", "transport_c05_retrieval_global_v2_10k"),
+    ("retrieval_sweep", "transport_c05_retrieval_k4_v2_10k"),
+    ("retrieval_sweep", "transport_c05_retrieval_k16_v2_10k"),
+    ("retrieval_combo", "transport_c05_retrieval_smallhole_k256_v2_10k"),
     # 230-235 (BANKSY niche candidate) intentionally NOT listed yet --
     # add once those configs exist and banksy_py is confirmed installed.
     ("reference", "transport_c05_all_modalities_concat_k128_v2_20k"),

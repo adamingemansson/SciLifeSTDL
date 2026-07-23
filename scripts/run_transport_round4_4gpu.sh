@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
 # Round-4 gene-encoder x candidate-mechanism matrix (2026-07-23) -- see
-# experimental/PLAN.md for the full 16-config design; this runs the 10
-# (220-229) that need no new dependency (the remaining 6, 230-235, are the
-# BANKSY-based niche candidate, held back until banksy_py is confirmed
-# installed on this machine).
+# experimental/PLAN.md for the full design; one combined run of the 20
+# configs (220-229, 236-245) that need no new dependency, across 4 GPUs,
+# all finishing into a single summary CSV. The remaining 6 (230-235,
+# BANKSY-based niche candidate) will fold into this same script once
+# banksy_py is confirmed installed on this machine -- not a separate run.
 #
 # Every config here shares an EXISTING sibling's evaluation.mask_bank_dir
 # (194/209/211/215's, already-established dirs) rather than a config from
-# this batch -- there is no inter-config dependency within 220-229, so
+# this batch -- there is no inter-config dependency within 220-245, so
 # unlike run_transport_extra_diagnostics_4gpu.sh's paired queues, jobs here
 # can be freely distributed across GPUs in any order.
 #
 # 10k steps (half the 20k main suite) -- this round trades per-run depth
 # for cross-run breadth across many comparable architecture variants.
 #
-#   GPU[0] (default 1): 220 (gene=mlp)              -> 224 (retrieval+smallhole)      -> 228 (gene=mlp+global)
-#   GPU[1] (default 2): 221 (gene=tokenized)         -> 225 (retrieval+k256)          -> 229 (gene=tokenized+global)
-#   GPU[2] (default 3): 222 (retrieval)              -> 226 (gene=mlp+retrieval)
-#   GPU[3] (default 5): 223 (retrieval+geometry)     -> 227 (gene=tokenized+retrieval)
+#   GPU[0] (default 1): 220 (gene=mlp) -> 224 (retrieval+smallhole) -> 228 (gene=mlp+global) -> 236 (gene=mlp+geometry) -> 240 (gene=mlp+k256)
+#   GPU[1] (default 2): 221 (gene=tokenized) -> 225 (retrieval+k256) -> 229 (gene=tokenized+global) -> 237 (gene=tokenized+geometry) -> 241 (gene=tokenized+k256)
+#   GPU[2] (default 3): 222 (retrieval) -> 226 (gene=mlp+retrieval) -> 238 (gene=mlp+smallhole) -> 242 (retrieval+global) -> 244 (retrieval_k=16)
+#   GPU[3] (default 5): 223 (retrieval+geometry) -> 227 (gene=tokenized+retrieval) -> 239 (gene=tokenized+smallhole) -> 243 (retrieval_k=4) -> 245 (retrieval+smallhole+k256)
 #
 # Usage:
 #   bash scripts/run_transport_round4_4gpu.sh
@@ -36,16 +37,16 @@ MIN_FREE_GB="${MIN_FREE_GB:-20}"
 GPU_IDS_CSV="${GPU_IDS:-1,2,3,5}"
 IFS=',' read -r -a GPUS <<< "$GPU_IDS_CSV"
 
-QUEUE_1=(220 224 228)
-QUEUE_2=(221 225 229)
-QUEUE_3=(222 226)
-QUEUE_4=(223 227)
+QUEUE_1=(220 224 228 236 240)
+QUEUE_2=(221 225 229 237 241)
+QUEUE_3=(222 226 238 242 244)
+QUEUE_4=(223 227 239 243 245)
 QUEUES=(QUEUE_1 QUEUE_2 QUEUE_3 QUEUE_4)
-ALL_NUMBERS=(220 221 222 223 224 225 226 227 228 229)
+ALL_NUMBERS=(220 221 222 223 224 225 226 227 228 229 236 237 238 239 240 241 242 243 244 245)
 
 declare -A CONFIG_PATH
 declare -A CONFIG_NAME
-for f in configs/recovery_suite/22[0-9]_transport_*.yaml; do
+for f in configs/recovery_suite/2[2-4][0-9]_transport_*.yaml; do
   number="$(basename "$f" | cut -d_ -f1)"
   name="$(awk -F': ' '/^experiment_name:/ {print $2; exit}' "$f")"
   if [[ -z "$name" ]]; then
@@ -73,13 +74,13 @@ export OPENBLAS_NUM_THREADS="$CPU_THREADS_PER_JOB"
 export NUMEXPR_NUM_THREADS="$CPU_THREADS_PER_JOB"
 mkdir -p "$LOG_ROOT" "$REPORT_ROOT"
 
-echo "===== YAML sanity check (all 10 configs parse and have distinct experiment_name) ====="
+echo "===== YAML sanity check (all 20 configs parse and have distinct experiment_name) ====="
 "$PYTHON_BIN" - <<'PYEOF'
 import sys
 from pathlib import Path
 import yaml
 
-numbers = [str(n) for n in range(220, 230)]
+numbers = [str(n) for n in list(range(220, 230)) + list(range(236, 246))]
 seen_names = {}
 for n in numbers:
     matches = list(Path("configs/recovery_suite").glob(f"{n}_transport_*.yaml"))
@@ -227,7 +228,7 @@ if [[ "$SMOKE_ONLY" == "1" ]]; then
   exit 0
 fi
 
-echo "===== Four parallel queues (2-3 jobs each, no inter-config dependencies) ====="
+echo "===== Four parallel queues (5 jobs each, 20 total, no inter-config dependencies) ====="
 queue_pids=()
 for idx in 0 1 2 3; do
   run_queue "${QUEUES[$idx]}" "${GPUS[$idx]}" &

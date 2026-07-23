@@ -80,19 +80,30 @@ unless the row itself is testing hole size or k.
 | 233 | weighted_linear | niche | local_k=256 | Niche candidate redundancy with wider k | banksy_py |
 | 234 | mlp | niche | -- | Best gene encoder x niche candidate | banksy_py |
 | 235 | tokenized | niche | -- | Best gene encoder x niche candidate | banksy_py |
+| 236 | mlp | none | conditioning_mode=geometry | Does gene encoder matter via the gene-gate pathway once neighbor-selection itself is geometry-only? (query_gate_projection is unconditional on conditioning_mode, unlike neighbor_projection/query_score_projection) | no |
+| 237 | tokenized | none | conditioning_mode=geometry | Same as 236, set-attention encoder | no |
+| 238 | mlp | none | smallhole | Does gene encoder choice matter more when local context is sparse? | no |
+| 239 | tokenized | none | smallhole | Same as 238, set-attention encoder | no |
+| 240 | mlp | none | local_k=256 | Gene encoder choice at a wider physical neighborhood | no |
+| 241 | tokenized | none | local_k=256 | Same as 240, set-attention encoder | no |
+| 242 | weighted_linear | retrieval+global | -- | Does stacking BOTH new candidate mechanisms beat either alone? | no |
+| 243 | weighted_linear | retrieval (k=4) | -- | Retrieval-count sensitivity, low end (retrieval analog of the local_k sweep) | no |
+| 244 | weighted_linear | retrieval (k=16) | -- | Retrieval-count sensitivity, high end | no |
+| 245 | weighted_linear | retrieval | smallhole+k256 | Retrieval's own "everything combined" stress test, mirroring 219 (global+smallhole+k256) | no |
 
-16 new configs (220-235), all matched to the existing suite's eval masks
-per the same sharing rules as 216-219 (reuse a sibling's
-`evaluation.mask_bank_dir` only when the masking config genuinely
-matches; always distinct `experiment_name`/`checkpoint_dir`/
-`training_mask_bank_path`). 220-229 (10 configs) need no new
-dependencies and can run as soon as the code lands. 230-235 (6 configs)
-need `banksy_py` installed on st-a100 first -- queued but held back from
-launch until that's confirmed.
+26 new configs total (220-245 plus the still-pending 230-235). All matched
+to the existing suite's eval masks per the same sharing rules as 216-219
+(reuse a sibling's `evaluation.mask_bank_dir` only when the masking config
+genuinely matches; always distinct `experiment_name`/`checkpoint_dir`/
+`training_mask_bank_path`). 220-229 + 236-245 (20 configs) need no new
+dependencies and run together as ONE combined batch (not two separate
+waves -- single script, single smoke test, single final summary). 230-235
+(6 configs, niche candidate) need `banksy_py`, now confirmed installed on
+st-a100 -- code not yet built, see "Build order" item 3.
 
 Combined with everything already running/queued this session
 (165-185 v1, 186-206 v2, 207-214 smallhole/k-sweep, 215-219 global
-candidate + combos), that's 60+ configs in the full lineage by the time
+candidate + combos), that's 70+ configs in the full lineage by the time
 this round lands -- real coverage, not padding.
 
 ## Build order (this session)
@@ -120,17 +131,18 @@ this round lands -- real coverage, not padding.
    reaches prediction, loss zero-when-off/finite-when-on-with-real-
    gradient); all 24 prior tests still pass unchanged (28 total across
    both hierarchical test files).
-3. **Niche candidate (BANKSY-based)** -- needs `banksy_py`. Build the
-   code path (precompute script + model wiring) defensively now; flag the
-   dependency install requirement clearly; configs 230-235 wait on
-   confirmation that install succeeded on st-a100 before launch.
-4. **10k-step 4-GPU runner for 220-229** -- DONE.
-   `scripts/run_transport_round4_4gpu.sh` (same
+3. **Niche candidate (BANKSY-based)** -- banksy_py install confirmed
+   working on st-a100 (`import banksy` -- note: PyPI package `banksy_py`,
+   import name `banksy`; existing torch/scanpy/anndata stack and our own
+   test suite all verified unaffected by the numpy pin). Code path
+   (precompute script + model wiring) not yet built -- next up.
+4. **10k-step 4-GPU runner for 220-229 + 236-245 (one combined run, not
+   two waves)** -- DONE. `scripts/run_transport_round4_4gpu.sh` (same
    smoke-test-first/preflight-check pattern as
    `run_transport_extra_diagnostics_4gpu.sh`, but no inter-config
    dependencies within this batch since every config shares an EXISTING
    sibling's eval masks, not a new one from this round) +
-   `scripts/summarize_transport_round4.py`. Verified: all 10 configs
+   `scripts/summarize_transport_round4.py`. Verified: all 20 configs
    parse, all model params accepted by the constructor, no
    experiment_name/checkpoint_dir/training_mask_bank_path collisions
    against each other or the rest of `configs/recovery_suite/`, all at
