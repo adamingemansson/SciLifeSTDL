@@ -16,10 +16,10 @@ a results table -- no scattershot changes without a stated purpose.
 
 | # | Variant | Hypothesis | Compares against | Status |
 |---|---|---|---|---|
-| 1 | Niche-conditioned global candidate (BANKSY) | A per-niche mean beats a flat whole-slide mean because local neighbors can be unrepresentative of the tissue a hole actually contains (e.g. a hole straddling a spatial domain boundary) | 215-219 (flat global candidate), C05/harmonic baseline | implemented + tested, configs 230-235 queued |
-| 2 | BLEEP-style embedding-retrieval candidate | Content-similarity retrieval (learned joint image/expression embedding) selects better candidates than physical k-NN distance, at least as a competing signal in the gate | C05/harmonic baseline, geometry-only (C07/218) | not started |
-| 3 | Alternate gene encoder(s) | `weighted_linear` (STPath-style) may not be the best gene encoder for this regime (real observed expression always available as context, 6-slide cohort) | C05/harmonic baseline | research done, see below -- implementation not started |
-| 4 | Alternate image encoder (lower priority) | Given geometry-only already wins twice, unlikely to move the needle, but cheap to test if GPU budget allows | C05/harmonic baseline | not started |
+| 1 | Niche-conditioned global candidate (BANKSY) | A per-niche mean beats a flat whole-slide mean because local neighbors can be unrepresentative of the tissue a hole actually contains (e.g. a hole straddling a spatial domain boundary) | 215-219 (flat global candidate), C05/harmonic baseline | implemented + tested, configs 230-235 + stacking configs 246-248 queued |
+| 2 | BLEEP-style embedding-retrieval candidate | Content-similarity retrieval (learned joint image/expression embedding) selects better candidates than physical k-NN distance, at least as a competing signal in the gate | C05/harmonic baseline, geometry-only (C07/218) | implemented + tested, configs 222-227/242-245/247-248 queued |
+| 3 | Alternate gene encoder(s) | `weighted_linear` (STPath-style) may not be the best gene encoder for this regime (real observed expression always available as context, 6-slide cohort) | C05/harmonic baseline | candidates 1/2 (mlp/tokenized) + candidate 4 (frozen STPath table) implemented + tested, configs 220-221/234-235/251 queued. Candidates 3 (scVI) and 5 (BulkFormer) still not started (new external dependency each). |
+| 4 | Alternate image encoder | "General, non-histology-pretrained" (DINOv2) vs. GigaPath -- motivated by Wang et al. 2025 (*Nat. Commun.*): its own 11-method SGE-from-H&E benchmark found none use a histology-specific foundation model, and the best performer used general ResNet features | C05/harmonic baseline, geometry-only (218/223) | implemented + tested, configs 249-250 queued |
 
 ## Variant 3 (gene encoder) -- research summary (2026-07-23)
 
@@ -59,31 +59,45 @@ Two independent research passes, reconciled:
 
 Candidates, ranked by engineering risk (lowest first):
 
-1. **`weighted_linear` vs `mlp`** -- both already implemented in
+1. **DONE.** `weighted_linear` vs `mlp` -- both already implemented in
    `hierarchical_slide.py`, never benchmarked against each other on this
-   model. Zero risk, config-only, run first.
-2. **`TokenizedGeneEncoder`** (set-attention over genes, from scratch) --
-   already implemented and used by `StormLiteContextEncoder`, never wired
-   into `hierarchical_slide.py`'s `gene_encoder_type` option or benchmarked
-   there. Low risk, no new dependency; needs an HVG-reduced gene subset
-   (attention cost caps below our full ~16k panel).
-3. **scVI/VAE-style expression embedding** -- new candidate from the
-   CellCharter cross-reference above. Would need a scVI dependency and a
-   training step (fit per-cohort or per-slide) before it can feed the
+   model. Zero risk, config-only. Configs 220/226/228/234/236/238/240.
+2. **DONE.** `TokenizedGeneEncoder` (set-attention over genes, from scratch)
+   -- already implemented and used by `StormLiteContextEncoder`, wired into
+   `hierarchical_slide.py`'s `gene_encoder_type` option 2026-07-23. Low
+   risk, no new dependency; uses an HVG-reduced gene subset (attention cost
+   caps below our full ~16k panel). Configs 221/227/229/235/237/239/241.
+3. **Not started.** scVI/VAE-style expression embedding -- new candidate
+   from the CellCharter cross-reference above. Would need a scVI dependency
+   and a training step (fit per-cohort or per-slide) before it can feed the
    transport head. Medium risk, no precedent for our exact conditioning use
    case.
-4. **Frozen STPath gene-embedding table alone** (not STPath's whole
+4. **DONE.** Frozen STPath gene-embedding table alone (not STPath's whole
    architecture) spliced into our own encoder -- isolates "does the
    *pretraining* help" from "does STPath's whole transformer help," which
-   our internal ablation above conflates. Medium risk: needs gene-vocab
-   alignment via `symbol2ensembl.json` (already in the repo from the STPath
-   integration).
-5. **BulkFormer** (bulk RNA-seq pretrained, MIT-licensed, public
-   checkpoints) -- structurally the closest pretraining distribution to a
-   Visium spot's dense pseudobulk profile of any candidate found, but zero
-   precedent as a conditioning encoder for a spatial model, new dependency,
-   new checkpoint, new vocab alignment. Exploratory, do last, only if 1-4
-   show real signal.
+   our internal ablation above conflates. Implemented 2026-07-23
+   (`src/models/stpath_gene_table.py`, `gene_encoder_type=
+   "stpath_frozen_table"`), grounded directly in STPath's real cloned
+   source (verified `EncodeInputs.gene_embed` structure and the
+   gene2id-reconstruction algorithm against the real
+   ~138k-entry `symbol2ensembl.json`). Config 251.
+5. **Not started.** BulkFormer (bulk RNA-seq pretrained, MIT-licensed,
+   public checkpoints) -- structurally the closest pretraining distribution
+   to a Visium spot's dense pseudobulk profile of any candidate found, but
+   zero precedent as a conditioning encoder for a spatial model, new
+   dependency, new checkpoint, new vocab alignment. Exploratory, do last,
+   only if 1/2/4's results show real signal.
+
+**Image encoder axis (separate from the gene-encoder list above):**
+`local_image_encoder_type="dinov2"` -- DONE, 2026-07-23
+(`DINOv2PatchEncoder` in `src/models/conditioning.py`). Swaps GigaPath's
+local per-spot tile encoder for DINOv2 (self-supervised, natural images
+only, never histology). Motivated by Wang et al. 2025's *Nat. Commun.*
+benchmark: all 11 SGE-from-H&E methods it tested use general/ImageNet-
+pretrained-or-from-scratch backbones, none use a histology-specific
+foundation model, and the best overall performer used general ResNet
+features. Public HuggingFace weights, no license gate (unlike GigaPath/UNI).
+Configs 249-250.
 
 **Explicitly not recommended**: scGPT, Geneformer, UCE, scFoundation as
 frozen encoders -- real, unverified risk that their single-cell training
