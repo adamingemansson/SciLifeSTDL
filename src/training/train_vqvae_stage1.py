@@ -62,6 +62,11 @@ def main(cfg_path: str):
     trainer = pl.Trainer(
         max_epochs=cfg.training.epochs,
         accelerator="auto",
+        # devices=1 (2026-07-23, real incident -- see train.py's identical
+        # fix): a bare, unscoped invocation (no CUDA_VISIBLE_DEVICES) would
+        # otherwise let accelerator="auto" launch DDP across every visible
+        # GPU rather than the one this job is meant to use.
+        devices=1,
         log_every_n_steps=cfg.training.log_every_n_steps,
         enable_checkpointing=False,
         logger=False,

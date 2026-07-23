@@ -2909,6 +2909,15 @@ def _main_multi_sample(cfg) -> None:
         trainer = pl.Trainer(
             max_epochs=1,
             accelerator="auto",
+            # devices=1 (2026-07-23, real incident): every launcher script in
+            # this project scopes a single GPU via CUDA_VISIBLE_DEVICES before
+            # invoking python, so accelerator="auto" always resolved to one
+            # device in practice -- but a bare, unscoped invocation (all GPUs
+            # visible) let Lightning's default device count silently launch
+            # DDP across every visible GPU, stepping on whatever else was
+            # running there. Explicit devices=1 makes this safe regardless of
+            # how many GPUs happen to be visible to the process.
+            devices=1,
             log_every_n_steps=int(cfg.training.log_every_n_steps),
             enable_checkpointing=False,
             logger=build_experiment_logger(cfg, checkpoint_dir),
@@ -3255,6 +3264,9 @@ def main(cfg_path: str, overrides: list[str] | None = None):
         trainer = pl.Trainer(
             max_epochs=1,  # one pass over `n_items` fresh masking draws == old epoch count
             accelerator="auto",
+            # devices=1 -- see the identical trainer construction in
+            # _main_multi_sample above for the real incident this fixes.
+            devices=1,
             log_every_n_steps=cfg.training.log_every_n_steps,
             enable_checkpointing=False,
             logger=build_experiment_logger(cfg, checkpoint_dir),
