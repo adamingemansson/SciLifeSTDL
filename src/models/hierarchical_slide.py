@@ -449,6 +449,17 @@ class HierarchicalMissingTissueEncoder(nn.Module):
             "neighbor_indices": nearest_index,
             "neighbor_distances": nearest_distance,
             "relative_geometry": relative,
+            # Mean of every visible context spot's post-context_transformer
+            # (i.e. already globally self-attended) token -- a single [H]
+            # summary of "what this tissue generally looks like", independent
+            # of local_k. Callers that only need k-nearest-neighbor behavior
+            # (e.g. HierarchicalMissingTissueRegressor) can ignore this key;
+            # it exists so a transport head can optionally give the learned
+            # gate one whole-slide fallback candidate alongside the k local
+            # ones, for regions (e.g. a tumor invasive front) where the
+            # nearest neighbors of a hole may not be representative of the
+            # tissue the hole actually contains.
+            "global_hidden": observed.mean(dim=0),
         }
 
     def forward(self, context: dict, query: dict) -> torch.Tensor:

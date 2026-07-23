@@ -1539,6 +1539,28 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
     and ``gene_gate_mode='shared'`` (one gate for every gene vs. one per
     gene) so the 20-run suite's C07/C08/C09 controls can be set
     independently of each other and of C05's full-richness baseline.
+
+    ``use_global_candidate`` (2026-07-23 diagnostic follow-up) adds exactly
+    one extra candidate to the transport gate's softmax competition, per
+    query: a whole-slide fallback built from
+    ``HierarchicalMissingTissueEncoder.forward_with_neighbors()``'s
+    ``global_hidden`` (mean of every visible context spot's already
+    globally-self-attended token) paired with the literal mean of every
+    visible context spot's real expression. The k local candidates and the
+    IDW anchor are entirely unchanged -- this only widens the *learned*
+    candidate's options from "k nearest neighbors only" to "k nearest
+    neighbors, or the tissue's general character, whichever this gene's
+    gate prefers". Motivation: pure k-nearest-neighbor conditioning has no
+    way to recover if a hole's local neighborhood happens to be
+    unrepresentative of the tissue it actually contains (e.g. a hole
+    straddling a tumor invasive front, where nearby expression can differ
+    sharply over a short distance even though the missing tissue is still
+    drawn from the same overall section). The global candidate is given a
+    sentinel relative-geometry entry (zero direction, distance = 3x the
+    query's own local scale, clearly out of the normal k-neighbor range)
+    rather than a fabricated real position, so the scorer can learn to
+    treat it distinctly by content (``neighbor_hidden``) as well as by that
+    sentinel distance.
     """
 
     def __init__(
@@ -1565,6 +1587,7 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
         idw_power: float = 2.0,
         conditioning_mode: str = "hierarchical",
         gene_gate_mode: str = "per_gene",
+        use_global_candidate: bool = False,
         use_query_gate: bool = True,
         use_query_gene_gate: bool = False,
         query_gene_gate_rank: int = 16,
@@ -1614,6 +1637,7 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
 
         self.conditioning_mode = str(conditioning_mode)
         self.gene_gate_mode = str(gene_gate_mode)
+        self.use_global_candidate = bool(use_global_candidate)
         self.use_query_gate = bool(use_query_gate)
         self.use_query_gene_gate = bool(use_query_gene_gate)
         self.use_residual = bool(use_residual)
@@ -1725,18 +1749,48 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
         neighbour_expression = context["expression"][neighbor_indices]  # [Nq, k, G]
         anchor_expression, idw_weights = self._idw_anchor(neighbor_distances, neighbour_expression)
 
-        hidden = self.geometry_encoder(relative_geometry)[:, :, None, :]  # [Nq,k,1,S]
+        # The IDW anchor above is deliberately computed from ONLY the k real
+        # local neighbors -- it must stay a pure, non-learned local
+        # interpolation, unaffected by whatever the learned candidate does.
+        # The global candidate (if enabled) only ever widens the *learned*
+        # transport candidate's own options, one extra slot in its softmax
+        # gate alongside the k local ones.
+        scoring_relative_geometry = relative_geometry
+        scoring_neighbor_hidden = neighbor_hidden
+        scoring_neighbour_expression = neighbour_expression
+        if self.use_global_candidate:
+            global_hidden = encoded["global_hidden"]  # [H]
+            global_expression = context["expression"].mean(dim=0)  # [G]
+            # relative_geometry's distance channel is already normalized by
+            # each query's own local_scale (the k-th/farthest local
+            # neighbor's distance, see forward_with_neighbors), so real
+            # neighbors fall in roughly (0, 1]. A constant 3.0 here reads as
+            # "three times farther than your farthest real local neighbor" --
+            # clearly out of that range without needing a fabricated
+            # position, so the scorer can learn to treat this slot as
+            # categorically different from a real neighbor.
+            global_relative = relative_geometry.new_zeros(n_query, 1, 3)
+            global_relative[..., 2] = 3.0
+            scoring_relative_geometry = torch.cat([relative_geometry, global_relative], dim=1)
+            scoring_neighbor_hidden = torch.cat(
+                [neighbor_hidden, global_hidden[None, None, :].expand(n_query, 1, -1)], dim=1
+            )
+            scoring_neighbour_expression = torch.cat(
+                [neighbour_expression, global_expression[None, None, :].expand(n_query, 1, -1)], dim=1
+            )
+
+        hidden = self.geometry_encoder(scoring_relative_geometry)[:, :, None, :]  # [Nq,k(+1),1,S]
         hidden = hidden + self.head_embedding[None, None, :, :]           # [1,1,H,S]
         if self.conditioning_mode == "hierarchical":
-            hidden = hidden + self.neighbor_projection(neighbor_hidden)[:, :, None, :]
+            hidden = hidden + self.neighbor_projection(scoring_neighbor_hidden)[:, :, None, :]
             hidden = hidden + self.query_score_projection(query_hidden)[:, None, None, :]
         hidden = torch.nn.functional.gelu(self.score_norm(hidden))
         logits = torch.einsum("qkhd,hd->qkh", hidden, self.head_score_vector)
         head_weights = torch.softmax(
             logits.transpose(1, 2) / self.transport_temperature, dim=-1
-        )  # [Nq, heads, k]
+        )  # [Nq, heads, k(+1)]
         head_expression = torch.einsum(
-            "qhk,qkg->qhg", head_weights, neighbour_expression
+            "qhk,qkg->qhg", head_weights, scoring_neighbour_expression
         )  # [Nq, heads, G]
 
         base_gate = (

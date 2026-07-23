@@ -244,6 +244,70 @@ def test_entropy_regularization_is_off_by_default():
           "and contributes nothing to the loss unless explicitly re-enabled")
 
 
+def test_global_candidate_off_by_default():
+    model = _build()
+    assert model.use_global_candidate is False
+    print("[hierarchical_gene_transport] OK — use_global_candidate defaults to False")
+
+
+def test_global_candidate_runs_and_stays_finite():
+    model = _build(use_global_candidate=True, local_k=3).eval()
+    context, query = _context_query(n_context=6)
+    with torch.inference_mode():
+        out = model.sample(context, query)
+    assert out["expression"].shape == (2, 6)
+    assert torch.isfinite(out["expression"]).all()
+    print("[hierarchical_gene_transport] OK — use_global_candidate=True runs and stays finite")
+
+
+def test_global_candidate_does_not_change_idw_anchor():
+    """The IDW anchor must stay a pure local interpolation over exactly the
+    k real neighbors, regardless of whether the learned candidate also sees
+    a global whole-slide fallback slot."""
+    torch.manual_seed(0)
+    model_off = _build(use_global_candidate=False, local_k=3).eval()
+    torch.manual_seed(0)
+    model_on = _build(use_global_candidate=True, local_k=3).eval()
+    context, query = _context_query(n_context=6)
+    with torch.inference_mode():
+        out_off = model_off.sample(context, query)
+        out_on = model_on.sample(context, query)
+    assert torch.allclose(out_off["anchor_expression"], out_on["anchor_expression"], atol=1e-6)
+    print("[hierarchical_gene_transport] OK — global candidate leaves the IDW anchor exactly unchanged")
+
+
+def test_global_candidate_lets_far_context_reach_the_prediction():
+    """A far-away group of context spots (never among the k nearest) with
+    very different expression can only ever move the prediction through the
+    global candidate -- pure local kNN (use_global_candidate=False)
+    structurally has no path for them to matter at all."""
+    torch.manual_seed(0)
+    model_off = _build(use_global_candidate=False, local_k=3, n_genes=2).eval()
+    torch.manual_seed(0)
+    model_on = _build(use_global_candidate=True, local_k=3, n_genes=2).eval()
+
+    local_coords = torch.tensor([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.1, 0.0]])
+    far_coords = torch.tensor([[500.0, 500.0, 0.0], [501.0, 500.0, 0.0], [500.0, 501.0, 0.0]])
+    context = {
+        "coords": torch.cat([local_coords, far_coords], dim=0),
+        "expression": torch.cat([torch.zeros(3, 2), torch.full((3, 2), 1000.0)], dim=0),
+    }
+    query = {"coords": torch.tensor([[0.02, 0.02, 0.0]])}
+
+    with torch.inference_mode():
+        out_off = model_off.sample(context, query)
+        out_on = model_on.sample(context, query)
+
+    assert torch.allclose(
+        out_off["expression"], torch.zeros_like(out_off["expression"]), atol=1e-3
+    ), "pure local kNN must be entirely untouched by context spots outside local_k"
+    assert not torch.allclose(out_on["expression"], out_off["expression"], atol=1e-6), (
+        "enabling use_global_candidate must let far, non-local context influence the prediction"
+    )
+    print("[hierarchical_gene_transport] OK — use_global_candidate lets far context spots reach "
+          "the prediction that pure local kNN structurally cannot see")
+
+
 def test_all_thirteen_mandated_metrics_are_logged():
     model = _build(use_residual=True, residual_rank=4)
     context, query = _context_query(n_context=6)
@@ -283,5 +347,9 @@ if __name__ == "__main__":
     test_geometry_conditioning_mode_ignores_multimodal_tokens()
     test_gradients_are_bucketed_into_the_three_mandated_groups()
     test_entropy_regularization_is_off_by_default()
+    test_global_candidate_off_by_default()
+    test_global_candidate_runs_and_stays_finite()
+    test_global_candidate_does_not_change_idw_anchor()
+    test_global_candidate_lets_far_context_reach_the_prediction()
     test_all_thirteen_mandated_metrics_are_logged()
     print("\nAll hierarchical_gene_transport_regressor tests passed.")

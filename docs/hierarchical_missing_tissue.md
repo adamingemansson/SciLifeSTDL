@@ -162,6 +162,51 @@ identical ablation grid was rerun as suite 2 --
 `scripts/run_transport_suite_v2_4gpu.sh` (`summarize_transport_suite_v2.py`
 also prints a direct per-run v1-vs-v2 PCC delta).
 
+**Suite 2 result (2026-07-22)**: the entropy fix was only partially
+effective -- `transport_head_entropy` dropped modestly (from ~4.81-4.85 to
+~4.61-4.77) but stayed close to the theoretical max, so the
+neighbor-weighting mechanism still barely specialized. PCC deltas vs. suite
+1 were small and inconsistent across configs; C01 (raw-GEX-only) actually
+got *worse*, and no config beat the harmonic control. C07 (geometry-only
+scoring) was consistently the strongest learned config in both suites,
+suggesting geometric signal dominates and that the six-slide training cohort
+may be the more fundamental limiting factor rather than any single richness
+axis tested so far.
+
+**Round 3 diagnostics (2026-07-23), still pending results**: three
+independent axes, run together via
+`scripts/run_transport_extra_diagnostics_4gpu.sh` +
+`scripts/summarize_transport_extra_diagnostics.py`:
+- **Hole size** (`configs/recovery_suite/207-210_*_smallhole.yaml`):
+  `radius_range` shrunk from `[3.0, 6.0]` to `[0.5, 1.0]` spot-spacings
+  (~24-36x smaller hole area) for C01/C07/C05 plus a matched harmonic
+  control, testing whether hole size itself is capping every config's
+  performance.
+- **Local neighborhood size** (`configs/recovery_suite/211-214_*.yaml`):
+  `local_k`/harmonic's `k` swept 128 -> 256 -> 512 at the original hole
+  size, testing whether the model is neighbor-starved rather than
+  architecture-limited (motivated by C07's consistent strength in both
+  prior suites).
+- **Global candidate** (`configs/recovery_suite/215_transport_c05_global_candidate_v2.yaml`,
+  `model.params.use_global_candidate: true`): adds exactly one extra
+  candidate to the transport gate's softmax competition per query -- a
+  whole-slide mean-pooled fallback
+  (`HierarchicalMissingTissueEncoder.forward_with_neighbors()`'s new
+  `global_hidden` token, paired with the literal mean of every visible
+  context spot's real expression) alongside the k local neighbors. The IDW
+  anchor is untouched; this only widens the *learned* candidate's options.
+  Motivation: pure k-nearest-neighbor conditioning has no way to recover if
+  a hole's local neighborhood happens to be unrepresentative of the tissue
+  it actually contains -- e.g. a hole straddling a tumor invasive front,
+  where expression can shift sharply over a short distance even though the
+  missing tissue is still drawn from the same overall section. See
+  `HierarchicalGeneTransportRegressor`'s docstring in `src/models/registry.py`
+  for the exact mechanism (sentinel relative-geometry entry, not a
+  fabricated position). Launch config 215 independently of the
+  4-GPU runner above once a GPU is free -- it shares its
+  `evaluation.mask_bank_dir` with the original suite 2 C05/harmonic-k128
+  runs (194/206) for a direct, same-test-mask comparison.
+
 ## Primary references
 
 - Prov-GigaPath: <https://www.nature.com/articles/s41586-024-07441-w>
