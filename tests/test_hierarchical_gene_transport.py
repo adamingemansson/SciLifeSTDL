@@ -427,6 +427,63 @@ def test_retrieval_loss_is_zero_when_disabled_and_finite_when_enabled():
           "finite and receives real gradient when enabled")
 
 
+def test_global_and_retrieval_candidates_stack_correctly():
+    """Config 242 stacks use_global_candidate AND use_retrieval_candidate
+    together for the first time -- neither mechanism was unit-tested in
+    combination with the other before, only individually. Both extend the
+    SAME scoring_relative_geometry/scoring_neighbor_hidden/
+    scoring_neighbour_expression tensors sequentially (global block first,
+    then retrieval), so this specifically checks that chaining produces the
+    correct final candidate count (k local + 1 global + retrieval_k
+    retrieved) and stays finite, with the anchor still completely
+    unaffected by either."""
+    n_context, local_k, retrieval_k = 6, 3, 2
+    model = _build(
+        use_global_candidate=True,
+        use_retrieval_candidate=True, retrieval_k=retrieval_k,
+        local_k=local_k, n_genes=6,
+    ).eval()
+    context, query = _context_query(n_context=n_context)
+
+    captured = {}
+    original_einsum = torch.einsum
+
+    def _spy_einsum(equation, *operands):
+        if equation == "qhk,qkg->qhg":
+            captured["n_candidates"] = operands[0].shape[-1]
+        return original_einsum(equation, *operands)
+
+    torch.einsum = _spy_einsum
+    try:
+        with torch.inference_mode():
+            out = model.sample(context, query)
+    finally:
+        torch.einsum = original_einsum
+
+    assert out["expression"].shape == (2, 6)
+    assert torch.isfinite(out["expression"]).all()
+    assert captured["n_candidates"] == local_k + 1 + retrieval_k, (
+        f"expected {local_k}(local) + 1(global) + {retrieval_k}(retrieval) = "
+        f"{local_k + 1 + retrieval_k} candidates in the gate's softmax, got {captured['n_candidates']}"
+    )
+
+    model_anchor_only = _build(
+        use_global_candidate=False, use_retrieval_candidate=False,
+        local_k=local_k, n_genes=6,
+    ).eval()
+    model_anchor_only.load_state_dict(
+        {k: v for k, v in model.state_dict().items() if k in model_anchor_only.state_dict()},
+        strict=False,
+    )
+    with torch.inference_mode():
+        out_anchor_only = model_anchor_only.sample(context, query)
+    assert torch.allclose(out["anchor_expression"], out_anchor_only["anchor_expression"], atol=1e-6), (
+        "stacking both candidate mechanisms must still leave the pure-local IDW anchor unchanged"
+    )
+    print("[hierarchical_gene_transport] OK — global + retrieval candidates stack to exactly "
+          "k+1+retrieval_k total candidates and leave the IDW anchor unchanged")
+
+
 def test_all_thirteen_mandated_metrics_are_logged():
     model = _build(use_residual=True, residual_rank=4)
     context, query = _context_query(n_context=6)
@@ -477,5 +534,6 @@ if __name__ == "__main__":
     test_retrieval_candidate_does_not_change_idw_anchor()
     test_retrieval_candidate_lets_far_context_reach_the_prediction()
     test_retrieval_loss_is_zero_when_disabled_and_finite_when_enabled()
+    test_global_and_retrieval_candidates_stack_correctly()
     test_all_thirteen_mandated_metrics_are_logged()
     print("\nAll hierarchical_gene_transport_regressor tests passed.")

@@ -206,13 +206,29 @@ run_queue() {
   done
 }
 
+smoke_queue() {
+  local queue_name="$1" gpu="$2"
+  local -n queue_ref="$queue_name"
+  local number
+  for number in "${queue_ref[@]}"; do
+    run_one "$number" "$gpu" 1 || return 1
+  done
+}
+
 if [[ "$SKIP_SMOKE" != "1" ]]; then
-  echo "===== One-step fail-closed smoke test (first job of each queue) ====="
+  # Unlike run_transport_extra_diagnostics_4gpu.sh's paired queues (where
+  # only the first job in each queue needed smoke-testing before a
+  # dependent sibling could run), every one of these 20 configs has a
+  # meaningfully different flag combination (gene_encoder_type,
+  # use_retrieval_candidate, retrieval_k, conditioning_mode, ...) and NONE
+  # of them depend on each other -- smoke-test all 20, not just 4, so a
+  # config-specific bug (a bad flag combo only present in job 2-5 of a
+  # queue) surfaces in seconds, not after it's already queued behind
+  # several hours of earlier jobs on the same GPU.
+  echo "===== One-step fail-closed smoke test (all 20 configs, 5 sequential per GPU) ====="
   smoke_pids=()
   for idx in 0 1 2 3; do
-    queue_name="${QUEUES[$idx]}"
-    declare -n q_ref="$queue_name"
-    run_one "${q_ref[0]}" "${GPUS[$idx]}" 1 &
+    smoke_queue "${QUEUES[$idx]}" "${GPUS[$idx]}" &
     smoke_pids+=("$!")
   done
   smoke_failed=0
@@ -221,7 +237,7 @@ if [[ "$SKIP_SMOKE" != "1" ]]; then
     echo "ERROR: smoke test failed; inspect $LOG_ROOT/smoke_*.log" >&2
     exit 1
   fi
-  echo "Smoke tests passed."
+  echo "Smoke tests passed (all 20 configs)."
 fi
 if [[ "$SMOKE_ONLY" == "1" ]]; then
   echo "Smoke tests passed; full runs were not started."
