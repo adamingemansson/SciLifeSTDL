@@ -1,4 +1,4 @@
-# Round-5 image-encoder axis (2026-07-23): 194 with local_image_encoder_type: dinov2 -- swaps ONLY the local per-spot tile encoder from Prov-GigaPath (pretrained on real histology) to DINOv2 (pretrained entirely on natural images, never histology). Motivated by Wang et al. 2025 (Nat. Commun., 'Benchmarking the translational potential of spatial gene expression prediction from histology'): its Table 1 shows all 11 benchmarked SGE-from-H&E methods use general/ImageNet-pretrained-or-from-scratch backbones, none use a histology-specific foundation model, and its best overall performer (EGNv2) uses a general ResNet feature extractor. Caveat: that benchmark's task is image-only prediction (no real neighbor expression), unlike ours -- this config tests whether the same 'general beats specific' pattern holds when image conditioning is only ONE signal among several real ones, not the entire task. use_slide_context stays Gigapath (no DINOv2 slide-level aggregator exists). 10k steps. Shares 194/215's evaluation masks. Needs a `pip install timm` + a real DINOv2 weight download (public, no license gate, unlike Gigapath) on first run -- see get_dinov2_features in train.py.
+# Round-5 image-encoder axis (2026-07-23): 194 with local_image_encoder_type: dinov2 -- swaps ONLY the local per-spot tile encoder from Prov-GigaPath (pretrained on real histology) to DINOv2 (pretrained entirely on natural images, never histology). Motivated by Wang et al. 2025 (Nat. Commun., 'Benchmarking the translational potential of spatial gene expression prediction from histology'): its Table 1 shows all 11 benchmarked SGE-from-H&E methods use general/ImageNet-pretrained-or-from-scratch backbones, none use a histology-specific foundation model, and its best overall performer (EGNv2) uses a general ResNet feature extractor. Caveat: that benchmark's task is image-only prediction (no real neighbor expression), unlike ours -- this config tests whether the same 'general beats specific' pattern holds when image conditioning is only ONE signal among several real ones, not the entire task. use_slide_context stays Gigapath (no DINOv2 slide-level aggregator exists). 20k steps. Shares 194/215's evaluation masks. Needs a `pip install timm` + a real DINOv2 weight download (public, no license gate, unlike Gigapath) on first run -- see get_dinov2_features in train.py.
 experiment_name: transport_c05_dinov2_v2_10k
 data:
   source: hest1k
@@ -70,13 +70,13 @@ model:
     conditioner_lr: 0.0003
     weight_decay: 0.01
 training:
-  epochs: 10000
+  epochs: 20000
   seed: 10
   mask_seed: 760000
   unique_mask_count: 256
   log_every_n_steps: 10
   log_print_every_n_steps: 500
-  checkpoint_every_n_steps: 5000
+  checkpoint_every_n_steps: 10000
   num_workers: 0
   augment_coords: false
   image_mode: target_zero
@@ -90,7 +90,7 @@ validation:
   enabled: true
   every_n_steps: 1000
   patience_checks: 1000
-  early_stopping_min_steps: 10000
+  early_stopping_min_steps: 20000
   require_anchor_improvement: false
   min_delta: 0.0001
   metric: rmse

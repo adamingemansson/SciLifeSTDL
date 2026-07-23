@@ -1,4 +1,4 @@
-# Round-5 niche-stacking follow-up (2026-07-23): 194 with BOTH use_niche_candidate=true (230) AND use_global_candidate=true (215) at once -- does per-niche pooling add anything on top of the flat whole-slide fallback, or vice versa? Mirrors 242's 'stack both new mechanisms' question, applied to niche+global instead of retrieval+global. 10k steps. Shares 194/215's evaluation masks.
+# Round-5 niche-stacking follow-up (2026-07-23): 194 with BOTH use_niche_candidate=true (230) AND use_global_candidate=true (215) at once -- does per-niche pooling add anything on top of the flat whole-slide fallback, or vice versa? Mirrors 242's 'stack both new mechanisms' question, applied to niche+global instead of retrieval+global. 20k steps. Shares 194/215's evaluation masks.
 experiment_name: transport_c05_niche_global_v2_10k
 data:
   source: hest1k
@@ -72,13 +72,13 @@ model:
     conditioner_lr: 0.0003
     weight_decay: 0.01
 training:
-  epochs: 10000
+  epochs: 20000
   seed: 10
   mask_seed: 760000
   unique_mask_count: 256
   log_every_n_steps: 10
   log_print_every_n_steps: 500
-  checkpoint_every_n_steps: 5000
+  checkpoint_every_n_steps: 10000
   num_workers: 0
   augment_coords: false
   image_mode: target_zero
@@ -92,7 +92,7 @@ validation:
   enabled: true
   every_n_steps: 1000
   patience_checks: 1000
-  early_stopping_min_steps: 10000
+  early_stopping_min_steps: 20000
   require_anchor_improvement: false
   min_delta: 0.0001
   metric: rmse

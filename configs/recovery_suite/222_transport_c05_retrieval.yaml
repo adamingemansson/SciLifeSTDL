@@ -1,4 +1,4 @@
-# Round-4 candidate-mechanism ablation (2026-07-23): 194 with model.params.use_retrieval_candidate: false -> true (BLEEP-style content-embedding retrieval, new this round -- see HierarchicalGeneTransportRegressor's own docstring for the exact mechanism and the BLEEP-vs-us tension it directly tests). Adds up to retrieval_k=8 extra transport-gate candidates selected by learned embedding similarity rather than physical distance, on top of the existing k=128 physically-nearest ones. 10k steps. Shares 194/215's evaluation masks.
+# Round-4 candidate-mechanism ablation (2026-07-23): 194 with model.params.use_retrieval_candidate: false -> true (BLEEP-style content-embedding retrieval, new this round -- see HierarchicalGeneTransportRegressor's own docstring for the exact mechanism and the BLEEP-vs-us tension it directly tests). Adds up to retrieval_k=8 extra transport-gate candidates selected by learned embedding similarity rather than physical distance, on top of the existing k=128 physically-nearest ones. 20k steps. Shares 194/215's evaluation masks.
 experiment_name: transport_c05_retrieval_v2_10k
 data:
   source: hest1k
@@ -74,13 +74,13 @@ model:
     conditioner_lr: 0.0003
     weight_decay: 0.01
 training:
-  epochs: 10000
+  epochs: 20000
   seed: 10
   mask_seed: 760000
   unique_mask_count: 256
   log_every_n_steps: 10
   log_print_every_n_steps: 500
-  checkpoint_every_n_steps: 5000
+  checkpoint_every_n_steps: 10000
   num_workers: 0
   augment_coords: false
   image_mode: target_zero
@@ -94,7 +94,7 @@ validation:
   enabled: true
   every_n_steps: 1000
   patience_checks: 1000
-  early_stopping_min_steps: 10000
+  early_stopping_min_steps: 20000
   require_anchor_improvement: false
   min_delta: 0.0001
   metric: rmse

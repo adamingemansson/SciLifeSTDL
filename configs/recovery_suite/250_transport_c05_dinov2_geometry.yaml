@@ -1,4 +1,4 @@
-# Round-5 image-encoder axis (2026-07-23): 194 with local_image_encoder_type: dinov2 AND conditioning_mode: geometry. Tests whether image-encoder choice matters at all once geometry-only scoring already dominates (the same 'does richness matter once the scorer ignores it' question 218/223/231/236/237 already ask of other axes) -- if DINOv2 vs. Gigapath makes zero difference here too, that's further evidence image encoder choice isn't this project's bottleneck, consistent with 218/223's own results. 10k steps. Shares 194/215's evaluation masks.
+# Round-5 image-encoder axis (2026-07-23): 194 with local_image_encoder_type: dinov2 AND conditioning_mode: geometry. Tests whether image-encoder choice matters at all once geometry-only scoring already dominates (the same 'does richness matter once the scorer ignores it' question 218/223/231/236/237 already ask of other axes) -- if DINOv2 vs. Gigapath makes zero difference here too, that's further evidence image encoder choice isn't this project's bottleneck, consistent with 218/223's own results. 20k steps. Shares 194/215's evaluation masks.
 experiment_name: transport_c05_dinov2_geometry_v2_10k
 data:
   source: hest1k
@@ -70,13 +70,13 @@ model:
     conditioner_lr: 0.0003
     weight_decay: 0.01
 training:
-  epochs: 10000
+  epochs: 20000
   seed: 10
   mask_seed: 760000
   unique_mask_count: 256
   log_every_n_steps: 10
   log_print_every_n_steps: 500
-  checkpoint_every_n_steps: 5000
+  checkpoint_every_n_steps: 10000
   num_workers: 0
   augment_coords: false
   image_mode: target_zero
@@ -90,7 +90,7 @@ validation:
   enabled: true
   every_n_steps: 1000
   patience_checks: 1000
-  early_stopping_min_steps: 10000
+  early_stopping_min_steps: 20000
   require_anchor_improvement: false
   min_delta: 0.0001
   metric: rmse

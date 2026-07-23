@@ -1,4 +1,4 @@
-# Round-4 wave-2 gap-fill (2026-07-23): 211 (local_k=256 C05) with gene_encoder_type: mlp. Tests gene encoder choice at a wider physical neighborhood than wave 1 covered. 10k steps. Shares 211/212's evaluation masks (k256).
+# Round-4 wave-2 gap-fill (2026-07-23): 211 (local_k=256 C05) with gene_encoder_type: mlp. Tests gene encoder choice at a wider physical neighborhood than wave 1 covered. 20k steps. Shares 211/212's evaluation masks (k256).
 experiment_name: transport_c05_gene_mlp_k256_v2_10k
 data:
   source: hest1k
@@ -69,13 +69,13 @@ model:
     conditioner_lr: 0.0003
     weight_decay: 0.01
 training:
-  epochs: 10000
+  epochs: 20000
   seed: 10
   mask_seed: 760000
   unique_mask_count: 256
   log_every_n_steps: 10
   log_print_every_n_steps: 500
-  checkpoint_every_n_steps: 5000
+  checkpoint_every_n_steps: 10000
   num_workers: 0
   augment_coords: false
   image_mode: target_zero
@@ -89,7 +89,7 @@ validation:
   enabled: true
   every_n_steps: 1000
   patience_checks: 1000
-  early_stopping_min_steps: 10000
+  early_stopping_min_steps: 20000
   require_anchor_improvement: false
   min_delta: 0.0001
   metric: rmse

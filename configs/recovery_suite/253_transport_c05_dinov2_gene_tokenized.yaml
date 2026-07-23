@@ -1,5 +1,5 @@
-# Round-4 wave-2 gap-fill (2026-07-23): 209 (smallhole C05) with gene_encoder_type: tokenized. Same reasoning as 238. 20k steps. Shares 209/210's evaluation masks (smallhole).
-experiment_name: transport_c05_gene_tokenized_smallhole_v2_10k
+# Round-5 image-encoder x gene-encoder cross (2026-07-23): 249 (local_image_encoder_type: dinov2) with gene_encoder_type: tokenized instead of weighted_linear -- same reasoning as 252, testing the set-attention encoder instead of mlp. 20k steps. Shares 194/215's evaluation masks.
+experiment_name: transport_c05_dinov2_gene_tokenized_v2_20k
 data:
   source: hest1k
   hest_data_dir: data/raw/hest1k
@@ -31,7 +31,7 @@ masking:
   context_selection: nearest_query
   params:
     n_patches: 1
-    radius_range: [0.5, 1.0]
+    radius_range: [3.0, 6.0]
     radius_unit: spot_spacing
     shape: mixed
 model:
@@ -48,6 +48,7 @@ model:
     use_local_images: true
     use_slide_context: true
     gene_encoder_type: tokenized
+    local_image_encoder_type: dinov2
     fusion_mode: concat
     slide_checkpoint_path: ${oc.env:GIGAPATH_SLIDE_CHECKPOINT}
     slide_output_dim: 768
@@ -84,7 +85,7 @@ training:
   all_image_dropout_p: 0.0
   context_gex_dropout_p: 0.0
   gradient_clip_val: 1.0
-  checkpoint_dir: results/checkpoints/recovery_suite/transport_c05_gene_tokenized_smallhole_v2_10k
+  checkpoint_dir: results/checkpoints/recovery_suite/transport_c05_dinov2_gene_tokenized_v2_20k
 validation:
   enabled: true
   every_n_steps: 1000
@@ -96,7 +97,7 @@ validation:
   n_samples: 1
   sampling_seed: 860000
 evaluation:
-  mask_bank_dir: results/mask_banks/recovery_suite/transport_c05_all_modalities_concat_k128_v2_20k_smallhole
+  mask_bank_dir: results/mask_banks/recovery_suite/transport_c05_all_modalities_concat_k128_v2_20k
   n_validation_masks: 8
   n_test_masks: 16
   validation_seed: 760000
@@ -111,7 +112,7 @@ evaluation:
   pca_n_components: 50
   fixed_gene_panel_paths: {stpath_hest_bench_ccrcc_50: resources/evaluation/hest_bench/CCRCC_var_50genes.json}
   train_variance_gene_panel_sizes: [50, 100, 250]
-  training_mask_bank_path: results/mask_banks/training/recovery_suite/transport_c05_gene_tokenized_smallhole_v2_10k_256_seed760000.json
+  training_mask_bank_path: results/mask_banks/training/recovery_suite/transport_c05_dinov2_gene_tokenized_v2_20k_256_seed760000.json
 logging:
   backend: csv
   project: st3d-lundeberg-lab

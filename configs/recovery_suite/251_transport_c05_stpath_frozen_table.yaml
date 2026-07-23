@@ -1,4 +1,4 @@
-# Round-5 gene-encoder axis (2026-07-23): 194 with gene_encoder_type: stpath_frozen_table -- isolates 'does STPath's PRETRAINING help' from 'does STPath's whole spatial-transformer architecture help,' a distinction the existing STPath-pretrained-vs-unfrozen ablation (docs/results_log.md, PCC 0.503 vs. 0.4706) cannot make on its own since it always uses STPath's whole architecture. Real observed expression is still the only input (real_expression @ STPath's own frozen gene_embed weights, gathered per-gene by symbol -> Ensembl ID -> STPath's vocabulary index, see src/models/stpath_gene_table.py) feeding a small trainable projection -- the pretrained table itself is a buffer, never trained. hidden_dim stays 256 (matching 194's own baseline exactly, a clean single-axis comparison): STPathFrozenGeneEncoder's own trainable projection adapts STPath's 512-dim table down to whatever hidden_dim the rest of the model uses, so nothing else about the architecture needs to change for this specific comparison. 10k steps. Shares 194/215's evaluation masks. Needs stpath_gene_voc_path/stpath_model_weight_path (same STPATH_GENE_VOC_PATH/STPATH_MODEL_WEIGHT_PATH env vars every other STPath config on this project already needs) -- see docs/hierarchical_missing_tissue.md or any exp_hest1k_*_stpath_*.yaml config for setup.
+# Round-5 gene-encoder axis (2026-07-23): 194 with gene_encoder_type: stpath_frozen_table -- isolates 'does STPath's PRETRAINING help' from 'does STPath's whole spatial-transformer architecture help,' a distinction the existing STPath-pretrained-vs-unfrozen ablation (docs/results_log.md, PCC 0.503 vs. 0.4706) cannot make on its own since it always uses STPath's whole architecture. Real observed expression is still the only input (real_expression @ STPath's own frozen gene_embed weights, gathered per-gene by symbol -> Ensembl ID -> STPath's vocabulary index, see src/models/stpath_gene_table.py) feeding a small trainable projection -- the pretrained table itself is a buffer, never trained. hidden_dim stays 256 (matching 194's own baseline exactly, a clean single-axis comparison): STPathFrozenGeneEncoder's own trainable projection adapts STPath's 512-dim table down to whatever hidden_dim the rest of the model uses, so nothing else about the architecture needs to change for this specific comparison. 20k steps. Shares 194/215's evaluation masks. Needs stpath_gene_voc_path/stpath_model_weight_path (same STPATH_GENE_VOC_PATH/STPATH_MODEL_WEIGHT_PATH env vars every other STPath config on this project already needs) -- see docs/hierarchical_missing_tissue.md or any exp_hest1k_*_stpath_*.yaml config for setup.
 experiment_name: transport_c05_stpath_frozen_table_v2_10k
 data:
   source: hest1k
@@ -72,13 +72,13 @@ model:
     conditioner_lr: 0.0003
     weight_decay: 0.01
 training:
-  epochs: 10000
+  epochs: 20000
   seed: 10
   mask_seed: 760000
   unique_mask_count: 256
   log_every_n_steps: 10
   log_print_every_n_steps: 500
-  checkpoint_every_n_steps: 5000
+  checkpoint_every_n_steps: 10000
   num_workers: 0
   augment_coords: false
   image_mode: target_zero
@@ -92,7 +92,7 @@ validation:
   enabled: true
   every_n_steps: 1000
   patience_checks: 1000
-  early_stopping_min_steps: 10000
+  early_stopping_min_steps: 20000
   require_anchor_improvement: false
   min_delta: 0.0001
   metric: rmse
