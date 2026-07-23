@@ -91,15 +91,18 @@ unless the row itself is testing hole size or k.
 | 244 | weighted_linear | retrieval (k=16) | -- | Retrieval-count sensitivity, high end | no |
 | 245 | weighted_linear | retrieval | smallhole+k256 | Retrieval's own "everything combined" stress test, mirroring 219 (global+smallhole+k256) | no |
 
-26 new configs total (220-245 plus the still-pending 230-235). All matched
+26 new configs total (220-245, including 230-235). All matched
 to the existing suite's eval masks per the same sharing rules as 216-219
 (reuse a sibling's `evaluation.mask_bank_dir` only when the masking config
 genuinely matches; always distinct `experiment_name`/`checkpoint_dir`/
-`training_mask_bank_path`). 220-229 + 236-245 (20 configs) need no new
-dependencies and run together as ONE combined batch (not two separate
-waves -- single script, single smoke test, single final summary). 230-235
-(6 configs, niche candidate) need `banksy_py`, now confirmed installed on
-st-a100 -- code not yet built, see "Build order" item 3.
+`training_mask_bank_path`). All 26 run together as ONE combined batch
+(not separate waves -- single script, single smoke test, single final
+summary) -- 230-235's niche candidate needed no NEW external dependency
+beyond `banksy_py` already being confirmed installed, since the actual
+clustering code (`src/data/niche_features.py`) reimplements BANKSY's own
+neighbor-augmented feature construction directly with scanpy/sklearn (see
+"Build order" item 3 for why) rather than calling the `banksy` package's
+own API.
 
 Combined with everything already running/queued this session
 (165-185 v1, 186-206 v2, 207-214 smallhole/k-sweep, 215-219 global
@@ -131,29 +134,55 @@ this round lands -- real coverage, not padding.
    reaches prediction, loss zero-when-off/finite-when-on-with-real-
    gradient); all 24 prior tests still pass unchanged (28 total across
    both hierarchical test files).
-3. **Niche candidate (BANKSY-based)** -- banksy_py install confirmed
-   working on st-a100 (`import banksy` -- note: PyPI package `banksy_py`,
-   import name `banksy`; existing torch/scanpy/anndata stack and our own
-   test suite all verified unaffected by the numpy pin). Code path
-   (precompute script + model wiring) not yet built -- next up.
-4. **10k-step 4-GPU runner for 220-229 + 236-245 (one combined run, not
-   two waves)** -- DONE. `scripts/run_transport_round4_4gpu.sh` (same
+3. **Niche candidate (BANKSY-based)** -- DONE. `banksy_py` install
+   confirmed working on st-a100 (`import banksy` -- note: PyPI package
+   `banksy_py`, import name `banksy`), but `src/data/niche_features.py`
+   deliberately does NOT call into that package's own API: it wasn't
+   introspectable/testable in the environment this was built in (no GPU,
+   no scanpy/sklearn), so blindly guessing its interactive multi-parameter
+   sweep API risked shipping broken code. Instead it hand-reproduces
+   BANKSY's own published mechanism (own expression concatenated with
+   lambda-weighted spatial-neighbor-mean expression, L2-normalized per
+   block before concatenating) using only already-vetted dependencies
+   (scanpy/sklearn), then clusters via the existing
+   `cluster_pseudo_labels` utility (`src/evaluation/cell_type_classifier.py`,
+   kmeans-by-default). `use_niche_candidate` on
+   `HierarchicalGeneTransportRegressor` adds one transport-gate candidate:
+   the mean of context spots sharing the query's own niche (read off its
+   nearest CONTEXT neighbor's label -- never the query's own hidden
+   expression). Leak-safety mirrors `ContextOnlyNovaeProvider` exactly via
+   a new generic alias, `ContextOnlyFeatureProvider`, plus a fail-closed
+   `data.niche_mode=context_only` gate
+   (`src/data/niche_features.py::niche_input_mode`). Threaded through the
+   full data pipeline (`_build_masked_item`, both single- and multi-sample
+   dataset classes, `make_dataloader`'s multiprocessing-safety check,
+   `evaluate_model_on_mask_bank`, `run_comparison.py`). 13 new tests total
+   (9 model-side incl. exact hand-computed niche-mean correctness and
+   global+niche stacking, 4 leak-safety/data-plumbing) -- all passing, zero
+   regressions. Configs 230-235 written and verified (see matrix above).
+4. **10k-step 4-GPU runner for all 26 configs (one combined run)** --
+   DONE. `scripts/run_transport_round4_4gpu.sh` (same
    smoke-test-first/preflight-check pattern as
    `run_transport_extra_diagnostics_4gpu.sh`, but no inter-config
    dependencies within this batch since every config shares an EXISTING
    sibling's eval masks, not a new one from this round) +
-   `scripts/summarize_transport_round4.py`. Verified: all 20 configs
+   `scripts/summarize_transport_round4.py`. Verified: all 26 configs
    parse, all model params accepted by the constructor, no
    experiment_name/checkpoint_dir/training_mask_bank_path collisions
    against each other or the rest of `configs/recovery_suite/`, all at
    `training.epochs: 10000`, bash syntax and the embedded YAML sanity
-   check both verified directly. 230-235 (niche candidate) will get added
-   to both scripts once item 3 lands.
+   check both verified directly (26 configs, 26 distinct experiment
+   names). Queues rebalanced to 6-7 jobs/GPU (was 5) to fit 230-235 in.
 
 ## GPU/time budget
 
-10k steps is roughly half of the 20k-step suite's per-run cost. With 10
-runnable-now configs (220-229) across 4 GPUs (2-3 sequential jobs per
-GPU) plus whatever's still finishing from 207-219, this is a genuine
-multi-hour-to-overnight batch, consistent with "let it run for a longer
-time." 230-235 add a further 6 once BANKSY is confirmed installed.
+10k steps is roughly half of the 20k-step suite's per-run cost. 26 configs
+across 4 GPUs (6-7 sequential jobs per GPU) plus whatever's still finishing
+from 207-219, is a genuine multi-hour-to-overnight batch, consistent with
+"let it run for a longer time."
+
+**Launch note**: if an earlier 20-config-only run of
+`run_transport_round4_4gpu.sh` is already in flight on st-a100 when this
+lands, the extra 6 niche-candidate jobs do NOT retroactively join that run
+-- re-run the script again (same command) to pick up 230-235, either after
+the first batch finishes or on any GPUs it isn't using.

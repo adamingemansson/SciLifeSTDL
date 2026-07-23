@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Summarize the round-4 gene-encoder x candidate-mechanism matrix (220-245,
-one combined batch -- see experimental/PLAN.md). Direct held-out runs (no
+"""Summarize the round-4/5 gene-encoder x candidate-mechanism matrix
+(220-245 and 230-235, one combined batch -- see experimental/PLAN.md).
+Direct held-out runs (no
 O0X-style capacity gates), reuses summarize_transport_suite_v2.py's own
 _heldout_row parsing of heldout_sample_summary.json, scoped to
 experiment_names that aren't in that script's own hardcoded HELDOUT_RUNS
@@ -37,8 +38,12 @@ RUNS = (
     ("retrieval_sweep", "transport_c05_retrieval_k4_v2_10k"),
     ("retrieval_sweep", "transport_c05_retrieval_k16_v2_10k"),
     ("retrieval_combo", "transport_c05_retrieval_smallhole_k256_v2_10k"),
-    # 230-235 (BANKSY niche candidate) intentionally NOT listed yet --
-    # add once those configs exist and banksy_py is confirmed installed.
+    ("niche", "transport_c05_niche_candidate_v2_10k"),
+    ("niche_combo", "transport_c05_niche_candidate_geometry_v2_10k"),
+    ("niche_combo", "transport_c05_niche_candidate_smallhole_v2_10k"),
+    ("niche_combo", "transport_c05_niche_candidate_k256_v2_10k"),
+    ("gene_x_niche", "transport_c05_niche_candidate_gene_mlp_v2_10k"),
+    ("gene_x_niche", "transport_c05_niche_candidate_gene_tokenized_v2_10k"),
     ("reference", "transport_c05_all_modalities_concat_k128_v2_20k"),
     ("reference", "transport_harmonic_k128_v2"),
     ("reference", "transport_c05_all_modalities_concat_k128_v2_20k_smallhole"),

@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
-# Round-4 gene-encoder x candidate-mechanism matrix (2026-07-23) -- see
-# experimental/PLAN.md for the full design; one combined run of the 20
-# configs (220-229, 236-245) that need no new dependency, across 4 GPUs,
-# all finishing into a single summary CSV. The remaining 6 (230-235,
-# BANKSY-based niche candidate) will fold into this same script once
-# banksy_py is confirmed installed on this machine -- not a separate run.
+# Round-4/5 gene-encoder x candidate-mechanism matrix (2026-07-23) -- see
+# experimental/PLAN.md for the full design; one combined run of 26 configs
+# (220-229, 236-245, and now 230-235 -- the BANKSY-based niche candidate,
+# folded in once its data pipeline (src/data/niche_features.py + train.py
+# wiring) landed and was tested) across 4 GPUs, all finishing into a single
+# summary CSV.
+#
+# NOTE for anyone re-launching after an EARLIER 20-config-only run of this
+# script is already in flight: this version adds 6 more jobs (230-235) to
+# the queues below. Do not `git pull` this update into a machine mid-run
+# expecting it to retroactively pick up the new jobs -- re-run this script
+# again afterward (or in parallel on free GPUs) to cover 230-235.
 #
 # Every config here shares an EXISTING sibling's evaluation.mask_bank_dir
 # (194/209/211/215's, already-established dirs) rather than a config from
-# this batch -- there is no inter-config dependency within 220-245, so
-# unlike run_transport_extra_diagnostics_4gpu.sh's paired queues, jobs here
-# can be freely distributed across GPUs in any order.
+# this batch -- there is no inter-config dependency within 220-245/230-235,
+# so unlike run_transport_extra_diagnostics_4gpu.sh's paired queues, jobs
+# here can be freely distributed across GPUs in any order.
 #
 # 10k steps (half the 20k main suite) -- this round trades per-run depth
 # for cross-run breadth across many comparable architecture variants.
 #
-#   GPU[0] (default 1): 220 (gene=mlp) -> 224 (retrieval+smallhole) -> 228 (gene=mlp+global) -> 236 (gene=mlp+geometry) -> 240 (gene=mlp+k256)
-#   GPU[1] (default 2): 221 (gene=tokenized) -> 225 (retrieval+k256) -> 229 (gene=tokenized+global) -> 237 (gene=tokenized+geometry) -> 241 (gene=tokenized+k256)
-#   GPU[2] (default 3): 222 (retrieval) -> 226 (gene=mlp+retrieval) -> 238 (gene=mlp+smallhole) -> 242 (retrieval+global) -> 244 (retrieval_k=16)
-#   GPU[3] (default 5): 223 (retrieval+geometry) -> 227 (gene=tokenized+retrieval) -> 239 (gene=tokenized+smallhole) -> 243 (retrieval_k=4) -> 245 (retrieval+smallhole+k256)
+#   GPU[0] (default 1): 220 (gene=mlp) -> 224 (retrieval+smallhole) -> 228 (gene=mlp+global) -> 236 (gene=mlp+geometry) -> 240 (gene=mlp+k256) -> 230 (niche) -> 234 (niche+gene=mlp)
+#   GPU[1] (default 2): 221 (gene=tokenized) -> 225 (retrieval+k256) -> 229 (gene=tokenized+global) -> 237 (gene=tokenized+geometry) -> 241 (gene=tokenized+k256) -> 231 (niche+geometry) -> 235 (niche+gene=tokenized)
+#   GPU[2] (default 3): 222 (retrieval) -> 226 (gene=mlp+retrieval) -> 238 (gene=mlp+smallhole) -> 242 (retrieval+global) -> 244 (retrieval_k=16) -> 232 (niche+smallhole)
+#   GPU[3] (default 5): 223 (retrieval+geometry) -> 227 (gene=tokenized+retrieval) -> 239 (gene=tokenized+smallhole) -> 243 (retrieval_k=4) -> 245 (retrieval+smallhole+k256) -> 233 (niche+k256)
 #
 # Usage:
 #   bash scripts/run_transport_round4_4gpu.sh
@@ -38,12 +44,12 @@ MIN_FREE_GB="${MIN_FREE_GB:-20}"
 GPU_IDS_CSV="${GPU_IDS:-1,2,3,5}"
 IFS=',' read -r -a GPUS <<< "$GPU_IDS_CSV"
 
-QUEUE_1=(220 224 228 236 240)
-QUEUE_2=(221 225 229 237 241)
-QUEUE_3=(222 226 238 242 244)
-QUEUE_4=(223 227 239 243 245)
+QUEUE_1=(220 224 228 236 240 230 234)
+QUEUE_2=(221 225 229 237 241 231 235)
+QUEUE_3=(222 226 238 242 244 232)
+QUEUE_4=(223 227 239 243 245 233)
 QUEUES=(QUEUE_1 QUEUE_2 QUEUE_3 QUEUE_4)
-ALL_NUMBERS=(220 221 222 223 224 225 226 227 228 229 236 237 238 239 240 241 242 243 244 245)
+ALL_NUMBERS=(220 221 222 223 224 225 226 227 228 229 230 231 232 233 234 235 236 237 238 239 240 241 242 243 244 245)
 
 declare -A CONFIG_PATH
 declare -A CONFIG_NAME
@@ -75,13 +81,13 @@ export OPENBLAS_NUM_THREADS="$CPU_THREADS_PER_JOB"
 export NUMEXPR_NUM_THREADS="$CPU_THREADS_PER_JOB"
 mkdir -p "$LOG_ROOT" "$REPORT_ROOT"
 
-echo "===== YAML sanity check (all 20 configs parse and have distinct experiment_name) ====="
+echo "===== YAML sanity check (all 26 configs parse and have distinct experiment_name) ====="
 "$PYTHON_BIN" - <<'PYEOF'
 import sys
 from pathlib import Path
 import yaml
 
-numbers = [str(n) for n in list(range(220, 230)) + list(range(236, 246))]
+numbers = [str(n) for n in list(range(220, 246))]
 seen_names = {}
 for n in numbers:
     matches = list(Path("configs/recovery_suite").glob(f"{n}_transport_*.yaml"))
@@ -225,14 +231,15 @@ smoke_queue() {
 if [[ "$SKIP_SMOKE" != "1" ]]; then
   # Unlike run_transport_extra_diagnostics_4gpu.sh's paired queues (where
   # only the first job in each queue needed smoke-testing before a
-  # dependent sibling could run), every one of these 20 configs has a
+  # dependent sibling could run), every one of these 26 configs has a
   # meaningfully different flag combination (gene_encoder_type,
-  # use_retrieval_candidate, retrieval_k, conditioning_mode, ...) and NONE
-  # of them depend on each other -- smoke-test all 20, not just 4, so a
-  # config-specific bug (a bad flag combo only present in job 2-5 of a
-  # queue) surfaces in seconds, not after it's already queued behind
-  # several hours of earlier jobs on the same GPU.
-  echo "===== One-step fail-closed smoke test (all 20 configs, 5 sequential per GPU) ====="
+  # use_retrieval_candidate, retrieval_k, use_niche_candidate,
+  # conditioning_mode, ...) and NONE of them depend on each other --
+  # smoke-test all 26, not just one per queue, so a config-specific bug (a
+  # bad flag combo only present partway down a queue) surfaces in seconds,
+  # not after it's already queued behind several hours of earlier jobs on
+  # the same GPU.
+  echo "===== One-step fail-closed smoke test (all 26 configs, up to 7 sequential per GPU) ====="
   smoke_pids=()
   for idx in 0 1 2 3; do
     smoke_queue "${QUEUES[$idx]}" "${GPUS[$idx]}" &
@@ -244,14 +251,14 @@ if [[ "$SKIP_SMOKE" != "1" ]]; then
     echo "ERROR: smoke test failed; inspect $LOG_ROOT/smoke_*.log" >&2
     exit 1
   fi
-  echo "Smoke tests passed (all 20 configs)."
+  echo "Smoke tests passed (all 26 configs)."
 fi
 if [[ "$SMOKE_ONLY" == "1" ]]; then
   echo "Smoke tests passed; full runs were not started."
   exit 0
 fi
 
-echo "===== Four parallel queues (5 jobs each, 20 total, no inter-config dependencies) ====="
+echo "===== Four parallel queues (6-7 jobs each, 26 total, no inter-config dependencies) ====="
 queue_pids=()
 for idx in 0 1 2 3; do
   run_queue "${QUEUES[$idx]}" "${GPUS[$idx]}" &

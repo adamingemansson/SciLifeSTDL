@@ -16,7 +16,7 @@ a results table -- no scattershot changes without a stated purpose.
 
 | # | Variant | Hypothesis | Compares against | Status |
 |---|---|---|---|---|
-| 1 | Niche-conditioned global candidate (BANKSY) | A per-niche mean beats a flat whole-slide mean because local neighbors can be unrepresentative of the tissue a hole actually contains (e.g. a hole straddling a spatial domain boundary) | 215-219 (flat global candidate), C05/harmonic baseline | not started |
+| 1 | Niche-conditioned global candidate (BANKSY) | A per-niche mean beats a flat whole-slide mean because local neighbors can be unrepresentative of the tissue a hole actually contains (e.g. a hole straddling a spatial domain boundary) | 215-219 (flat global candidate), C05/harmonic baseline | implemented + tested, configs 230-235 queued |
 | 2 | BLEEP-style embedding-retrieval candidate | Content-similarity retrieval (learned joint image/expression embedding) selects better candidates than physical k-NN distance, at least as a competing signal in the gate | C05/harmonic baseline, geometry-only (C07/218) | not started |
 | 3 | Alternate gene encoder(s) | `weighted_linear` (STPath-style) may not be the best gene encoder for this regime (real observed expression always available as context, 6-slide cohort) | C05/harmonic baseline | research done, see below -- implementation not started |
 | 4 | Alternate image encoder (lower priority) | Given geometry-only already wins twice, unlikely to move the needle, but cheap to test if GPU budget allows | C05/harmonic baseline | not started |
