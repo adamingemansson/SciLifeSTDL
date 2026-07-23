@@ -207,6 +207,31 @@ independent axes, run together via
   `evaluation.mask_bank_dir` with the original suite 2 C05/harmonic-k128
   runs (194/206) for a direct, same-test-mask comparison.
 
+**Round 4: global candidate x other axes (2026-07-23), queued to run after
+round 3 finishes** -- `configs/recovery_suite/216-219_transport_c05_global_candidate_*.yaml`,
+each combining `use_global_candidate: true` with one other axis rather than
+testing it in isolation, so a null result on 215 alone doesn't foreclose the
+idea if it turns out to only matter in combination:
+- **216** (`_smallhole`): + shrunk hole (`[0.5, 1.0]`) -- shares 209's eval
+  masks for a direct 209/210/216 three-way comparison.
+- **217** (`_k256`): + `local_k: 256` -- shares 211's eval masks for a
+  direct 211/212/217 three-way comparison. Tests whether the global slot is
+  redundant once the local neighborhood is already wide.
+- **218** (`_geometry`): + `conditioning_mode: geometry` (the C07-style
+  pure-geometry scorer, encoder itself untouched) -- shares 194/215's eval
+  masks. Tests whether the global fallback needs multimodal content to help
+  or works from relative geometry alone.
+- **219** (`_smallhole_k256`): + both the shrunk hole AND `local_k: 256` at
+  once -- shares 209's eval masks. Tests the compound hypothesis directly:
+  does a wider local neighborhood add anything on top of the global
+  candidate once the hole is already small.
+
+Each is a standalone single-GPU job, same launch pattern as 215
+(`python3 -m src.training.train --config configs/recovery_suite/<N>_...yaml`).
+`scripts/summarize_transport_extra_diagnostics.py` picks up 216-219 (and
+215, 207-214, plus 194/206 reference rows) once their
+`heldout_sample_summary.json` files exist.
+
 ## Primary references
 
 - Prov-GigaPath: <https://www.nature.com/articles/s41586-024-07441-w>

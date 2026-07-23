@@ -29,6 +29,10 @@ RUNS = (
     ("local_k_sweep", "transport_c05_all_modalities_concat_k512_v2_20k"),
     ("local_k_sweep", "transport_harmonic_k512_v2"),
     ("global_candidate", "transport_c05_global_candidate_v2_20k"),
+    ("global_candidate_combo", "transport_c05_global_candidate_v2_20k_smallhole"),
+    ("global_candidate_combo", "transport_c05_global_candidate_k256_v2_20k"),
+    ("global_candidate_combo", "transport_c05_global_candidate_geometry_v2_20k"),
+    ("global_candidate_combo", "transport_c05_global_candidate_smallhole_k256_v2_20k"),
     ("reference", "transport_c05_all_modalities_concat_k128_v2_20k"),
     ("reference", "transport_harmonic_k128_v2"),
 )
