@@ -63,6 +63,12 @@ def main() -> None:
     parser.add_argument("--shape", default="mixed", choices=["circle", "ellipse", "irregular", "mixed"])
     parser.add_argument("--n-example-patches", type=int, default=12,
                          help="How many real context/query patch PNGs to save individually.")
+    parser.add_argument("--query-patch-size", type=float, default=224.0,
+                         help="Matches query_patch_size_fullres in the transport-suite "
+                              "configs -- patch footprint size in the SAME pixel units as "
+                              "adata.obsm['spatial'], used to decide which context spots' "
+                              "images overlap the physical hole (see strict_broken_region "
+                              "below).")
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
 
@@ -70,6 +76,7 @@ def main() -> None:
         load_hest_sample, basic_qc_and_normalize, load_hest_patches, align_patches_to_adata,
     )
     from src.data import masking
+    from src.data.slide_context import nonoverlapping_context_patch_mask
 
     output_dir = Path(args.output_dir)
     (output_dir / "context_patches").mkdir(parents=True, exist_ok=True)
@@ -98,9 +105,28 @@ def main() -> None:
     )
     print(f"  context: {context_mask.sum()} real spots, query/masked: {query_mask.sum()} real spots")
 
+    # strict_broken_region (active in every transport-suite config): a
+    # physical hole removes PIXELS, not just query-centred patches -- any
+    # context spot whose own patch footprint overlaps the hole gets its
+    # IMAGE zeroed too, even though it stays a real context spot (its
+    # measured expression is still used). See train.py's own comment at the
+    # nonoverlapping_context_patch_mask call site for the exact reasoning.
+    context_idx_all = np.where(context_mask)[0]
+    query_idx_all = np.where(query_mask)[0]
+    safe_image = nonoverlapping_context_patch_mask(
+        coords_xy[context_idx_all], coords_xy[query_idx_all], args.query_patch_size,
+    )
+    image_available = np.ones(len(coords_xy), dtype=bool)
+    image_available[query_idx_all] = False
+    image_available[context_idx_all] = safe_image
+    n_boundary_zeroed = int((~safe_image).sum())
+    print(f"  strict_broken_region: {n_boundary_zeroed} context spots keep real expression "
+          f"but have their IMAGE zeroed too (patch footprint overlaps the hole)")
+
     np.savez(
         output_dir / "mask.npz",
         context_mask=context_mask, query_mask=query_mask,
+        image_available=image_available,
         coords_xy=coords_xy, barcodes=spot_barcodes,
         sample_id=args.sample_id, seed=args.seed,
     )
@@ -112,19 +138,30 @@ def main() -> None:
 
     # Real H&E patches for the N context/query spots closest to the hole --
     # the most visually informative ones (border of the missing region).
-    query_idx = np.where(query_mask)[0]
-    context_idx = np.where(context_mask)[0]
+    # These are also the ones most likely to have image_available=False
+    # (strict_broken_region) despite being real context spots.
+    context_idx, query_idx = context_idx_all, query_idx_all
     hole_center = coords_xy[query_idx].mean(axis=0)
     ctx_by_dist = context_idx[np.argsort(np.linalg.norm(coords_xy[context_idx] - hole_center, axis=1))]
     qry_by_dist = query_idx[np.argsort(np.linalg.norm(coords_xy[query_idx] - hole_center, axis=1))]
 
+    (output_dir / "context_patches_as_seen_by_model").mkdir(parents=True, exist_ok=True)
     n = min(args.n_example_patches, len(ctx_by_dist), len(qry_by_dist))
+    n_ctx_zeroed_saved = 0
     for i in ctx_by_dist[:n]:
         save_png(patches[i], output_dir / "context_patches" / f"{spot_barcodes[i]}.png")
+        if image_available[i]:
+            save_png(patches[i], output_dir / "context_patches_as_seen_by_model" / f"{spot_barcodes[i]}.png")
+        else:
+            save_png(np.zeros_like(patches[i]), output_dir / "context_patches_as_seen_by_model" / f"{spot_barcodes[i]}.png")
+            n_ctx_zeroed_saved += 1
     for i in qry_by_dist[:n]:
         save_png(patches[i], output_dir / "query_patches_ground_truth" / f"{spot_barcodes[i]}.png")
         save_png(np.zeros_like(patches[i]), output_dir / "query_patches_as_seen_by_model" / f"{spot_barcodes[i]}.png")
-    print(f"  wrote {n} real context patches, {n} real query ground-truth patches, "
+    print(f"  wrote {n} real context patches (context_patches/ -- always the true tissue), "
+          f"{n} context patches as the model actually receives them "
+          f"(context_patches_as_seen_by_model/ -- {n_ctx_zeroed_saved} of these {n} are "
+          f"zeroed by strict_broken_region), {n} real query ground-truth patches, "
           f"{n} all-zero query patches (image_mode=target_zero)")
 
     print("Building composite (real patches placed at real coordinates)...")
@@ -150,10 +187,14 @@ def main() -> None:
     fig = plt.figure(figsize=(10, 10.6))
     ax = fig.add_axes([0.05, 0.05, 0.9, 0.82])
     in_window = np.linalg.norm(coords_xy - hole_center, axis=1) < window
-    for i in np.where(in_window & context_mask)[0]:
+    # Context spots render as their real patch ONLY if image_available -- a
+    # context spot whose patch footprint overlaps the hole (strict_broken_
+    # region) is rendered black too, exactly like what the model receives,
+    # even though it still contributes real expression as context.
+    for i in np.where(in_window & context_mask & image_available)[0]:
         x, y = coords_xy[i]
         ax.imshow(patches[i], extent=[x - half, x + half, y - half, y + half], zorder=1)
-    for i in np.where(in_window & query_mask)[0]:
+    for i in np.where(in_window & (query_mask | (context_mask & ~image_available)))[0]:
         x, y = coords_xy[i]
         ax.imshow(np.zeros_like(patches[0]), extent=[x - half, x + half, y - half, y + half], zorder=2)
     ax.set_xlim(hole_center[0] - window, hole_center[0] + window)
@@ -164,9 +205,11 @@ def main() -> None:
     ax.set_title(
         f"{args.sample_id}, seed={args.seed}: real H&E patches, real coordinates "
         f"(local crop, {window / spacing:.0f} spot-spacings shown each way)\n"
-        f"Black = query spots as image_mode=target_zero delivers them (GEX hidden too). "
-        f"This hole = {query_mask.sum()}/{len(coords_xy)} spots on the whole slide "
-        f"({pct_of_slide:.1f}%)", fontsize=10,
+        f"Black = image_mode=target_zero's actual input: query spots (GEX also hidden) "
+        f"PLUS {n_boundary_zeroed} context spots whose patch overlaps the hole "
+        f"(real GEX still used, only the image is zeroed).\n"
+        f"Hole = {query_mask.sum()}/{len(coords_xy)} spots on the whole slide "
+        f"({pct_of_slide:.1f}%)", fontsize=9.5,
     )
 
     # Full-slide inset for honest scale: where does this crop actually sit
