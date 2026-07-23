@@ -1,4 +1,4 @@
-# SMALL-HOLE diagnostic (2026-07-23): identical to 206_transport_harmonic_k128_control_v2.yaml except radius_range: [3.0, 6.0] -> [1.0, 2.0], and mask_bank_dir repointed at the smallhole C05's bank so masks stay matched to that run's exact test masks.
+# SMALL-HOLE diagnostic (2026-07-23): identical to 206_transport_harmonic_k128_control_v2.yaml except radius_range: [3.0, 6.0] -> [0.5, 1.0], and mask_bank_dir repointed at the smallhole C05's bank so masks stay matched to that run's exact test masks.
 # Non-learned control on the exact same held-out sample, spot cohort and
 # holes as C05 v2 (194_transport_c05_all_modalities_concat_k128_v2.yaml) --
 # shares its evaluation.mask_bank_dir so "beats harmonic" is a real
@@ -38,7 +38,7 @@ masking:
   strategy: random_dropout_patches
   max_context_points: 3000
   context_selection: nearest_query
-  params: {n_patches: 1, radius_range: [1.0, 2.0], radius_unit: spot_spacing, shape: mixed}
+  params: {n_patches: 1, radius_range: [0.5, 1.0], radius_unit: spot_spacing, shape: mixed}
 model:
   name: spatial_baseline
   params: {mode: harmonic, k: 128, ridge: 0.0001}

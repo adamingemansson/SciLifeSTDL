@@ -1,4 +1,4 @@
-# SMALL-HOLE diagnostic (2026-07-23): identical to 190_transport_c01_raw_gex_only_v2.yaml except radius_range: [3.0, 6.0] -> [1.0, 2.0] (roughly 9x smaller hole area). Tests whether hole size itself caps performance -- harmonic and every learned config face the identical hole geometry, so if size were the dominant factor both should improve substantially here.
+# SMALL-HOLE diagnostic (2026-07-23): identical to 190_transport_c01_raw_gex_only_v2.yaml except radius_range: [3.0, 6.0] -> [0.5, 1.0] (roughly 24-36x smaller hole area). Tests whether hole size itself caps performance -- harmonic and every learned config face the identical hole geometry, so if size were the dominant factor both should improve substantially here.
 # C01 v2: raw GEX only -- learned spatial GEX control without Novae or H&E.
 # Held-out matched run: INT1-6 train / INT7 validation / INT8 test, shared
 # masks/seeds/optimizer/20000 training draws with every other run in the
@@ -35,7 +35,7 @@ masking:
   context_selection: nearest_query
   params:
     n_patches: 1
-    radius_range: [1.0, 2.0]
+    radius_range: [0.5, 1.0]
     radius_unit: spot_spacing
     shape: mixed
 model:
