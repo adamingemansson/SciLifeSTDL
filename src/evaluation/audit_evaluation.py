@@ -359,6 +359,7 @@ def evaluate_model_on_mask_bank(
                 context_novae_features=novae_inputs.get("context_novae_features"),
                 context_gene_feature_provider=novae_inputs.get("context_gene_feature_provider"),
                 context_novae_feature_provider=novae_inputs.get("context_novae_feature_provider"),
+                context_niche_feature_provider=novae_inputs.get("context_niche_feature_provider"),
                 organ=organ, tech=tech, augment=False, image_mode=str(image_mode),
                 context_gex_mode=context_gex_mode,
                 fixed_context_mask=context_mask, fixed_query_mask=query_mask,

@@ -168,10 +168,38 @@ def test_single_sample_training_excludes_all_evaluation_query_spots():
     assert all(not np.any(mask & excluded) for mask in provider_masks)
 
 
+def test_niche_feature_provider_is_context_only_and_lands_in_niche_labels():
+    coords3d, expr, slice_ids = _make_synthetic(n_points=200, n_genes=12)
+    masking_cfg = OmegaConf.create({
+        "strategy": "random_dropout_patches",
+        "params": {"n_patches": 1, "radius_range": [20, 45]},
+    })
+    provider_masks = []
+
+    def provider(context_mask):
+        context_mask = np.asarray(context_mask, dtype=bool)
+        provider_masks.append(context_mask.copy())
+        return np.zeros((int(context_mask.sum()), 1), dtype=np.float32)
+
+    dataset = MaskedContextQueryDataset(
+        coords3d, expr, slice_ids, masking_cfg, n_items=5, base_seed=0,
+        context_niche_feature_provider=provider,
+    )
+    for index in range(len(dataset)):
+        item = dataset[index]
+        assert "niche_labels" in item["context"]
+        assert item["context"]["niche_labels"].shape == (item["context"]["expression"].shape[0], 1)
+        # never invoked with query rows included
+        assert provider_masks[-1].sum() == item["context"]["expression"].shape[0]
+    print("[masked_dataset] OK — context_niche_feature_provider is called context-only "
+          "and its output lands in context['niche_labels']")
+
+
 if __name__ == "__main__":
     test_random_dropout_patches_variety()
     test_hold_out_slice_variety()
     test_max_context_points_caps_context_size()
     test_max_context_points_none_preserves_prior_behavior()
     test_single_sample_training_excludes_all_evaluation_query_spots()
+    test_niche_feature_provider_is_context_only_and_lands_in_niche_labels()
     print("\nAll MaskedContextQueryDataset smoke tests passed.")

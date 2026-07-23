@@ -66,6 +66,7 @@ def _audit_metrics_for_config(path: str, overrides: list[str] | None, skip_train
         load_trained_model,
         _load_data,
         prepare_novae_inputs,
+        prepare_niche_inputs,
         _mask_bank_for_config,
     )
     from src.evaluation.audit_evaluation import evaluate_model_on_mask_bank
@@ -94,6 +95,10 @@ def _audit_metrics_for_config(path: str, overrides: list[str] | None, skip_train
             cfg, adata, model_params, coords3d, slice_ids,
             sample_id=cfg.data.get("sample_id"),
         )
+        niche_inputs = prepare_niche_inputs(
+            cfg, adata, model_params, sample_id=cfg.data.get("sample_id"),
+        )
+        novae_inputs["context_niche_feature_provider"] = niche_inputs["context_niche_feature_provider"]
         bank, _ = _mask_bank_for_config(cfg, adata, coords3d, slice_ids)
         organ = str(adata.obs["organ"].iloc[0]) if "organ" in adata.obs else None
         tech = str(adata.obs["tech"].iloc[0]) if "tech" in adata.obs else None

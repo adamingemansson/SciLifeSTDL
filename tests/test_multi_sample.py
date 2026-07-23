@@ -204,6 +204,82 @@ def test_multi_sample_dataset_carries_gene_features_per_sample():
           "correctly carried through per-sample, never cross-contaminated")
 
 
+def test_multi_sample_dataset_carries_niche_labels_per_sample():
+    """12-entry tuple form (context_niche_feature_provider added as the
+    12th slot, 2026-07-23) -- verifies the provider is invoked with THIS
+    item's own sample context-only, and its output lands in
+    context['niche_labels'] correctly per-sample, mirroring
+    test_multi_sample_dataset_carries_gene_features_per_sample above."""
+    n_genes, n_points = 12, 30
+    rng = np.random.default_rng(0)
+
+    coords_a = np.concatenate([rng.uniform(0, 100, size=(n_points, 2)),
+                                np.zeros((n_points, 1))], axis=1)
+    expr_a = rng.random((n_points, n_genes)).astype(np.float32)
+    slice_ids_a = np.array(["SAMPA"] * n_points)
+
+    coords_b = np.concatenate([rng.uniform(0, 100, size=(n_points, 2)) + 100_000.0,
+                                np.zeros((n_points, 1))], axis=1)
+    expr_b = rng.random((n_points, n_genes)).astype(np.float32)
+    slice_ids_b = np.array(["SAMPB"] * n_points)
+
+    def provider_a(context_mask):
+        return np.full((int(np.asarray(context_mask).sum()), 1), 1.0, dtype=np.float32)
+
+    def provider_b(context_mask):
+        return np.full((int(np.asarray(context_mask).sum()), 1), 2.0, dtype=np.float32)
+
+    samples = [
+        (coords_a, expr_a, slice_ids_a, None, "Kidney", "Visium",
+         None, None, None, None, None, provider_a),
+        (coords_b, expr_b, slice_ids_b, None, "Lung", "Visium",
+         None, None, None, None, None, provider_b),
+    ]
+    masking_cfg = OmegaConf.create({
+        "strategy": "random_dropout_patches",
+        "params": {"n_patches": 2, "radius_range": [10, 30]},
+    })
+    dataset = MultiSampleMaskedContextQueryDataset(samples, masking_cfg, n_items=20, base_seed=0)
+
+    for i in range(len(dataset)):
+        item = dataset[i]
+        context_xy = item["context"]["coords"][:, :2].numpy()
+        in_a = bool((context_xy < 50_000.0).all())
+        niche = item["context"]["niche_labels"].numpy()
+        expected_marker = 1.0 if in_a else 2.0
+        assert np.allclose(niche, expected_marker), (
+            f"item {i}: niche_labels didn't match its own sample's provider "
+            f"(expected all {expected_marker}, got {niche[:3]})"
+        )
+    print("[MultiSampleMaskedContextQueryDataset] OK — context_niche_feature_provider "
+          "correctly carried through per-sample via the 12-entry tuple form")
+
+
+def test_multi_sample_dataset_backwards_compatible_tuple_lengths():
+    """8/10/11-entry tuples (older configs/tests, providers absent) must
+    still work unchanged after the niche provider slot was added as a 12th
+    entry."""
+    n_points = 10
+    rng = np.random.default_rng(0)
+    coords = np.concatenate([rng.uniform(0, 100, size=(n_points, 2)),
+                              np.zeros((n_points, 1))], axis=1)
+    expr = rng.random((n_points, 5)).astype(np.float32)
+    slice_ids = np.array(["SAMPA"] * n_points)
+    masking_cfg = OmegaConf.create({
+        "strategy": "random_dropout_patches",
+        "params": {"n_patches": 1, "radius_range": [5, 15]},
+    })
+    base = (coords, expr, slice_ids, None, "Kidney", "Visium")
+    for tail in [(None, None), (None, None, None, None), (None, None, None, None, None)]:
+        samples = [base + tail]
+        dataset = MultiSampleMaskedContextQueryDataset(samples, masking_cfg, n_items=3, base_seed=0)
+        for i in range(len(dataset)):
+            item = dataset[i]
+            assert "niche_labels" not in item["context"]
+    print("[MultiSampleMaskedContextQueryDataset] OK — 8/10/11-entry tuples "
+          "(no niche provider) still work unchanged")
+
+
 def test_inject_multi_sample_n_genes():
     """2026-07-17 real gap closed — multi-sample n_genes previously had no
     auto-injector at all (see exp_hest1k_fm_ot_multisample.yaml's own
@@ -232,6 +308,8 @@ if __name__ == "__main__":
     test_multi_sample_dataset_never_mixes_samples()
     test_load_multi_sample_organs_techs()
     test_multi_sample_dataset_carries_gene_features_per_sample()
+    test_multi_sample_dataset_carries_niche_labels_per_sample()
+    test_multi_sample_dataset_backwards_compatible_tuple_lengths()
     test_inject_multi_sample_n_genes()
     print("\nAll multi-sample loader/dataset smoke tests passed.")
 

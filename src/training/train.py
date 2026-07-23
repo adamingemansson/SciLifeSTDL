@@ -35,7 +35,12 @@ from omegaconf import OmegaConf
 
 from src.data import loaders, masking
 from src.data.augmentation import augment_coords_xy
-from src.data.context_features import ContextOnlyNovaeProvider, model_uses_novae, novae_input_mode
+from src.data.context_features import (
+    ContextOnlyFeatureProvider, ContextOnlyNovaeProvider, model_uses_novae, novae_input_mode,
+)
+from src.data.niche_features import (
+    compute_banksy_augmented_niche_labels, model_uses_niche_candidate, niche_input_mode,
+)
 from src.data.slide_context import (
     load_slide_context,
     nonoverlapping_context_patch_mask,
@@ -839,6 +844,7 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
                         context_novae_features: np.ndarray | None = None,
                         context_gene_feature_provider=None,
                         context_novae_feature_provider=None,
+                        context_niche_feature_provider=None,
                         organ: str | None = None, tech: str | None = None,
                         augment: bool = False,
                         image_mode: str = "full",
@@ -882,6 +888,15 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
     enforces that — the caller (train.py main()/run_comparison.py
     _train_model) decides which one to populate based on which config
     option is actually set.
+
+    context_niche_feature_provider (2026-07-23, HierarchicalGeneTransport-
+    Regressor's use_niche_candidate): a context-only Callable[[mask], array]
+    (see src/data/niche_features.py), invoked here with THIS item's own
+    context_mask and stashed under context["niche_labels"] -- same
+    context-only-recomputation discipline as context_novae_feature_provider,
+    for the same reason (the niche clustering itself is a neighbor-averaging
+    operation that would leak hidden query expression if ever computed on
+    the full slide).
 
     organ/tech (2026-07-16, multi-sample training + OrganTechEmbedding
     follow-up): whole-sample metadata, not per-point — stashed identically
@@ -960,6 +975,9 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
         context["novae_features"] = torch.tensor(
             context_novae_features[context_mask], dtype=torch.float32
         )
+    if context_niche_feature_provider is not None:
+        niche_context = np.asarray(context_niche_feature_provider(context_mask), dtype=np.float32)
+        context["niche_labels"] = torch.tensor(niche_context, dtype=torch.float32)
 
     context_gex_mode = str(context_gex_mode).lower()
     if context_gex_mode not in {"full", "zero", "shuffled"}:
@@ -980,7 +998,12 @@ def _build_masked_item(coords3d: np.ndarray, expr: np.ndarray, slice_ids: np.nda
             and np.random.default_rng(seed + 3).random() < context_gex_dropout_p
         )
     )
-    gex_keys = [key for key in ("expression", "novae_features") if key in context]
+    # niche_labels is expression-DERIVED (BANKSY-style clustering over real
+    # observed expression), so context_gex_mode's ablation/shuffle must
+    # cover it too -- otherwise a "zero"/"shuffled" GEX ablation config
+    # would still leak real expression-derived structure through the niche
+    # candidate, defeating the point of the ablation.
+    gex_keys = [key for key in ("expression", "novae_features", "niche_labels") if key in context]
     if drop_context_gex:
         for key in gex_keys:
             context[key] = torch.zeros_like(context[key])
@@ -1051,6 +1074,7 @@ class MaskedContextQueryDataset(Dataset):
                  context_novae_features: np.ndarray | None = None,
                  context_gene_feature_provider=None,
                  context_novae_feature_provider=None,
+                 context_niche_feature_provider=None,
                  organ: str | None = None, tech: str | None = None,
                  augment: bool = False,
                  image_mode: str = "full",
@@ -1090,6 +1114,7 @@ class MaskedContextQueryDataset(Dataset):
         self.context_novae_features = context_novae_features
         self.context_gene_feature_provider = context_gene_feature_provider
         self.context_novae_feature_provider = context_novae_feature_provider
+        self.context_niche_feature_provider = context_niche_feature_provider
         self.image_mode = image_mode
         self.query_image_dropout_p = float(query_image_dropout_p)
         self.all_image_dropout_p = float(all_image_dropout_p)
@@ -1122,6 +1147,7 @@ class MaskedContextQueryDataset(Dataset):
             context_novae_features=self.context_novae_features,
             context_gene_feature_provider=self.context_gene_feature_provider,
             context_novae_feature_provider=self.context_novae_feature_provider,
+            context_niche_feature_provider=self.context_niche_feature_provider,
             organ=self.organ, tech=self.tech, augment=self.augment,
             image_mode=self.image_mode,
             query_image_dropout_p=self.query_image_dropout_p,
@@ -1155,7 +1181,11 @@ class MultiSampleMaskedContextQueryDataset(Dataset):
     coordinate spaces).
 
     samples: list of (coords3d, expr, slice_ids, images, organ, tech,
-    context_gene_features, context_novae_features) tuples, one per
+    context_gene_features, context_novae_features,
+    context_gene_feature_provider, context_novae_feature_provider,
+    slide_context, context_niche_feature_provider) tuples (the last four
+    optional/defaulting to None -- see __getitem__'s own backwards-
+    compatible tuple-length migration for 8/10/11/12-entry forms), one per
     already-loaded/QC'd/gene-aligned sample (see src/data/loaders.py
     load_multi_sample for the loading half — it returns a list of
     gene-aligned AnnData; callers derive these tuples from that list the
@@ -1221,18 +1251,22 @@ class MultiSampleMaskedContextQueryDataset(Dataset):
             sample = (*sample, None, None)
         if len(sample) == 10:
             sample = (*sample, None)
-        if len(sample) != 11:
-            raise ValueError(f"multi-sample tuple must have 8, 10, or 11 entries, got {len(sample)}")
+        if len(sample) == 11:
+            # niche providers were added later and default to absent.
+            sample = (*sample, None)
+        if len(sample) != 12:
+            raise ValueError(f"multi-sample tuple must have 8, 10, 11, or 12 entries, got {len(sample)}")
         (coords3d, expr, slice_ids, images, organ, tech,
          context_gene_features, context_novae_features,
          context_gene_feature_provider, context_novae_feature_provider,
-         slide_context) = sample
+         slide_context, context_niche_feature_provider) = sample
         return _build_masked_item(
             coords3d, expr, slice_ids, self.masking_cfg, images, seed + 1,
             context_gene_features=context_gene_features,
             context_novae_features=context_novae_features,
             context_gene_feature_provider=context_gene_feature_provider,
             context_novae_feature_provider=context_novae_feature_provider,
+            context_niche_feature_provider=context_niche_feature_provider,
             organ=organ, tech=tech, augment=self.augment,
             image_mode=self.image_mode,
             query_image_dropout_p=self.query_image_dropout_p,
@@ -1275,15 +1309,17 @@ def make_dataloader(dataset, cfg) -> DataLoader:
     has_context_provider = bool(
         getattr(dataset, "context_gene_feature_provider", None)
         or getattr(dataset, "context_novae_feature_provider", None)
+        or getattr(dataset, "context_niche_feature_provider", None)
     )
     if isinstance(dataset, MultiSampleMaskedContextQueryDataset):
         has_context_provider = any(
-            len(sample) >= 10 and (sample[8] is not None or sample[9] is not None)
+            (len(sample) >= 10 and (sample[8] is not None or sample[9] is not None))
+            or (len(sample) >= 12 and sample[11] is not None)
             for sample in dataset.samples
         )
     if has_context_provider and num_workers > 0:
         raise ValueError(
-            "context-only Novae providers hold AnnData/model state and must use "
+            "context-only Novae/niche providers hold AnnData/model state and must use "
             "training.num_workers=0; multiprocessing copies can corrupt caches or "
             "multiply memory unexpectedly"
         )
@@ -1531,6 +1567,28 @@ def prepare_novae_inputs(cfg, adata, model_params: dict, coords3d: np.ndarray,
     return result
 
 
+def prepare_niche_inputs(cfg, adata, model_params: dict, sample_id: str | None = None) -> dict:
+    """Resolve use_niche_candidate inputs without silently exposing hidden
+    query expression -- mirrors prepare_novae_inputs, but simpler: unlike
+    Novae, the niche candidate has no learned architecture-time dimension
+    to probe (context['niche_labels'] is always [Nc, 1], read directly by
+    HierarchicalGeneTransportRegressor.sample()) and no historical
+    unsafe_full_graph reproduction mode to support."""
+    result = {"mode": "disabled", "context_niche_feature_provider": None}
+    if not model_uses_niche_candidate(dict(model_params)):
+        return result
+    mode = niche_input_mode(cfg, dict(model_params))
+    result["mode"] = mode
+    sid = sample_id or str(cfg.data.get("sample_id", "sample"))
+    result["context_niche_feature_provider"] = ContextOnlyFeatureProvider(
+        adata,
+        cache_dir=_cache_root(cfg) / "niche_context_cache",
+        sample_id=sid,
+        feature_fn=compute_banksy_augmented_niche_labels,
+    )
+    return result
+
+
 def _mask_bank_for_config(cfg, adata, coords3d: np.ndarray, slice_ids: np.ndarray) -> tuple[dict, Path]:
     evaluation = cfg.get("evaluation", {})
     default_path = f"results/mask_banks/{cfg.data.get('sample_id', cfg.experiment_name)}.json"
@@ -1646,6 +1704,7 @@ def _fixed_items_from_bank(cfg, adata, coords3d, expr, slice_ids, images, bank, 
             context_novae_features=novae_inputs.get("context_novae_features"),
             context_gene_feature_provider=novae_inputs.get("context_gene_feature_provider"),
             context_novae_feature_provider=novae_inputs.get("context_novae_feature_provider"),
+            context_niche_feature_provider=novae_inputs.get("context_niche_feature_provider"),
             organ=organ, tech=tech, augment=False, image_mode=image_mode,
             context_gex_mode=context_gex_mode,
             fixed_context_mask=context_mask, fixed_query_mask=query_mask,
@@ -1701,6 +1760,7 @@ def _fixed_training_seed_item(
         context_novae_features=novae_inputs.get("context_novae_features"),
         context_gene_feature_provider=novae_inputs.get("context_gene_feature_provider"),
         context_novae_feature_provider=novae_inputs.get("context_novae_feature_provider"),
+        context_niche_feature_provider=novae_inputs.get("context_niche_feature_provider"),
         organ=organ, tech=tech, augment=False,
         image_mode=str(cfg.training.get("image_mode", "full")),
         context_gex_mode=str(cfg.training.get("context_gex_mode", "full")),
@@ -2222,6 +2282,7 @@ def load_multi_sample_data(
         novae_inputs = prepare_novae_inputs(
             cfg, adata, model_params, coords3d, slice_ids, sample_id=str(sample_id)
         )
+        niche_inputs = prepare_niche_inputs(cfg, adata, model_params, sample_id=str(sample_id))
         slide_context = load_slide_context(
             cfg, str(sample_id), images, coords3d
         )
@@ -2229,7 +2290,7 @@ def load_multi_sample_data(
             coords3d, expr, slice_ids, images, organ, tech,
             novae_inputs["context_gene_features"], novae_inputs["context_novae_features"],
             novae_inputs["context_gene_feature_provider"], novae_inputs["context_novae_feature_provider"],
-            slide_context,
+            slide_context, niche_inputs["context_niche_feature_provider"],
         ))
         updated_adatas.append(adata)
     return samples, updated_adatas
@@ -2612,6 +2673,7 @@ def _main_multi_sample(cfg) -> None:
             "context_novae_features": sample[7],
             "context_gene_feature_provider": sample[8],
             "context_novae_feature_provider": sample[9],
+            "context_niche_feature_provider": sample[11],
         }
 
     callbacks = []
@@ -2850,10 +2912,19 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     novae_inputs = prepare_novae_inputs(
         cfg, adata, model_params, coords3d, slice_ids, sample_id=cfg.data.get("sample_id")
     )
+    niche_inputs = prepare_niche_inputs(cfg, adata, model_params, sample_id=cfg.data.get("sample_id"))
     context_gene_features = novae_inputs["context_gene_features"]
     context_novae_features = novae_inputs["context_novae_features"]
     context_gene_feature_provider = novae_inputs["context_gene_feature_provider"]
     context_novae_feature_provider = novae_inputs["context_novae_feature_provider"]
+    context_niche_feature_provider = niche_inputs["context_niche_feature_provider"]
+    # Threaded into the SAME novae_inputs dict (rather than passed
+    # separately) since every downstream helper below already accepts one
+    # "context provider bag" dict and reads specific keys via .get() --
+    # _fixed_items_from_bank/_fixed_training_seed_item/
+    # evaluate_model_on_mask_bank all forward whatever novae_inputs
+    # contains, so adding this key here is enough for all three.
+    novae_inputs["context_niche_feature_provider"] = context_niche_feature_provider
 
     # 2026-07-17: RandomFourierFeatures real-scale bug fix — see
     # inject_coord_scale's own docstring
@@ -2937,6 +3008,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
             context_novae_features=context_novae_features,
             context_gene_feature_provider=context_gene_feature_provider,
             context_novae_feature_provider=context_novae_feature_provider,
+            context_niche_feature_provider=context_niche_feature_provider,
             organ=organ, tech=tech, augment=augment,
             image_mode=str(cfg.training.get("image_mode", "full")),
             query_image_dropout_p=float(cfg.training.get("query_image_dropout_p", 0.0)),
