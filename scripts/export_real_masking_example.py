@@ -137,9 +137,19 @@ def main() -> None:
     spacing = float(np.median(neighbour_d[:, 1]))
     half = spacing * 0.5
 
-    window = spacing * 9
+    # Crop window must be generous relative to the REALIZED hole radius (up
+    # to radius_range[1] spot-spacings), not a fixed constant -- a window
+    # only slightly bigger than the hole makes any hole look like it
+    # dominates the whole slide, which is misleading (real fix, 2026-07-23:
+    # a first version used window=9*spacing against a hole that can itself
+    # be up to 6*spacing in radius, leaving almost no visible context ring).
+    realized_hole_radius = float(np.linalg.norm(coords_xy[query_idx] - hole_center, axis=1).max())
+    window = max(realized_hole_radius * 2.2, spacing * 12)
+    pct_of_slide = 100.0 * query_mask.sum() / len(coords_xy)
+
+    fig = plt.figure(figsize=(10, 10.6))
+    ax = fig.add_axes([0.05, 0.05, 0.9, 0.82])
     in_window = np.linalg.norm(coords_xy - hole_center, axis=1) < window
-    fig, ax = plt.subplots(figsize=(9, 9))
     for i in np.where(in_window & context_mask)[0]:
         x, y = coords_xy[i]
         ax.imshow(patches[i], extent=[x - half, x + half, y - half, y + half], zorder=1)
@@ -151,12 +161,34 @@ def main() -> None:
     ax.invert_yaxis()
     ax.set_aspect("equal")
     ax.set_xticks([]); ax.set_yticks([])
-    ax.set_title(f"{args.sample_id}, seed={args.seed}: real H&E patches, real coordinates.\n"
-                 f"Black squares = query spots as image_mode=target_zero delivers them "
-                 f"(GEX also hidden for these spots).", fontsize=10)
-    fig.tight_layout()
+    ax.set_title(
+        f"{args.sample_id}, seed={args.seed}: real H&E patches, real coordinates "
+        f"(local crop, {window / spacing:.0f} spot-spacings shown each way)\n"
+        f"Black = query spots as image_mode=target_zero delivers them (GEX hidden too). "
+        f"This hole = {query_mask.sum()}/{len(coords_xy)} spots on the whole slide "
+        f"({pct_of_slide:.1f}%)", fontsize=10,
+    )
+
+    # Full-slide inset for honest scale: where does this crop actually sit
+    # relative to the ENTIRE tissue section, and how small is the hole
+    # really once the whole slide is in view.
+    inset = fig.add_axes([0.68, 0.83, 0.28, 0.15])
+    inset.scatter(coords_xy[context_mask, 0], coords_xy[context_mask, 1], s=1.5, c="#2E86AB", linewidths=0)
+    inset.scatter(coords_xy[query_mask, 0], coords_xy[query_mask, 1], s=1.5, c="#E63946", linewidths=0)
+    from matplotlib.patches import Rectangle
+    inset.add_patch(Rectangle(
+        (hole_center[0] - window, hole_center[1] - window), 2 * window, 2 * window,
+        fill=False, edgecolor="black", linewidth=1.0,
+    ))
+    inset.invert_yaxis()
+    inset.set_aspect("equal")
+    inset.set_xticks([]); inset.set_yticks([])
+    inset.set_title("whole slide (box = crop above)", fontsize=7.5)
+
     fig.savefig(output_dir / "composite_real_patches.png", dpi=200, bbox_inches="tight", facecolor="white")
     print(f"  wrote {output_dir / 'composite_real_patches.png'}")
+    print(f"  this hole covers {query_mask.sum()}/{len(coords_xy)} spots on the whole slide "
+          f"({pct_of_slide:.1f}%)")
     print(f"\nDone. Everything in {output_dir} is real data from {args.sample_id} -- "
           f"pull the whole directory to your local machine to inspect/share.")
 
