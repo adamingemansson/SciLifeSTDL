@@ -97,12 +97,29 @@ this round lands -- real coverage, not padding.
 
 ## Build order (this session)
 
-1. **`TokenizedGeneEncoder` wiring** -- lowest risk, no new dependency.
-   `hierarchical_slide.py` gene_encoder_type branch, HVG-derivation
-   helper in `train.py` (mirroring `inject_decoder_gene_names`'s existing
-   pattern), tests.
-2. **Retrieval candidate (BLEEP-style)** -- no new dependency, real new
-   trainable component. `registry.py`/`hierarchical_slide.py`, tests.
+1. **`TokenizedGeneEncoder` wiring** -- DONE. `hierarchical_slide.py`
+   gene_encoder_type='tokenized' branch, `inject_tokenized_gene_names` in
+   `train.py`, 2 new tests, all 19 prior tests still pass unchanged.
+2. **Retrieval candidate (BLEEP-style)** -- DONE.
+   `use_retrieval_candidate`/`retrieval_k`/`retrieval_dim`/
+   `retrieval_temperature`/`retrieval_loss_weight` on
+   `HierarchicalGeneTransportRegressor`; two new linear projections
+   (`retrieval_query_projection`, `retrieval_expression_projection`); at
+   inference, ranks ALL visible context spots by embedding similarity to
+   `query_hidden` and adds the top `retrieval_k` as extra transport-gate
+   candidates with REAL relative geometry (not a sentinel, since retrieved
+   candidates are genuine positioned spots) via the encoder's own shared
+   `relative_coord` module; trained via an in-batch InfoNCE loss (query's
+   projection pulled toward its own real target, pushed away from every
+   other query's target AND every visible context spot in the same draw).
+   `hierarchical_slide.py`'s `forward_with_neighbors` now also exposes
+   `context_hidden` (the full per-context-spot fused token, not just the
+   k-nearest-gathered or mean-pooled versions) so retrieval candidates get
+   the same fused representation every k-nearest neighbor gets. 5 new
+   tests (off-by-default, runs-finite, anchor-unaffected, far-context
+   reaches prediction, loss zero-when-off/finite-when-on-with-real-
+   gradient); all 24 prior tests still pass unchanged (28 total across
+   both hierarchical test files).
 3. **Niche candidate (BANKSY-based)** -- needs `banksy_py`. Build the
    code path (precompute script + model wiring) defensively now; flag the
    dependency install requirement clearly; configs 230-235 wait on

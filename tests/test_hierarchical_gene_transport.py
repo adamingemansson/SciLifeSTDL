@@ -336,6 +336,97 @@ def test_global_candidate_lets_far_context_reach_the_prediction():
           "the prediction that pure local kNN structurally cannot see")
 
 
+def test_retrieval_candidate_off_by_default():
+    model = _build()
+    assert model.use_retrieval_candidate is False
+    assert model.retrieval_query_projection is None
+    assert model.retrieval_expression_projection is None
+    print("[hierarchical_gene_transport] OK — use_retrieval_candidate defaults to False")
+
+
+def test_retrieval_candidate_runs_and_stays_finite():
+    model = _build(use_retrieval_candidate=True, retrieval_k=2, local_k=3).eval()
+    context, query = _context_query(n_context=6)
+    with torch.inference_mode():
+        out = model.sample(context, query)
+    assert out["expression"].shape == (2, 6)
+    assert torch.isfinite(out["expression"]).all()
+    print("[hierarchical_gene_transport] OK — use_retrieval_candidate=True runs and stays finite")
+
+
+def test_retrieval_candidate_does_not_change_idw_anchor():
+    """The IDW anchor must stay a pure local interpolation over exactly the
+    k real neighbors, regardless of whether the learned candidate also gets
+    content-retrieved candidates."""
+    torch.manual_seed(0)
+    model_off = _build(use_retrieval_candidate=False, local_k=3).eval()
+    torch.manual_seed(0)
+    model_on = _build(use_retrieval_candidate=True, retrieval_k=2, local_k=3).eval()
+    context, query = _context_query(n_context=6)
+    with torch.inference_mode():
+        out_off = model_off.sample(context, query)
+        out_on = model_on.sample(context, query)
+    assert torch.allclose(out_off["anchor_expression"], out_on["anchor_expression"], atol=1e-6)
+    print("[hierarchical_gene_transport] OK — retrieval candidates leave the IDW anchor exactly unchanged")
+
+
+def test_retrieval_candidate_lets_far_context_reach_the_prediction():
+    """With retrieval_k set to the full context size, every context spot
+    (including ones far outside local_k) is guaranteed to be retrieved
+    regardless of the random projection weights -- a deterministic version
+    of the same "far context can only reach the prediction through the new
+    mechanism" property already tested for use_global_candidate."""
+    torch.manual_seed(0)
+    model_off = _build(use_retrieval_candidate=False, local_k=3, n_genes=2).eval()
+    torch.manual_seed(0)
+    model_on = _build(use_retrieval_candidate=True, retrieval_k=6, local_k=3, n_genes=2).eval()
+
+    local_coords = torch.tensor([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.1, 0.0]])
+    far_coords = torch.tensor([[500.0, 500.0, 0.0], [501.0, 500.0, 0.0], [500.0, 501.0, 0.0]])
+    context = {
+        "coords": torch.cat([local_coords, far_coords], dim=0),
+        "expression": torch.cat([torch.zeros(3, 2), torch.full((3, 2), 1000.0)], dim=0),
+    }
+    query = {"coords": torch.tensor([[0.02, 0.02, 0.0]])}
+
+    with torch.inference_mode():
+        out_off = model_off.sample(context, query)
+        out_on = model_on.sample(context, query)
+
+    assert torch.allclose(
+        out_off["expression"], torch.zeros_like(out_off["expression"]), atol=1e-3
+    ), "pure local kNN must be entirely untouched by context spots outside local_k"
+    assert not torch.allclose(out_on["expression"], out_off["expression"], atol=1e-6), (
+        "enabling use_retrieval_candidate must let far, content-retrieved context influence the prediction"
+    )
+    print("[hierarchical_gene_transport] OK — use_retrieval_candidate lets far context spots reach "
+          "the prediction that pure local kNN structurally cannot see")
+
+
+def test_retrieval_loss_is_zero_when_disabled_and_finite_when_enabled():
+    context, query = _context_query(n_context=6)
+    target = torch.rand(2, 6)
+    batch = {"context": context, "query": query, "target_expression": target}
+
+    model_off = _build(use_retrieval_candidate=False, local_k=3)
+    logged_off = {}
+    model_off.log_dict = lambda values, **kwargs: logged_off.update(values)  # type: ignore[assignment]
+    model_off.training_step(batch, 0)
+    assert logged_off["train/retrieval_loss"] == 0.0
+
+    model_on = _build(use_retrieval_candidate=True, retrieval_k=2, local_k=3)
+    logged_on = {}
+    model_on.log_dict = lambda values, **kwargs: logged_on.update(values)  # type: ignore[assignment]
+    loss = model_on.training_step(batch, 0)
+    assert torch.isfinite(logged_on["train/retrieval_loss"])
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert model_on.retrieval_query_projection.weight.grad is not None
+    assert model_on.retrieval_expression_projection.weight.grad is not None
+    print("[hierarchical_gene_transport] OK — retrieval contrastive loss is exactly 0 when disabled, "
+          "finite and receives real gradient when enabled")
+
+
 def test_all_thirteen_mandated_metrics_are_logged():
     model = _build(use_residual=True, residual_rank=4)
     context, query = _context_query(n_context=6)
@@ -381,5 +472,10 @@ if __name__ == "__main__":
     test_global_candidate_runs_and_stays_finite()
     test_global_candidate_does_not_change_idw_anchor()
     test_global_candidate_lets_far_context_reach_the_prediction()
+    test_retrieval_candidate_off_by_default()
+    test_retrieval_candidate_runs_and_stays_finite()
+    test_retrieval_candidate_does_not_change_idw_anchor()
+    test_retrieval_candidate_lets_far_context_reach_the_prediction()
+    test_retrieval_loss_is_zero_when_disabled_and_finite_when_enabled()
     test_all_thirteen_mandated_metrics_are_logged()
     print("\nAll hierarchical_gene_transport_regressor tests passed.")

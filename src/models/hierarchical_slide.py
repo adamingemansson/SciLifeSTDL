@@ -484,6 +484,15 @@ class HierarchicalMissingTissueEncoder(nn.Module):
             # nearest neighbors of a hole may not be representative of the
             # tissue the hole actually contains.
             "global_hidden": observed.mean(dim=0),
+            # Full per-context-spot fused representation (post
+            # context_transformer, pre k-NN gathering) -- [Nc, H]. Exposed
+            # so a caller can retrieve candidates OTHER than the k
+            # physically-nearest ones (e.g. by content-embedding
+            # similarity, see HierarchicalGeneTransportRegressor's
+            # use_retrieval_candidate) and still get the same fused,
+            # globally-self-attended token every k-nearest neighbor gets --
+            # not a separate, inconsistent representation.
+            "context_hidden": observed,
         }
 
     def forward(self, context: dict, query: dict) -> torch.Tensor:

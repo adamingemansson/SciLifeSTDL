@@ -1561,6 +1561,35 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
     rather than a fabricated real position, so the scorer can learn to
     treat it distinctly by content (``neighbor_hidden``) as well as by that
     sentinel distance.
+
+    ``use_retrieval_candidate`` (2026-07-23 round-4 architecture matrix)
+    adds up to ``retrieval_k`` further candidates per query, selected by
+    learned content-embedding similarity rather than physical distance --
+    directly testing BLEEP's (Xie et al., NeurIPS 2023) published position
+    that "the implicit assumption that spatially adjacent regions should
+    have similar representations... may not be beneficial... hard coding
+    position information could also lead to overfitting in data-scarce
+    scenarios" against this project's own opposite finding (geometry-only
+    scoring has been the strongest learned configuration in every suite so
+    far). Two small linear projections (``retrieval_query_projection``,
+    ``retrieval_expression_projection``) map a query's own hidden state and
+    any real expression vector into a shared, L2-normalized space; at
+    inference the query's projection is compared against every visible
+    context spot's projected real expression, and the top ``retrieval_k``
+    most similar spots are added as extra transport-gate candidates --
+    using their REAL relative geometry and their real
+    ``forward_with_neighbors()``-fused token (``context_hidden``), not a
+    sentinel, since retrieved candidates are genuine spots with genuine
+    positions, unlike the whole-slide global candidate above. Trained via
+    an in-batch InfoNCE loss (``retrieval_loss_weight``,
+    ``retrieval_temperature``): a query's projection is pulled toward its
+    own real target expression's projection and pushed away from every
+    other query's target AND every visible context spot's real expression
+    in the same draw -- the same real spots the retrieval step ranks
+    against at inference, so training and inference share one objective.
+    The k local candidates, the IDW anchor, and the global candidate (if
+    also enabled) are entirely unaffected; this only adds more options to
+    the *learned* candidate's own softmax competition.
     """
 
     def __init__(
@@ -1592,6 +1621,11 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
         conditioning_mode: str = "hierarchical",
         gene_gate_mode: str = "per_gene",
         use_global_candidate: bool = False,
+        use_retrieval_candidate: bool = False,
+        retrieval_k: int = 8,
+        retrieval_dim: int = 64,
+        retrieval_temperature: float = 0.1,
+        retrieval_loss_weight: float = 0.1,
         use_query_gate: bool = True,
         use_query_gene_gate: bool = False,
         query_gene_gate_rank: int = 16,
@@ -1626,6 +1660,15 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
             raise ValueError("loss weights must be non-negative")
         if use_residual and residual_rank < 1:
             raise ValueError("residual_rank must be positive when use_residual=True")
+        if use_retrieval_candidate:
+            if retrieval_k < 1:
+                raise ValueError("retrieval_k must be positive when use_retrieval_candidate=True")
+            if retrieval_dim < 1:
+                raise ValueError("retrieval_dim must be positive when use_retrieval_candidate=True")
+            if retrieval_temperature <= 0:
+                raise ValueError("retrieval_temperature must be positive when use_retrieval_candidate=True")
+            if retrieval_loss_weight < 0:
+                raise ValueError("retrieval_loss_weight must be non-negative")
         self.save_hyperparameters()
 
         self.n_genes = int(n_genes)
@@ -1646,6 +1689,15 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
         self.conditioning_mode = str(conditioning_mode)
         self.gene_gate_mode = str(gene_gate_mode)
         self.use_global_candidate = bool(use_global_candidate)
+        self.use_retrieval_candidate = bool(use_retrieval_candidate)
+        self.retrieval_k = int(retrieval_k)
+        self.retrieval_temperature = float(retrieval_temperature)
+        self.retrieval_loss_weight = float(retrieval_loss_weight)
+        self.retrieval_query_projection = None
+        self.retrieval_expression_projection = None
+        if self.use_retrieval_candidate:
+            self.retrieval_query_projection = nn.Linear(hidden_dim, retrieval_dim)
+            self.retrieval_expression_projection = nn.Linear(n_genes, retrieval_dim)
         self.use_query_gate = bool(use_query_gate)
         self.use_query_gene_gate = bool(use_query_gene_gate)
         self.use_residual = bool(use_residual)
@@ -1787,6 +1839,42 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
                 [neighbour_expression, global_expression[None, None, :].expand(n_query, 1, -1)], dim=1
             )
 
+        if self.use_retrieval_candidate:
+            # Rank EVERY visible context spot (not just the k physically
+            # nearest) by learned content-embedding similarity to this
+            # query, take the top retrieval_k. Unlike the global candidate,
+            # these are genuine individual spots with real positions, so
+            # they get real relative geometry (same normalization/
+            # relative_coord embedding as the k local neighbors) rather
+            # than a sentinel.
+            query_key = torch.nn.functional.normalize(
+                self.retrieval_query_projection(query_hidden), dim=-1
+            )  # [Nq, D]
+            context_key = torch.nn.functional.normalize(
+                self.retrieval_expression_projection(context["expression"]), dim=-1
+            )  # [Nc, D]
+            similarity = query_key @ context_key.T  # [Nq, Nc]
+            retrieval_k = min(self.retrieval_k, context["expression"].shape[0])
+            _, retrieval_idx = torch.topk(similarity, k=retrieval_k, dim=-1)  # [Nq, rk]
+
+            retrieval_delta = context["coords"][retrieval_idx][..., :2] - query["coords"][:, None, :2]
+            retrieval_distance = torch.linalg.norm(retrieval_delta, dim=-1, keepdim=True)
+            local_scale = neighbor_distances[:, -1:].clamp_min(1e-6)  # [Nq, 1]
+            retrieval_relative = torch.cat(
+                [retrieval_delta / local_scale[..., None], retrieval_distance / local_scale[..., None]],
+                dim=-1,
+            )  # [Nq, rk, 3]
+            retrieval_hidden = (
+                encoded["context_hidden"][retrieval_idx] + self.context_encoder.relative_coord(retrieval_relative)
+            )  # [Nq, rk, H] -- same fused token + positional embedding every k-nearest neighbor gets
+            retrieval_expression = context["expression"][retrieval_idx]  # [Nq, rk, G]
+
+            scoring_relative_geometry = torch.cat([scoring_relative_geometry, retrieval_relative], dim=1)
+            scoring_neighbor_hidden = torch.cat([scoring_neighbor_hidden, retrieval_hidden], dim=1)
+            scoring_neighbour_expression = torch.cat(
+                [scoring_neighbour_expression, retrieval_expression], dim=1
+            )
+
         hidden = self.geometry_encoder(scoring_relative_geometry)[:, :, None, :]  # [Nq,k(+1),1,S]
         hidden = hidden + self.head_embedding[None, None, :, :]           # [1,1,H,S]
         if self.conditioning_mode == "hierarchical":
@@ -1844,6 +1932,7 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
             "transport_head_entropy": head_entropy,
             "gene_gate_entropy": gate_entropy,
             "idw_weights": idw_weights,
+            "query_hidden": query_hidden,
         }
 
     def training_step(self, batch, batch_idx):
@@ -1873,11 +1962,34 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
         standardized_residual = out["factorized_residual"] / self.target_gene_scale
         residual_penalty = standardized_residual.square().mean()
 
+        retrieval_loss = standardized_mse.new_zeros(())
+        if self.use_retrieval_candidate:
+            # In-batch InfoNCE: a query's projection should be closest to
+            # its OWN real target's projection, among every other query's
+            # target AND every visible context spot's real expression in
+            # this same draw -- the same real spots the retrieval step in
+            # sample() ranks against, so training and inference share one
+            # objective (BLEEP's own real contrastive design, adapted:
+            # BLEEP's query side is a real image embedding since it always
+            # has the query's own real image; ours is query_hidden, since
+            # the query's own image/expression are exactly what's hidden).
+            query_key = nn.functional.normalize(
+                self.retrieval_query_projection(out["query_hidden"]), dim=-1
+            )  # [Nq, D]
+            key_pool = torch.cat([target, batch["context"]["expression"]], dim=0)  # [Nq+Nc, G]
+            pool_key = nn.functional.normalize(
+                self.retrieval_expression_projection(key_pool), dim=-1
+            )  # [Nq+Nc, D]
+            retrieval_logits = query_key @ pool_key.T / self.retrieval_temperature  # [Nq, Nq+Nc]
+            retrieval_labels = torch.arange(query_key.shape[0], device=query_key.device)
+            retrieval_loss = nn.functional.cross_entropy(retrieval_logits, retrieval_labels)
+
         loss = (
             standardized_mse
             + self.correlation_loss_weight * correlation_loss
             + self.transport_reg_weight * transport_regularization
             + self.residual_penalty_weight * residual_penalty
+            + self.retrieval_loss_weight * retrieval_loss
         )
 
         transport_delta_rms = (
@@ -1897,6 +2009,7 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
             "train/prediction_delta_rms": prediction_delta_rms,
             "train/transport_head_entropy": out["transport_head_entropy"],
             "train/gene_gate_entropy": out["gene_gate_entropy"],
+            "train/retrieval_loss": retrieval_loss,
         })
         return loss
 
