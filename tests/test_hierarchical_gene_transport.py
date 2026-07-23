@@ -327,6 +327,68 @@ def test_tokenized_gene_encoder_requires_gene_names():
     print("[hierarchical_gene_transport] OK — gene_encoder_type='tokenized' fails closed without gene names")
 
 
+def test_stpath_frozen_gene_encoder_runs_and_stays_finite():
+    """gene_encoder_type='stpath_frozen_table' -- isolates STPath's
+    pretraining from its whole architecture (see
+    src/models/stpath_gene_table.py's module docstring). Must produce the
+    same [Nq, n_genes] output contract as every other gene encoder."""
+    n_genes = 6
+    torch.manual_seed(0)
+    frozen_table = torch.randn(8, n_genes)  # [d_model=8, n_genes]
+    model = _build(
+        n_genes=n_genes, gene_encoder_type="stpath_frozen_table",
+        stpath_frozen_gene_table=frozen_table,
+    ).eval()
+    context, query = _context_query(n_genes=n_genes)
+    with torch.inference_mode():
+        out = model.sample(context, query)
+    assert out["expression"].shape == (2, n_genes)
+    assert torch.isfinite(out["expression"]).all()
+    print("[hierarchical_gene_transport] OK — gene_encoder_type='stpath_frozen_table' runs and stays finite")
+
+
+def test_stpath_frozen_gene_encoder_requires_the_table():
+    try:
+        _build(gene_encoder_type="stpath_frozen_table")
+        assert False, "expected ValueError for missing stpath_frozen_gene_table"
+    except ValueError as exc:
+        assert "stpath_frozen_gene_table" in str(exc)
+    print("[hierarchical_gene_transport] OK — gene_encoder_type='stpath_frozen_table' fails closed "
+          "without the frozen table")
+
+
+def test_stpath_frozen_gene_encoder_table_stays_frozen_through_training():
+    """The pretrained STPath weights must never move, even after a real
+    optimizer step -- only the small trainable projection on top of them
+    (and everything else in the model) is allowed to update."""
+    n_genes = 6
+    torch.manual_seed(0)
+    frozen_table = torch.randn(8, n_genes)
+    model = _build(
+        n_genes=n_genes, gene_encoder_type="stpath_frozen_table",
+        stpath_frozen_gene_table=frozen_table,
+    )
+    before = model.context_encoder.gene_encoder.frozen_table.clone()
+
+    context, query = _context_query(n_genes=n_genes)
+    target = torch.rand(2, n_genes)
+    batch = {"context": context, "query": query, "target_expression": target}
+    optimizer = model.configure_optimizers()
+    if isinstance(optimizer, dict):
+        optimizer = optimizer["optimizer"]
+    for _ in range(3):
+        optimizer.zero_grad()
+        loss = model.training_step(batch, 0)
+        loss.backward()
+        optimizer.step()
+
+    after = model.context_encoder.gene_encoder.frozen_table
+    assert torch.equal(before, after), "the pretrained STPath gene table must never change during training"
+    assert model.context_encoder.gene_encoder.proj.weight.grad is not None
+    print("[hierarchical_gene_transport] OK — stpath_frozen_table stays byte-identical through real "
+          "training steps; only its trainable projection head updates")
+
+
 def test_global_candidate_off_by_default():
     model = _build()
     assert model.use_global_candidate is False
@@ -815,6 +877,9 @@ if __name__ == "__main__":
     test_entropy_regularization_is_off_by_default()
     test_tokenized_gene_encoder_runs_and_stays_finite()
     test_tokenized_gene_encoder_requires_gene_names()
+    test_stpath_frozen_gene_encoder_runs_and_stays_finite()
+    test_stpath_frozen_gene_encoder_requires_the_table()
+    test_stpath_frozen_gene_encoder_table_stays_frozen_through_training()
     test_global_candidate_off_by_default()
     test_global_candidate_runs_and_stays_finite()
     test_global_candidate_does_not_change_idw_anchor()

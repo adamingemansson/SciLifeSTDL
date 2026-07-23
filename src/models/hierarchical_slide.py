@@ -21,6 +21,7 @@ import torch.nn as nn
 from src.models.conditioning import (
     DINOv2PatchEncoder, GigapathPatchEncoder, MLPGeneEncoder, NovaeGeneEncoder, TokenizedGeneEncoder,
 )
+from src.models.stpath_gene_table import STPathFrozenGeneEncoder
 
 
 class WeightedGeneExpressionEncoder(nn.Module):
@@ -261,6 +262,7 @@ class HierarchicalMissingTissueEncoder(nn.Module):
         tokenized_full_gene_names: list[str] | None = None,
         tokenized_pool_layers: int = 1,
         tokenized_pool_heads: int = 4,
+        stpath_frozen_gene_table=None,
         fusion_mode: str = "concat",
         slide_checkpoint_path: str | None = None,
         slide_output_dim: int = 768,
@@ -322,8 +324,21 @@ class HierarchicalMissingTissueEncoder(nn.Module):
                 n_pool_layers=int(tokenized_pool_layers),
                 n_pool_heads=int(tokenized_pool_heads),
             )
+        elif gene_encoder_type == "stpath_frozen_table":
+            if stpath_frozen_gene_table is None:
+                raise ValueError(
+                    "gene_encoder_type='stpath_frozen_table' requires "
+                    "stpath_frozen_gene_table ([d_model, n_genes], produced by "
+                    "src/models/stpath_gene_table.py's extract_stpath_gene_embedding_table) "
+                    "-- see train.py's inject_stpath_frozen_gene_table for how this is "
+                    "normally auto-derived from the loaded AnnData."
+                )
+            self.gene_encoder = STPathFrozenGeneEncoder(stpath_frozen_gene_table, hidden_dim)
         else:
-            raise ValueError("gene_encoder_type must be 'weighted_linear', 'mlp' or 'tokenized'")
+            raise ValueError(
+                "gene_encoder_type must be 'weighted_linear', 'mlp', 'tokenized' or "
+                "'stpath_frozen_table'"
+            )
         self.novae_encoder = NovaeGeneEncoder(int(novae_dim), hidden_dim) if use_novae else None
         modality_count = 1 + int(use_local_images) + int(use_novae)
         if fusion_mode == "concat":

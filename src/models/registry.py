@@ -1634,6 +1634,23 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
     LongNet aggregator stays Gigapath-only regardless of this setting --
     DINOv2 has no equivalent long-context slide aggregator, so this is
     deliberately a single-axis (local tile encoder only) comparison.
+
+    ``gene_encoder_type='stpath_frozen_table'`` (2026-07-23) isolates
+    "does STPath's PRETRAINING help" from "does STPath's whole spatial-
+    transformer architecture help" -- a distinction this project's own
+    internal ablation (STPath pretrained vs. unfrozen/from-scratch, PCC
+    0.503 vs. 0.4706, ``docs/results_log.md``) cannot make, since it always
+    uses STPath's whole architecture. Requires ``stpath_frozen_gene_table``
+    ([d_model, n_genes], produced by
+    ``src/models/stpath_gene_table.py::extract_stpath_gene_embedding_table``,
+    grounded directly in STPath's real ``EncodeInputs.gene_embed`` weights,
+    gathered per-gene by symbol -> Ensembl ID -> STPath's own vocabulary
+    index). Still real observed expression as the only input
+    (``real_expression @ frozen_table``, STPath's own frozen gene_embed
+    computation, exactly) feeding a small trainable projection -- same RAE
+    pattern as every other gene/image encoder in this file; the pretrained
+    table itself is a buffer, never a Parameter, so it structurally cannot
+    receive gradient.
     """
 
     def __init__(
@@ -1656,6 +1673,7 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
         tokenized_full_gene_names: list[str] | None = None,
         tokenized_pool_layers: int = 1,
         tokenized_pool_heads: int = 4,
+        stpath_frozen_gene_table=None,
         fusion_mode: str = "concat",
         slide_checkpoint_path: str | None = None,
         slide_output_dim: int = 768,
@@ -1729,6 +1747,7 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
             tokenized_full_gene_names=tokenized_full_gene_names,
             tokenized_pool_layers=tokenized_pool_layers,
             tokenized_pool_heads=tokenized_pool_heads,
+            stpath_frozen_gene_table=stpath_frozen_gene_table,
             fusion_mode=fusion_mode, slide_checkpoint_path=slide_checkpoint_path,
             slide_output_dim=slide_output_dim,
         )

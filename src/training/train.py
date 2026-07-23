@@ -2517,6 +2517,84 @@ def inject_tokenized_gene_names(model_cfg: dict, adata) -> None:
         )
 
 
+def _stpath_frozen_table_cache_path(cfg, model_cfg: dict) -> Path:
+    """Where the extracted (small, [d_model, n_genes]) frozen STPath gene
+    table gets cached across runs -- avoids reloading the whole STPath
+    checkpoint (multi-GB) every launch just to re-derive a per-gene-panel
+    lookup that never changes for a fixed (gene panel, checkpoint) pair.
+    Keyed by experiment_name since the gene panel is config-specific."""
+    experiment_name = str(cfg.get("experiment_name", "experiment"))
+    return _cache_root(cfg) / "stpath_frozen_gene_table_cache" / f"{experiment_name}.npz"
+
+
+def inject_stpath_frozen_gene_table(model_cfg: dict, adata, cfg) -> None:
+    """If gene_encoder_type is "stpath_frozen_table", auto-derive
+    stpath_frozen_gene_table by extracting STPath's real pretrained
+    gene_embed columns for this config's actual gene panel (see
+    src/models/stpath_gene_table.py -- isolates STPath's PRETRAINING from
+    its whole architecture, a distinction the existing STPath-vs-unfrozen
+    ablation in docs/results_log.md cannot make on its own). Reads
+    stpath_gene_voc_path/stpath_model_weight_path/stpath_d_model from
+    model_cfg params -- same config convention context_encoder_type="stpath"
+    configs already use for the first two
+    (${oc.env:STPATH_GENE_VOC_PATH}/${oc.env:STPATH_MODEL_WEIGHT_PATH}), not
+    a new one. These three keys are config-only INPUTS to this extraction
+    step, not accepted by HierarchicalGeneTransportRegressor's own
+    constructor (build_model does a plain **params unpack, no filtering) --
+    always popped from params before returning, on every path, so they
+    never leak into build_model and crash with an unexpected-keyword error.
+    No-op for every config that doesn't set
+    gene_encoder_type="stpath_frozen_table"."""
+    params = model_cfg.get("params", {})
+    if params.get("gene_encoder_type") != "stpath_frozen_table":
+        return
+    if "stpath_frozen_gene_table" in params:
+        params.pop("stpath_gene_voc_path", None)
+        params.pop("stpath_model_weight_path", None)
+        params.pop("stpath_d_model", None)
+        return
+    voc_path = params.pop("stpath_gene_voc_path", None)
+    weight_path = params.pop("stpath_model_weight_path", None)
+    d_model = int(params.pop("stpath_d_model", 512))
+    if not voc_path or not weight_path:
+        raise ValueError(
+            "gene_encoder_type='stpath_frozen_table' requires stpath_gene_voc_path and "
+            "stpath_model_weight_path (same params context_encoder_type='stpath' configs "
+            "already set, typically ${oc.env:STPATH_GENE_VOC_PATH}/"
+            "${oc.env:STPATH_MODEL_WEIGHT_PATH})"
+        )
+    gene_names = adata.var_names.tolist()
+
+    cache_path = _stpath_frozen_table_cache_path(cfg, model_cfg)
+    if cache_path.exists():
+        cached = np.load(cache_path, allow_pickle=True)
+        if cached["gene_names"].tolist() == gene_names:
+            print(f"inject_stpath_frozen_gene_table: loaded cached table for "
+                  f"{len(gene_names)} genes from {cache_path} "
+                  f"(delete this file to force a recompute).")
+            params["stpath_frozen_gene_table"] = cached["table"].tolist()
+            return
+        print(f"inject_stpath_frozen_gene_table: cache at {cache_path} does not match "
+              f"the current gene panel — recomputing.")
+
+    from src.models.stpath_gene_table import extract_stpath_gene_embedding_table
+    print(f"Extracting STPath's frozen gene_embed table for {len(gene_names)} genes "
+          f"(one-time cost, cached to {cache_path} so future runs skip this step)...")
+    table, report = extract_stpath_gene_embedding_table(
+        gene_names, voc_path, weight_path, d_model=d_model,
+    )
+    print(f"inject_stpath_frozen_gene_table: {report['n_found']}/{report['n_genes']} genes "
+          f"matched STPath's vocabulary ({report['n_missing']} missing genes get a zero "
+          f"frozen column, contributing nothing through this pathway).")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_savez(
+        cache_path,
+        table=table,
+        gene_names=np.asarray(gene_names, dtype=object),
+    )
+    params["stpath_frozen_gene_table"] = table.tolist()
+
+
 def inject_single_sample_n_genes(model_cfg: dict, adata) -> None:
     """Single-sample n_genes has always been a MANUALLY hardcoded config
     value (e.g. "n_genes: 16570  # INT1 after QC"), unlike every other
@@ -2689,12 +2767,26 @@ def _main_multi_sample(cfg) -> None:
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     _inject(model_cfg)
+    # stpath_frozen_gene_table is NOT in _inject: it needs to read real
+    # stpath_gene_voc_path/stpath_model_weight_path FILES, which only hold
+    # real paths on the RESOLVED copy -- the unresolved copy below
+    # deliberately keeps ${oc.env:...} as literal placeholder strings (see
+    # its own comment), so calling this on that copy would try to open a
+    # literal "${oc.env:...}" path and crash. Computed once here, copied
+    # (not re-derived) into the unresolved copy afterward -- same "derived
+    # data is safe to bake into both copies, only PATHS must stay
+    # unresolved" reasoning as inject_stpath_gene_names/novae_dim above.
+    inject_stpath_frozen_gene_table(model_cfg, fit_adatas[0], cfg)
     model = build_model(model_cfg)
     init_checkpoint_dir = cfg.training.get("init_checkpoint_dir")
     if init_checkpoint_dir:
         load_pretrained_weights_into(model, init_checkpoint_dir)
     unresolved_model_cfg = OmegaConf.to_container(cfg.model, resolve=False)
     _inject(unresolved_model_cfg)
+    if "stpath_frozen_gene_table" in model_cfg.get("params", {}):
+        unresolved_model_cfg.setdefault("params", {})["stpath_frozen_gene_table"] = (
+            model_cfg["params"]["stpath_frozen_gene_table"]
+        )
 
     checkpoint_dir = cfg.training.get("checkpoint_dir", f"results/checkpoints/{cfg.experiment_name}")
     composite_train_obs_names = [
@@ -3007,6 +3099,11 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     inject_decoder_gene_names(model_cfg, adata)
     inject_storm_lite_tokenizer_gene_names(model_cfg, adata)
     inject_tokenized_gene_names(model_cfg, adata)
+    # Only ever called on this RESOLVED copy (see the unresolved copy's own
+    # comment below, and inject_stpath_frozen_gene_table's docstring) --
+    # reads real stpath_gene_voc_path/stpath_model_weight_path FILES, which
+    # only hold real paths here, not on the deliberately-unresolved copy.
+    inject_stpath_frozen_gene_table(model_cfg, adata, cfg)
     inject_expression_preprocessing(model_cfg, adata)
     inject_residual_gene_scale(model_cfg, [training_expr])
     inject_direct_regression_stats(model_cfg, [training_expr])
@@ -3038,6 +3135,10 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     inject_decoder_gene_names(unresolved_model_cfg, adata)
     inject_storm_lite_tokenizer_gene_names(unresolved_model_cfg, adata)
     inject_tokenized_gene_names(unresolved_model_cfg, adata)
+    if "stpath_frozen_gene_table" in model_cfg.get("params", {}):
+        unresolved_model_cfg.setdefault("params", {})["stpath_frozen_gene_table"] = (
+            model_cfg["params"]["stpath_frozen_gene_table"]
+        )
     inject_expression_preprocessing(unresolved_model_cfg, adata)
     inject_residual_gene_scale(unresolved_model_cfg, [training_expr])
     inject_direct_regression_stats(unresolved_model_cfg, [training_expr])
