@@ -587,16 +587,29 @@ def _load_dinov2_tile_encoder(model_name: str = "vit_large_patch14_dinov2.lvd142
 _DINOV2_FEAT_DIM = 1024
 
 
+def _dinov2_expected_size(tile_encoder) -> int:
+    """The actual input resolution THIS loaded DINOv2 checkpoint expects --
+    real bug found 2026-07-23: hardcoded 224 (matching Gigapath's own
+    convention) crashed with 'Input height (224) doesn't match model
+    (518)' the first time this ran on real hardware. timm's
+    vit_large_patch14_dinov2.lvd142m variant is registered at 518x518 (37x37
+    patch tokens at patch size 14), not the 224 some other DINOv2 releases
+    use -- read it from the real loaded model instead of assuming any
+    constant, so this stays correct regardless of which DINOv2 variant a
+    future config points at."""
+    return int(tile_encoder.patch_embed.img_size[0])
+
+
 def _dinov2_preprocess_and_encode(tile_encoder, patches: torch.Tensor) -> torch.Tensor:
-    """DINOv2's own documented preprocessing (resize to a multiple of its
-    14x14 patch size, ImageNet normalize) + a forward pass through the
-    frozen tile encoder. patches: [B, 3, H, W] float in [0, 1]. Mirrors
-    _gigapath_preprocess_and_encode's structure; 224x224 (16x16 patch
-    tokens at patch size 14) is DINOv2's own standard evaluation
-    resolution."""
+    """DINOv2's own documented preprocessing (resize to whatever resolution
+    the loaded checkpoint actually expects -- see _dinov2_expected_size --
+    ImageNet normalize) + a forward pass through the frozen tile encoder.
+    patches: [B, 3, H, W] float in [0, 1]. Mirrors
+    _gigapath_preprocess_and_encode's structure."""
     device = patches.device
+    target_size = _dinov2_expected_size(tile_encoder)
     x = nn.functional.interpolate(
-        patches.cpu(), size=224, mode="bicubic", align_corners=False
+        patches.cpu(), size=target_size, mode="bicubic", align_corners=False
     ).to(device)
     x = (x - _IMAGENET_MEAN.to(device)) / _IMAGENET_STD.to(device)
     with torch.no_grad():
@@ -646,8 +659,11 @@ class DINOv2PatchEncoder(nn.Module):
     def _ensure_tile_encoder(self, device: torch.device) -> nn.Module:
         if self.tile_encoder is None:
             tile_encoder = _load_dinov2_tile_encoder().to(device)
+            target_size = _dinov2_expected_size(tile_encoder)
             with torch.no_grad():
-                real_dim = tile_encoder(torch.zeros(1, 3, 224, 224, device=device)).shape[-1]
+                real_dim = tile_encoder(
+                    torch.zeros(1, 3, target_size, target_size, device=device)
+                ).shape[-1]
             assert real_dim == _DINOV2_FEAT_DIM, (
                 f"DINOv2's real tile-encoder output dim ({real_dim}) doesn't match "
                 f"the hardcoded _DINOV2_FEAT_DIM ({_DINOV2_FEAT_DIM}) — update the constant"
