@@ -1,0 +1,72 @@
+# LOCAL_K SWEEP control (2026-07-23): non-learned harmonic baseline at k=512, matched to 213_transport_c05_all_modalities_concat_k512_v2.yaml
+# (same held-out sample/spot cohort/holes, shares its evaluation.mask_bank_dir
+# so "beats harmonic" stays an apples-to-apples comparison on identical test
+# masks at the SAME k for both). Original hole size [3.0,6.0], not smallhole.
+experiment_name: transport_harmonic_k512_v2
+data:
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  hest_cache_dir: data/cache/hest1k
+  slide_context_source: disabled
+  strict_broken_region: true
+  query_patch_size_fullres: 224.0
+  sample_ids: [INT1, INT2, INT3, INT4, INT5, INT6, INT7, INT8]
+  train_sample_ids: [INT1, INT2, INT3, INT4, INT5, INT6]
+  validation_sample_ids: [INT7]
+  test_sample_ids: [INT8]
+  holdout_unit: sample
+  task: intra_slice
+  task_contract: missing_tissue
+  modality_ablation: gex_only
+  min_genes: 200
+  min_cells: 3
+  expression_transform: normalize_log1p
+  expression_target_sum: 10000.0
+  novae_mode: disabled
+  require_image_coverage: true
+  # Load image coverage even though the baseline ignores pixel features so
+  # its spot cohort and held-out holes exactly match the learned runs.
+  use_images: true
+  organ_by_sample: {INT1: Kidney, INT2: Kidney, INT3: Kidney, INT4: Kidney, INT5: Kidney, INT6: Kidney, INT7: Kidney, INT8: Kidney}
+  tech_by_sample: {INT1: Visium, INT2: Visium, INT3: Visium, INT4: Visium, INT5: Visium, INT6: Visium, INT7: Visium, INT8: Visium}
+masking:
+  strategy: random_dropout_patches
+  max_context_points: 3000
+  context_selection: nearest_query
+  params: {n_patches: 1, radius_range: [3.0, 6.0], radius_unit: spot_spacing, shape: mixed}
+model:
+  name: spatial_baseline
+  params: {mode: harmonic, k: 512, ridge: 0.0001}
+training:
+  epochs: 1
+  seed: 10
+  mask_seed: 760000
+  unique_mask_count: 1
+  log_every_n_steps: 10
+  num_workers: 0
+  augment_coords: false
+  image_mode: all_zero
+  context_gex_mode: full
+  query_image_dropout_p: 0.0
+  all_image_dropout_p: 0.0
+  context_gex_dropout_p: 0.0
+  checkpoint_dir: results/checkpoints/recovery_suite/transport_harmonic_k512_v2
+validation: {enabled: false}
+evaluation:
+  mask_bank_dir: results/mask_banks/recovery_suite/transport_c05_all_modalities_concat_k512_v2_20k
+  n_validation_masks: 8
+  n_test_masks: 16
+  validation_seed: 760000
+  test_seed: 960000
+  sampling_seed: 1260000
+  n_samples: 1
+  primary_image_mode: all_zero
+  image_modes: [all_zero]
+  validation_image_mode: all_zero
+  context_gex_mode: full
+  k_neighborhood: 8
+  pca_n_components: 50
+  fixed_gene_panel_paths: {stpath_hest_bench_ccrcc_50: resources/evaluation/hest_bench/CCRCC_var_50genes.json}
+  train_variance_gene_panel_sizes: [50, 100, 250]
+  training_mask_bank_path: results/mask_banks/training/recovery_suite/transport_harmonic_aligned_1_v2_k512_seed760000.json
+logging: {backend: csv, project: st3d-lundeberg-lab}
