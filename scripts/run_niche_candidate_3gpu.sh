@@ -1,36 +1,29 @@
 #!/usr/bin/env bash
-# Round-4 gene-encoder x candidate-mechanism matrix (2026-07-23) -- see
-# experimental/PLAN.md for the full design; one combined run of the 20
-# configs (220-229, 236-245) that need no new dependency, across 4 GPUs,
-# all finishing into a single summary CSV.
+# Niche-candidate matrix + stacking follow-up (2026-07-23) -- see
+# experimental/PLAN.md Build order item 3. 9 configs (230-235: the core
+# niche-candidate matrix; 246-248: niche+global/niche+retrieval/
+# niche+global+retrieval stacking, mirroring 242's "stack the new
+# mechanisms together" question) across 3 GPUs, 3 jobs each -- a separate
+# run from run_transport_round4_4gpu.sh's 26-config batch (already in
+# flight when this was written) rather than folded into it, since that
+# script assumes exactly 4 GPUs and this one targets 3 specific GPUs
+# (1,3,5) chosen to share lightly-loaded GPUs with other running jobs.
 #
-# 230-235 (the BANKSY-based niche candidate) and 246-248 (niche-candidate
-# stacking with global/retrieval) deliberately run via a SEPARATE script,
-# scripts/run_niche_candidate_3gpu.sh, on 3 different GPUs -- they were
-# briefly folded into THIS script's queues, then pulled back out, because
-# leaving them in both places risks two processes eventually training into
-# the same checkpoint_dir if this script's queue reaches them before the
-# dedicated niche run finishes. Keep the two scripts' job sets disjoint.
+# Every config here shares 194/215's existing evaluation.mask_bank_dir
+# (230/234/235/246/247/248) or 209/210's (232, smallhole) or 211/212's
+# (233, k256) -- no new eval-mask dependency from this batch, so jobs can
+# be freely distributed across GPUs in any order, same as the round-4/5
+# script.
 #
-# Every config here shares an EXISTING sibling's evaluation.mask_bank_dir
-# (194/209/211/215's, already-established dirs) rather than a config from
-# this batch -- there is no inter-config dependency within 220-245, so
-# unlike run_transport_extra_diagnostics_4gpu.sh's paired queues, jobs here
-# can be freely distributed across GPUs in any order.
-#
-# 10k steps (half the 20k main suite) -- this round trades per-run depth
-# for cross-run breadth across many comparable architecture variants.
-#
-#   GPU[0] (default 1): 220 (gene=mlp) -> 224 (retrieval+smallhole) -> 228 (gene=mlp+global) -> 236 (gene=mlp+geometry) -> 240 (gene=mlp+k256)
-#   GPU[1] (default 2): 221 (gene=tokenized) -> 225 (retrieval+k256) -> 229 (gene=tokenized+global) -> 237 (gene=tokenized+geometry) -> 241 (gene=tokenized+k256)
-#   GPU[2] (default 3): 222 (retrieval) -> 226 (gene=mlp+retrieval) -> 238 (gene=mlp+smallhole) -> 242 (retrieval+global) -> 244 (retrieval_k=16)
-#   GPU[3] (default 5): 223 (retrieval+geometry) -> 227 (gene=tokenized+retrieval) -> 239 (gene=tokenized+smallhole) -> 243 (retrieval_k=4) -> 245 (retrieval+smallhole+k256)
+#   GPU[0] (default 1): 230 (niche) -> 233 (niche+k256) -> 246 (niche+global)
+#   GPU[1] (default 3): 231 (niche+geometry) -> 234 (niche+gene=mlp) -> 247 (niche+retrieval)
+#   GPU[2] (default 5): 232 (niche+smallhole) -> 235 (niche+gene=tokenized) -> 248 (niche+global+retrieval)
 #
 # Usage:
-#   bash scripts/run_transport_round4_4gpu.sh
-#   GPU_IDS=1,2,3,5 SMOKE_ONLY=1 bash scripts/run_transport_round4_4gpu.sh
-#   SKIP_SMOKE=1 bash scripts/run_transport_round4_4gpu.sh
-#   ALLOW_EXISTING_TRANSPORT_JOBS=1 bash scripts/run_transport_round4_4gpu.sh  # share GPUs with already-running light jobs
+#   bash scripts/run_niche_candidate_3gpu.sh
+#   GPU_IDS=1,3,5 SMOKE_ONLY=1 bash scripts/run_niche_candidate_3gpu.sh
+#   SKIP_SMOKE=1 bash scripts/run_niche_candidate_3gpu.sh
+#   ALLOW_EXISTING_TRANSPORT_JOBS=1 bash scripts/run_niche_candidate_3gpu.sh  # share GPUs with already-running jobs (default on -- see below)
 set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -41,19 +34,22 @@ RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 SMOKE_ONLY="${SMOKE_ONLY:-0}"
 SKIP_SMOKE="${SKIP_SMOKE:-0}"
 MIN_FREE_GB="${MIN_FREE_GB:-20}"
-GPU_IDS_CSV="${GPU_IDS:-1,2,3,5}"
+GPU_IDS_CSV="${GPU_IDS:-1,3,5}"
 IFS=',' read -r -a GPUS <<< "$GPU_IDS_CSV"
+# This run is designed from the start to share GPUs with the already-running
+# 20/26-config round-4/5 batch and the earlier 207-219 diagnostics -- default
+# to warn-not-block, unlike run_transport_round4_4gpu.sh's opt-in default.
+ALLOW_EXISTING_TRANSPORT_JOBS="${ALLOW_EXISTING_TRANSPORT_JOBS:-1}"
 
-QUEUE_1=(220 224 228 236 240)
-QUEUE_2=(221 225 229 237 241)
-QUEUE_3=(222 226 238 242 244)
-QUEUE_4=(223 227 239 243 245)
-QUEUES=(QUEUE_1 QUEUE_2 QUEUE_3 QUEUE_4)
-ALL_NUMBERS=(220 221 222 223 224 225 226 227 228 229 236 237 238 239 240 241 242 243 244 245)
+QUEUE_1=(230 233 246)
+QUEUE_2=(231 234 247)
+QUEUE_3=(232 235 248)
+QUEUES=(QUEUE_1 QUEUE_2 QUEUE_3)
+ALL_NUMBERS=(230 231 232 233 234 235 246 247 248)
 
 declare -A CONFIG_PATH
 declare -A CONFIG_NAME
-for f in configs/recovery_suite/2[2-4][0-9]_transport_*.yaml; do
+for f in configs/recovery_suite/2[34][0-9]_transport_*.yaml; do
   number="$(basename "$f" | cut -d_ -f1)"
   name="$(awk -F': ' '/^experiment_name:/ {print $2; exit}' "$f")"
   if [[ -z "$name" ]]; then
@@ -70,8 +66,8 @@ for number in "${ALL_NUMBERS[@]}"; do
   fi
 done
 
-LOG_ROOT="logs/recovery_suite/transport_round4_${RUN_ID}"
-REPORT_ROOT="reports/recovery_suite/transport_round4_${RUN_ID}"
+LOG_ROOT="logs/recovery_suite/niche_candidate_${RUN_ID}"
+REPORT_ROOT="reports/recovery_suite/niche_candidate_${RUN_ID}"
 
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:${PYTHONPATH}}"
 export PYTHONUNBUFFERED=1
@@ -81,13 +77,13 @@ export OPENBLAS_NUM_THREADS="$CPU_THREADS_PER_JOB"
 export NUMEXPR_NUM_THREADS="$CPU_THREADS_PER_JOB"
 mkdir -p "$LOG_ROOT" "$REPORT_ROOT"
 
-echo "===== YAML sanity check (all 20 configs parse and have distinct experiment_name) ====="
-"$PYTHON_BIN" - <<'PYEOF'
+echo "===== YAML sanity check (all 9 configs parse and have distinct experiment_name) ====="
+"$PYTHON_BIN" - <<PYEOF
 import sys
 from pathlib import Path
 import yaml
 
-numbers = [str(n) for n in list(range(220, 230)) + list(range(236, 246))]
+numbers = [str(n) for n in [230, 231, 232, 233, 234, 235, 246, 247, 248]]
 seen_names = {}
 for n in numbers:
     matches = list(Path("configs/recovery_suite").glob(f"{n}_transport_*.yaml"))
@@ -103,12 +99,18 @@ for n in numbers:
     if int(cfg["training"]["epochs"]) != 10000:
         print(f"ERROR: {n} does not have training.epochs=10000", file=sys.stderr)
         sys.exit(2)
-print(f"OK: {len(numbers)} configs parse, {len(seen_names)} distinct experiment_names, all at 10k steps.")
+    if cfg["model"]["params"].get("use_niche_candidate") is not True:
+        print(f"ERROR: {n} does not have use_niche_candidate: true", file=sys.stderr)
+        sys.exit(2)
+    if cfg["data"].get("niche_mode") != "context_only":
+        print(f"ERROR: {n} does not have data.niche_mode: context_only", file=sys.stderr)
+        sys.exit(2)
+print(f"OK: {len(numbers)} configs parse, {len(seen_names)} distinct experiment_names, all at 10k steps, niche_mode set.")
 PYEOF
 
 echo "===== GPU_IDS check ====="
-if (( ${#GPUS[@]} != 4 )); then
-  echo "ERROR: GPU_IDS must provide exactly four comma-separated devices (got '$GPU_IDS_CSV')." >&2
+if (( ${#GPUS[@]} != 3 )); then
+  echo "ERROR: GPU_IDS must provide exactly three comma-separated devices (got '$GPU_IDS_CSV')." >&2
   exit 2
 fi
 declare -A seen_gpus=()
@@ -163,13 +165,12 @@ for sid in INT1 INT2 INT3 INT4 INT5 INT6 INT7 INT8; do
   }
 done
 if pgrep -af -- 'src.training.train.*transport_' >"$LOG_ROOT/existing_processes.txt"; then
-  if [[ "${ALLOW_EXISTING_TRANSPORT_JOBS:-0}" == "1" ]]; then
+  if [[ "$ALLOW_EXISTING_TRANSPORT_JOBS" == "1" ]]; then
     echo "WARNING: transport jobs already exist, proceeding anyway (ALLOW_EXISTING_TRANSPORT_JOBS=1):" >&2
     cat "$LOG_ROOT/existing_processes.txt" >&2
   else
     echo "ERROR: transport jobs already exist (some other suite/diagnostic is running):" >&2
     cat "$LOG_ROOT/existing_processes.txt" >&2
-    echo "  If these are known-light jobs and you want to share GPUs with them, rerun with ALLOW_EXISTING_TRANSPORT_JOBS=1." >&2
     exit 2
   fi
 fi
@@ -193,7 +194,7 @@ run_one() {
       validation.patience_checks=1000 validation.require_anchor_improvement=false
       "evaluation.training_mask_bank_path=results/mask_banks/training/recovery_suite/smoke_${RUN_ID}_${name}.json"
       evaluation.n_validation_masks=1 evaluation.n_test_masks=1 evaluation.n_samples=1
-      "evaluation.mask_bank_dir=results/mask_banks/recovery_suite/smoke_round4_${RUN_ID}_${name}"
+      "evaluation.mask_bank_dir=results/mask_banks/recovery_suite/smoke_niche_${RUN_ID}_${name}"
     )
     echo "GPU $gpu -> $name (smoke)"
     CUDA_VISIBLE_DEVICES="$gpu" "${command[@]}" >"$LOG_ROOT/smoke_${name}.log" 2>&1
@@ -229,19 +230,9 @@ smoke_queue() {
 }
 
 if [[ "$SKIP_SMOKE" != "1" ]]; then
-  # Unlike run_transport_extra_diagnostics_4gpu.sh's paired queues (where
-  # only the first job in each queue needed smoke-testing before a
-  # dependent sibling could run), every one of these 20 configs has a
-  # meaningfully different flag combination (gene_encoder_type,
-  # use_retrieval_candidate, retrieval_k, use_niche_candidate,
-  # conditioning_mode, ...) and NONE of them depend on each other --
-  # smoke-test all 20, not just 4, so a config-specific bug (a bad flag
-  # combo only present in job 2-5 of a queue) surfaces in seconds, not
-  # after it's already queued behind several hours of earlier jobs on the
-  # same GPU.
-  echo "===== One-step fail-closed smoke test (all 20 configs, 5 sequential per GPU) ====="
+  echo "===== One-step fail-closed smoke test (all 9 configs, 3 sequential per GPU) ====="
   smoke_pids=()
-  for idx in 0 1 2 3; do
+  for idx in 0 1 2; do
     smoke_queue "${QUEUES[$idx]}" "${GPUS[$idx]}" &
     smoke_pids+=("$!")
   done
@@ -251,16 +242,16 @@ if [[ "$SKIP_SMOKE" != "1" ]]; then
     echo "ERROR: smoke test failed; inspect $LOG_ROOT/smoke_*.log" >&2
     exit 1
   fi
-  echo "Smoke tests passed (all 20 configs)."
+  echo "Smoke tests passed (all 9 configs)."
 fi
 if [[ "$SMOKE_ONLY" == "1" ]]; then
   echo "Smoke tests passed; full runs were not started."
   exit 0
 fi
 
-echo "===== Four parallel queues (5 jobs each, 20 total, no inter-config dependencies) ====="
+echo "===== Three parallel queues (3 jobs each, 9 total, no inter-config dependencies) ====="
 queue_pids=()
-for idx in 0 1 2 3; do
+for idx in 0 1 2; do
   run_queue "${QUEUES[$idx]}" "${GPUS[$idx]}" &
   queue_pids+=("$!")
 done
@@ -271,5 +262,5 @@ if (( queue_failed )); then
   echo "WARNING: at least one job failed; inspect $LOG_ROOT/*.log" >&2
 fi
 "$PYTHON_BIN" scripts/summarize_transport_round4.py --output "$REPORT_ROOT/summary.csv" || true
-echo "Round-4 run finished (RUN_ID=$RUN_ID). Report: $REPORT_ROOT/summary.csv"
+echo "Niche-candidate run finished (RUN_ID=$RUN_ID). Report: $REPORT_ROOT/summary.csv"
 echo "Logs: $LOG_ROOT"

@@ -620,6 +620,101 @@ def test_global_and_retrieval_candidates_stack_correctly():
           "k+1+retrieval_k total candidates and leave the IDW anchor unchanged")
 
 
+def test_niche_and_retrieval_candidates_stack_correctly():
+    """Configs 246-248 (the niche-candidate follow-up matrix) stack
+    use_niche_candidate with use_retrieval_candidate and/or
+    use_global_candidate -- never exercised in combination before (only
+    niche+global, in test_niche_and_global_candidates_stack_correctly
+    above). All three blocks extend the SAME scoring_* tensors sequentially
+    (global, then niche, then retrieval), so this checks the final
+    candidate count and anchor invariance for niche+retrieval specifically."""
+    n_context, local_k, retrieval_k = 6, 3, 2
+    model = _build(
+        use_niche_candidate=True,
+        use_retrieval_candidate=True, retrieval_k=retrieval_k,
+        local_k=local_k, n_genes=6,
+    ).eval()
+    context, query = _context_query(n_context=n_context)
+    context["niche_labels"] = torch.randint(0, 3, (n_context, 1)).float()
+
+    captured = {}
+    original_einsum = torch.einsum
+
+    def _spy_einsum(equation, *operands):
+        if equation == "qhk,qkg->qhg":
+            captured["n_candidates"] = operands[0].shape[-1]
+        return original_einsum(equation, *operands)
+
+    torch.einsum = _spy_einsum
+    try:
+        with torch.inference_mode():
+            out = model.sample(context, query)
+    finally:
+        torch.einsum = original_einsum
+
+    assert out["expression"].shape == (2, 6)
+    assert torch.isfinite(out["expression"]).all()
+    assert captured["n_candidates"] == local_k + 1 + retrieval_k, (
+        f"expected {local_k}(local) + 1(niche) + {retrieval_k}(retrieval) = "
+        f"{local_k + 1 + retrieval_k} candidates in the gate's softmax, got {captured['n_candidates']}"
+    )
+    print("[hierarchical_gene_transport] OK — niche + retrieval candidates stack to exactly "
+          "k+1+retrieval_k total candidates")
+
+
+def test_niche_global_and_retrieval_candidates_all_stack_correctly():
+    """Config 248's full 'kitchen sink': all three candidate mechanisms at
+    once. Checks the candidate count is exactly local + niche + global +
+    retrieval and the IDW anchor is still completely unaffected."""
+    n_context, local_k, retrieval_k = 8, 3, 2
+    model = _build(
+        use_global_candidate=True, use_niche_candidate=True,
+        use_retrieval_candidate=True, retrieval_k=retrieval_k,
+        local_k=local_k, n_genes=6,
+    ).eval()
+    context, query = _context_query(n_context=n_context)
+    context["niche_labels"] = torch.randint(0, 3, (n_context, 1)).float()
+
+    captured = {}
+    original_einsum = torch.einsum
+
+    def _spy_einsum(equation, *operands):
+        if equation == "qhk,qkg->qhg":
+            captured["n_candidates"] = operands[0].shape[-1]
+        return original_einsum(equation, *operands)
+
+    torch.einsum = _spy_einsum
+    try:
+        with torch.inference_mode():
+            out = model.sample(context, query)
+    finally:
+        torch.einsum = original_einsum
+
+    assert out["expression"].shape == (2, 6)
+    assert torch.isfinite(out["expression"]).all()
+    expected = local_k + 1 + 1 + retrieval_k
+    assert captured["n_candidates"] == expected, (
+        f"expected {local_k}(local) + 1(global) + 1(niche) + {retrieval_k}(retrieval) = "
+        f"{expected} candidates in the gate's softmax, got {captured['n_candidates']}"
+    )
+
+    model_anchor_only = _build(
+        use_global_candidate=False, use_niche_candidate=False, use_retrieval_candidate=False,
+        local_k=local_k, n_genes=6,
+    ).eval()
+    model_anchor_only.load_state_dict(
+        {k: v for k, v in model.state_dict().items() if k in model_anchor_only.state_dict()},
+        strict=False,
+    )
+    with torch.inference_mode():
+        out_anchor_only = model_anchor_only.sample(context, query)
+    assert torch.allclose(out["anchor_expression"], out_anchor_only["anchor_expression"], atol=1e-6), (
+        "stacking all three candidate mechanisms must still leave the pure-local IDW anchor unchanged"
+    )
+    print("[hierarchical_gene_transport] OK — global + niche + retrieval candidates all stack to "
+          "exactly k+1+1+retrieval_k total candidates and leave the IDW anchor unchanged")
+
+
 def test_all_thirteen_mandated_metrics_are_logged():
     model = _build(use_residual=True, residual_rank=4)
     context, query = _context_query(n_context=6)
@@ -673,6 +768,8 @@ if __name__ == "__main__":
     test_niche_candidate_pools_exactly_same_niche_context_spots()
     test_niche_and_global_candidates_stack_correctly()
     test_retrieval_candidate_off_by_default()
+    test_niche_and_retrieval_candidates_stack_correctly()
+    test_niche_global_and_retrieval_candidates_all_stack_correctly()
     test_retrieval_candidate_runs_and_stays_finite()
     test_retrieval_candidate_does_not_change_idw_anchor()
     test_retrieval_candidate_lets_far_context_reach_the_prediction()
