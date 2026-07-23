@@ -1590,6 +1590,35 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
     The k local candidates, the IDW anchor, and the global candidate (if
     also enabled) are entirely unaffected; this only adds more options to
     the *learned* candidate's own softmax competition.
+
+    ``use_niche_candidate`` (2026-07-23 round-5 follow-up) adds one further
+    candidate: the mean of every OBSERVED context spot that shares the
+    query's own spatial-domain ("niche") assignment, rather than the flat
+    whole-slide mean ``use_global_candidate`` uses. Motivation: a hole
+    straddling a domain boundary (e.g. a tumor invasive front) can have a
+    whole-slide mean that is just as unrepresentative as its k nearest
+    neighbors, since it averages over every domain in the section, not just
+    the one the hole actually sits in. Niche labels are NOT computed inside
+    this model -- they must arrive pre-computed on ``context["niche_labels"]``
+    (an ``[Nc, 1]`` integer-valued tensor, one label per visible context
+    spot), produced upstream by ``src/data/niche_features.py``'s context-only
+    BANKSY-style clustering (mirrors ``ContextOnlyNovaeProvider``'s leak-safety
+    discipline: the labels must be recomputed fresh on each training draw's
+    observed context subgraph only, never on the full slide, since the
+    clustering itself is a neighbor-averaging operation that would otherwise
+    leak hidden query expression through the graph -- see
+    ``src/data/context_features.py``'s module docstring for the general
+    argument). The QUERY's own niche is never computed from the query's own
+    (hidden) expression -- it is read off the single physically-nearest
+    context neighbor's label (``neighbor_indices[:, 0]``, already the
+    nearest by construction since ``forward_with_neighbors`` sorts by
+    distance), which only uses real spatial position, never hidden content.
+    Candidates with no niche-mate other than that nearest neighbor itself
+    still get a valid (single-member) mean. Like the global candidate, this
+    gets a sentinel relative-geometry entry (distance = 2x local scale,
+    distinct from the global candidate's 3x so the two remain distinguishable
+    if a config ever stacks both) rather than a fabricated position, since a
+    niche mean is not any single real spot.
     """
 
     def __init__(
@@ -1621,6 +1650,7 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
         conditioning_mode: str = "hierarchical",
         gene_gate_mode: str = "per_gene",
         use_global_candidate: bool = False,
+        use_niche_candidate: bool = False,
         use_retrieval_candidate: bool = False,
         retrieval_k: int = 8,
         retrieval_dim: int = 64,
@@ -1689,6 +1719,7 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
         self.conditioning_mode = str(conditioning_mode)
         self.gene_gate_mode = str(gene_gate_mode)
         self.use_global_candidate = bool(use_global_candidate)
+        self.use_niche_candidate = bool(use_niche_candidate)
         self.use_retrieval_candidate = bool(use_retrieval_candidate)
         self.retrieval_k = int(retrieval_k)
         self.retrieval_temperature = float(retrieval_temperature)
@@ -1837,6 +1868,45 @@ class HierarchicalGeneTransportRegressor(BaseGenerativeModel):
             )
             scoring_neighbour_expression = torch.cat(
                 [neighbour_expression, global_expression[None, None, :].expand(n_query, 1, -1)], dim=1
+            )
+
+        if self.use_niche_candidate:
+            if "niche_labels" not in context:
+                raise ValueError(
+                    "use_niche_candidate=True requires context['niche_labels'] "
+                    "([Nc, 1], produced by src/data/niche_features.py's "
+                    "context-only clustering) -- see this class's own "
+                    "docstring for why niche labels cannot be computed inside "
+                    "the model itself."
+                )
+            niche_labels = context["niche_labels"].reshape(-1)  # [Nc]
+            if niche_labels.shape[0] != context["expression"].shape[0]:
+                raise ValueError(
+                    "context['niche_labels'] must have exactly one row per "
+                    f"context spot ({context['expression'].shape[0]}), got "
+                    f"{niche_labels.shape[0]}"
+                )
+            # The query's own niche is read off its single nearest CONTEXT
+            # neighbor (real spatial position only) -- never from the
+            # query's own hidden expression, which would leak the answer
+            # into the lookup used to help predict it.
+            query_niche = niche_labels[neighbor_indices[:, 0]]  # [Nq]
+            # Dense [Nq, Nc] membership matrix -- Nc is at most a few
+            # thousand context spots per slide, so this stays one cheap
+            # batched matmul rather than a python loop over niches.
+            membership = (niche_labels[None, :] == query_niche[:, None]).to(neighbor_hidden.dtype)
+            member_count = membership.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            niche_hidden = (membership @ encoded["context_hidden"]) / member_count  # [Nq, H]
+            niche_expression = (membership @ context["expression"]) / member_count  # [Nq, G]
+
+            niche_relative = relative_geometry.new_zeros(n_query, 1, 3)
+            niche_relative[..., 2] = 2.0  # distinct sentinel from the global candidate's 3.0
+            scoring_relative_geometry = torch.cat([scoring_relative_geometry, niche_relative], dim=1)
+            scoring_neighbor_hidden = torch.cat(
+                [scoring_neighbor_hidden, niche_hidden[:, None, :]], dim=1
+            )
+            scoring_neighbour_expression = torch.cat(
+                [scoring_neighbour_expression, niche_expression[:, None, :]], dim=1
             )
 
         if self.use_retrieval_candidate:

@@ -336,6 +336,142 @@ def test_global_candidate_lets_far_context_reach_the_prediction():
           "the prediction that pure local kNN structurally cannot see")
 
 
+def test_niche_candidate_off_by_default():
+    model = _build()
+    assert model.use_niche_candidate is False
+    print("[hierarchical_gene_transport] OK — use_niche_candidate defaults to False")
+
+
+def test_niche_candidate_requires_niche_labels():
+    model = _build(use_niche_candidate=True, local_k=3).eval()
+    context, query = _context_query(n_context=6)
+    try:
+        with torch.inference_mode():
+            model.sample(context, query)
+        raise AssertionError("expected a ValueError for missing context['niche_labels']")
+    except ValueError as exc:
+        assert "niche_labels" in str(exc)
+    print("[hierarchical_gene_transport] OK — use_niche_candidate=True fails closed "
+          "without context['niche_labels']")
+
+
+def test_niche_candidate_requires_matching_niche_label_count():
+    model = _build(use_niche_candidate=True, local_k=3).eval()
+    context, query = _context_query(n_context=6)
+    context["niche_labels"] = torch.zeros(4, 1)  # wrong count, should be 6
+    try:
+        with torch.inference_mode():
+            model.sample(context, query)
+        raise AssertionError("expected a ValueError for mismatched niche_labels row count")
+    except ValueError as exc:
+        assert "one row per context spot" in str(exc)
+    print("[hierarchical_gene_transport] OK — use_niche_candidate=True fails closed "
+          "on a mismatched context['niche_labels'] row count")
+
+
+def test_niche_candidate_runs_and_stays_finite():
+    model = _build(use_niche_candidate=True, local_k=3).eval()
+    context, query = _context_query(n_context=6)
+    context["niche_labels"] = torch.randint(0, 3, (6, 1)).float()
+    with torch.inference_mode():
+        out = model.sample(context, query)
+    assert out["expression"].shape == (2, 6)
+    assert torch.isfinite(out["expression"]).all()
+    print("[hierarchical_gene_transport] OK — use_niche_candidate=True runs and stays finite")
+
+
+def test_niche_candidate_does_not_change_idw_anchor():
+    torch.manual_seed(0)
+    model_off = _build(use_niche_candidate=False, local_k=3).eval()
+    torch.manual_seed(0)
+    model_on = _build(use_niche_candidate=True, local_k=3).eval()
+    context, query = _context_query(n_context=6)
+    context_with_niche = dict(context)
+    context_with_niche["niche_labels"] = torch.randint(0, 3, (6, 1)).float()
+    with torch.inference_mode():
+        out_off = model_off.sample(context, query)
+        out_on = model_on.sample(context_with_niche, query)
+    assert torch.allclose(out_off["anchor_expression"], out_on["anchor_expression"], atol=1e-6)
+    print("[hierarchical_gene_transport] OK — niche candidate leaves the IDW anchor exactly unchanged")
+
+
+def test_niche_candidate_pools_exactly_same_niche_context_spots():
+    """The niche candidate must be the mean of exactly the context spots
+    sharing the query's own niche (read off its nearest context neighbor's
+    label), never spots from a different niche and never the whole slide --
+    the thing that actually distinguishes it from use_global_candidate."""
+    model = _build(use_niche_candidate=True, local_k=4, n_genes=2).eval()
+    context = {
+        "coords": torch.tensor([
+            [0.0, 0.0, 0.0], [0.1, 0.0, 0.0],   # niche 0
+            [5.0, 5.0, 0.0], [5.1, 5.0, 0.0],   # niche 1
+        ]),
+        "expression": torch.tensor([
+            [1.0, 0.0], [3.0, 0.0],
+            [100.0, 0.0], [300.0, 0.0],
+        ]),
+        "niche_labels": torch.tensor([[0], [0], [1], [1]], dtype=torch.float32),
+    }
+    query = {"coords": torch.tensor([[0.0, 0.0, 0.0]])}  # nearest context spot = 0, niche 0
+
+    captured = {}
+    original_einsum = torch.einsum
+
+    def _spy_einsum(equation, *operands):
+        if equation == "qhk,qkg->qhg":
+            captured["scoring_neighbour_expression"] = operands[1]
+        return original_einsum(equation, *operands)
+
+    torch.einsum = _spy_einsum
+    try:
+        with torch.inference_mode():
+            model.sample(context, query)
+    finally:
+        torch.einsum = original_einsum
+
+    niche_candidate_expression = captured["scoring_neighbour_expression"][0, -1]
+    expected = torch.tensor([2.0, 0.0])  # mean of the two real niche-0 spots
+    assert torch.allclose(niche_candidate_expression, expected, atol=1e-5), (
+        f"expected the niche candidate to be exactly {expected.tolist()} (mean of the "
+        f"query's own niche's real context spots), got {niche_candidate_expression.tolist()}"
+    )
+    print("[hierarchical_gene_transport] OK — niche candidate pools exactly the context "
+          "spots sharing the query's own (nearest-context-neighbor-derived) niche label")
+
+
+def test_niche_and_global_candidates_stack_correctly():
+    n_context, local_k = 6, 3
+    model = _build(
+        use_global_candidate=True, use_niche_candidate=True,
+        local_k=local_k, n_genes=6,
+    ).eval()
+    context, query = _context_query(n_context=n_context)
+    context["niche_labels"] = torch.randint(0, 3, (n_context, 1)).float()
+
+    captured = {}
+    original_einsum = torch.einsum
+
+    def _spy_einsum(equation, *operands):
+        if equation == "qhk,qkg->qhg":
+            captured["n_candidates"] = operands[0].shape[-1]
+        return original_einsum(equation, *operands)
+
+    torch.einsum = _spy_einsum
+    try:
+        with torch.inference_mode():
+            out = model.sample(context, query)
+    finally:
+        torch.einsum = original_einsum
+
+    assert out["expression"].shape == (2, 6)
+    assert torch.isfinite(out["expression"]).all()
+    assert captured["n_candidates"] == local_k + 1 + 1, (
+        "expected local_k neighbors + 1 global + 1 niche candidate slots"
+    )
+    print("[hierarchical_gene_transport] OK — niche + global candidates stack to exactly "
+          "k+1+1 total candidates")
+
+
 def test_retrieval_candidate_off_by_default():
     model = _build()
     assert model.use_retrieval_candidate is False
@@ -529,6 +665,13 @@ if __name__ == "__main__":
     test_global_candidate_runs_and_stays_finite()
     test_global_candidate_does_not_change_idw_anchor()
     test_global_candidate_lets_far_context_reach_the_prediction()
+    test_niche_candidate_off_by_default()
+    test_niche_candidate_requires_niche_labels()
+    test_niche_candidate_requires_matching_niche_label_count()
+    test_niche_candidate_runs_and_stays_finite()
+    test_niche_candidate_does_not_change_idw_anchor()
+    test_niche_candidate_pools_exactly_same_niche_context_spots()
+    test_niche_and_global_candidates_stack_correctly()
     test_retrieval_candidate_off_by_default()
     test_retrieval_candidate_runs_and_stays_finite()
     test_retrieval_candidate_does_not_change_idw_anchor()

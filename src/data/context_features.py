@@ -148,6 +148,17 @@ class ContextOnlyNovaeProvider:
         return features
 
 
+# The engine above (mask digest, data/feature-function signature, disk
+# caching keyed to both) has no Novae-specific behavior -- it is a generic
+# "compute this feature function on the observed context subgraph only"
+# mechanism. Reused directly (not subclassed) for the niche candidate's
+# BANKSY-style clustering in src/data/niche_features.py, which needs the
+# exact same context-only-recomputation discipline for the exact same
+# reason (its neighbor-averaging step would otherwise leak hidden query
+# expression through the graph).
+ContextOnlyFeatureProvider = ContextOnlyNovaeProvider
+
+
 def model_uses_novae(model_params: dict) -> bool:
     """Return whether a model configuration requests any Novae-derived input."""
     # HierarchicalMissingTissueRegressor keeps raw GEX and adds Novae as a
