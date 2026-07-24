@@ -309,12 +309,20 @@ class SimpleFusionSpatialTransformerContextEncoder(nn.Module):
     token (all zeros here -- single sample, no cross-sample batching,
     same convention STPathContextEncoder already uses).
 
-    NOT verified by actually running it (the `stpath` package isn't
-    installed in every environment this repo runs in, including the one
-    this class was written in) -- unlike every other class in this file,
-    this one has only been checked for import-time/construction-time
-    correctness, not a real forward+backward pass. Smoke-test this
-    config for real before trusting its numbers."""
+    First real run (2026-07-24, `stpath` package installed on the actual
+    training server) surfaced a real bug the mocked-backbone test could
+    never have caught: coordinates were fed to the backbone raw
+    (pixel-scale, thousands), never rescaled the way STPathContextEncoder's
+    real pipeline always does before calling this exact same backbone
+    class. SpatialTransformer's frame-averaging attention bias assumes
+    roughly unit-scale coordinates -- unrescaled, it saturates, every
+    query loses real positional differentiation, and every query
+    collapses to an identical output (PCC exactly 0.0 in both image
+    modes -- the actual symptom that caught this). Fixed by mirroring
+    STPathContextEncoder.forward's exact real coordinate handling
+    (per-axis min-subtract, then STPath's own real rescale_coords)
+    instead of skipping it. See forward()'s own inline comment for the
+    full mechanism."""
 
     def __init__(self, n_genes: int, hidden_dim: int = 128, n_layers: int = 2,
                  n_heads: int = 4, dropout: float = 0.1, attn_dropout: float = 0.1,
@@ -327,6 +335,7 @@ class SimpleFusionSpatialTransformerContextEncoder(nn.Module):
         try:
             from stpath.model.encoder.spatial_transformer import SpatialTransformer
             from stpath.model.nn_utils.config import ModelConfig
+            from stpath.data.dataset import rescale_coords
         except ImportError as exc:
             raise ImportError(
                 "SimpleFusionSpatialTransformerContextEncoder requires the external "
@@ -338,6 +347,7 @@ class SimpleFusionSpatialTransformerContextEncoder(nn.Module):
 
         self.hidden_dim = int(hidden_dim)
         self.input_already_log1p = bool(input_already_log1p)
+        self._rescale_coords = rescale_coords
         self.image_encoder = GigapathPatchEncoder(feat_dim=hidden_dim)
         self.gene_encoder = _build_gene_encoder(gene_encoder_type, n_genes, hidden_dim, gene_names, gene_voc_path)
         self.mask_token = nn.Parameter(torch.zeros(hidden_dim))
@@ -380,7 +390,26 @@ class SimpleFusionSpatialTransformerContextEncoder(nn.Module):
         query_tokens = query_img + self.mask_token[None, :].expand(n_query, self.hidden_dim).to(device)
 
         tokens = torch.cat([context_tokens, query_tokens], dim=0)  # [n_total, hidden_dim]
+        # Real bug found 2026-07-24 (first real run of this class, against
+        # the real stpath package -- the mocked-backbone test could never
+        # have caught this): raw HEST-1k coordinates are pixel-scale
+        # (thousands), and SpatialTransformer's real frame-averaging
+        # attention bias assumes roughly unit-scale coordinates -- same
+        # class of bug this project already hit with RandomFourierFeatures.
+        # Unrescaled, the positional bias saturates/garbages, every query
+        # token loses real positional differentiation, and (with no other
+        # per-query signal under target_zero, where every query gets the
+        # same mask_token for both image and gene) every query collapses
+        # to an identical output -- exactly the "PCC exactly 0.0" symptom
+        # this fix addresses. Mirrors STPathContextEncoder.forward's own
+        # real pipeline exactly (stpath_encoder.py) rather than
+        # approximating it: per-axis min-subtract, then STPath's own real
+        # rescale_coords (min-max normalize to [0, 100]).
         coords = torch.cat([context_coords[:, :2], query_coords[:, :2]], dim=0)  # [n_total, 2]
+        coords = coords.clone()
+        coords[:, 0] -= coords[:, 0].min()
+        coords[:, 1] -= coords[:, 1].min()
+        coords = self._rescale_coords(coords)
         batch_idx = torch.zeros(n_total, dtype=torch.long, device=device)
 
         fused = self.backbone(tokens, coords, batch_idx)  # [n_total, hidden_dim]
