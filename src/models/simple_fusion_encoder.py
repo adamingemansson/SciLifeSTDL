@@ -35,6 +35,37 @@ import torch.nn as nn
 from src.models.conditioning import GigapathPatchEncoder, MLPGeneEncoder, _knn_indices
 
 
+def _build_universal_vocab_mapping(gene_names: list[str], gene_voc_path: str, caller: str):
+    """Shared by UniversalMLPGeneEncoder and UniversalLinearGeneEncoder.
+    Mirrors STPath's real GeneExpTokenizer vocabulary construction exactly
+    (stpath/tokenization/ge_tokenizer.py, verified 2026-07-24): symbol ->
+    symbol2gene[symbol] (an Ensembl-style ID) -> gene2id[that ID], where
+    gene2id enumerates the SORTED SET of unique values in symbol2gene.json,
+    offset by 2 (STPath reserves 0/1 for pad/mask -- kept here too so the
+    vocabulary SIZE and every gene's ID are identical to STPath's real
+    ones, not just the same ordering rule applied fresh). Genes in the
+    local panel not in STPath's vocabulary are silently dropped (same as
+    STPath's own real out-of-vocabulary handling)."""
+    with open(gene_voc_path) as f:
+        symbol2gene = json.load(f)
+    unique_gene_ids = sorted(set(symbol2gene.values()))
+    gene2id = {gene_id: i + 2 for i, gene_id in enumerate(unique_gene_ids)}
+    n_vocab_tokens = max(gene2id.values()) + 1
+
+    local_idx, vocab_idx = [], []
+    for i, symbol in enumerate(gene_names):
+        mapped = symbol2gene.get(symbol)
+        if mapped is not None and mapped in gene2id:
+            local_idx.append(i)
+            vocab_idx.append(gene2id[mapped])
+    if not local_idx:
+        raise ValueError(f"{caller}: none of the supplied gene_names are in the vocabulary at {gene_voc_path}")
+    n_mapped, n_total = len(local_idx), len(gene_names)
+    print(f"{caller}: {n_mapped}/{n_total} local genes ({n_mapped / n_total:.0%}) "
+          f"mapped into STPath's real {n_vocab_tokens}-token gene-identity vocabulary.")
+    return n_vocab_tokens, local_idx, vocab_idx
+
+
 class UniversalMLPGeneEncoder(nn.Module):
     """MLPGeneEncoder (ours: 2-layer, LayerNorm+GELU, real nonlinear
     depth), but scattered into STPath's own real fixed gene-ID vocabulary
@@ -46,47 +77,15 @@ class UniversalMLPGeneEncoder(nn.Module):
     cross-dataset-stable gene identity space help, holding encoder depth
     and nonlinearity roughly fixed (both are 2-layer MLPs; STPath's own
     real gene_embed is actually a single bias-free Linear with less depth
-    than either of these, see registry.py's stpath_backbone_simple_gene
-    docstring / this session's read of stpath/model/model.py).
-
-    Vocabulary construction mirrors STPath's real GeneExpTokenizer
-    exactly (stpath/tokenization/ge_tokenizer.py, verified 2026-07-24):
-    symbol -> symbol2gene[symbol] (an Ensembl-style ID) -> gene2id[that
-    ID], where gene2id enumerates the SORTED SET of unique values in
-    symbol2gene.json, offset by 2 (STPath reserves 0/1 for pad/mask,
-    kept here too even though this class doesn't use those tokens itself
-    -- keeps the vocabulary SIZE and every gene's ID identical to
-    STPath's real ones, not just the same ordering rule applied fresh).
-    Genes in this dataset's local panel that aren't in STPath's
-    vocabulary are silently dropped from the scatter (same as STPath's
-    own real out-of-vocabulary handling) -- their local expression value
-    is simply never scattered anywhere, contributing nothing."""
+    than either of these -- see UniversalLinearGeneEncoder below for the
+    exact-match version of that)."""
 
     def __init__(self, gene_names: list[str], gene_voc_path: str, feat_dim: int = 128,
                  hidden_dim: int = 512, bottleneck_dim: int = 256):
         super().__init__()
-        with open(gene_voc_path) as f:
-            symbol2gene = json.load(f)
-        unique_gene_ids = sorted(set(symbol2gene.values()))
-        gene2id = {gene_id: i + 2 for i, gene_id in enumerate(unique_gene_ids)}
-        n_vocab_tokens = max(gene2id.values()) + 1
-
-        local_idx, vocab_idx = [], []
-        for i, symbol in enumerate(gene_names):
-            mapped = symbol2gene.get(symbol)
-            if mapped is not None and mapped in gene2id:
-                local_idx.append(i)
-                vocab_idx.append(gene2id[mapped])
-        if not local_idx:
-            raise ValueError(
-                "UniversalMLPGeneEncoder: none of the supplied gene_names are in "
-                f"the vocabulary at {gene_voc_path}"
-            )
-        n_mapped, n_total = len(local_idx), len(gene_names)
-        print(f"UniversalMLPGeneEncoder: {n_mapped}/{n_total} local genes "
-              f"({n_mapped / n_total:.0%}) mapped into STPath's real "
-              f"{n_vocab_tokens}-token gene-identity vocabulary.")
-
+        n_vocab_tokens, local_idx, vocab_idx = _build_universal_vocab_mapping(
+            gene_names, gene_voc_path, "UniversalMLPGeneEncoder"
+        )
         self.n_vocab_tokens = n_vocab_tokens
         self.register_buffer("local_idx", torch.as_tensor(local_idx, dtype=torch.long))
         self.register_buffer("vocab_idx", torch.as_tensor(vocab_idx, dtype=torch.long))
@@ -102,22 +101,61 @@ class UniversalMLPGeneEncoder(nn.Module):
         return self.mlp_encoder(scattered)
 
 
+class UniversalLinearGeneEncoder(nn.Module):
+    """The exact same universal gene-ID vocabulary scatter as
+    UniversalMLPGeneEncoder, but encoded with a single bias-free Linear
+    layer instead of our 2-layer MLP -- a literal copy of STPath's own
+    real gene_embed mechanism (`nn.Linear(n_genes, d_model, bias=False)`,
+    verified directly against stpath/model/model.py), reused on top of
+    our own architectures (2026-07-24 request: "an exact copy of the gene
+    encoder stpath uses"). Isolates the last remaining variable between
+    our gene encoding and STPath's real one: with the SAME vocabulary
+    (UniversalMLPGeneEncoder already covers that) and now the SAME
+    encoder shape too, any remaining difference against 301/305's real
+    STPath numbers has to come from elsewhere (the backbone/decoder/
+    organ-tech, each already isolated by the other configs this round)."""
+
+    def __init__(self, gene_names: list[str], gene_voc_path: str, feat_dim: int = 128):
+        super().__init__()
+        n_vocab_tokens, local_idx, vocab_idx = _build_universal_vocab_mapping(
+            gene_names, gene_voc_path, "UniversalLinearGeneEncoder"
+        )
+        self.n_vocab_tokens = n_vocab_tokens
+        self.register_buffer("local_idx", torch.as_tensor(local_idx, dtype=torch.long))
+        self.register_buffer("vocab_idx", torch.as_tensor(vocab_idx, dtype=torch.long))
+        self.gene_embed = nn.Linear(n_vocab_tokens, feat_dim, bias=False)
+
+    def forward(self, expression: torch.Tensor) -> torch.Tensor:
+        n = expression.shape[0]
+        scattered = expression.new_zeros((n, self.n_vocab_tokens))
+        scattered[:, self.vocab_idx] = expression[:, self.local_idx]
+        return self.gene_embed(scattered)
+
+
 def _build_gene_encoder(gene_encoder_type: str, n_genes: int, feat_dim: int,
                          gene_names: list[str] | None, gene_voc_path: str | None) -> nn.Module:
     """Shared dispatch so SimpleCrossAttentionContextEncoder and
     SimpleFusionSpatialTransformerContextEncoder (2026-07-24) offer the
-    same 'local_mlp' (default, this dataset's own ad-hoc gene panel) vs
-    'universal_mlp' (STPath's real fixed gene-ID vocabulary, our MLP)
-    choice without duplicating the same three-line check three times."""
+    same three gene-encoder choices without duplicating the same check
+    three times: 'local_mlp' (default, this dataset's own ad-hoc gene
+    panel, our 2-layer MLP), 'universal_mlp' (STPath's real fixed
+    gene-ID vocabulary, still our MLP), 'universal_linear' (STPath's real
+    vocabulary AND STPath's real single-Linear-no-bias encoder shape --
+    a literal copy of its gene_embed mechanism)."""
     if gene_encoder_type == "local_mlp":
         return MLPGeneEncoder(n_genes, feat_dim=feat_dim)
-    if gene_encoder_type == "universal_mlp":
+    if gene_encoder_type in ("universal_mlp", "universal_linear"):
         if not gene_names or not gene_voc_path:
             raise ValueError(
-                "gene_encoder_type='universal_mlp' requires both gene_names and gene_voc_path"
+                f"gene_encoder_type={gene_encoder_type!r} requires both gene_names and gene_voc_path"
             )
-        return UniversalMLPGeneEncoder(gene_names=gene_names, gene_voc_path=gene_voc_path, feat_dim=feat_dim)
-    raise ValueError(f"unknown gene_encoder_type {gene_encoder_type!r}, must be 'local_mlp' or 'universal_mlp'")
+        if gene_encoder_type == "universal_mlp":
+            return UniversalMLPGeneEncoder(gene_names=gene_names, gene_voc_path=gene_voc_path, feat_dim=feat_dim)
+        return UniversalLinearGeneEncoder(gene_names=gene_names, gene_voc_path=gene_voc_path, feat_dim=feat_dim)
+    raise ValueError(
+        f"unknown gene_encoder_type {gene_encoder_type!r}, must be 'local_mlp', "
+        "'universal_mlp', or 'universal_linear'"
+    )
 
 
 class SimpleFusionContextEncoder(nn.Module):

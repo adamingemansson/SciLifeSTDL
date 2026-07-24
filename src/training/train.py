@@ -2417,15 +2417,15 @@ def inject_stpath_gene_names(model_cfg: dict, adata) -> None:
 
 
 def inject_universal_gene_names(model_cfg: dict, adata) -> None:
-    """If a config sets gene_encoder_type: "universal_mlp"
-    (UniversalMLPGeneEncoder, 2026-07-24 -- scatters this dataset's local
-    gene panel into STPath's real fixed gene-ID vocabulary before our own
-    MLP encodes it), auto-derive gene_names from the loaded AnnData's
-    var_names, same reasoning as inject_stpath_gene_names above (a
-    vocabulary/mapping fixed at construction time from real data, not
-    hardcoded into a YAML file)."""
+    """If a config sets gene_encoder_type: "universal_mlp" or
+    "universal_linear" (UniversalMLPGeneEncoder / UniversalLinearGeneEncoder,
+    2026-07-24 -- scatter this dataset's local gene panel into STPath's
+    real fixed gene-ID vocabulary before encoding it), auto-derive
+    gene_names from the loaded AnnData's var_names, same reasoning as
+    inject_stpath_gene_names above (a vocabulary/mapping fixed at
+    construction time from real data, not hardcoded into a YAML file)."""
     params = model_cfg.get("params", {})
-    if params.get("gene_encoder_type") == "universal_mlp" and "gene_names" not in params:
+    if params.get("gene_encoder_type") in ("universal_mlp", "universal_linear") and "gene_names" not in params:
         params["gene_names"] = adata.var_names.tolist()
 
 
