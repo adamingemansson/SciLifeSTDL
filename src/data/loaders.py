@@ -151,7 +151,14 @@ def basic_qc_and_normalize(
     # since that subsetting would otherwise silently shrink the sum.
     raw_x = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()
     adata.obs["_scilifestdl_raw_library_size"] = np.asarray(raw_x.sum(axis=1)).ravel()
-    adata.layers["raw_counts"] = adata.X.copy()
+    # Store the DENSIFIED array (raw_x), not adata.X.copy() — adata.X is
+    # still a scipy sparse matrix at this point for real HEST-1k data, and
+    # a sparse layer breaks plain numpy indexing/float() coercion
+    # downstream (real bug hit 2026-07-24 on an actual training-machine
+    # run: "TypeError: float() argument must be a string or a real
+    # number, not 'csr_matrix'" inside evaluate_model_on_mask_bank's
+    # raw-log1p metric).
+    adata.layers["raw_counts"] = raw_x.copy()
     if transform in {"normalize", "normalize_log1p"}:
         sc.pp.normalize_total(adata, target_sum=target_sum)
     if transform == "normalize_log1p":
