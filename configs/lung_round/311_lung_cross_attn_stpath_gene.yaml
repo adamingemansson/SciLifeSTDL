@@ -3,7 +3,7 @@
 # gene_encoder_type: universal_linear -- see
 # 310_lung_spatial_transformer_stpath_gene.yaml's header for the full
 # 2x3 layout and what this isolates.
-experiment_name: transport_lung_cross_attn_stpath_gene_v1_10k
+experiment_name: transport_lung_cross_attn_stpath_gene_v1_10k_holefix
 data:
   source: hest1k
   hest_data_dir: data/raw/hest1k
@@ -34,7 +34,7 @@ masking:
   context_selection: nearest_query
   params:
     n_patches: 1
-    radius_range: [0.5, 1.0]
+    radius_range: [5.0, 8.0]
     radius_unit: spot_spacing
     shape: mixed
 model:
@@ -67,7 +67,7 @@ training:
   all_image_dropout_p: 0.0
   context_gex_dropout_p: 0.0
   gradient_clip_val: 1.0
-  checkpoint_dir: results/checkpoints/lung_round/transport_lung_cross_attn_stpath_gene_v1_10k
+  checkpoint_dir: results/checkpoints/lung_round/transport_lung_cross_attn_stpath_gene_v1_10k_holefix
 validation:
   enabled: true
   every_n_steps: 1000
@@ -79,7 +79,7 @@ validation:
   n_samples: 1
   sampling_seed: 871000
 evaluation:
-  mask_bank_dir: results/mask_banks/lung_round/transport_lung_v1_10k
+  mask_bank_dir: results/mask_banks/lung_round/transport_lung_v2_10k_holefix
   n_validation_masks: 8
   n_test_masks: 16
   validation_seed: 761000
@@ -94,7 +94,7 @@ evaluation:
   pca_n_components: 50
   fixed_gene_panel_paths: {lung_hest_bench_50: resources/evaluation/hest_bench/LUNG_var_50genes.json}
   train_variance_gene_panel_sizes: [50, 200]
-  training_mask_bank_path: results/mask_banks/training/lung_round/transport_lung_cross_attn_stpath_gene_v1_10k_256_seed871000.json
+  training_mask_bank_path: results/mask_banks/training/lung_round/transport_lung_cross_attn_stpath_gene_v1_10k_holefix_256_seed871000.json
 logging:
   backend: csv
   project: st3d-lundeberg-lab
