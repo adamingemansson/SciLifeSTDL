@@ -318,10 +318,18 @@ def save_trained_model(model, model_cfg: dict, gene_names: list, checkpoint_dir:
     NAME, not position — impossible without recording gene_names here.
     Discussed 2026-07-15 when planning cross-sample testing; this is the
     save half, load_trained_model below is the load half."""
+    # Real bug fixed 2026-07-24 (config 305 stpath_pretrained_eval, an
+    # entirely-frozen-weights config with zero trainable parameters by
+    # design): this used to return None here whenever
+    # save_trainable_state_dict found nothing to save, which ALSO skipped
+    # model_cfg.json/gene_names.json below -- throwing away the only
+    # record of the exact architecture/gene vocabulary needed to
+    # reconstruct even a fully deterministic, weights-free model later. A
+    # frozen model still needs those two files (there just won't be a
+    # trainable_weights.pt alongside them).
     weights_path = save_trainable_state_dict(model, checkpoint_dir)
-    if weights_path is None:
-        return None
-    out_dir = weights_path.parent
+    out_dir = Path(checkpoint_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     # same concurrent-DDP-writer reasoning as save_trainable_state_dict's
     # atomic torch.save above — plain-text JSON corrupts less
     # catastrophically than a torn zip (a parse error, not a segfault),
@@ -333,7 +341,7 @@ def save_trained_model(model, model_cfg: dict, gene_names: list, checkpoint_dir:
         with open(tmp_path, "w") as f:
             json.dump(payload, f)
         os.replace(tmp_path, final_path)
-    return weights_path
+    return weights_path if weights_path is not None else out_dir / "model_cfg.json"
 
 
 class PeriodicCheckpointCallback(pl.Callback):
@@ -549,14 +557,28 @@ def load_trained_model(checkpoint_dir: str):
     with open(in_dir / "gene_names.json") as f:
         gene_names = json.load(f)
     model = build_model(model_cfg)
-    state = torch.load(in_dir / "trainable_weights.pt", map_location="cpu")
     trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
-    missing_trainable = trainable_names - set(state.keys())
-    assert not missing_trainable, (
-        f"saved weights at {in_dir} are missing trainable parameters this "
-        f"model architecture expects: {missing_trainable} (model_cfg mismatch?)"
-    )
-    model.load_state_dict(state, strict=False)
+    weights_path = in_dir / "trainable_weights.pt"
+    if weights_path.is_file():
+        state = torch.load(weights_path, map_location="cpu")
+        missing_trainable = trainable_names - set(state.keys())
+        assert not missing_trainable, (
+            f"saved weights at {in_dir} are missing trainable parameters this "
+            f"model architecture expects: {missing_trainable} (model_cfg mismatch?)"
+        )
+        model.load_state_dict(state, strict=False)
+    else:
+        # save_trained_model only skips writing this file when the model
+        # genuinely had zero trainable parameters/non-frozen buffers (see
+        # its own 2026-07-24 docstring note) -- a freshly-built model IS
+        # that checkpoint exactly, nothing to load on top. If this
+        # architecture unexpectedly DOES have trainable params, that's a
+        # real save/load mismatch, not something to silently paper over.
+        assert not trainable_names, (
+            f"{weights_path} is missing but this model architecture has "
+            f"trainable parameters {trainable_names}; the checkpoint at "
+            f"{in_dir} looks incomplete, not weights-free by design"
+        )
     model.eval()
     return model, gene_names
 

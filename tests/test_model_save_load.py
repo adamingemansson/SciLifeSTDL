@@ -172,15 +172,23 @@ def test_gigapath_frozen_backbone_still_excluded():
 
 
 def test_interp_baseline_save_is_noop():
-    """Parameter-free models (interp_baseline) have nothing to save —
-    save_trained_model must return None cleanly, not crash or write an
-    empty/meaningless checkpoint."""
+    """Parameter-free models (interp_baseline) have no WEIGHTS to save, but
+    save_trained_model must still record model_cfg.json/gene_names.json —
+    real bug fixed 2026-07-24 (config 305 stpath_pretrained_eval, a
+    deliberately all-frozen-weights config): skipping those too made such
+    a checkpoint impossible to reconstruct later via load_trained_model,
+    even though the architecture is fully deterministic without any
+    weights file. Only trainable_weights.pt is genuinely skippable here."""
     model = build_model({"name": "interp_baseline", "params": {}})
     with tempfile.TemporaryDirectory() as tmp:
         result = save_trained_model(model, {"name": "interp_baseline", "params": {}}, [], tmp)
-        assert result is None
+        assert result is not None
         assert not (Path(tmp) / "trainable_weights.pt").exists()
-    print("[model_save_load] OK — parameter-free model save is a clean no-op")
+        assert (Path(tmp) / "model_cfg.json").exists()
+        assert (Path(tmp) / "gene_names.json").exists()
+        reloaded, gene_names = load_trained_model(tmp)
+        assert gene_names == []
+    print("[model_save_load] OK — parameter-free model still saves reloadable metadata")
 
 
 if __name__ == "__main__":
