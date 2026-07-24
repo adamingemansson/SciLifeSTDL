@@ -400,21 +400,31 @@ _GIGAPATH_FEAT_DIM = 1536
 
 
 def _gigapath_preprocess_and_encode(tile_encoder, patches: torch.Tensor) -> torch.Tensor:
-    """Prov-GigaPath's own documented preprocessing (resize 256 -> center
-    crop 224 -> ImageNet normalize, its GitHub README) + a forward pass
-    through the frozen tile encoder. patches: [B, 3, H, W] float in
-    [0, 1]. Shared by GigapathPatchEncoder, STPathContextEncoder, and
-    precompute_gigapath_features below so the preprocessing logic exists
-    in exactly one place."""
+    """STPath's REAL official GigaPath preprocessing (stpath/hest_utils/
+    encoder.py's load_encoder, verified 2026-07-24 by fetching that file
+    directly, not the generic GigaPath README): `transforms.Compose([
+    CenterCrop(224), ToTensor(), Normalize(imagenet_mean, imagenet_std)])`
+    -- NO resize step. This function previously did an extra bicubic
+    resize-to-256 before the center crop, which for HEST-1k's raw patches
+    (already exactly 224x224, src/data/loaders.py's own docstring) meant
+    every single patch went through an unnecessary upsample-then-crop
+    cycle: introduces interpolation blur and effectively zooms in ~12.5%
+    (crops away real border content) versus STPath's real CenterCrop(224)
+    on an already-224x224 patch, which is a pure no-op. Every image
+    feature computed by this project (GigapathPatchEncoder, STPathContext-
+    Encoder, precompute_gigapath_features) was affected, not just STPath
+    configs. Fixed by using torchvision's own center_crop, which exactly
+    replicates transforms.CenterCrop(224)'s crop-or-zero-pad semantics for
+    any input size, rather than hand-rolling a resize this project's own
+    STPath usage never actually calls.
+
+    patches: [B, 3, H, W] float in [0, 1]. Shared by GigapathPatchEncoder,
+    STPathContextEncoder, and precompute_gigapath_features below so the
+    preprocessing logic exists in exactly one place."""
+    import torchvision.transforms.functional as TF  # lazy, like timm above -- optional dependency
+
     device = patches.device
-    # bicubic interpolate isn't implemented on MPS (Apple Silicon) as of
-    # this writing - do this one op on CPU rather than switch to a mode
-    # MPS does support, to stay faithful to the documented preprocessing
-    x = nn.functional.interpolate(
-        patches.cpu(), size=256, mode="bicubic", align_corners=False
-    ).to(device)
-    top = (256 - 224) // 2
-    x = x[:, :, top:top + 224, top:top + 224]
+    x = TF.center_crop(patches, [224, 224])
     x = (x - _IMAGENET_MEAN.to(device)) / _IMAGENET_STD.to(device)
     with torch.no_grad():
         return tile_encoder(x)

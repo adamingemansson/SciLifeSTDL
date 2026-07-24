@@ -162,6 +162,7 @@ def random_dropout_patches(coords_xy: np.ndarray, slice_ids: np.ndarray,
                             aspect_ratio_range=(1.5, 3.0),
                             blob_strength_range=(0.2, 0.45),
                             blob_harmonics: int = 4,
+                            center_mode: str = "random",
                             ) -> tuple[np.ndarray, np.ndarray]:
     """Multiple random holes per call — for stress-testing / making a held-
     out evaluation set with varied difficulty.
@@ -182,9 +183,25 @@ def random_dropout_patches(coords_xy: np.ndarray, slice_ids: np.ndarray,
     opt-in ``spot_spacing`` mode expresses radii in median nearest-neighbour
     distances on the selected slice, making hole size comparable across
     slides with different pixel coordinate scales.
+
+    ``center_mode="random"`` (default, unchanged behavior) picks a uniformly
+    random spot on the selected slice as each patch's center. The opt-in
+    ``"geometric_median"`` mode (2026-07-24, added to reproduce a reference
+    STPath benchmark notebook's masking scheme for a direct comparison)
+    instead always centers the patch on the slice's own geometric-median
+    spot (nearest observed spot to the coordinate-wise median, same
+    selection rule as that notebook's `choose_central_window`) -- every
+    hole for a given slice lands in the same place, only n_patches'
+    per-patch radius/shape randomness still varies it. Deliberately NOT the
+    default: a hole that always sits in a slide's richest, most
+    representative region is easier to interpolate than one placed
+    uniformly at random (which can land near edges/sparse tissue), so
+    "random" stays the right choice for a task meant to reflect real,
+    arbitrarily-located tissue damage.
     """
     assert shape in ("circle", "ellipse", "irregular", "mixed"), f"unknown shape {shape!r}"
     assert radius_unit in ("coordinate", "spot_spacing"), f"unknown radius_unit {radius_unit!r}"
+    assert center_mode in ("random", "geometric_median"), f"unknown center_mode {center_mode!r}"
     rng = np.random.default_rng(seed)
     query_mask = np.zeros(len(coords_xy), dtype=bool)
     unique_slices = np.unique(slice_ids)
@@ -193,7 +210,12 @@ def random_dropout_patches(coords_xy: np.ndarray, slice_ids: np.ndarray,
         in_slice_idx = np.where(slice_ids == s)[0]
         if len(in_slice_idx) == 0:
             continue
-        center_idx = rng.choice(in_slice_idx)
+        if center_mode == "geometric_median":
+            slice_coords = coords_xy[in_slice_idx]
+            target = np.median(slice_coords, axis=0)
+            center_idx = in_slice_idx[int(np.argmin(np.linalg.norm(slice_coords - target, axis=1)))]
+        else:
+            center_idx = rng.choice(in_slice_idx)
         center = coords_xy[center_idx]
         radius = rng.uniform(*radius_range)
         if radius_unit == "spot_spacing":

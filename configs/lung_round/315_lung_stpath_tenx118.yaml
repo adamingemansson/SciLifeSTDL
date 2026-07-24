@@ -1,0 +1,78 @@
+# Lung round DIAGNOSTIC (2026-07-24): isolates SAMPLE-choice effect for
+# STPath itself. Same model/masking as
+# 305_lung_stpath_pretrained_eval.yaml (unchanged, uniformly-random
+# placement) but on TENX118 instead of MEND85 -- see 314's header for the
+# full rationale and the TENX118-availability caveat.
+experiment_name: transport_lung_stpath_tenx118_v1_holefix
+data:
+  source: hest1k
+  hest_data_dir: data/raw/hest1k
+  hest_cache_dir: data/cache/hest1k
+  sample_id: TENX118
+  task: intra_slice
+  task_contract: missing_tissue
+  modality_ablation: both
+  strict_broken_region: true
+  query_patch_size_fullres: 224.0
+  min_genes: 200
+  min_cells: 3
+  expression_transform: normalize_log1p
+  expression_target_sum: 10000.0
+  novae_mode: context_only
+  require_image_coverage: true
+  use_images: true
+masking:
+  strategy: random_dropout_patches
+  max_context_points: 3000
+  context_selection: nearest_query
+  params:
+    n_patches: 1
+    radius_range: [5.0, 8.0]
+    radius_unit: spot_spacing
+    shape: mixed
+model:
+  name: stpath_official
+  params:
+    stpath_gene_voc_path: ${oc.env:STPATH_GENE_VOC_PATH}
+    stpath_model_weight_path: ${oc.env:STPATH_MODEL_WEIGHT_PATH}
+    stpath_organ_type: Lung
+    stpath_tech_type: Visium
+    context_encoder_type: stpath
+training:
+  epochs: 1
+  seed: 10
+  mask_seed: 783000
+  unique_mask_count: 1
+  log_every_n_steps: 10
+  log_print_every_n_steps: 500
+  checkpoint_every_n_steps: 5000
+  num_workers: 0
+  augment_coords: false
+  image_mode: target_zero
+  context_gex_mode: full
+  query_image_dropout_p: 0.0
+  all_image_dropout_p: 0.0
+  context_gex_dropout_p: 0.0
+  gradient_clip_val: 1.0
+  checkpoint_dir: results/checkpoints/lung_round/transport_lung_stpath_tenx118_v1_holefix
+validation:
+  enabled: false
+evaluation:
+  mask_bank_path: results/mask_banks/lung_round/tenx118_v1_10k.json
+  n_validation_masks: 8
+  n_test_masks: 16
+  validation_seed: 761000
+  test_seed: 961000
+  sampling_seed: 1261000
+  n_samples: 1
+  primary_image_mode: target_zero
+  image_modes: [target_zero, all_zero, full]
+  validation_image_mode: target_zero
+  context_gex_mode: full
+  k_neighborhood: 8
+  pca_n_components: 50
+  fixed_gene_panel_paths: {lung_hest_bench_50: resources/evaluation/hest_bench/LUNG_var_50genes.json}
+  train_variance_gene_panel_sizes: [50, 200]
+logging:
+  backend: csv
+  project: st3d-lundeberg-lab

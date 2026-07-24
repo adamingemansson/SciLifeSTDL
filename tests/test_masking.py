@@ -164,6 +164,45 @@ def test_mixed_dropout_combines_both_mechanisms():
           f"patches+sparse: {mixed_query.sum()}")
 
 
+def test_center_mode_geometric_median_is_deterministic_and_central():
+    coords, slice_ids = _grid(n_side=41)  # odd side -> exact center point exists
+    expected_center_idx = int(
+        np.argmin(np.linalg.norm(coords - np.median(coords, axis=0), axis=1))
+    )
+
+    # Different seeds must still pick the SAME center under geometric_median
+    # (only radius/shape randomness should vary) -- the opposite of "random".
+    centers_seen = set()
+    for seed in (0, 1, 2, 100):
+        _, query = random_dropout_patches(
+            coords, slice_ids, n_patches=1, radius_range=(1, 1),
+            shape="circle", seed=seed, center_mode="geometric_median",
+        )
+        masked_idx = np.flatnonzero(query)
+        assert expected_center_idx in masked_idx, (
+            "geometric_median center_mode did not include the true geometric-median spot"
+        )
+        centers_seen.add(tuple(sorted(masked_idx.tolist())))
+    assert len(centers_seen) == 1, (
+        f"geometric_median center_mode should be seed-independent in WHERE it centers, got {centers_seen}"
+    )
+
+    # A real random-seed sweep under center_mode="random" must NOT always
+    # pick the same center (sanity check that the two modes actually differ).
+    random_centers = set()
+    for seed in (0, 1, 2, 100):
+        _, query = random_dropout_patches(
+            coords, slice_ids, n_patches=1, radius_range=(1, 1),
+            shape="circle", seed=seed, center_mode="random",
+        )
+        random_centers.add(tuple(sorted(np.flatnonzero(query).tolist())))
+    assert len(random_centers) > 1, (
+        "center_mode='random' unexpectedly produced the same hole across all seeds"
+    )
+    print("[center_mode='geometric_median'] OK — deterministic central placement, "
+          "distinct from 'random' across seeds")
+
+
 if __name__ == "__main__":
     test_elliptical_hole_reduces_to_circle()
     test_elliptical_hole_is_actually_elongated()
@@ -172,4 +211,5 @@ if __name__ == "__main__":
     test_sparse_spot_dropout()
     test_random_dropout_patches_shape_switch()
     test_mixed_dropout_combines_both_mechanisms()
+    test_center_mode_geometric_median_is_deterministic_and_central()
     print("\nAll mask-geometry smoke tests passed.")
