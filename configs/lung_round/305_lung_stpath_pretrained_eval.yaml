@@ -5,6 +5,18 @@
 # see that class's docstring) inside this repo's own eval harness instead
 # of a standalone Jupyter notebook, so it's directly comparable to the 3
 # trained conditions on the same Lung samples/masks/metrics.
+#
+# evaluation.image_modes includes "full" (query H&E genuinely observed)
+# as a DIAGNOSTIC-ONLY third entry, added after the first run scored a
+# surprisingly negative PCC (-0.20) versus the notebook's much stronger
+# in-context results (0.44-0.65 with observed image, still positive
+# 0.13-0.21 even at masked_zero) -- "full" is NOT a valid primary/
+# training mode for this task_contract (missing_tissue always withholds
+# query H&E by definition, enforced by train.py's own consistency check),
+# so primary_image_mode stays target_zero for the real cross-model
+# comparison. "full" here only tells us whether the zero-fill specifically
+# (vs. general out-of-distribution transfer to unfamiliar Lung tissue
+# never seen in STPath's own pretraining) is what's driving the gap.
 experiment_name: transport_lung_stpath_pretrained_eval_v1
 data:
   source: hest1k
@@ -75,7 +87,7 @@ evaluation:
   sampling_seed: 1261000
   n_samples: 1
   primary_image_mode: target_zero
-  image_modes: [target_zero, all_zero]
+  image_modes: [target_zero, all_zero, full]
   validation_image_mode: target_zero
   context_gex_mode: full
   k_neighborhood: 8
