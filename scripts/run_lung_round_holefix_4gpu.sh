@@ -113,7 +113,7 @@ for n in numbers:
         sys.exit(2)
     cfg = yaml.safe_load(matches[0].read_text())
     name = cfg["experiment_name"]
-    if not name.endswith("_holefix"):
+    if "_holefix" not in name:
         print(f"ERROR: {n}'s experiment_name {name!r} is missing the _holefix suffix", file=sys.stderr)
         sys.exit(2)
     if name in seen_names:

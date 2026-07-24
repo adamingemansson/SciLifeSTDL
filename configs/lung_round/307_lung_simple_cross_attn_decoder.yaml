@@ -10,7 +10,7 @@
 # backbone. No dedicated GPU slot in run_lung_round_4gpu.sh (added after
 # that launcher was written) -- run manually alongside 304/305 on
 # whichever GPU frees up first.
-experiment_name: transport_lung_simple_cross_attn_decoder_v1_10k_holefix
+experiment_name: transport_lung_simple_cross_attn_decoder_v1_10k_holefix_gigapathfix
 data:
   source: hest1k
   hest_data_dir: data/raw/hest1k
@@ -72,7 +72,7 @@ training:
   all_image_dropout_p: 0.0
   context_gex_dropout_p: 0.0
   gradient_clip_val: 1.0
-  checkpoint_dir: results/checkpoints/lung_round/transport_lung_simple_cross_attn_decoder_v1_10k_holefix
+  checkpoint_dir: results/checkpoints/lung_round/transport_lung_simple_cross_attn_decoder_v1_10k_holefix_gigapathfix
 validation:
   enabled: true
   every_n_steps: 1000
@@ -99,7 +99,7 @@ evaluation:
   pca_n_components: 50
   fixed_gene_panel_paths: {lung_hest_bench_50: resources/evaluation/hest_bench/LUNG_var_50genes.json}
   train_variance_gene_panel_sizes: [50, 200]
-  training_mask_bank_path: results/mask_banks/training/lung_round/transport_lung_simple_cross_attn_decoder_v1_10k_holefix_256_seed767000.json
+  training_mask_bank_path: results/mask_banks/training/lung_round/transport_lung_simple_cross_attn_decoder_v1_10k_holefix_gigapathfix_256_seed767000.json
 logging:
   backend: csv
   project: st3d-lundeberg-lab

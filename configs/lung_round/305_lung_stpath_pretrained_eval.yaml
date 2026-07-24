@@ -17,7 +17,7 @@
 # comparison. "full" here only tells us whether the zero-fill specifically
 # (vs. general out-of-distribution transfer to unfamiliar Lung tissue
 # never seen in STPath's own pretraining) is what's driving the gap.
-experiment_name: transport_lung_stpath_pretrained_eval_v1_holefix
+experiment_name: transport_lung_stpath_pretrained_eval_v1_holefix_gigapathfix
 data:
   source: hest1k
   hest_data_dir: data/raw/hest1k
@@ -75,7 +75,7 @@ training:
   all_image_dropout_p: 0.0
   context_gex_dropout_p: 0.0
   gradient_clip_val: 1.0
-  checkpoint_dir: results/checkpoints/lung_round/transport_lung_stpath_pretrained_eval_v1_holefix
+  checkpoint_dir: results/checkpoints/lung_round/transport_lung_stpath_pretrained_eval_v1_holefix_gigapathfix
 validation:
   enabled: false
 evaluation:

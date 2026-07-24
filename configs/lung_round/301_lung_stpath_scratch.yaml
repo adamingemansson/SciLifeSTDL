@@ -13,7 +13,7 @@
 # test sample) 604-spot post-QC budget. See docs/results_log.md
 # for where the HEST-1k copy this uses (/data/hest, symlinked into
 # data/raw/hest1k) actually lives.
-experiment_name: transport_lung_stpath_scratch_v1_10k_holefix
+experiment_name: transport_lung_stpath_scratch_v1_10k_holefix_gigapathfix
 data:
   source: hest1k
   hest_data_dir: data/raw/hest1k
@@ -73,7 +73,7 @@ training:
   all_image_dropout_p: 0.0
   context_gex_dropout_p: 0.0
   gradient_clip_val: 1.0
-  checkpoint_dir: results/checkpoints/lung_round/transport_lung_stpath_scratch_v1_10k_holefix
+  checkpoint_dir: results/checkpoints/lung_round/transport_lung_stpath_scratch_v1_10k_holefix_gigapathfix
 validation:
   enabled: true
   every_n_steps: 1000
@@ -100,7 +100,7 @@ evaluation:
   pca_n_components: 50
   fixed_gene_panel_paths: {lung_hest_bench_50: resources/evaluation/hest_bench/LUNG_var_50genes.json}
   train_variance_gene_panel_sizes: [50, 200]
-  training_mask_bank_path: results/mask_banks/training/lung_round/transport_lung_stpath_scratch_v1_10k_holefix_256_seed761000.json
+  training_mask_bank_path: results/mask_banks/training/lung_round/transport_lung_stpath_scratch_v1_10k_holefix_gigapathfix_256_seed761000.json
 logging:
   backend: csv
   project: st3d-lundeberg-lab
