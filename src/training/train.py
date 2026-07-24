@@ -36,7 +36,8 @@ from omegaconf import OmegaConf
 from src.data import loaders, masking
 from src.data.augmentation import augment_coords_xy
 from src.data.context_features import (
-    ContextOnlyFeatureProvider, ContextOnlyNovaeProvider, model_uses_novae, novae_input_mode,
+    ContextOnlyFeatureProvider, ContextOnlyNovaeProvider, model_uses_novae, model_uses_scfoundation,
+    novae_input_mode,
 )
 from src.data.niche_features import (
     compute_banksy_augmented_niche_labels, model_uses_niche_candidate, niche_input_mode,
@@ -1630,6 +1631,93 @@ def prepare_novae_inputs(cfg, adata, model_params: dict, coords3d: np.ndarray,
     return result
 
 
+def prepare_scfoundation_inputs(cfg, adata, model_params: dict, sample_id: str | None = None) -> dict:
+    """Resolve gene_encoder_type='scfoundation' inputs. Returns the SAME
+    dict shape as prepare_novae_inputs (mode/context_gene_features/
+    context_novae_features/context_gene_feature_provider/
+    context_novae_feature_provider/feature_dim) so every downstream call
+    site that already merges novae_inputs's keys works completely
+    unchanged -- scFoundation is always the "builtin replacement" case
+    (populates context_gene_features/context_gene_feature_provider,
+    which _build_masked_item already substitutes for raw context["expression"]
+    whenever either is non-None -- see that function's own docstring),
+    never the additive context_novae_features case, since
+    gene_encoder_type is a single mutually-exclusive choice in
+    _build_gene_encoder (src/models/simple_fusion_encoder.py), not a
+    combinable one the way STPathContextEncoder's new_gene_encoder_type
+    ("both") is.
+
+    Unlike Novae, scFoundation features depend only on a spot's own
+    measured expression (no spatial-neighbor-graph propagation), so there
+    is no query-expression-leakage risk and therefore no unsafe_full_graph
+    historical mode to support -- always context-only, same as
+    prepare_niche_inputs. Reuses ContextOnlyFeatureProvider's existing
+    generic engine (mask-digest + data-signature disk caching,
+    context-subgraph-only recomputation) with
+    precompute_scfoundation_features bound as feature_fn, exactly the way
+    prepare_niche_inputs already reuses it for the BANKSY niche
+    candidate -- no new caching/plumbing invented here."""
+    result = {
+        "mode": "disabled", "context_gene_features": None,
+        "context_novae_features": None, "context_gene_feature_provider": None,
+        "context_novae_feature_provider": None, "feature_dim": None,
+    }
+    if not model_uses_scfoundation(dict(model_params)):
+        return result
+    repo_path = cfg.data.get("scfoundation_repo_path")
+    model_path = cfg.data.get("scfoundation_model_path")
+    if not repo_path or not model_path:
+        raise ValueError(
+            "This model requests gene_encoder_type='scfoundation', but "
+            "data.scfoundation_repo_path and/or data.scfoundation_model_path "
+            "are not set."
+        )
+    result["mode"] = "context_only"
+
+    def _feature_fn(spot_adata):
+        from src.models.conditioning import precompute_scfoundation_features
+        expr = spot_adata.X if isinstance(spot_adata.X, np.ndarray) else spot_adata.X.toarray()
+        return precompute_scfoundation_features(
+            expr, list(spot_adata.var_names), str(repo_path), str(model_path),
+            # This project's own loaders (src/data/loaders.py's
+            # basic_qc_and_normalize) already apply the exact
+            # library-size-to-1e4 + log1p transform scFoundation's own
+            # real preprocessing expects (pre_normalized='F' branch of
+            # its get_embedding.py) BEFORE adata ever reaches this
+            # function -- applying it a second time here would silently
+            # double-normalize every value. See precompute_scfoundation_
+            # features's own docstring for the exact formula this skips.
+            already_normalized_log1p=True,
+        )
+
+    sid = sample_id or str(cfg.data.get("sample_id", "sample"))
+    provider = ContextOnlyFeatureProvider(
+        adata,
+        cache_dir=_cache_root(cfg) / "scfoundation_context_cache",
+        sample_id=sid,
+        feature_fn=_feature_fn,
+    )
+    # Probe one deterministic context mask before model construction so the
+    # real scFoundation output width (4 * the loaded checkpoint's encoder
+    # hidden dim) can be injected into the architecture -- same reasoning
+    # as prepare_novae_inputs's own probe below.
+    probe_context, probe_query = make_context_query_split(
+        loaders.get_coords_3d(adata), adata.obs["slice_id"].to_numpy(), cfg.masking, seed=606_061,
+    )
+    probe_context = _cap_context_mask(
+        probe_context,
+        getattr(cfg.masking, "max_context_points", None),
+        606_061,
+        coords3d=loaders.get_coords_3d(adata),
+        query_mask=probe_query,
+        selection=str(getattr(cfg.masking, "context_selection", "random")),
+    )
+    probe = provider(probe_context)
+    result["feature_dim"] = int(probe.shape[1])
+    result["context_gene_feature_provider"] = provider
+    return result
+
+
 def prepare_niche_inputs(cfg, adata, model_params: dict, sample_id: str | None = None) -> dict:
     """Resolve use_niche_candidate inputs without silently exposing hidden
     query expression -- mirrors prepare_novae_inputs, but simpler: unlike
@@ -1980,6 +2068,19 @@ def inject_novae_dim(model_cfg: dict, novae_dim: int) -> None:
         or bool(params.get("use_novae", False))
     ) and "novae_dim" not in params:
         params["novae_dim"] = novae_dim
+
+
+def inject_scfoundation_dim(model_cfg: dict, scfoundation_dim: int) -> None:
+    """Same reasoning as inject_novae_dim above, for _build_gene_encoder's
+    (src/models/simple_fusion_encoder.py) gene_encoder_type='scfoundation'
+    option: the real output width (4 * the loaded checkpoint's encoder
+    hidden dim) is only known once scFoundation has actually run, so it's
+    probed (prepare_scfoundation_inputs) and injected here rather than
+    hardcoded into a YAML file. Mutates model_cfg["params"] in place;
+    no-op for every other config."""
+    params = model_cfg.get("params", {})
+    if params.get("gene_encoder_type") == "scfoundation" and "scfoundation_dim" not in params:
+        params["scfoundation_dim"] = scfoundation_dim
 
 
 def inject_expression_preprocessing(model_cfg: dict, adata) -> None:
@@ -2370,6 +2471,17 @@ def load_multi_sample_data(
         novae_inputs = prepare_novae_inputs(
             cfg, adata, model_params, coords3d, slice_ids, sample_id=str(sample_id)
         )
+        scfoundation_inputs = prepare_scfoundation_inputs(cfg, adata, model_params, sample_id=str(sample_id))
+        if scfoundation_inputs["mode"] != "disabled":
+            # Mutually exclusive with Novae by construction (gene_encoder_type
+            # is a single value) -- overlay scFoundation's own
+            # context_gene_features/context_gene_feature_provider onto the
+            # SAME slots novae_inputs would otherwise populate, so every
+            # downstream reader of novae_inputs (this function's own tuple
+            # below, _inject's novae_dim probe) works unchanged regardless
+            # of which one actually ran.
+            novae_inputs["context_gene_features"] = scfoundation_inputs["context_gene_features"]
+            novae_inputs["context_gene_feature_provider"] = scfoundation_inputs["context_gene_feature_provider"]
         niche_inputs = prepare_niche_inputs(cfg, adata, model_params, sample_id=str(sample_id))
         slide_context = load_slide_context(
             cfg, str(sample_id), images, coords3d
@@ -2795,6 +2907,7 @@ def _main_multi_sample(cfg) -> None:
                 inject_stpath_novae_dim(model_cfg, novae_dim)
             else:
                 inject_novae_dim(model_cfg, novae_dim)
+                inject_scfoundation_dim(model_cfg, novae_dim)
 
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     _inject(model_cfg)
@@ -3115,6 +3228,14 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     novae_inputs = prepare_novae_inputs(
         cfg, adata, model_params, coords3d, slice_ids, sample_id=cfg.data.get("sample_id")
     )
+    scfoundation_inputs = prepare_scfoundation_inputs(
+        cfg, adata, model_params, sample_id=cfg.data.get("sample_id")
+    )
+    if scfoundation_inputs["mode"] != "disabled":
+        # Same overlay reasoning as load_multi_sample_data's identical merge.
+        novae_inputs["context_gene_features"] = scfoundation_inputs["context_gene_features"]
+        novae_inputs["context_gene_feature_provider"] = scfoundation_inputs["context_gene_feature_provider"]
+        novae_inputs["feature_dim"] = scfoundation_inputs["feature_dim"]
     niche_inputs = prepare_niche_inputs(cfg, adata, model_params, sample_id=cfg.data.get("sample_id"))
     context_gene_features = novae_inputs["context_gene_features"]
     context_novae_features = novae_inputs["context_novae_features"]
@@ -3155,6 +3276,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
             inject_stpath_novae_dim(model_cfg, novae_inputs["feature_dim"])
         else:
             inject_novae_dim(model_cfg, novae_inputs["feature_dim"])
+            inject_scfoundation_dim(model_cfg, novae_inputs["feature_dim"])
     model = build_model(model_cfg)
     # init_checkpoint_dir (2026-07-19): opt-in pretrain->finetune warm
     # start — see _main_multi_sample's identical block / load_pretrained_
@@ -3191,6 +3313,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
             inject_stpath_novae_dim(unresolved_model_cfg, novae_inputs["feature_dim"])
         else:
             inject_novae_dim(unresolved_model_cfg, novae_inputs["feature_dim"])
+            inject_scfoundation_dim(unresolved_model_cfg, novae_inputs["feature_dim"])
 
 
     # Train (skipped entirely for parameter-free baselines like interp_baseline) --

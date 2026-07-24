@@ -133,15 +133,36 @@ class UniversalLinearGeneEncoder(nn.Module):
 
 
 def _build_gene_encoder(gene_encoder_type: str, n_genes: int, feat_dim: int,
-                         gene_names: list[str] | None, gene_voc_path: str | None) -> nn.Module:
+                         gene_names: list[str] | None, gene_voc_path: str | None,
+                         scfoundation_dim: int | None = None) -> nn.Module:
     """Shared dispatch so SimpleCrossAttentionContextEncoder and
-    SimpleFusionSpatialTransformerContextEncoder (2026-07-24) offer the
-    same three gene-encoder choices without duplicating the same check
-    three times: 'local_mlp' (default, this dataset's own ad-hoc gene
-    panel, our 2-layer MLP), 'universal_mlp' (STPath's real fixed
-    gene-ID vocabulary, still our MLP), 'universal_linear' (STPath's real
+    SimpleFusionSpatialTransformerContextEncoder offer the same
+    gene-encoder choices without duplicating the same check in both
+    classes: 'local_mlp' (default, this dataset's own ad-hoc gene panel,
+    our 2-layer MLP), 'universal_mlp' (STPath's real fixed gene-ID
+    vocabulary, still our MLP), 'universal_linear' (STPath's real
     vocabulary AND STPath's real single-Linear-no-bias encoder shape --
-    a literal copy of its gene_embed mechanism)."""
+    a literal copy of its gene_embed mechanism), 'scfoundation'
+    (2026-07-24: precomputed scFoundation cell embeddings -- see
+    src/models/conditioning.py's ScFoundationGeneEncoder/
+    precompute_scfoundation_features and src/training/train.py's
+    prepare_scfoundation_inputs for how the real 100M-parameter
+    pretrained checkpoint's output actually reaches this class; this
+    dispatcher only builds the small trainable projection head on top of
+    it, same RAE pattern as 'universal_mlp'/'universal_linear' wrap
+    STPath's real vocabulary).
+
+    Unlike the other three, 'scfoundation' does NOT receive raw
+    per-forward-call expression at all -- train.py's
+    context_gene_feature_provider mechanism substitutes the precomputed
+    scFoundation embedding directly into context["expression"] at the
+    dataset level (see _build_masked_item's own docstring), so this
+    class's forward() code needs no changes: it already just calls
+    self.gene_encoder(context["expression"]) unconditionally, and for
+    this gene_encoder_type that tensor already IS the pretrained
+    embedding, not raw counts (configs using 'scfoundation' MUST set
+    input_already_log1p: true for the same reason -- an already-computed
+    embedding must never be log1p'd again)."""
     if gene_encoder_type == "local_mlp":
         return MLPGeneEncoder(n_genes, feat_dim=feat_dim)
     if gene_encoder_type in ("universal_mlp", "universal_linear"):
@@ -152,9 +173,18 @@ def _build_gene_encoder(gene_encoder_type: str, n_genes: int, feat_dim: int,
         if gene_encoder_type == "universal_mlp":
             return UniversalMLPGeneEncoder(gene_names=gene_names, gene_voc_path=gene_voc_path, feat_dim=feat_dim)
         return UniversalLinearGeneEncoder(gene_names=gene_names, gene_voc_path=gene_voc_path, feat_dim=feat_dim)
+    if gene_encoder_type == "scfoundation":
+        if not scfoundation_dim:
+            raise ValueError(
+                "gene_encoder_type='scfoundation' requires scfoundation_dim (auto-injected by "
+                "train.py's inject_scfoundation_dim once prepare_scfoundation_inputs has probed "
+                "the real checkpoint's output width -- set explicitly only if you already know it)"
+            )
+        from src.models.conditioning import ScFoundationGeneEncoder
+        return ScFoundationGeneEncoder(scfoundation_dim=scfoundation_dim, feat_dim=feat_dim)
     raise ValueError(
         f"unknown gene_encoder_type {gene_encoder_type!r}, must be 'local_mlp', "
-        "'universal_mlp', or 'universal_linear'"
+        "'universal_mlp', 'universal_linear', or 'scfoundation'"
     )
 
 
@@ -266,7 +296,7 @@ class SimpleCrossAttentionContextEncoder(nn.Module):
                  mlp_ratio: float = 2.0, dropout: float = 0.1, knn_k: int = 16,
                  n_layers: int = 2, input_already_log1p: bool = True,
                  gene_encoder_type: str = "local_mlp", gene_names: list[str] | None = None,
-                 gene_voc_path: str | None = None):
+                 gene_voc_path: str | None = None, scfoundation_dim: int | None = None):
         super().__init__()
         if hidden_dim % n_heads != 0:
             raise ValueError(f"hidden_dim ({hidden_dim}) must be divisible by n_heads ({n_heads})")
@@ -276,7 +306,9 @@ class SimpleCrossAttentionContextEncoder(nn.Module):
         self.knn_k = int(knn_k)
         self.input_already_log1p = bool(input_already_log1p)
         self.image_encoder = GigapathPatchEncoder(feat_dim=hidden_dim)
-        self.gene_encoder = _build_gene_encoder(gene_encoder_type, n_genes, hidden_dim, gene_names, gene_voc_path)
+        self.gene_encoder = _build_gene_encoder(
+            gene_encoder_type, n_genes, hidden_dim, gene_names, gene_voc_path, scfoundation_dim,
+        )
         self.mask_token = nn.Parameter(torch.zeros(hidden_dim))
 
         self.layers = nn.ModuleList([
@@ -366,7 +398,7 @@ class SimpleFusionSpatialTransformerContextEncoder(nn.Module):
                  n_heads: int = 4, dropout: float = 0.1, attn_dropout: float = 0.1,
                  mlp_ratio: float = 2.0, input_already_log1p: bool = True,
                  gene_encoder_type: str = "local_mlp", gene_names: list[str] | None = None,
-                 gene_voc_path: str | None = None):
+                 gene_voc_path: str | None = None, scfoundation_dim: int | None = None):
         super().__init__()
         if hidden_dim % n_heads != 0:
             raise ValueError(f"hidden_dim ({hidden_dim}) must be divisible by n_heads ({n_heads})")
@@ -387,7 +419,9 @@ class SimpleFusionSpatialTransformerContextEncoder(nn.Module):
         self.input_already_log1p = bool(input_already_log1p)
         self._rescale_coords = rescale_coords
         self.image_encoder = GigapathPatchEncoder(feat_dim=hidden_dim)
-        self.gene_encoder = _build_gene_encoder(gene_encoder_type, n_genes, hidden_dim, gene_names, gene_voc_path)
+        self.gene_encoder = _build_gene_encoder(
+            gene_encoder_type, n_genes, hidden_dim, gene_names, gene_voc_path, scfoundation_dim,
+        )
         self.mask_token = nn.Parameter(torch.zeros(hidden_dim))
         self.backbone = SpatialTransformer(ModelConfig(
             n_genes=n_genes, d_input=hidden_dim, d_model=hidden_dim,

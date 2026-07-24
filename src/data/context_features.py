@@ -176,6 +176,20 @@ def model_uses_novae(model_params: dict) -> bool:
     return False
 
 
+def model_uses_scfoundation(model_params: dict) -> bool:
+    """Return whether a model configuration requests scFoundation-derived
+    gene features. Mirrors model_uses_novae's structure exactly, but
+    scFoundation features carry no query-expression-leakage risk the way
+    unsafe_full_graph Novae does (they're computed per-spot from that
+    spot's own expression alone, not a spatial-neighbor graph) -- so
+    there is no analogous "unsafe" mode to gate, just context-only
+    (see prepare_scfoundation_inputs in src/training/train.py)."""
+    encoder = model_params.get("context_encoder_type", "builtin")
+    if encoder == "builtin":
+        return model_params.get("gene_encoder_type") == "scfoundation"
+    return False
+
+
 def novae_input_mode(cfg, model_params: dict) -> str:
     """Validate and return the requested Novae safety mode.
 

@@ -755,6 +755,201 @@ class MLPGeneEncoder(nn.Module):
 _NOVAE_MODEL_CACHE: dict[str, object] = {}
 
 
+# Bumped whenever precompute_scfoundation_features's actual preprocessing
+# logic changes -- same cache-fingerprint reasoning as
+# _GIGAPATH_PREPROCESS_VERSION, folded into get_scfoundation_features's
+# cache fingerprint (src/training/train.py) from day one, learning
+# directly from the real GigaPath cache-staleness bug this project hit
+# 2026-07-24 (a code fix was silently masked because the cache fingerprint
+# never depended on the preprocessing code, only the raw input bytes).
+_SCFOUNDATION_PREPROCESS_VERSION = "cell_embed_pool_all_t4_v1_2026-07-24"
+
+# scFoundation's own real 19,264-gene vocabulary size (Minsheng Hao et al.
+# 2024, Nature Methods, "Large-scale foundation model on single-cell
+# transcriptomics" -- github.com/biomap-research/scFoundation). Its
+# cell-embedding output ('pool_type=all') concatenates 4 pooled views of
+# the encoder's hidden dim, so the real output width is read from the
+# loaded checkpoint at runtime (see precompute_scfoundation_features),
+# never hardcoded here -- same "confirmed via the actual loaded model,
+# not assumed" discipline this file already applies to GigaPath/DINOv2's
+# feature dims.
+_SCFOUNDATION_N_VOCAB_GENES = 19264
+
+
+def _scfoundation_align_genes(expression, gene_names: list[str], vocab_genes: list[str]):
+    """Zero-pad/reorder `expression` [N, G] (columns = gene_names) onto
+    scFoundation's own fixed 19,264-gene vocabulary, in that exact order.
+    Faithful reimplementation of scFoundation's own real
+    `main_gene_selection` (model/get_embedding.py and model/load.py in
+    the official repo, verified 2026-07-24 by cloning and reading the
+    actual source) -- NOT imported directly, since get_embedding.py
+    parses sys.argv at module import time (`args = parser.parse_args()`
+    executes on import), which would crash/hijack this process's own
+    argv. load.py's copy of the same function has an identical bug-for-
+    bug algorithm, reimplemented here in pure numpy instead of pandas to
+    avoid a pandas round-trip for what's just a gene-index remap."""
+    import numpy as np
+
+    expression = np.asarray(expression, dtype=np.float32)
+    gene_to_col = {str(name): i for i, name in enumerate(gene_names)}
+    n_cells = expression.shape[0]
+    aligned = np.zeros((n_cells, len(vocab_genes)), dtype=np.float32)
+    matched = 0
+    for vocab_idx, gene in enumerate(vocab_genes):
+        col = gene_to_col.get(gene)
+        if col is not None:
+            aligned[:, vocab_idx] = expression[:, col]
+            matched += 1
+    print(f"_scfoundation_align_genes: {matched}/{len(vocab_genes)} of scFoundation's "
+          f"real gene vocabulary matched by symbol; the rest are zero-padded "
+          f"(scFoundation's own real main_gene_selection behavior for missing genes).")
+    return aligned
+
+
+def precompute_scfoundation_features(
+    expression, gene_names: list[str], scfoundation_repo_path: str,
+    scfoundation_model_path: str, already_normalized_log1p: bool = False,
+    tgthighres: str = "t4",
+):
+    """Run scFoundation's real frozen pretrained encoder (Hao et al. 2024,
+    Nature Methods -- github.com/biomap-research/scFoundation, 100M
+    params, 19,264-gene vocabulary, ~50M human single-cell transcriptomes)
+    ONCE per sample and return a [N, feat_dim] cell-embedding array,
+    mirroring precompute_gigapath_features/precompute_novae_features'
+    "frozen model output never changes, precompute don't recompute per
+    training step" reasoning.
+
+    Faithful to the REAL official `output_type='cell'`, `version='ce'`
+    (key='cell') path in model/get_embedding.py -- verified 2026-07-24 by
+    cloning the actual repo and reading get_embedding.py/load.py/
+    mae_autobin.py directly, not trusting a secondhand description (the
+    exact lesson from this project's own GigaPath preprocessing bug the
+    same day: a plausible-sounding but unverified reimplementation
+    silently produces wrong features). Reimplements ONLY the input
+    preprocessing (gene alignment, normalization, the two special
+    resolution/depth tokens) in this file; the actual tokenization
+    (`gatherData`) and model forward pass call scFoundation's own real
+    functions, imported from the cloned repo, not reimplemented.
+
+    scfoundation_repo_path: path to a `git clone
+    https://github.com/biomap-research/scFoundation` checkout (no pip
+    package / setup.py exists upstream -- its own model/ scripts assume
+    being run FROM that directory via relative imports, so this function
+    adds `<repo>/model` to sys.path rather than pip-installing it).
+    scfoundation_model_path: path to the downloaded checkpoint (SharePoint
+    link in the upstream README's model/README.md; there is no
+    HuggingFace mirror as of 2026-07-24 -- verify this yourself, it may
+    have changed). load_model_frommmf hardcodes `.cuda()` internally (the
+    upstream code has no CPU/MPS path), so this only runs on a CUDA
+    device -- fine for this project's actual A100 training server, not
+    portable beyond that without patching scFoundation's own load.py.
+
+    expression: [N, G] raw counts (already_normalized_log1p=False, the
+    default -- this function applies scFoundation's own real
+    library-size-to-1e4 + log1p formula itself, `log1p(x / x.sum() *
+    1e4)`, matching this project's existing `expression_target_sum:
+    10000.0` convention) or already-normalized+log1p values
+    (already_normalized_log1p=True, skips renormalizing). gene_names: G
+    gene symbols, column-aligned with expression. tgthighres: scFoundation's
+    own real "target resolution" conditioning token; 't4' matches
+    get_embedding.py's own real CLI default for standard (non
+    read-depth-enhancement) cell embedding extraction -- see that file's
+    own argparse help text for the 'f'/'a'/'t' encoding this string uses.
+
+    Returns [N, 4*encoder_hidden_dim] float32 numpy array (pool_type='all':
+    concatenation of the two special resolution-token embeddings plus a
+    max-pool and mean-pool over the real gene tokens -- scFoundation's own
+    real pooling scheme, not a design choice made here)."""
+    import sys
+    from pathlib import Path
+
+    import numpy as np
+    import pandas as pd
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "precompute_scfoundation_features requires CUDA -- scFoundation's own "
+            "load_model_frommmf hardcodes model.cuda() with no CPU/MPS fallback."
+        )
+
+    model_dir = str(Path(scfoundation_repo_path) / "model")
+    if model_dir not in sys.path:
+        sys.path.insert(0, model_dir)
+    from load import gatherData, load_model_frommmf  # noqa: E402 -- real scFoundation code, not reimplemented
+
+    vocab_path = Path(model_dir) / "OS_scRNA_gene_index.19264.tsv"
+    vocab_genes = pd.read_csv(vocab_path, sep="\t")["gene_name"].astype(str).tolist()
+    if len(vocab_genes) != _SCFOUNDATION_N_VOCAB_GENES:
+        raise ValueError(
+            f"expected {_SCFOUNDATION_N_VOCAB_GENES} genes in {vocab_path}, got {len(vocab_genes)}"
+        )
+
+    aligned = _scfoundation_align_genes(expression, gene_names, vocab_genes)
+
+    if already_normalized_log1p:
+        normalized = aligned
+    else:
+        totals = aligned.sum(axis=1, keepdims=True)
+        totals = np.maximum(totals, 1.0)
+        normalized = np.log1p(aligned / totals * 1e4)
+
+    pretrainmodel, pretrainconfig = load_model_frommmf(scfoundation_model_path, key="cell")
+    pretrainmodel.eval()
+    device = next(pretrainmodel.parameters()).device
+
+    all_embeddings = []
+    with torch.no_grad():
+        for i in range(normalized.shape[0]):
+            row = normalized[i]
+            totalcount = float(aligned[i].sum())
+            # scFoundation's own real resolution/depth conditioning: append
+            # two extra values after the 19,264 real genes, per its own
+            # documented 't'/'f'/'a' tgthighres encoding (model/README.md,
+            # model/get_embedding.py's singlecell branch, verified
+            # 2026-07-24). 't' = an absolute target value.
+            if tgthighres[0] == "t":
+                resolution_token = float(tgthighres[1:])
+            elif tgthighres[0] == "f":
+                resolution_token = float(np.log10(max(totalcount, 1.0) * float(tgthighres[1:])))
+            elif tgthighres[0] == "a":
+                resolution_token = float(np.log10(max(totalcount, 1.0))) + float(tgthighres[1:])
+            else:
+                raise ValueError(f"tgthighres must start with 't', 'f', or 'a', got {tgthighres!r}")
+            log_totalcount = float(np.log10(max(totalcount, 1.0)))
+
+            pretrain_gene_x = torch.tensor(
+                row.tolist() + [resolution_token, log_totalcount], dtype=torch.float32,
+            ).unsqueeze(0).to(device)
+            data_gene_ids = torch.arange(
+                _SCFOUNDATION_N_VOCAB_GENES + 2, device=device,
+            ).repeat(pretrain_gene_x.shape[0], 1)
+
+            value_labels = pretrain_gene_x > 0
+            x, x_padding = gatherData(pretrain_gene_x, value_labels, pretrainconfig["pad_token_id"])
+            position_gene_ids, _ = gatherData(data_gene_ids, value_labels, pretrainconfig["pad_token_id"])
+
+            x = pretrainmodel.token_emb(torch.unsqueeze(x, 2).float(), output_weight=0)
+            position_emb = pretrainmodel.pos_emb(position_gene_ids)
+            x = x + position_emb
+            geneemb = pretrainmodel.encoder(x, x_padding)
+
+            # scFoundation's own real pool_type='all' scheme: the last two
+            # positions are always the resolution/depth tokens (appended
+            # above), never real genes, so they're pooled separately from
+            # the rest via straight indexing, then max/mean-pooled over
+            # everything else and concatenated -- verified against the
+            # real get_embedding.py, not a guessed pooling choice.
+            geneemb1 = geneemb[:, -1, :]
+            geneemb2 = geneemb[:, -2, :]
+            geneemb3, _ = torch.max(geneemb[:, :-2, :], dim=1)
+            geneemb4 = torch.mean(geneemb[:, :-2, :], dim=1)
+            merged = torch.cat([geneemb1, geneemb2, geneemb3, geneemb4], dim=1)
+            all_embeddings.append(merged.cpu().numpy())
+
+    return np.concatenate(all_embeddings, axis=0).astype(np.float32)
+
+
 def precompute_novae_features(adata, checkpoint: str = "prism-oncology/novae-human-0"):
     """Run pretrained Novae (Novae et al. 2025, Nature Methods — graph-based
     ST foundation model, github.com/MICS-Lab/novae) ONCE over a whole
@@ -846,6 +1041,51 @@ class NovaeGeneEncoder(nn.Module):
                 f"got shape {tuple(novae_features.shape)} — see precompute_novae_features()"
             )
         return self.proj(self.embedding_norm(novae_features))
+
+
+class ScFoundationGeneEncoder(nn.Module):
+    """Wraps precomputed scFoundation cell embeddings
+    (precompute_scfoundation_features above) as a pretrained-gene-
+    foundation-model alternative to raw expression / MLPGeneEncoder --
+    same RAE pattern as NovaeGeneEncoder immediately above (frozen big
+    representation + small trainable LayerNorm+Linear head), and reuses
+    that exact same wiring end-to-end (2026-07-24): scFoundation features
+    are computed per-spot from that spot's OWN measured expression alone
+    (no spatial-neighbor-graph dependency the way Novae's are), so they
+    are safe to compute once per sample and slice by context_mask like
+    any other precomputed per-spot feature -- but this project's existing
+    `ContextOnlyFeatureProvider` engine (src/data/context_features.py,
+    explicitly documented there as "no Novae-specific behavior... a
+    generic 'compute this feature function on the observed context
+    subgraph only' mechanism", already reused once for the niche
+    candidate) already provides exactly this precompute-once + disk-cache
+    + context-only-recomputation machinery, so this class reuses that
+    SAME channel/plumbing (context_novae_features, context["novae_features"],
+    `new_gene_encoder_type`/`gene_encoder_type`'s existing dispatch) rather
+    than inventing a parallel one -- see prepare_scfoundation_inputs in
+    src/training/train.py for where this gets wired up, and
+    _build_gene_encoder in src/models/simple_fusion_encoder.py for the
+    "scfoundation" gene_encoder_type option that constructs this class.
+
+    forward() always expects already-precomputed [B, scfoundation_dim]
+    features (scfoundation_dim = 4 * the loaded checkpoint's real encoder
+    hidden dim, since scFoundation's own real cell-embedding pooling
+    concatenates 4 pooled views -- read from the actual precomputed
+    array's shape by the caller, never hardcoded/guessed here, same
+    "probe, don't assume" discipline as NovaeGeneEncoder/GigapathPatchEncoder)."""
+
+    def __init__(self, scfoundation_dim: int, feat_dim: int = 64):
+        super().__init__()
+        self.embedding_norm = nn.LayerNorm(scfoundation_dim)
+        self.proj = nn.Linear(scfoundation_dim, feat_dim)
+
+    def forward(self, scfoundation_features: torch.Tensor) -> torch.Tensor:
+        if scfoundation_features.dim() != 2:
+            raise ValueError(
+                f"ScFoundationGeneEncoder expects precomputed [B, scfoundation_dim] features, "
+                f"got shape {tuple(scfoundation_features.shape)} — see precompute_scfoundation_features()"
+            )
+        return self.proj(self.embedding_norm(scfoundation_features))
 
 
 class CombinedGeneEncoder(nn.Module):
