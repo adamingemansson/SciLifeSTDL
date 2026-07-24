@@ -27,10 +27,97 @@ passes through a biased nn.Linear and injects a real, wrong signal; a
 dedicated learned mask_token has no such failure mode)."""
 from __future__ import annotations
 
+import json
+
 import torch
 import torch.nn as nn
 
 from src.models.conditioning import GigapathPatchEncoder, MLPGeneEncoder, _knn_indices
+
+
+class UniversalMLPGeneEncoder(nn.Module):
+    """MLPGeneEncoder (ours: 2-layer, LayerNorm+GELU, real nonlinear
+    depth), but scattered into STPath's own real fixed gene-ID vocabulary
+    space first, instead of this dataset's local ad-hoc column order
+    (2026-07-24 request: "keep our MLP... but a bit adjusted to better
+    look like stpath's").
+
+    Isolates ONE variable against the plain MLPGeneEncoder: does a fixed,
+    cross-dataset-stable gene identity space help, holding encoder depth
+    and nonlinearity roughly fixed (both are 2-layer MLPs; STPath's own
+    real gene_embed is actually a single bias-free Linear with less depth
+    than either of these, see registry.py's stpath_backbone_simple_gene
+    docstring / this session's read of stpath/model/model.py).
+
+    Vocabulary construction mirrors STPath's real GeneExpTokenizer
+    exactly (stpath/tokenization/ge_tokenizer.py, verified 2026-07-24):
+    symbol -> symbol2gene[symbol] (an Ensembl-style ID) -> gene2id[that
+    ID], where gene2id enumerates the SORTED SET of unique values in
+    symbol2gene.json, offset by 2 (STPath reserves 0/1 for pad/mask,
+    kept here too even though this class doesn't use those tokens itself
+    -- keeps the vocabulary SIZE and every gene's ID identical to
+    STPath's real ones, not just the same ordering rule applied fresh).
+    Genes in this dataset's local panel that aren't in STPath's
+    vocabulary are silently dropped from the scatter (same as STPath's
+    own real out-of-vocabulary handling) -- their local expression value
+    is simply never scattered anywhere, contributing nothing."""
+
+    def __init__(self, gene_names: list[str], gene_voc_path: str, feat_dim: int = 128,
+                 hidden_dim: int = 512, bottleneck_dim: int = 256):
+        super().__init__()
+        with open(gene_voc_path) as f:
+            symbol2gene = json.load(f)
+        unique_gene_ids = sorted(set(symbol2gene.values()))
+        gene2id = {gene_id: i + 2 for i, gene_id in enumerate(unique_gene_ids)}
+        n_vocab_tokens = max(gene2id.values()) + 1
+
+        local_idx, vocab_idx = [], []
+        for i, symbol in enumerate(gene_names):
+            mapped = symbol2gene.get(symbol)
+            if mapped is not None and mapped in gene2id:
+                local_idx.append(i)
+                vocab_idx.append(gene2id[mapped])
+        if not local_idx:
+            raise ValueError(
+                "UniversalMLPGeneEncoder: none of the supplied gene_names are in "
+                f"the vocabulary at {gene_voc_path}"
+            )
+        n_mapped, n_total = len(local_idx), len(gene_names)
+        print(f"UniversalMLPGeneEncoder: {n_mapped}/{n_total} local genes "
+              f"({n_mapped / n_total:.0%}) mapped into STPath's real "
+              f"{n_vocab_tokens}-token gene-identity vocabulary.")
+
+        self.n_vocab_tokens = n_vocab_tokens
+        self.register_buffer("local_idx", torch.as_tensor(local_idx, dtype=torch.long))
+        self.register_buffer("vocab_idx", torch.as_tensor(vocab_idx, dtype=torch.long))
+        self.mlp_encoder = MLPGeneEncoder(
+            n_genes=n_vocab_tokens, feat_dim=feat_dim, hidden_dim=hidden_dim,
+            bottleneck_dim=bottleneck_dim,
+        )
+
+    def forward(self, expression: torch.Tensor) -> torch.Tensor:
+        n = expression.shape[0]
+        scattered = expression.new_zeros((n, self.n_vocab_tokens))
+        scattered[:, self.vocab_idx] = expression[:, self.local_idx]
+        return self.mlp_encoder(scattered)
+
+
+def _build_gene_encoder(gene_encoder_type: str, n_genes: int, feat_dim: int,
+                         gene_names: list[str] | None, gene_voc_path: str | None) -> nn.Module:
+    """Shared dispatch so SimpleCrossAttentionContextEncoder and
+    SimpleFusionSpatialTransformerContextEncoder (2026-07-24) offer the
+    same 'local_mlp' (default, this dataset's own ad-hoc gene panel) vs
+    'universal_mlp' (STPath's real fixed gene-ID vocabulary, our MLP)
+    choice without duplicating the same three-line check three times."""
+    if gene_encoder_type == "local_mlp":
+        return MLPGeneEncoder(n_genes, feat_dim=feat_dim)
+    if gene_encoder_type == "universal_mlp":
+        if not gene_names or not gene_voc_path:
+            raise ValueError(
+                "gene_encoder_type='universal_mlp' requires both gene_names and gene_voc_path"
+            )
+        return UniversalMLPGeneEncoder(gene_names=gene_names, gene_voc_path=gene_voc_path, feat_dim=feat_dim)
+    raise ValueError(f"unknown gene_encoder_type {gene_encoder_type!r}, must be 'local_mlp' or 'universal_mlp'")
 
 
 class SimpleFusionContextEncoder(nn.Module):
@@ -139,7 +226,9 @@ class SimpleCrossAttentionContextEncoder(nn.Module):
 
     def __init__(self, n_genes: int, hidden_dim: int = 128, n_heads: int = 4,
                  mlp_ratio: float = 2.0, dropout: float = 0.1, knn_k: int = 16,
-                 n_layers: int = 2, input_already_log1p: bool = True):
+                 n_layers: int = 2, input_already_log1p: bool = True,
+                 gene_encoder_type: str = "local_mlp", gene_names: list[str] | None = None,
+                 gene_voc_path: str | None = None):
         super().__init__()
         if hidden_dim % n_heads != 0:
             raise ValueError(f"hidden_dim ({hidden_dim}) must be divisible by n_heads ({n_heads})")
@@ -149,7 +238,7 @@ class SimpleCrossAttentionContextEncoder(nn.Module):
         self.knn_k = int(knn_k)
         self.input_already_log1p = bool(input_already_log1p)
         self.image_encoder = GigapathPatchEncoder(feat_dim=hidden_dim)
-        self.gene_encoder = MLPGeneEncoder(n_genes, feat_dim=hidden_dim)
+        self.gene_encoder = _build_gene_encoder(gene_encoder_type, n_genes, hidden_dim, gene_names, gene_voc_path)
         self.mask_token = nn.Parameter(torch.zeros(hidden_dim))
 
         self.layers = nn.ModuleList([
@@ -229,7 +318,9 @@ class SimpleFusionSpatialTransformerContextEncoder(nn.Module):
 
     def __init__(self, n_genes: int, hidden_dim: int = 128, n_layers: int = 2,
                  n_heads: int = 4, dropout: float = 0.1, attn_dropout: float = 0.1,
-                 mlp_ratio: float = 2.0, input_already_log1p: bool = True):
+                 mlp_ratio: float = 2.0, input_already_log1p: bool = True,
+                 gene_encoder_type: str = "local_mlp", gene_names: list[str] | None = None,
+                 gene_voc_path: str | None = None):
         super().__init__()
         if hidden_dim % n_heads != 0:
             raise ValueError(f"hidden_dim ({hidden_dim}) must be divisible by n_heads ({n_heads})")
@@ -248,7 +339,7 @@ class SimpleFusionSpatialTransformerContextEncoder(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.input_already_log1p = bool(input_already_log1p)
         self.image_encoder = GigapathPatchEncoder(feat_dim=hidden_dim)
-        self.gene_encoder = MLPGeneEncoder(n_genes, feat_dim=hidden_dim)
+        self.gene_encoder = _build_gene_encoder(gene_encoder_type, n_genes, hidden_dim, gene_names, gene_voc_path)
         self.mask_token = nn.Parameter(torch.zeros(hidden_dim))
         self.backbone = SpatialTransformer(ModelConfig(
             n_genes=n_genes, d_input=hidden_dim, d_model=hidden_dim,

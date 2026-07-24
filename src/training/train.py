@@ -2416,6 +2416,19 @@ def inject_stpath_gene_names(model_cfg: dict, adata) -> None:
         params["stpath_gene_names"] = adata.var_names.tolist()
 
 
+def inject_universal_gene_names(model_cfg: dict, adata) -> None:
+    """If a config sets gene_encoder_type: "universal_mlp"
+    (UniversalMLPGeneEncoder, 2026-07-24 -- scatters this dataset's local
+    gene panel into STPath's real fixed gene-ID vocabulary before our own
+    MLP encodes it), auto-derive gene_names from the loaded AnnData's
+    var_names, same reasoning as inject_stpath_gene_names above (a
+    vocabulary/mapping fixed at construction time from real data, not
+    hardcoded into a YAML file)."""
+    params = model_cfg.get("params", {})
+    if params.get("gene_encoder_type") == "universal_mlp" and "gene_names" not in params:
+        params["gene_names"] = adata.var_names.tolist()
+
+
 def inject_decoder_gene_names(model_cfg: dict, adata) -> None:
     """If a config sets decoder_type: "panel_invariant" (2026-07-17,
     diagram-5 gap analysis follow-up — see PanelInvariantGeneDecoder's own
@@ -2759,6 +2772,7 @@ def _main_multi_sample(cfg) -> None:
         inject_decoder_gene_names(model_cfg, fit_adatas[0])
         inject_pretrained_autoencoder_gene_names(model_cfg, fit_adatas[0])
         inject_stpath_gene_names(model_cfg, fit_adatas[0])
+        inject_universal_gene_names(model_cfg, fit_adatas[0])
         inject_storm_lite_tokenizer_gene_names(model_cfg, fit_adatas[0])
         inject_tokenized_gene_names(model_cfg, fit_adatas[0])
         inject_expression_preprocessing(model_cfg, fit_adatas[0])
@@ -3111,6 +3125,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
     inject_single_sample_n_genes(model_cfg, adata)
     inject_stpath_gene_names(model_cfg, adata)
+    inject_universal_gene_names(model_cfg, adata)
     inject_decoder_gene_names(model_cfg, adata)
     inject_storm_lite_tokenizer_gene_names(model_cfg, adata)
     inject_tokenized_gene_names(model_cfg, adata)
@@ -3147,6 +3162,7 @@ def main(cfg_path: str, overrides: list[str] | None = None):
     unresolved_model_cfg = OmegaConf.to_container(cfg.model, resolve=False)
     inject_single_sample_n_genes(unresolved_model_cfg, adata)
     inject_stpath_gene_names(unresolved_model_cfg, adata)
+    inject_universal_gene_names(unresolved_model_cfg, adata)
     inject_decoder_gene_names(unresolved_model_cfg, adata)
     inject_storm_lite_tokenizer_gene_names(unresolved_model_cfg, adata)
     inject_tokenized_gene_names(unresolved_model_cfg, adata)

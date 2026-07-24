@@ -687,6 +687,8 @@ class STPathBackboneSimpleGene(BaseGenerativeModel):
     def __init__(self, n_genes: int, hidden_dim: int = 512, n_layers: int = 4,
                  n_heads: int = 4, dropout: float = 0.1, attn_dropout: float = 0.1,
                  mlp_ratio: float = 2.0, input_already_log1p: bool = True,
+                 gene_encoder_type: str = "local_mlp", gene_names: list[str] | None = None,
+                 gene_voc_path: str | None = None,
                  lr: float = 1e-3, target_gene_scale: list[float] | None = None,
                  target_scale_floor: float = 0.05):
         super().__init__()
@@ -697,7 +699,8 @@ class STPathBackboneSimpleGene(BaseGenerativeModel):
         self.encoder = SimpleFusionSpatialTransformerContextEncoder(
             n_genes=n_genes, hidden_dim=hidden_dim, n_layers=n_layers, n_heads=n_heads,
             dropout=dropout, attn_dropout=attn_dropout, mlp_ratio=mlp_ratio,
-            input_already_log1p=input_already_log1p,
+            input_already_log1p=input_already_log1p, gene_encoder_type=gene_encoder_type,
+            gene_names=gene_names, gene_voc_path=gene_voc_path,
         )
         # Same head shape as STPath's own real prediction_head (LayerNorm +
         # Linear, verified against stpath/model/model.py) -- just to our
@@ -760,6 +763,8 @@ class SimpleCrossAttnDenseDecoder(BaseGenerativeModel):
     def __init__(self, n_genes: int, hidden_dim: int = 128, n_heads: int = 4,
                  mlp_ratio: float = 2.0, dropout: float = 0.1, knn_k: int = 16,
                  n_layers: int = 2, input_already_log1p: bool = True,
+                 gene_encoder_type: str = "local_mlp", gene_names: list[str] | None = None,
+                 gene_voc_path: str | None = None,
                  lr: float = 1e-3, target_gene_scale: list[float] | None = None,
                  target_scale_floor: float = 0.05):
         super().__init__()
@@ -770,7 +775,8 @@ class SimpleCrossAttnDenseDecoder(BaseGenerativeModel):
         self.encoder = SimpleCrossAttentionContextEncoder(
             n_genes=n_genes, hidden_dim=hidden_dim, n_heads=n_heads, mlp_ratio=mlp_ratio,
             dropout=dropout, knn_k=knn_k, n_layers=n_layers,
-            input_already_log1p=input_already_log1p,
+            input_already_log1p=input_already_log1p, gene_encoder_type=gene_encoder_type,
+            gene_names=gene_names, gene_voc_path=gene_voc_path,
         )
         self.decoder = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, n_genes))
 
