@@ -41,7 +41,8 @@ model:
   name: spatial_baseline
   params:
     mode: harmonic
-    k: 8
+    k: 128
+    ridge: 0.0001
 training:
   epochs: 1
   seed: 10
