@@ -1426,17 +1426,25 @@ def get_gigapath_features(cfg, patches: np.ndarray, barcodes: np.ndarray,
     set at once, a real ~25GB RAM crash).
 
     sample_id: see _gigapath_cache_path's own docstring."""
+    from src.models.conditioning import _GIGAPATH_PREPROCESS_VERSION
+
     cache_path = _gigapath_cache_path(cfg, sample_id=sample_id)
     # HEST Visium samples may reuse the same capture-array barcode strings.
     # Barcode equality alone therefore cannot prove that a cache belongs to
     # the selected H&E file. Hash the actual patch tensor so caches made by
     # the historical INT1/INT10 prefix-resolution bug are rejected even when
-    # their barcode arrays happen to be identical.
+    # their barcode arrays happen to be identical. Also fold in the
+    # preprocessing version (2026-07-24, real bug found: a fix to
+    # _gigapath_preprocess_and_encode was silently masked because this
+    # fingerprint used to depend only on the raw patch bytes, which never
+    # change even when the CODE that turns them into features does) so a
+    # future preprocessing change can never be silently served stale.
     patch_array = np.ascontiguousarray(patches)
     digest = hashlib.sha256()
     digest.update(str(patch_array.shape).encode("ascii"))
     digest.update(str(patch_array.dtype).encode("ascii"))
     digest.update(memoryview(patch_array).cast("B"))
+    digest.update(_GIGAPATH_PREPROCESS_VERSION.encode("ascii"))
     patch_fingerprint = digest.hexdigest()
     if cache_path.exists():
         cached = np.load(cache_path)
@@ -1451,7 +1459,7 @@ def get_gigapath_features(cfg, patches: np.ndarray, barcodes: np.ndarray,
                   f"(delete this file to force a recompute).")
             return cached["features"]
         print(f"get_gigapath_features: cache at {cache_path} does not match "
-              f"the current patch tensor and barcode set — recomputing.")
+              f"the current patch tensor, barcode set, or preprocessing version — recomputing.")
     from src.models.conditioning import precompute_gigapath_features, _default_device
     print(f"Precomputing Gigapath features for {patches.shape[0]} spots on "
           f"{_default_device()} (one-time cost, cached to {cache_path} "
@@ -1483,12 +1491,15 @@ def get_dinov2_features(cfg, patches: np.ndarray, barcodes: np.ndarray,
     _dinov2_cache_path) if available, else compute + cache them. Mirrors
     get_gigapath_features exactly -- see that function's own docstring for
     the caching/fingerprinting reasoning, identical here."""
+    from src.models.conditioning import _DINOV2_PREPROCESS_VERSION
+
     cache_path = _dinov2_cache_path(cfg, sample_id=sample_id)
     patch_array = np.ascontiguousarray(patches)
     digest = hashlib.sha256()
     digest.update(str(patch_array.shape).encode("ascii"))
     digest.update(str(patch_array.dtype).encode("ascii"))
     digest.update(memoryview(patch_array).cast("B"))
+    digest.update(_DINOV2_PREPROCESS_VERSION.encode("ascii"))
     patch_fingerprint = digest.hexdigest()
     if cache_path.exists():
         cached = np.load(cache_path)
@@ -1503,7 +1514,7 @@ def get_dinov2_features(cfg, patches: np.ndarray, barcodes: np.ndarray,
                   f"(delete this file to force a recompute).")
             return cached["features"]
         print(f"get_dinov2_features: cache at {cache_path} does not match "
-              f"the current patch tensor and barcode set — recomputing.")
+              f"the current patch tensor, barcode set, or preprocessing version — recomputing.")
     from src.models.conditioning import precompute_dinov2_features, _default_device
     print(f"Precomputing DINOv2 features for {patches.shape[0]} spots on "
           f"{_default_device()} (one-time cost, cached to {cache_path} "

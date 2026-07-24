@@ -398,6 +398,16 @@ _IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 # from an earlier successful download).
 _GIGAPATH_FEAT_DIM = 1536
 
+# Bumped whenever _gigapath_preprocess_and_encode's actual pixel-processing
+# logic changes (2026-07-24: added after a real bug was found where the
+# on-disk feature cache in src/training/train.py's get_gigapath_features
+# was keyed only on the raw patch bytes, never on the preprocessing code
+# itself -- fixing this function silently kept serving stale pre-fix
+# features from cache, forever, because the raw patches on disk hadn't
+# changed. get_gigapath_features folds this string into its cache
+# fingerprint so a future preprocessing change can't repeat that silently.
+_GIGAPATH_PREPROCESS_VERSION = "centercrop224_no_resize_v2_2026-07-24"
+
 
 def _gigapath_preprocess_and_encode(tile_encoder, patches: torch.Tensor) -> torch.Tensor:
     """STPath's REAL official GigaPath preprocessing (stpath/hest_utils/
@@ -608,6 +618,18 @@ def _dinov2_expected_size(tile_encoder) -> int:
     constant, so this stays correct regardless of which DINOv2 variant a
     future config points at."""
     return int(tile_encoder.patch_embed.img_size[0])
+
+
+# Bumped whenever _dinov2_preprocess_and_encode's actual pixel-processing
+# logic changes -- same cache-fingerprint reasoning as
+# _GIGAPATH_PREPROCESS_VERSION above, folded into get_dinov2_features's
+# cache fingerprint (src/training/train.py) so a future preprocessing fix
+# to THIS function can't be silently masked by a stale on-disk cache
+# either. Unchanged by today's fix (that only touched GigaPath), kept as
+# its own separate constant since GigaPath and DINOv2 preprocessing are
+# independent code paths -- bumping one must not force a pointless
+# recompute of the other.
+_DINOV2_PREPROCESS_VERSION = "bicubic_resize_imagenet_norm_v1"
 
 
 def _dinov2_preprocess_and_encode(tile_encoder, patches: torch.Tensor) -> torch.Tensor:
