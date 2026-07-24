@@ -18,25 +18,45 @@
 #   sample_split.json, evaluation_gene_panels.json, training_exclusion.json,
 #   overfit_training_mask.json, logs/ (Lightning CSVLogger curves)
 #
-# Skips any checkpoint_dir that currently has a live training process
-# attached (matched the same way scripts/audit_recovery_suite_status.sh
-# does), so this is safe to run while other configs are still training.
+# Skips any checkpoint_dir whose OWNING CONFIG is currently being trained
+# (i.e. python3 -m src.training.train --config <that file> is a live
+# process) -- matched by config file path, the same signal
+# scripts/audit_recovery_suite_status.sh uses, since checkpoint_dir itself
+# never actually appears in a training process's argv (only --config does).
+# So this is safe to run while other configs are still training.
 #
 # Usage:
 #   ./scripts/cleanup_checkpoint_weights.sh --dry-run   # preview, no deletes
 #   ./scripts/cleanup_checkpoint_weights.sh              # actually delete
 set -euo pipefail
 
-ROOT="${1:-results/checkpoints}"
+ROOT="results/checkpoints"
 DRY_RUN=0
 for arg in "$@"; do
-  [[ "$arg" == "--dry-run" ]] && DRY_RUN=1
+  if [[ "$arg" == "--dry-run" ]]; then
+    DRY_RUN=1
+  else
+    ROOT="$arg"
+  fi
 done
 
 if [[ ! -d "$ROOT" ]]; then
   echo "No such directory: $ROOT (nothing to clean up)"
   exit 0
 fi
+
+# Build checkpoint_dir -> owning config file map, so "is this still
+# running" can check for the config path in `ps` output (what actually
+# shows up in a launch command's argv) instead of the checkpoint_dir path
+# (which never does).
+declare -A CKPT_TO_CONFIG
+while IFS= read -r -d '' cfg; do
+  ckpt_line="$(grep -m1 '^\s*checkpoint_dir:' "$cfg" || true)"
+  [[ -z "$ckpt_line" ]] && continue
+  ckpt_path="${ckpt_line#*checkpoint_dir:}"
+  ckpt_path="$(echo "$ckpt_path" | tr -d '[:space:]')"
+  CKPT_TO_CONFIG["$ckpt_path"]="$cfg"
+done < <(find configs -name "*.yaml" -print0 2>/dev/null)
 
 total_bytes=0
 n_deleted=0
@@ -46,11 +66,24 @@ n_skipped_no_weights=0
 while IFS= read -r -d '' weights_file; do
   ckpt_dir="$(dirname "$weights_file")"
 
-  # Skip if a live process has this exact checkpoint_dir open (running job).
-  if ps -eo args= | grep -F -- "$ckpt_dir" | grep -qv grep; then
-    echo "SKIP (running):   $ckpt_dir"
-    n_skipped_running=$((n_skipped_running + 1))
-    continue
+  # Skip if the config that owns this checkpoint_dir is currently being
+  # trained. Require BOTH "src.training.train" (real launch commands are
+  # `python3 -m src.training.train --config <path>`) AND the config path
+  # in the same ps line -- a plain single-substring grep against the
+  # config path alone is not safe: it can false-positive on any unrelated
+  # process whose argv happens to mention that path for other reasons
+  # (verified in testing -- a shell wrapper that echoes/logs the full
+  # command line is enough to trigger it). Neither this script nor any
+  # other non-training tool in this repo has "src.training.train" in its
+  # own invocation, so the two-substring AND is specific to an actual
+  # training process.
+  config_file="${CKPT_TO_CONFIG[$ckpt_dir]:-}"
+  if [[ -n "$config_file" ]]; then
+    if ps -eo args= | grep -F "src.training.train" | grep -qF -- "$config_file"; then
+      echo "SKIP (running, config=$config_file): $ckpt_dir"
+      n_skipped_running=$((n_skipped_running + 1))
+      continue
+    fi
   fi
 
   dir_bytes=0
