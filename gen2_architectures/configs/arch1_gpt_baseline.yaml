@@ -1,0 +1,80 @@
+# Architecture 1 -- "GPT-v1 faithful": small local-neighborhood
+# transformer, from-scratch MLP gene encoder, frozen GigaPath image
+# encoder. See gen2_architectures/README.md for the full spec.
+#
+# PLACEHOLDER SAMPLE LIST: the 8 Lung samples already confirmed available
+# on this project's server (same set used throughout the lung_round
+# architecture-search phase). Replace train/validation/test_sample_ids
+# below with the real full-HEST-1k sample list once confirmed -- see
+# README.md section 7 ("What you need to fill in before launching").
+experiment_name: gen2_arch1_gpt_baseline_v1
+data:
+  hest_data_dir: data/raw/hest1k
+  hest_cache_dir: data/cache/hest1k
+  min_genes: 200
+  min_cells: 3
+  expression_transform: normalize_log1p
+  expression_target_sum: 10000.0
+  train_sample_ids: [TENX72, TENX62, MEND90, MEND89, MEND88, MEND87]
+  validation_sample_ids: [MEND86]
+  test_sample_ids: [MEND85]
+  organ_by_sample: {TENX72: Lung, TENX62: Lung, MEND90: Lung, MEND89: Lung, MEND88: Lung, MEND87: Lung, MEND86: Lung, MEND85: Lung}
+  tech_by_sample: {TENX72: Visium, TENX62: Visium, MEND90: Visium, MEND89: Visium, MEND88: Visium, MEND87: Visium, MEND86: Visium, MEND85: Visium}
+masking:
+  strategy: random_dropout_patches
+  max_context_points: 80
+  context_selection: nearest_query
+  params:
+    n_patches: 1
+    radius_range: [5.0, 8.0]
+    radius_unit: spot_spacing
+    shape: mixed
+model:
+  architecture: "1"
+  params:
+    feat_dim: 256
+    coord_dim: 64
+    conf_dim: 16
+    hidden_dim: 512
+    n_layers: 8
+    n_heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.1
+    max_neighbors: 80
+    coord_scale: 1000.0   # verify against this dataset's real coordinate spread before launching -- see README
+    decoder_hidden_dim: 1024
+    # organ_vocab/tech_vocab: fill in once the real full-HEST-1k sample
+    # list is known, e.g. organ_vocab: [Lung, Kidney, Colon, Breast, ...]
+    organ_vocab: [Lung]
+    tech_vocab: [Visium]
+training:
+  device: cuda
+  seed: 0
+  lr: 1.0e-4
+  total_steps: 100000   # placeholder -- see README section 7 for how to derive a real budget from a smoke run's steps/sec
+  gradient_clip_val: 1.0
+  log_every_n_steps: 50
+  checkpoint_every_n_steps: 2000
+  eval_every_n_steps: 5000
+  checkpoint_dir: gen2_architectures/results/arch1_gpt_baseline
+  image_mode: target_zero
+  context_gex_mode: full
+  augment_coords: true
+  loss:
+    stage1_end: 0.2
+    stage2_end: 0.6
+    stage2_pearson_weight: 0.1
+    stage3_pearson_weight: 0.3
+evaluation:
+  mask_bank_dir: gen2_architectures/results/mask_banks/arch1_gpt_baseline
+  n_validation_masks: 8
+  n_test_masks: 16
+  validation_seed: 761000
+  test_seed: 961000
+  sampling_seed: 1261000
+  n_samples: 1   # deterministic regressor, see models/eval_compat.py -- n_samples>1 would just repeat the same prediction
+  primary_image_mode: target_zero
+  image_modes: [target_zero, all_zero]
+  k_neighborhood: 8
+  pca_n_components: 50
+  fixed_gene_panel_paths: {lung_hest_bench_50: resources/evaluation/hest_bench/LUNG_var_50genes.json}

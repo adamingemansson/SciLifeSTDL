@@ -1,0 +1,89 @@
+# Architecture 2 -- scFoundation as the gene encoder (GPT's #1-ranked
+# pretrained option). Same local-neighborhood transformer/image encoder as
+# Architecture 1; the gene encoder is a frozen scFoundation checkpoint
+# instead of a from-scratch MLP. See gen2_architectures/README.md.
+#
+# REQUIRES scfoundation_repo_path/scfoundation_model_path below to point to
+# a real `git clone https://github.com/biomap-research/scFoundation` and
+# its downloaded checkpoint (SharePoint link in the upstream README) --
+# CUDA-only (load_model_frommmf hardcodes .cuda()). This is the FIRST real
+# run of this project's scFoundation integration on live hardware -- if it
+# fails, that's a legitimate, expected finding to report, not a sign the
+# plan was wrong (see README's open-risk note on Architecture 2).
+#
+# PLACEHOLDER SAMPLE LIST -- see arch1_gpt_baseline.yaml's own note.
+experiment_name: gen2_arch2_scfoundation_v1
+data:
+  hest_data_dir: data/raw/hest1k
+  hest_cache_dir: data/cache/hest1k
+  min_genes: 200
+  min_cells: 3
+  expression_transform: normalize_log1p
+  expression_target_sum: 10000.0
+  scfoundation_repo_path: ${oc.env:SCFOUNDATION_REPO_PATH}
+  scfoundation_model_path: ${oc.env:SCFOUNDATION_MODEL_PATH}
+  train_sample_ids: [TENX72, TENX62, MEND90, MEND89, MEND88, MEND87]
+  validation_sample_ids: [MEND86]
+  test_sample_ids: [MEND85]
+  organ_by_sample: {TENX72: Lung, TENX62: Lung, MEND90: Lung, MEND89: Lung, MEND88: Lung, MEND87: Lung, MEND86: Lung, MEND85: Lung}
+  tech_by_sample: {TENX72: Visium, TENX62: Visium, MEND90: Visium, MEND89: Visium, MEND88: Visium, MEND87: Visium, MEND86: Visium, MEND85: Visium}
+masking:
+  strategy: random_dropout_patches
+  max_context_points: 80
+  context_selection: nearest_query
+  params:
+    n_patches: 1
+    radius_range: [5.0, 8.0]
+    radius_unit: spot_spacing
+    shape: mixed
+model:
+  architecture: "2"
+  params:
+    feat_dim: 256
+    coord_dim: 64
+    conf_dim: 16
+    hidden_dim: 512
+    n_layers: 8
+    n_heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.1
+    max_neighbors: 80
+    coord_scale: 1000.0
+    decoder_hidden_dim: 1024
+    organ_vocab: [Lung]
+    tech_vocab: [Visium]
+    # scfoundation_dim is NOT set here -- it's auto-detected at runtime from
+    # a real probe call against the loaded checkpoint (see
+    # train_local_neighborhood.py's data_prep._probe_context_feature_dim),
+    # never hardcoded/guessed.
+training:
+  device: cuda
+  seed: 0
+  lr: 1.0e-4
+  total_steps: 100000   # placeholder -- see README section 7
+  gradient_clip_val: 1.0
+  log_every_n_steps: 50
+  checkpoint_every_n_steps: 2000
+  eval_every_n_steps: 5000
+  checkpoint_dir: gen2_architectures/results/arch2_scfoundation
+  image_mode: target_zero
+  context_gex_mode: full
+  augment_coords: true
+  loss:
+    stage1_end: 0.2
+    stage2_end: 0.6
+    stage2_pearson_weight: 0.1
+    stage3_pearson_weight: 0.3
+evaluation:
+  mask_bank_dir: gen2_architectures/results/mask_banks/arch2_scfoundation
+  n_validation_masks: 8
+  n_test_masks: 16
+  validation_seed: 761000
+  test_seed: 961000
+  sampling_seed: 1261000
+  n_samples: 1
+  primary_image_mode: target_zero
+  image_modes: [target_zero, all_zero]
+  k_neighborhood: 8
+  pca_n_components: 50
+  fixed_gene_panel_paths: {lung_hest_bench_50: resources/evaluation/hest_bench/LUNG_var_50genes.json}

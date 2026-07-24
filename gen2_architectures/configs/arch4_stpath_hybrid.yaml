@@ -1,0 +1,89 @@
+# Architecture 4 -- STPath-grounded hybrid: frozen real pretrained STPath
+# weights + a small scFoundation additive residual. Leans on this
+# project's own real result (STPath's frozen backbone consistently
+# outperformed every from-scratch alternative on the Lung pilot), with the
+# verified library-size-preprocessing bug fixed (context expression fed as
+# raw-count log1p, matching STPath's actual pretrained-weight contract).
+#
+# GPT review's #6 concern (riskiest of the 4 -- STPath's frozen weights may
+# be domain-mismatched outside the organs it was pretrained on) is handled
+# here via HALF the compute budget of the other 3 (total_steps below) --
+# be prepared to stop this one early if a smoke run's loss curve looks
+# flat/stuck rather than pushing the full budget regardless.
+#
+# KNOWN LIMITATION (see arch4_stpath_hybrid.py's own module docstring):
+# STPathContextEncoder's organ_type/tech_type are FIXED at construction,
+# not per-sample -- this architecture is NOT naturally multi-organ the way
+# 1/2/3 are. Restricted to a single organ/tech below (Lung/Visium, the
+# confirmed-available set) rather than the full multi-organ HEST-1k corpus
+# the other 3 architectures can use.
+#
+# REQUIRES real STPATH_GENE_VOC_PATH/STPATH_MODEL_WEIGHT_PATH and
+# SCFOUNDATION_REPO_PATH/SCFOUNDATION_MODEL_PATH env vars pointing to real
+# downloaded resources (see this project's existing lung_round STPath
+# configs for how those were obtained).
+experiment_name: gen2_arch4_stpath_hybrid_v1
+data:
+  hest_data_dir: data/raw/hest1k
+  hest_cache_dir: data/cache/hest1k
+  min_genes: 200
+  min_cells: 3
+  expression_transform: normalize_log1p   # note: this feeds everything EXCEPT context["expression"] itself for this model
+  expression_target_sum: 10000.0
+  scfoundation_repo_path: ${oc.env:SCFOUNDATION_REPO_PATH}
+  scfoundation_model_path: ${oc.env:SCFOUNDATION_MODEL_PATH}
+  train_sample_ids: [TENX72, TENX62, MEND90, MEND89, MEND88, MEND87]
+  validation_sample_ids: [MEND86]
+  test_sample_ids: [MEND85]
+  organ_by_sample: {TENX72: Lung, TENX62: Lung, MEND90: Lung, MEND89: Lung, MEND88: Lung, MEND87: Lung, MEND86: Lung, MEND85: Lung}
+  tech_by_sample: {TENX72: Visium, TENX62: Visium, MEND90: Visium, MEND89: Visium, MEND88: Visium, MEND87: Visium, MEND86: Visium, MEND85: Visium}
+masking:
+  strategy: random_dropout_patches
+  max_context_points: 3000   # deliberately NOT 80 -- STPath's real pretrained weights were calibrated against a much larger context set; shrinking it to match Architectures 1-3 would itself be an unintended intervention on a component we are NOT trying to change
+  context_selection: nearest_query
+  params:
+    n_patches: 1
+    radius_range: [5.0, 8.0]
+    radius_unit: spot_spacing
+    shape: mixed
+model:
+  architecture: "4"
+  params:
+    gene_voc_path: ${oc.env:STPATH_GENE_VOC_PATH}
+    model_weight_path: ${oc.env:STPATH_MODEL_WEIGHT_PATH}
+    organ_type: Lung
+    tech_type: Visium
+    hidden_dim: 256
+    # scfoundation_dim is NOT set here -- auto-detected at runtime from a
+    # real probe call, same as Architecture 2.
+training:
+  device: cuda
+  seed: 0
+  lr: 1.0e-4
+  total_steps: 50000   # HALF of the other 3 architectures' placeholder budget -- see GPT review #6 note above
+  gradient_clip_val: 1.0
+  log_every_n_steps: 50
+  checkpoint_every_n_steps: 2000
+  eval_every_n_steps: 5000
+  checkpoint_dir: gen2_architectures/results/arch4_stpath_hybrid
+  image_mode: target_zero
+  context_gex_mode: full
+  augment_coords: false   # STPathContextEncoder's real coordinate rescaling assumes a consistent frame per call; leave augmentation off for this architecture (matches this project's existing STPath configs)
+  loss:
+    stage1_end: 0.2
+    stage2_end: 0.6
+    stage2_pearson_weight: 0.1
+    stage3_pearson_weight: 0.3
+evaluation:
+  mask_bank_dir: gen2_architectures/results/mask_banks/arch4_stpath_hybrid
+  n_validation_masks: 8
+  n_test_masks: 16
+  validation_seed: 761000
+  test_seed: 961000
+  sampling_seed: 1261000
+  n_samples: 1
+  primary_image_mode: target_zero
+  image_modes: [target_zero, all_zero]
+  k_neighborhood: 8
+  pca_n_components: 50
+  fixed_gene_panel_paths: {lung_hest_bench_50: resources/evaluation/hest_bench/LUNG_var_50genes.json}

@@ -1,0 +1,49 @@
+# Architecture 3, Stage A -- self-supervised DENOISING transcriptome
+# autoencoder pretraining (GPT review suggestion #3). Run this FIRST, then
+# point arch3_stage_b_spatial.yaml's model.stage_a_checkpoint_dir at this
+# run's training.checkpoint_dir below. No images, no masking, no
+# context/query split -- pure expression -> expression reconstruction on
+# every observed spot from every training slide. Cheap relative to Stage B
+# (train_arch3_stage_b.py) -- expect this to finish well within the
+# combined 1-2 day budget for the pair.
+#
+# IMPORTANT: Stage A and Stage B MUST share the exact same
+# train_sample_ids/min_genes/min_cells/expression_transform (i.e. the exact
+# same resulting gene panel and expression values) -- train_arch3_stage_b.py
+# checks the gene COUNT matches and raises if not, but cannot verify gene
+# IDENTITY/order matches beyond that, so keep this file and
+# arch3_stage_b_spatial.yaml's [data] section identical by construction.
+#
+# PLACEHOLDER SAMPLE LIST -- see arch1_gpt_baseline.yaml's own note.
+experiment_name: gen2_arch3_stage_a_pretrain_v1
+data:
+  hest_data_dir: data/raw/hest1k
+  hest_cache_dir: data/cache/hest1k
+  min_genes: 200
+  min_cells: 3
+  expression_transform: normalize_log1p
+  expression_target_sum: 10000.0
+  train_sample_ids: [TENX72, TENX62, MEND90, MEND89, MEND88, MEND87]
+  organ_by_sample: {TENX72: Lung, TENX62: Lung, MEND90: Lung, MEND89: Lung, MEND88: Lung, MEND87: Lung}
+  tech_by_sample: {TENX72: Visium, TENX62: Visium, MEND90: Visium, MEND89: Visium, MEND88: Visium, MEND87: Visium}
+model:
+  params:
+    latent_dim: 256
+    hidden_dims: [4096, 1024]
+training:
+  device: cuda
+  seed: 0
+  lr: 1.0e-4
+  total_steps: 30000   # placeholder -- pure reconstruction on pooled spots converges much faster than the spatial stage; verify with a smoke run
+  batch_size: 256
+  gradient_clip_val: 1.0
+  log_every_n_steps: 100
+  checkpoint_every_n_steps: 5000
+  checkpoint_dir: gen2_architectures/results/arch3_stage_a_pretrain
+  mask_fraction: 0.2   # GPT's suggested 20% per-row gene masking
+  gaussian_std: 0.0    # additive Gaussian noise on top of masking; 0.0 = masking only
+  loss:
+    stage1_end: 0.2
+    stage2_end: 0.6
+    stage2_pearson_weight: 0.1
+    stage3_pearson_weight: 0.3
