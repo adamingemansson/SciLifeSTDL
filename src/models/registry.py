@@ -78,6 +78,9 @@ def _build_context_encoder(
     storm_lite_tokenizer_gene_names: list[str] | None = None,
     storm_lite_tokenizer_full_gene_names: list[str] | None = None,
     storm_lite_tokenizer_n_pool_layers: int = 1, storm_lite_tokenizer_n_pool_heads: int = 4,
+    simple_fusion_knn_k: int = 16, simple_fusion_input_already_log1p: bool = True,
+    simple_cross_attn_n_heads: int = 4, simple_cross_attn_mlp_ratio: float = 2.0,
+    simple_cross_attn_dropout: float = 0.1,
     organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
 ):
     """Shared by WAE-GAN/FM-OT/VQ-VAE+AR so each model's __init__ doesn't
@@ -178,6 +181,19 @@ def _build_context_encoder(
             use_absolute_coords=storm_lite_use_absolute_coords,
             input_already_log1p=storm_lite_input_already_log1p,
             organ_vocab=organ_vocab, tech_vocab=tech_vocab,
+        )
+    elif context_encoder_type == "simple_fusion":
+        from src.models.simple_fusion_encoder import SimpleFusionContextEncoder
+        return SimpleFusionContextEncoder(
+            n_genes=n_genes, hidden_dim=cond_hidden_dim, knn_k=simple_fusion_knn_k,
+            input_already_log1p=simple_fusion_input_already_log1p,
+        )
+    elif context_encoder_type == "simple_cross_attn":
+        from src.models.simple_fusion_encoder import SimpleCrossAttentionContextEncoder
+        return SimpleCrossAttentionContextEncoder(
+            n_genes=n_genes, hidden_dim=cond_hidden_dim, n_heads=simple_cross_attn_n_heads,
+            mlp_ratio=simple_cross_attn_mlp_ratio, dropout=simple_cross_attn_dropout,
+            knn_k=simple_fusion_knn_k, input_already_log1p=simple_fusion_input_already_log1p,
         )
     else:
         raise ValueError(f"unknown context_encoder_type {context_encoder_type!r}")
@@ -1023,15 +1039,21 @@ class ContextTransportRegressor(BaseGenerativeModel):
         storm_lite_local_k: int = 32,
         storm_lite_use_absolute_coords: bool = True,
         storm_lite_input_already_log1p: bool = True,
+        simple_fusion_knn_k: int = 16,
+        simple_fusion_input_already_log1p: bool = True,
+        simple_cross_attn_n_heads: int = 4,
+        simple_cross_attn_mlp_ratio: float = 2.0,
+        simple_cross_attn_dropout: float = 0.1,
         target_gene_scale: list[float] | None = None,
         target_scale_floor: float = 0.05,
         organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
     ):
         super().__init__()
-        if conditioning_mode not in {"uniform", "geometry", "storm_lite"}:
-            raise ValueError(
-                "conditioning_mode must be 'uniform', 'geometry', or 'storm_lite'"
-            )
+        _known_conditioning_modes = {
+            "uniform", "geometry", "storm_lite", "simple_fusion", "simple_cross_attn",
+        }
+        if conditioning_mode not in _known_conditioning_modes:
+            raise ValueError(f"conditioning_mode must be one of {sorted(_known_conditioning_modes)}")
         if transport_k < 1:
             raise ValueError("transport_k must be positive")
         if target_scale_floor <= 0:
@@ -1056,10 +1078,11 @@ class ContextTransportRegressor(BaseGenerativeModel):
         self.geometry_encoder = None
         self.condition_projection = None
         self.weight_scorer = None
-        if conditioning_mode == "storm_lite":
-            if context_encoder_type != "storm_lite":
+        if conditioning_mode in {"storm_lite", "simple_fusion", "simple_cross_attn"}:
+            if context_encoder_type != conditioning_mode:
                 raise ValueError(
-                    "conditioning_mode='storm_lite' requires context_encoder_type='storm_lite'"
+                    f"conditioning_mode={conditioning_mode!r} requires "
+                    f"context_encoder_type={conditioning_mode!r}"
                 )
             self.context_encoder = _build_context_encoder(
                 n_genes=n_genes, coord_dim=coord_dim, cond_hidden_dim=cond_hidden_dim,
@@ -1077,6 +1100,11 @@ class ContextTransportRegressor(BaseGenerativeModel):
                 storm_lite_local_k=storm_lite_local_k,
                 storm_lite_use_absolute_coords=storm_lite_use_absolute_coords,
                 storm_lite_input_already_log1p=storm_lite_input_already_log1p,
+                simple_fusion_knn_k=simple_fusion_knn_k,
+                simple_fusion_input_already_log1p=simple_fusion_input_already_log1p,
+                simple_cross_attn_n_heads=simple_cross_attn_n_heads,
+                simple_cross_attn_mlp_ratio=simple_cross_attn_mlp_ratio,
+                simple_cross_attn_dropout=simple_cross_attn_dropout,
                 organ_vocab=organ_vocab, tech_vocab=tech_vocab,
             )
             self.condition_projection = nn.Sequential(
