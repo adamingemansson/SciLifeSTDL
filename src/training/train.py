@@ -3101,11 +3101,20 @@ def _main_multi_sample(cfg) -> None:
                 organ=organ, tech=tech,
                 slide_context=sample[10],
                 gene_panels=evaluation_gene_panels,
+                raw_counts=(
+                    adata.layers["raw_counts"] if "raw_counts" in adata.layers else None
+                ),
+                raw_library_size=(
+                    adata.obs["_scilifestdl_raw_library_size"].to_numpy()
+                    if "_scilifestdl_raw_library_size" in adata.obs else None
+                ),
+                expression_target_sum=float(cfg.data.get("expression_target_sum", 1e4)),
             )
         aggregate = {}
         aggregate_metrics = (
             "pcc", "n_pcc_genes", "rmse", "nonzero_auc", "st_fid", "st_mmd",
             "spatial_domain_plausibility", "predictive_std", "interval90_coverage",
+            "pcc_raw_log1p", "n_pcc_raw_log1p_genes", "rmse_raw_log1p",
             *(
                 metric
                 for panel_name in evaluation_gene_panels

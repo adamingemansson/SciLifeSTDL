@@ -204,6 +204,9 @@ def evaluate_model_on_mask_bank(
     tech: str | None = None,
     slide_context: dict | None = None,
     gene_panels: dict[str, list[str]] | None = None,
+    raw_counts: np.ndarray | None = None,
+    raw_library_size: np.ndarray | None = None,
+    expression_target_sum: float = 1e4,
 ) -> dict[str, Any]:
     """Evaluate predictive means and uncertainty on untouched test masks.
 
@@ -211,7 +214,20 @@ def evaluate_model_on_mask_bank(
     pseudo-label diagnostic is deliberately named ``spatial_domain`` rather
     than ``cell_type`` because the labels are unsupervised Leiden domains from
     the complete slide, not curated biological annotations.
-    """
+
+    raw_counts/raw_library_size (2026-07-24, notebook-comparability check):
+    optional, row/column-aligned with ``expr`` (see
+    src/data/loaders.py::basic_qc_and_normalize's "raw_counts"/
+    "_scilifestdl_raw_library_size" stash). When supplied, an ADDITIONAL
+    ``pcc_raw_log1p`` metric is computed by inverting the model's prediction
+    (which lives in our library-size-normalized log1p space) back to raw-
+    count-log1p space using each query spot's TRUE total count, then
+    comparing against real log1p(raw_counts) ground truth — the exact space
+    STPath's own pretrained weights and the reference notebook evaluate in
+    (see stpath/app/pipeline/inference.py's agent.inference internal log1p-
+    only convention, verified directly against the cloned STPath source).
+    None (default) skips this entirely — purely additive, does not change
+    any existing metric for any config that doesn't pass it."""
     from src.training.train import _build_masked_item
 
     output_path = Path(output_path)
@@ -244,10 +260,12 @@ def evaluate_model_on_mask_bank(
     if decoder_idx is None:
         metric_expr = expr
         metric_gene_names = [str(name) for name in adata.var_names]
+        metric_raw_counts = raw_counts
     else:
         idx_np = decoder_idx.detach().cpu().numpy()
         metric_expr = expr[:, idx_np]
         metric_gene_names = [str(adata.var_names[idx]) for idx in idx_np]
+        metric_raw_counts = None if raw_counts is None else raw_counts[:, idx_np]
     panel_indices, panel_metadata = _resolve_gene_panels(metric_gene_names, gene_panels)
     pca, effective_pca = _fixed_pca(
         records, adata.obs_names, coords3d, metric_expr, requested_pca, k
@@ -407,6 +425,24 @@ def evaluate_model_on_mask_bank(
                 "interval90_coverage": float(((target_t >= lower) & (target_t <= upper)).float().mean().cpu()),
                 "interval90_width": float((upper - lower).mean().cpu()),
             }
+            if metric_raw_counts is not None and raw_library_size is not None:
+                raw_target = np.asarray(metric_raw_counts[query_mask], dtype=np.float64)
+                library_size = np.asarray(raw_library_size, dtype=np.float64)[query_mask][:, None]
+                # Invert our library-size-normalized-log1p prediction back to
+                # raw-count-log1p space using the query spot's OWN true total
+                # count (a per-spot scalar normalizing constant, not per-gene
+                # signal) -- the exact space STPath's pretrained weights and
+                # the reference notebook evaluate in.
+                pred_counts_est = np.clip(
+                    np.expm1(pred.astype(np.float64)) * library_size / float(expression_target_sum),
+                    a_min=0.0, a_max=None,
+                )
+                pred_raw_log1p = np.log1p(pred_counts_est)
+                target_raw_log1p = np.log1p(raw_target)
+                pcc_raw_by_gene = ev.pearson_per_gene(pred_raw_log1p, target_raw_log1p)
+                row["pcc_raw_log1p"] = float(np.nanmean(pcc_raw_by_gene))
+                row["n_pcc_raw_log1p_genes"] = int(np.isfinite(pcc_raw_by_gene).sum())
+                row["rmse_raw_log1p"] = float(ev.rmse(pred_raw_log1p, target_raw_log1p))
             for panel_name, panel_idx in panel_indices.items():
                 panel_pred = pred[:, panel_idx]
                 panel_target = target[:, panel_idx]

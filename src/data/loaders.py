@@ -140,6 +140,18 @@ def basic_qc_and_normalize(
 
     sc.pp.filter_cells(adata, min_genes=min_genes)
     sc.pp.filter_genes(adata, min_cells=min_cells)
+    # Stash raw (post-QC, pre-normalization) counts and each spot's true
+    # total count BEFORE normalize_total rescales adata.X in place. This is
+    # for notebook-comparable raw-log1p evaluation only (STPath's own
+    # preprocessing/the reference notebook never library-size-normalize —
+    # see src/models/stpath_encoder.py's input_already_log1p docstring) and
+    # never feeds training/model input, which stays on the transform above.
+    # The library size must be captured HERE, before any later shared-gene-
+    # panel subsetting (loaders.load_multi_sample's a[:, shared_genes]),
+    # since that subsetting would otherwise silently shrink the sum.
+    raw_x = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()
+    adata.obs["_scilifestdl_raw_library_size"] = np.asarray(raw_x.sum(axis=1)).ravel()
+    adata.layers["raw_counts"] = adata.X.copy()
     if transform in {"normalize", "normalize_log1p"}:
         sc.pp.normalize_total(adata, target_sum=target_sum)
     if transform == "normalize_log1p":
