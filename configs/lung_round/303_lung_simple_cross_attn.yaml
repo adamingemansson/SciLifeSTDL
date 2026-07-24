@@ -1,12 +1,12 @@
 # Lung round (2026-07-24): new architecture, simple_cross_attn mode --
 # identical GigaPath + gene-MLP token construction as
 # 302_lung_simple_fusion.yaml, but the query attends over its k nearest
-# context tokens via ONE learned cross-attention layer (with residuals --
-# structurally required for a transformer block) instead of a fixed
-# uniform average. The "with a transformer" condition; the direct
+# context tokens via a 2-layer learned cross-attention stack (with
+# residuals -- structurally required for a transformer block) instead of
+# a fixed uniform average. The "with a transformer" condition; the direct
 # fusion-vs-attention contrast against 302 isolates one variable. One of
-# 3 GPU-training conditions this round (GPUs 2,3,5). 10k steps, smallhole
-# masking.
+# 4 GPU-training conditions this round (GPU 2 of 1,2,3,5 -- smallest
+# model, 302, gets GPU 1). 10k steps, smallhole masking.
 experiment_name: transport_lung_simple_cross_attn_v1_10k
 data:
   source: hest1k
@@ -56,6 +56,7 @@ model:
     simple_cross_attn_n_heads: 4
     simple_cross_attn_mlp_ratio: 2.0
     simple_cross_attn_dropout: 0.1
+    simple_cross_attn_n_layers: 2
     lr: 0.001
     target_scale_floor: 0.05
 training:

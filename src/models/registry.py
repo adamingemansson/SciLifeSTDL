@@ -80,7 +80,11 @@ def _build_context_encoder(
     storm_lite_tokenizer_n_pool_layers: int = 1, storm_lite_tokenizer_n_pool_heads: int = 4,
     simple_fusion_knn_k: int = 16, simple_fusion_input_already_log1p: bool = True,
     simple_cross_attn_n_heads: int = 4, simple_cross_attn_mlp_ratio: float = 2.0,
-    simple_cross_attn_dropout: float = 0.1,
+    simple_cross_attn_dropout: float = 0.1, simple_cross_attn_n_layers: int = 2,
+    simple_stpath_transformer_n_layers: int = 2, simple_stpath_transformer_n_heads: int = 4,
+    simple_stpath_transformer_dropout: float = 0.1,
+    simple_stpath_transformer_attn_dropout: float = 0.1,
+    simple_stpath_transformer_mlp_ratio: float = 2.0,
     organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
 ):
     """Shared by WAE-GAN/FM-OT/VQ-VAE+AR so each model's __init__ doesn't
@@ -193,7 +197,19 @@ def _build_context_encoder(
         return SimpleCrossAttentionContextEncoder(
             n_genes=n_genes, hidden_dim=cond_hidden_dim, n_heads=simple_cross_attn_n_heads,
             mlp_ratio=simple_cross_attn_mlp_ratio, dropout=simple_cross_attn_dropout,
+            n_layers=simple_cross_attn_n_layers,
             knn_k=simple_fusion_knn_k, input_already_log1p=simple_fusion_input_already_log1p,
+        )
+    elif context_encoder_type == "simple_stpath_transformer":
+        from src.models.simple_fusion_encoder import SimpleFusionSpatialTransformerContextEncoder
+        return SimpleFusionSpatialTransformerContextEncoder(
+            n_genes=n_genes, hidden_dim=cond_hidden_dim,
+            n_layers=simple_stpath_transformer_n_layers,
+            n_heads=simple_stpath_transformer_n_heads,
+            dropout=simple_stpath_transformer_dropout,
+            attn_dropout=simple_stpath_transformer_attn_dropout,
+            mlp_ratio=simple_stpath_transformer_mlp_ratio,
+            input_already_log1p=simple_fusion_input_already_log1p,
         )
     else:
         raise ValueError(f"unknown context_encoder_type {context_encoder_type!r}")
@@ -1148,6 +1164,12 @@ class ContextTransportRegressor(BaseGenerativeModel):
         simple_cross_attn_n_heads: int = 4,
         simple_cross_attn_mlp_ratio: float = 2.0,
         simple_cross_attn_dropout: float = 0.1,
+        simple_cross_attn_n_layers: int = 2,
+        simple_stpath_transformer_n_layers: int = 2,
+        simple_stpath_transformer_n_heads: int = 4,
+        simple_stpath_transformer_dropout: float = 0.1,
+        simple_stpath_transformer_attn_dropout: float = 0.1,
+        simple_stpath_transformer_mlp_ratio: float = 2.0,
         target_gene_scale: list[float] | None = None,
         target_scale_floor: float = 0.05,
         organ_vocab: list[str] | None = None, tech_vocab: list[str] | None = None,
@@ -1155,6 +1177,7 @@ class ContextTransportRegressor(BaseGenerativeModel):
         super().__init__()
         _known_conditioning_modes = {
             "uniform", "geometry", "storm_lite", "simple_fusion", "simple_cross_attn",
+            "simple_stpath_transformer",
         }
         if conditioning_mode not in _known_conditioning_modes:
             raise ValueError(f"conditioning_mode must be one of {sorted(_known_conditioning_modes)}")
@@ -1182,7 +1205,9 @@ class ContextTransportRegressor(BaseGenerativeModel):
         self.geometry_encoder = None
         self.condition_projection = None
         self.weight_scorer = None
-        if conditioning_mode in {"storm_lite", "simple_fusion", "simple_cross_attn"}:
+        if conditioning_mode in {
+            "storm_lite", "simple_fusion", "simple_cross_attn", "simple_stpath_transformer",
+        }:
             if context_encoder_type != conditioning_mode:
                 raise ValueError(
                     f"conditioning_mode={conditioning_mode!r} requires "
@@ -1209,6 +1234,12 @@ class ContextTransportRegressor(BaseGenerativeModel):
                 simple_cross_attn_n_heads=simple_cross_attn_n_heads,
                 simple_cross_attn_mlp_ratio=simple_cross_attn_mlp_ratio,
                 simple_cross_attn_dropout=simple_cross_attn_dropout,
+                simple_cross_attn_n_layers=simple_cross_attn_n_layers,
+                simple_stpath_transformer_n_layers=simple_stpath_transformer_n_layers,
+                simple_stpath_transformer_n_heads=simple_stpath_transformer_n_heads,
+                simple_stpath_transformer_dropout=simple_stpath_transformer_dropout,
+                simple_stpath_transformer_attn_dropout=simple_stpath_transformer_attn_dropout,
+                simple_stpath_transformer_mlp_ratio=simple_stpath_transformer_mlp_ratio,
                 organ_vocab=organ_vocab, tech_vocab=tech_vocab,
             )
             self.condition_projection = nn.Sequential(

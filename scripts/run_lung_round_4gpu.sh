@@ -1,31 +1,38 @@
 #!/usr/bin/env bash
-# Lung round (2026-07-24) -- 3 GPU-training conditions, 1 config per GPU,
+# Lung round (2026-07-24) -- 4 GPU-training conditions, 1 config per GPU,
 # smoke-tested up front before any full run starts (same pattern as
 # scripts/run_consolidated_37_4gpu.sh, trimmed since there's no queueing
-# needed with exactly 3 configs on 3 GPUs):
+# needed with exactly 4 configs on 4 GPUs). Smallest model (zero attention
+# parameters) deliberately placed on GPU 1 per explicit instruction:
 #
-#   GPU[0] (default 2): 301_lung_stpath_scratch      (STPath architecture, no pretraining)
-#   GPU[1] (default 3): 302_lung_simple_fusion        (GigaPath+gene sum, mean-pooled, no attention)
-#   GPU[2] (default 5): 303_lung_simple_cross_attn    (same tokens, one learned cross-attn layer)
+#   GPU[0] (default 1): 302_lung_simple_fusion                (smallest -- GigaPath+gene sum, mean-pooled, no attention)
+#   GPU[1] (default 2): 303_lung_simple_cross_attn             (same tokens, 2-layer learned cross-attn stack)
+#   GPU[2] (default 3): 301_lung_stpath_scratch                 (STPath's real architecture, no pretraining)
+#   GPU[3] (default 5): 306_lung_simple_stpath_transformer      (our tokens + STPath's real SpatialTransformer backbone, no organ/tech)
 #
 # 304_lung_harmonic.yaml (closed-form, no training) and
 # 305_lung_stpath_pretrained_eval.yaml (frozen weights, eval only) need no
 # GPU-training slot -- run them separately, e.g. on whichever GPU frees up
 # first:
-#   CUDA_VISIBLE_DEVICES=2 python3 -m src.training.train --config configs/lung_round/304_lung_harmonic.yaml
-#   CUDA_VISIBLE_DEVICES=2 python3 -m src.training.train --config configs/lung_round/305_lung_stpath_pretrained_eval.yaml
+#   CUDA_VISIBLE_DEVICES=1 python3 -m src.training.train --config configs/lung_round/304_lung_harmonic.yaml
+#   CUDA_VISIBLE_DEVICES=1 python3 -m src.training.train --config configs/lung_round/305_lung_stpath_pretrained_eval.yaml
 #
 # 305 additionally needs STPATH_MODEL_WEIGHT_PATH (real released weight,
-# huggingface.co/tlhuang/STPath) set -- 301/302/303 don't, since 301 trains
-# from a random init and 302/303 don't use STPath's package at all.
-# All 5 configs need STPATH_GENE_VOC_PATH (the gene vocabulary resource,
-# not a model weight -- a fixed lookup table, needed even for
-# pretrained=False per STPathContextEncoder's own docstring).
+# huggingface.co/tlhuang/STPath) set -- 301/302/303/306 don't (301 trains
+# from a random init; 302/303 don't use the stpath package at all; 306
+# only needs stpath's SpatialTransformer/ModelConfig classes, no weights).
+# All configs except 302/303 need STPATH_GENE_VOC_PATH (301/305's gene
+# vocabulary resource -- a fixed lookup table, not a model weight).
+#
+# 306 has only been verified by reading STPath's real source, never
+# executed end-to-end (the `stpath` package wasn't installed anywhere
+# this session had shell access) -- its smoke test below is the actual
+# first real verification, not a formality. Watch its smoke log closely.
 #
 # Usage:
-#   bash scripts/run_lung_round_3gpu.sh
-#   GPU_IDS=2,3,5 SMOKE_ONLY=1 bash scripts/run_lung_round_3gpu.sh
-#   SKIP_SMOKE=1 bash scripts/run_lung_round_3gpu.sh
+#   bash scripts/run_lung_round_4gpu.sh
+#   GPU_IDS=1,2,3,5 SMOKE_ONLY=1 bash scripts/run_lung_round_4gpu.sh
+#   SKIP_SMOKE=1 bash scripts/run_lung_round_4gpu.sh
 set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -36,10 +43,10 @@ RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 SMOKE_ONLY="${SMOKE_ONLY:-0}"
 SKIP_SMOKE="${SKIP_SMOKE:-0}"
 MIN_FREE_GB="${MIN_FREE_GB:-20}"
-GPU_IDS_CSV="${GPU_IDS:-2,3,5}"
+GPU_IDS_CSV="${GPU_IDS:-1,2,3,5}"
 IFS=',' read -r -a GPUS <<< "$GPU_IDS_CSV"
 
-NUMBERS=(301 302 303)
+NUMBERS=(302 303 301 306)
 declare -A CONFIG_PATH
 declare -A CONFIG_NAME
 for number in "${NUMBERS[@]}"; do
@@ -68,13 +75,13 @@ export MKL_NUM_THREADS="$CPU_THREADS_PER_JOB"
 export OPENBLAS_NUM_THREADS="$CPU_THREADS_PER_JOB"
 export NUMEXPR_NUM_THREADS="$CPU_THREADS_PER_JOB"
 
-echo "===== YAML sanity check (3 configs parse, distinct experiment_name, all at 10k steps, matching sample lists) ====="
+echo "===== YAML sanity check (4 configs parse, distinct experiment_name, all at 10k steps, matching sample lists) ====="
 "$PYTHON_BIN" - <<PYEOF
 import sys
 from pathlib import Path
 import yaml
 
-numbers = ["301", "302", "303"]
+numbers = ["302", "303", "301", "306"]
 seen_names = {}
 expected_samples = None
 for n in numbers:
@@ -102,8 +109,8 @@ print(f"OK: {len(numbers)} configs parse, {len(seen_names)} distinct experiment_
 PYEOF
 
 echo "===== GPU_IDS check ====="
-if (( ${#GPUS[@]} != 3 )); then
-  echo "ERROR: GPU_IDS must provide exactly three comma-separated devices (got '$GPU_IDS_CSV')." >&2
+if (( ${#GPUS[@]} != 4 )); then
+  echo "ERROR: GPU_IDS must provide exactly four comma-separated devices (got '$GPU_IDS_CSV')." >&2
   exit 2
 fi
 declare -A seen_gpus=()
@@ -142,8 +149,15 @@ fi
 echo "OK: ${avail_gb}GiB free."
 
 if [[ -z "${STPATH_GENE_VOC_PATH:-}" || ! -f "$STPATH_GENE_VOC_PATH" ]]; then
-  echo "ERROR: STPATH_GENE_VOC_PATH is missing or not a file (needed by all 3 configs -- 301" >&2
-  echo "  directly, 302/303 only via the shared config schema check above, harmless if unused)." >&2
+  echo "ERROR: STPATH_GENE_VOC_PATH is missing or not a file (needed by 301 directly; 302/303/306" >&2
+  echo "  only via the shared config-schema check above, harmless if unused)." >&2
+  exit 2
+fi
+
+echo "===== stpath package presence check (needed by 301 and 306) ====="
+if ! "$PYTHON_BIN" -c 'import stpath' 2>/dev/null; then
+  echo "ERROR: the external stpath package is not importable -- 301 and 306 both need it" >&2
+  echo "  (git clone Graph-and-Geometric-Learning/STPath + pip install -e .)." >&2
   exit 2
 fi
 
@@ -191,9 +205,9 @@ run_one() {
 }
 
 if [[ "$SKIP_SMOKE" != "1" ]]; then
-  echo "===== One-step fail-closed smoke test (3 configs in parallel) ====="
+  echo "===== One-step fail-closed smoke test (4 configs in parallel) ====="
   smoke_pids=()
-  for i in 0 1 2; do
+  for i in 0 1 2 3; do
     run_one "${NUMBERS[$i]}" "${GPUS[$i]}" 1 &
     smoke_pids+=("$!")
   done
@@ -203,7 +217,7 @@ if [[ "$SKIP_SMOKE" != "1" ]]; then
     echo "ERROR: smoke test failed; inspect $LOG_ROOT/smoke_*.log" >&2
     exit 1
   fi
-  echo "OK: all 3 smoke tests passed."
+  echo "OK: all 4 smoke tests passed."
 fi
 
 if [[ "$SMOKE_ONLY" == "1" ]]; then
@@ -211,15 +225,15 @@ if [[ "$SMOKE_ONLY" == "1" ]]; then
   exit 0
 fi
 
-echo "===== Full run (3 configs, 1 per GPU, 10k steps each) ====="
+echo "===== Full run (4 configs, 1 per GPU, 10k steps each) ====="
 run_pids=()
-for i in 0 1 2; do
+for i in 0 1 2 3; do
   run_one "${NUMBERS[$i]}" "${GPUS[$i]}" 0 &
   run_pids+=("$!")
 done
 
 failed=0
-for i in 0 1 2; do
+for i in 0 1 2 3; do
   number="${NUMBERS[$i]}"
   if ! wait "${run_pids[$i]}"; then
     echo "ERROR: ${CONFIG_NAME[$number]} failed; see $LOG_ROOT/full_${CONFIG_NAME[$number]}.log" >&2
@@ -233,4 +247,4 @@ if [[ "$failed" != "0" ]]; then
   echo "WARNING: at least one job failed -- check logs above." >&2
   exit 1
 fi
-echo "Lung round finished: all 3 training conditions completed."
+echo "Lung round finished: all 4 training conditions completed."

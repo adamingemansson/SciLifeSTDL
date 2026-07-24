@@ -1,15 +1,20 @@
-# Lung round (2026-07-24): STPath's real architecture (STFM), randomly
-# initialized, trained from scratch on our own Lung samples -- no added
-# components (new_gene_encoder_type='none'). The comparison arm for "does
-# STPath's architecture help without its massive external pretraining, on
-# our data alone." One of 4 GPU-training conditions this round (GPU 3 of
-# 1,2,3,5 -- smallest model, 302, gets GPU 1); the pretrained (frozen,
-# no-training) STPath condition is a separate config,
-# 305_lung_stpath_pretrained_eval.yaml, since it needs no GPU-training
-# slot. 10k steps, smallhole masking. See docs/results_log.md
-# for where the HEST-1k copy this uses (/data/hest, symlinked into
-# data/raw/hest1k) actually lives.
-experiment_name: transport_lung_stpath_scratch_v1_10k
+# Lung round (2026-07-24): new architecture, simple_stpath_transformer
+# mode -- our own GigaPath + gene-MLP tokens (identical construction to
+# 302/303), fed through STPath's REAL SpatialTransformer backbone (the
+# same class the released model uses internally, imported directly from
+# the `stpath` package) instead of mean-pooling (302) or a hand-rolled
+# cross-attention stack (303). "Basically STPath, but without STPath's
+# own organ/tech tokens and fixed-vocabulary gene tokenizer" -- isolates
+# whether STPath's real backbone helps when paired with simpler encoders
+# that don't need its ~39k-gene vocabulary lookup or organ/tech
+# conditioning at all. See SimpleFusionSpatialTransformerContextEncoder's
+# own docstring: construction verified against STPath's real source, but
+# NOT executed end-to-end before a real run of this config -- treat the
+# smoke test as the actual first verification.
+#
+# GPU assignment this round (4 GPUs total): 302 (smallest, no attention
+# params at all) -> GPU 1; 303, 301, 306 (this config) -> GPUs 2/3/5.
+experiment_name: transport_lung_simple_stpath_transformer_v1_10k
 data:
   source: hest1k
   hest_data_dir: data/raw/hest1k
@@ -45,19 +50,26 @@ masking:
     radius_unit: spot_spacing
     shape: mixed
 model:
-  name: stpath_scratch
+  name: context_transport_regressor
   params:
-    stpath_gene_voc_path: ${oc.env:STPATH_GENE_VOC_PATH}
-    stpath_organ_type: Lung
-    stpath_tech_type: Visium
-    stpath_hidden_dim: 512
-    context_encoder_type: stpath
+    coord_dim: 3
+    cond_hidden_dim: 128
+    score_hidden_dim: 128
+    transport_k: 32
+    conditioning_mode: simple_stpath_transformer
+    context_encoder_type: simple_stpath_transformer
+    simple_fusion_input_already_log1p: true
+    simple_stpath_transformer_n_layers: 2
+    simple_stpath_transformer_n_heads: 4
+    simple_stpath_transformer_dropout: 0.1
+    simple_stpath_transformer_attn_dropout: 0.1
+    simple_stpath_transformer_mlp_ratio: 2.0
     lr: 0.001
     target_scale_floor: 0.05
 training:
   epochs: 10000
   seed: 10
-  mask_seed: 761000
+  mask_seed: 766000
   unique_mask_count: 256
   log_every_n_steps: 10
   log_print_every_n_steps: 500
@@ -70,7 +82,7 @@ training:
   all_image_dropout_p: 0.0
   context_gex_dropout_p: 0.0
   gradient_clip_val: 1.0
-  checkpoint_dir: results/checkpoints/lung_round/transport_lung_stpath_scratch_v1_10k
+  checkpoint_dir: results/checkpoints/lung_round/transport_lung_simple_stpath_transformer_v1_10k
 validation:
   enabled: true
   every_n_steps: 1000
@@ -80,7 +92,7 @@ validation:
   min_delta: 0.0001
   metric: rmse
   n_samples: 1
-  sampling_seed: 861000
+  sampling_seed: 866000
 evaluation:
   mask_bank_dir: results/mask_banks/lung_round/transport_lung_v1_10k
   n_validation_masks: 8
@@ -97,7 +109,7 @@ evaluation:
   pca_n_components: 50
   fixed_gene_panel_paths: {lung_hest_bench_50: resources/evaluation/hest_bench/LUNG_var_50genes.json}
   train_variance_gene_panel_sizes: [50, 200]
-  training_mask_bank_path: results/mask_banks/training/lung_round/transport_lung_stpath_scratch_v1_10k_256_seed761000.json
+  training_mask_bank_path: results/mask_banks/training/lung_round/transport_lung_simple_stpath_transformer_v1_10k_256_seed766000.json
 logging:
   backend: csv
   project: st3d-lundeberg-lab

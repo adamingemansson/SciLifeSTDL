@@ -1,11 +1,11 @@
 # Lung round (2026-07-24): new architecture, simple_fusion mode --
 # GigaPath + gene-MLP tokens summed per context spot (STPath's own real
 # fusion, see src/models/simple_fusion_encoder.py), mean-pooled over each
-# query's k nearest neighbors, no attention. One of 3 GPU-training
-# conditions this round (GPUs 2,3,5) -- the direct contrast against
-# 303_lung_simple_cross_attn.yaml isolates exactly one variable: does
-# learned attention over neighbors beat unweighted averaging. 10k steps,
-# smallhole masking.
+# query's k nearest neighbors, no attention -- the smallest model of the
+# 4 GPU-training conditions this round, deliberately placed on GPU 1 of
+# 1,2,3,5. The direct contrast against 303_lung_simple_cross_attn.yaml
+# isolates exactly one variable: does learned attention over neighbors
+# beat unweighted averaging. 10k steps, smallhole masking.
 experiment_name: transport_lung_simple_fusion_v1_10k
 data:
   source: hest1k
