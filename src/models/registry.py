@@ -540,6 +540,110 @@ class OfficialSTPathBaseline(BaseGenerativeModel):
         return None
 
 
+@register_model("stpath_scratch")
+class STPathFromScratch(BaseGenerativeModel):
+    """STPath's own real architecture (STFM, same class as stpath_official
+    above), randomly initialized and trained from scratch on our data --
+    no added components (no gene-table injection, no residual adapter,
+    same new_gene_encoder_type='none' as the frozen baseline). The
+    comparison arm for "does STPath's architecture help without its
+    massive external pretraining, on our data alone" (lung round,
+    2026-07-24).
+
+    Deliberately does NOT zero missing_image_token the way
+    stpath_official does -- that zero-fill exists there only to
+    reproduce, as a labelled stress test, the exact zero-fill the
+    RELEASED (frozen) weights were never trained to handle (see that
+    class's own docstring, and the real notebook collapse it explains:
+    STPath's own fusion sums a biased nn.Linear projection of the image
+    feature into every token, so a zeroed feature still injects a real,
+    wrong signal). Here the token is trainable from a random init like
+    everything else, so training can learn to actually use it correctly.
+
+    Gradient flow through STFM's own layers when pretrained=False is
+    STPathContextEncoder's own responsibility (see its forward()
+    docstring, needs_grad = ... or not self.pretrained) -- verified
+    directly, not assumed."""
+
+    def __init__(
+        self,
+        n_genes: int,
+        stpath_gene_names: list[str],
+        stpath_gene_voc_path: str,
+        stpath_organ_type: str = "Kidney",
+        stpath_tech_type: str = "Visium",
+        stpath_input_already_log1p: bool = True,
+        stpath_hidden_dim: int = 512,
+        context_encoder_type: str = "stpath",
+        lr: float = 1e-3,
+        target_gene_scale: list[float] | None = None,
+        target_scale_floor: float = 0.05,
+    ):
+        super().__init__()
+        if context_encoder_type != "stpath":
+            raise ValueError("stpath_scratch requires context_encoder_type='stpath'")
+        from src.models.stpath_encoder import STPathContextEncoder
+
+        self.predictor = STPathContextEncoder(
+            gene_names=stpath_gene_names,
+            gene_voc_path=stpath_gene_voc_path,
+            model_weight_path=None,
+            organ_type=stpath_organ_type,
+            tech_type=stpath_tech_type,
+            hidden_dim=stpath_hidden_dim,
+            new_gene_encoder_type="none",
+            pretrained=False,
+            input_already_log1p=stpath_input_already_log1p,
+        )
+        self.lr = float(lr)
+        valid_positions = torch.as_tensor(
+            self.predictor._valid_gene_pos, dtype=torch.long
+        )
+        if valid_positions.numel() == 0:
+            raise ValueError("none of the evaluation genes are supported by STPath")
+        self.register_buffer("_decoder_target_col_idx", valid_positions)
+        self.n_genes = int(n_genes)
+
+        scale = torch.ones(valid_positions.numel()) if target_gene_scale is None else torch.as_tensor(
+            target_gene_scale, dtype=torch.float32
+        )
+        if scale.shape != (valid_positions.numel(),):
+            raise ValueError(
+                f"target_gene_scale must have shape ({valid_positions.numel()},) "
+                f"(one entry per STPath-supported gene), got {tuple(scale.shape)}"
+            )
+        if not torch.isfinite(scale).all():
+            raise ValueError("target_gene_scale contains non-finite values")
+        self.register_buffer("target_gene_scale", scale.clamp_min(float(target_scale_floor)))
+
+    def sample(self, context, query):
+        expression = self.predictor(
+            context["coords"], context["expression"], query["coords"],
+            context_images=context.get("images"),
+            query_images=query.get("images"),
+            context_image_available=context.get("image_available"),
+            query_image_available=query.get("image_available"),
+            organ=context.get("organ"), tech=context.get("tech"),
+            return_official_predictions=True,
+        )
+        return {"coords": query["coords"], "expression": expression}
+
+    def training_step(self, batch, batch_idx):
+        out = self.sample(batch["context"], batch["query"])
+        target = self._slice_target_for_decoder(batch["target_expression"])
+        standardized_error = (out["expression"] - target) / self.target_gene_scale
+        loss = standardized_error.square().mean()
+        absolute_mse = nn.functional.mse_loss(out["expression"], target)
+        self.log_dict({"train/loss": loss, "train/absolute_mse": absolute_mse})
+        return loss
+
+    def configure_optimizers(self):
+        parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
+        if not parameters:
+            return None
+        return torch.optim.AdamW(parameters, lr=self.lr)
+
+
 @register_model("set_summary_baseline")
 class SetSummaryBaseline(BaseGenerativeModel):
     """Strict learned mean/sum embedding baseline.
