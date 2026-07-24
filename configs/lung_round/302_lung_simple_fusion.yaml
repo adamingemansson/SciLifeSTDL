@@ -11,8 +11,7 @@ data:
   source: hest1k
   hest_data_dir: data/raw/hest1k
   hest_cache_dir: data/cache/hest1k
-  slide_context_source: dense_wsi_cache
-  slide_context_cache_dir: data/cache/hest1k/gigapath_slide_cache
+  slide_context_source: disabled
   strict_broken_region: true
   query_patch_size_fullres: 224.0
   sample_ids: [TENX72, TENX62, MEND90, MEND89, MEND88, MEND87, MEND86, MEND85]
@@ -50,6 +49,7 @@ model:
     transport_k: 32
     conditioning_mode: simple_fusion
     context_encoder_type: simple_fusion
+    image_encoder_type: gigapath
     simple_fusion_knn_k: 16
     simple_fusion_input_already_log1p: true
     lr: 0.001
