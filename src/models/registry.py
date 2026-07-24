@@ -660,6 +660,156 @@ class STPathFromScratch(BaseGenerativeModel):
         return torch.optim.AdamW(parameters, lr=self.lr)
 
 
+@register_model("stpath_backbone_simple_gene")
+class STPathBackboneSimpleGene(BaseGenerativeModel):
+    """As close to STPathFromScratch (stpath_scratch, above) as possible,
+    with exactly the two changes actually requested (2026-07-24) and
+    NOTHING else: a different gene encoder (MLPGeneEncoder, replacing
+    STPath's own fixed-vocabulary tokenizer -- not residually added on
+    top of it the way new_gene_encoder_type='mlp' on STPathContextEncoder
+    does; a genuine replacement) and no organ/tech tokens. Everything
+    else stays identical to real STPath: elementwise-sum fusion of
+    image+gene tokens (via SimpleFusionSpatialTransformerContextEncoder,
+    which already reuses STPath's real SpatialTransformer backbone), and
+    critically, the SAME prediction mechanism -- a dense
+    LayerNorm+Linear decoder head predicting expression directly,
+    not a neighbor-weighted transport average.
+
+    An earlier version of "the STPath-transformer arm without organ/tech"
+    (simple_stpath_transformer, in context_transport_regressor) got this
+    wrong: it kept the transformer but swapped the whole prediction
+    mechanism to transport-over-neighbors, never asked for. That silently
+    made it incomparable to stpath_scratch on the single axis that
+    actually mattered most. This class fixes that by keeping
+    stpath_scratch's own dense-decoder training_step/sample structure
+    verbatim and swapping ONLY the encoder that feeds it."""
+
+    def __init__(self, n_genes: int, hidden_dim: int = 512, n_layers: int = 4,
+                 n_heads: int = 4, dropout: float = 0.1, attn_dropout: float = 0.1,
+                 mlp_ratio: float = 2.0, input_already_log1p: bool = True,
+                 lr: float = 1e-3, target_gene_scale: list[float] | None = None,
+                 target_scale_floor: float = 0.05):
+        super().__init__()
+        from src.models.simple_fusion_encoder import SimpleFusionSpatialTransformerContextEncoder
+
+        self.n_genes = int(n_genes)
+        self.lr = float(lr)
+        self.encoder = SimpleFusionSpatialTransformerContextEncoder(
+            n_genes=n_genes, hidden_dim=hidden_dim, n_layers=n_layers, n_heads=n_heads,
+            dropout=dropout, attn_dropout=attn_dropout, mlp_ratio=mlp_ratio,
+            input_already_log1p=input_already_log1p,
+        )
+        # Same head shape as STPath's own real prediction_head (LayerNorm +
+        # Linear, verified against stpath/model/model.py) -- just to our
+        # local n_genes instead of STPath's ~39k-gene vocabulary, since
+        # this arm never uses that vocabulary at all (see class docstring).
+        self.decoder = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, n_genes))
+
+        scale = torch.ones(n_genes) if target_gene_scale is None else torch.as_tensor(
+            target_gene_scale, dtype=torch.float32
+        )
+        if scale.shape != (n_genes,):
+            raise ValueError(f"target_gene_scale must have shape ({n_genes},), got {tuple(scale.shape)}")
+        if not torch.isfinite(scale).all():
+            raise ValueError("target_gene_scale contains non-finite values")
+        self.register_buffer("target_gene_scale", scale.clamp_min(float(target_scale_floor)))
+
+    def sample(self, context, query):
+        condition = self.encoder(
+            context["coords"], context["expression"], query["coords"],
+            context_images=context.get("images"), query_images=query.get("images"),
+            context_image_available=context.get("image_available"),
+            query_image_available=query.get("image_available"),
+            organ=context.get("organ"), tech=context.get("tech"),
+        )
+        expression = self.decoder(condition)
+        return {"coords": query["coords"], "expression": expression}
+
+    def training_step(self, batch, batch_idx):
+        out = self.sample(batch["context"], batch["query"])
+        target = batch["target_expression"]
+        standardized_error = (out["expression"] - target) / self.target_gene_scale
+        loss = standardized_error.square().mean()
+        absolute_mse = nn.functional.mse_loss(out["expression"], target)
+        self.log_dict({"train/loss": loss, "train/absolute_mse": absolute_mse})
+        return loss
+
+    def configure_optimizers(self):
+        parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
+        if not parameters:
+            return None
+        return torch.optim.AdamW(parameters, lr=self.lr)
+
+
+@register_model("simple_cross_attn_dense_decoder")
+class SimpleCrossAttnDenseDecoder(BaseGenerativeModel):
+    """Same isolation stpath_backbone_simple_gene applies to the STPath
+    transformer, applied to the cross-attention encoder (2026-07-24):
+    SimpleCrossAttentionContextEncoder (GigaPath+gene tokens, learned
+    cross-attention over k nearest neighbors -- see
+    simple_fusion_encoder.py) feeding a dense LayerNorm+Linear decoder
+    head that predicts expression directly, instead of
+    context_transport_regressor's neighbor-weighted transport average
+    (what 303_lung_simple_cross_attn.yaml actually uses).
+
+    Structurally identical to STPathBackboneSimpleGene above except which
+    encoder it wraps -- lets "does a dense decoder beat transport" get
+    checked on the cross-attention architecture too, not just the STPath
+    backbone one."""
+
+    def __init__(self, n_genes: int, hidden_dim: int = 128, n_heads: int = 4,
+                 mlp_ratio: float = 2.0, dropout: float = 0.1, knn_k: int = 16,
+                 n_layers: int = 2, input_already_log1p: bool = True,
+                 lr: float = 1e-3, target_gene_scale: list[float] | None = None,
+                 target_scale_floor: float = 0.05):
+        super().__init__()
+        from src.models.simple_fusion_encoder import SimpleCrossAttentionContextEncoder
+
+        self.n_genes = int(n_genes)
+        self.lr = float(lr)
+        self.encoder = SimpleCrossAttentionContextEncoder(
+            n_genes=n_genes, hidden_dim=hidden_dim, n_heads=n_heads, mlp_ratio=mlp_ratio,
+            dropout=dropout, knn_k=knn_k, n_layers=n_layers,
+            input_already_log1p=input_already_log1p,
+        )
+        self.decoder = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, n_genes))
+
+        scale = torch.ones(n_genes) if target_gene_scale is None else torch.as_tensor(
+            target_gene_scale, dtype=torch.float32
+        )
+        if scale.shape != (n_genes,):
+            raise ValueError(f"target_gene_scale must have shape ({n_genes},), got {tuple(scale.shape)}")
+        if not torch.isfinite(scale).all():
+            raise ValueError("target_gene_scale contains non-finite values")
+        self.register_buffer("target_gene_scale", scale.clamp_min(float(target_scale_floor)))
+
+    def sample(self, context, query):
+        condition = self.encoder(
+            context["coords"], context["expression"], query["coords"],
+            context_images=context.get("images"), query_images=query.get("images"),
+            context_image_available=context.get("image_available"),
+            query_image_available=query.get("image_available"),
+            organ=context.get("organ"), tech=context.get("tech"),
+        )
+        expression = self.decoder(condition)
+        return {"coords": query["coords"], "expression": expression}
+
+    def training_step(self, batch, batch_idx):
+        out = self.sample(batch["context"], batch["query"])
+        target = batch["target_expression"]
+        standardized_error = (out["expression"] - target) / self.target_gene_scale
+        loss = standardized_error.square().mean()
+        absolute_mse = nn.functional.mse_loss(out["expression"], target)
+        self.log_dict({"train/loss": loss, "train/absolute_mse": absolute_mse})
+        return loss
+
+    def configure_optimizers(self):
+        parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
+        if not parameters:
+            return None
+        return torch.optim.AdamW(parameters, lr=self.lr)
+
+
 @register_model("set_summary_baseline")
 class SetSummaryBaseline(BaseGenerativeModel):
     """Strict learned mean/sum embedding baseline.

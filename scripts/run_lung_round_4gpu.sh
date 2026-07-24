@@ -8,7 +8,13 @@
 #   GPU[0] (default 1): 302_lung_simple_fusion                (smallest -- GigaPath+gene sum, mean-pooled, no attention)
 #   GPU[1] (default 2): 303_lung_simple_cross_attn             (same tokens, 2-layer learned cross-attn stack)
 #   GPU[2] (default 3): 301_lung_stpath_scratch                 (STPath's real architecture, no pretraining)
-#   GPU[3] (default 5): 306_lung_simple_stpath_transformer      (our tokens + STPath's real SpatialTransformer backbone, no organ/tech)
+#   GPU[3] (default 5): 306_lung_simple_stpath_transformer      (stpath_backbone_simple_gene -- as close to 301 as
+#                                                                 possible: same SpatialTransformer backbone, same
+#                                                                 fusion, same dense decoder head; only the gene
+#                                                                 encoder and organ/tech differ. REWRITTEN 2026-07-24
+#                                                                 -- the first version silently used a different
+#                                                                 prediction mechanism (transport, not a decoder),
+#                                                                 never requested and not comparable to 301.)
 #
 # 304_lung_harmonic.yaml (closed-form, no training) and
 # 305_lung_stpath_pretrained_eval.yaml (frozen weights, eval only) need no
@@ -19,15 +25,19 @@
 #
 # 305 additionally needs STPATH_MODEL_WEIGHT_PATH (real released weight,
 # huggingface.co/tlhuang/STPath) set -- 301/302/303/306 don't (301 trains
-# from a random init; 302/303 don't use the stpath package at all; 306
-# only needs stpath's SpatialTransformer/ModelConfig classes, no weights).
-# All configs except 302/303 need STPATH_GENE_VOC_PATH (301/305's gene
-# vocabulary resource -- a fixed lookup table, not a model weight).
+# from a random init; 302/303/306 don't use STPath's real weights at all).
+# Only 301 and 305 need STPATH_GENE_VOC_PATH (STPath's own fixed gene
+# vocabulary/tokenizer) -- 306 deliberately doesn't use STPath's
+# tokenizer at all (that's the "different gene encoder" it's testing),
+# so it needs neither STPath env var.
 #
-# 306 has only been verified by reading STPath's real source, never
-# executed end-to-end (the `stpath` package wasn't installed anywhere
-# this session had shell access) -- its smoke test below is the actual
-# first real verification, not a formality. Watch its smoke log closely.
+# 306 has only been verified by reading STPath's real source plus a
+# mocked-backbone test of everything AROUND the real SpatialTransformer
+# call (tests/test_stpath_backbone_simple_gene.py) -- never executed
+# against the real backbone (the `stpath` package wasn't installed
+# anywhere this session had shell access). Its smoke test below is the
+# actual first real verification, not a formality. Watch its smoke log
+# closely.
 #
 # Usage:
 #   bash scripts/run_lung_round_4gpu.sh

@@ -2181,6 +2181,12 @@ def _load_images(cfg, adata, sample_id: str | None = None):
             model_params.get("image_encoder_type") == "gigapath"
             or model_params.get("context_encoder_type") in ("stpath", "storm_lite")
             or is_hierarchical_transport_family
+            # stpath_backbone_simple_gene / simple_cross_attn_dense_decoder
+            # (2026-07-24): both reuse GigapathPatchEncoder internally exactly
+            # like simple_fusion/simple_cross_attn/simple_stpath_transformer do on
+            # context_transport_regressor -- same real bug those hit (recomputing
+            # GigaPath from raw patches every step) if this isn't flagged here too.
+            or cfg.model.get("name") in ("stpath_backbone_simple_gene", "simple_cross_attn_dense_decoder")
         )
     )
     if uses_frozen_dinov2:

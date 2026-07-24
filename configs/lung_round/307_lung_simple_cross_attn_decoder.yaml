@@ -1,21 +1,16 @@
-# Lung round (2026-07-24, REWRITTEN after a real correctness bug):
-# stpath_backbone_simple_gene -- as close to 301_lung_stpath_scratch.yaml
-# as possible, changing ONLY the two things actually requested: a
-# different gene encoder (ours, MLP, genuinely replacing STPath's own
-# tokenizer -- not residually added on top of it) and no organ/tech
-# tokens. Same STPath SpatialTransformer backbone, same elementwise-sum
-# fusion, same dense LayerNorm+Linear decoder head predicting expression
-# directly, same hidden_dim/n_layers/n_heads as 301 -- everything that
-# wasn't explicitly asked to change stays identical.
-#
-# The first version of this config used context_transport_regressor's
-# simple_stpath_transformer conditioning_mode, which kept the real
-# transformer but silently swapped the WHOLE prediction mechanism to a
-# neighbor-weighted transport average -- never requested, and the actual
-# reason its results (~0.0053 PCC) weren't comparable to 301's (~0.0449
-# PCC): different prediction strategy, not just different gene encoder.
-# See src/models/registry.py's stpath_backbone_simple_gene docstring.
-experiment_name: transport_lung_simple_stpath_transformer_v2_10k
+# Lung round (2026-07-24): simple_cross_attn_dense_decoder -- the same
+# transport-vs-decoder isolation applied to 301 vs 306 (see that config's
+# header), applied here to the cross-attention architecture. Identical
+# GigaPath + gene-MLP token construction and 2-layer cross-attention
+# stack as 303_lung_simple_cross_attn.yaml, but a dense LayerNorm+Linear
+# decoder head predicts expression directly instead of
+# context_transport_regressor's neighbor-weighted transport average.
+# Compare against 303 to isolate: does a dense decoder beat transport
+# for this specific encoder, same question 306 asks for the STPath
+# backbone. No dedicated GPU slot in run_lung_round_4gpu.sh (added after
+# that launcher was written) -- run manually alongside 304/305 on
+# whichever GPU frees up first.
+experiment_name: transport_lung_simple_cross_attn_decoder_v1_10k
 data:
   source: hest1k
   hest_data_dir: data/raw/hest1k
@@ -50,21 +45,21 @@ masking:
     radius_unit: spot_spacing
     shape: mixed
 model:
-  name: stpath_backbone_simple_gene
+  name: simple_cross_attn_dense_decoder
   params:
-    hidden_dim: 512
-    n_layers: 4
+    hidden_dim: 128
     n_heads: 4
-    dropout: 0.1
-    attn_dropout: 0.1
     mlp_ratio: 2.0
+    dropout: 0.1
+    knn_k: 16
+    n_layers: 2
     input_already_log1p: true
     lr: 0.001
     target_scale_floor: 0.05
 training:
   epochs: 10000
   seed: 10
-  mask_seed: 766000
+  mask_seed: 767000
   unique_mask_count: 256
   log_every_n_steps: 10
   log_print_every_n_steps: 500
@@ -77,7 +72,7 @@ training:
   all_image_dropout_p: 0.0
   context_gex_dropout_p: 0.0
   gradient_clip_val: 1.0
-  checkpoint_dir: results/checkpoints/lung_round/transport_lung_simple_stpath_transformer_v2_10k
+  checkpoint_dir: results/checkpoints/lung_round/transport_lung_simple_cross_attn_decoder_v1_10k
 validation:
   enabled: true
   every_n_steps: 1000
@@ -87,7 +82,7 @@ validation:
   min_delta: 0.0001
   metric: rmse
   n_samples: 1
-  sampling_seed: 866000
+  sampling_seed: 867000
 evaluation:
   mask_bank_dir: results/mask_banks/lung_round/transport_lung_v1_10k
   n_validation_masks: 8
@@ -104,7 +99,7 @@ evaluation:
   pca_n_components: 50
   fixed_gene_panel_paths: {lung_hest_bench_50: resources/evaluation/hest_bench/LUNG_var_50genes.json}
   train_variance_gene_panel_sizes: [50, 200]
-  training_mask_bank_path: results/mask_banks/training/lung_round/transport_lung_simple_stpath_transformer_v2_10k_256_seed766000.json
+  training_mask_bank_path: results/mask_banks/training/lung_round/transport_lung_simple_cross_attn_decoder_v1_10k_256_seed767000.json
 logging:
   backend: csv
   project: st3d-lundeberg-lab
