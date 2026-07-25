@@ -36,7 +36,9 @@ def usable_local_ids(hest_data_dir: str | Path) -> set[str]:
     return st_ids & patch_ids
 
 
-def load_visium_metadata(metadata_csv: str, species: str | None = "Homo sapiens") -> pd.DataFrame:
+def load_visium_metadata(
+    metadata_csv: str, species: str | None = "Homo sapiens", min_nb_genes: int | None = 5000,
+) -> pd.DataFrame:
     """Real HEST-1k metadata CSV, filtered to Visium (st_technology).
     metadata_csv is normally the public `hf://datasets/MahmoodLab/hest/
     HEST_v1_3_0.csv` URI (docs/dataset_notes.md), but any local path works
@@ -55,12 +57,36 @@ def load_visium_metadata(metadata_csv: str, species: str | None = "Homo sapiens"
     STPath, scFoundation -- is human-gene-symbol-based); pass
     species=None to keep every species (e.g. for a deliberate
     mouse-vs-human comparison run), or an explicit string/list to select
-    otherwise."""
+    otherwise.
+
+    min_nb_genes (real SECOND bug found 2026-07-25, same server run,
+    AFTER the species fix): even human-only, a multi-organ selection
+    still hit a zero-gene-panel crash. Confirmed against the live data:
+    HEST-1k's `st_technology == "Visium"` label is not a reliable proxy
+    for "whole-transcriptome" -- samples with an id starting "TENX" carry
+    that label but really have a small ~541-gene TARGETED panel (likely
+    CytAssist or a specific Xenium-adjacent 10x product bundled under the
+    same technology tag), exactly the Visium-vs-Xenium scale mismatch
+    this project already knew to avoid, just hiding inside "Visium." Every
+    other real source-study group (INT/MEND/MISC/NCBI/SPA/ZEN prefixes)
+    is whole-transcriptome scale (14,808-36,601 raw genes) and mutually
+    compatible (pairwise overlap >=79%, full 6-way intersection 13,234
+    genes with TENX excluded, confirmed against real data). Rather than
+    hardcode the "TENX" prefix (brittle -- HEST-1k could add other
+    small-panel studies later), this filters on the real `nb_genes`
+    metadata column HEST-1k already provides for exactly this purpose,
+    with a threshold (5000) chosen with a large safety margin below
+    every legitimate whole-transcriptome group's real count and far
+    above TENX's real ~541. Rows with a missing/NaN nb_genes value are
+    EXCLUDED (unknown panel compatibility, not assumed safe) -- pass
+    min_nb_genes=None to disable this filter entirely."""
     meta = pd.read_csv(metadata_csv)
     visium = meta[meta["st_technology"] == "Visium"].copy()
     if species is not None:
         allowed = {species} if isinstance(species, str) else set(species)
         visium = visium[visium["species"].isin(allowed)]
+    if min_nb_genes is not None:
+        visium = visium[visium["nb_genes"] >= min_nb_genes]
     visium["organ"] = visium["organ"].fillna("(unlabeled)")
     return visium
 
@@ -69,6 +95,7 @@ def resolve_sample_selection(
     hest_data_dir: str | Path, metadata_csv: str,
     organs: list[str] | str = "all",
     species: str | list[str] | None = "Homo sapiens",
+    min_nb_genes: int | None = 5000,
     min_samples_per_organ: int = 3,
     max_samples_per_organ: int | None = None,
     n_validation_per_organ: int = 1,
@@ -86,6 +113,10 @@ def resolve_sample_selection(
     species: defaults to human-only (see load_visium_metadata's own
     docstring for the real zero-gene-intersection bug this guards
     against -- HEST-1k genuinely mixes human and mouse Visium samples).
+
+    min_nb_genes: defaults to 5000, excluding small-targeted-panel
+    samples mislabeled "Visium" (see load_visium_metadata's own
+    docstring for the real TENX-prefix finding this guards against).
 
     min_samples_per_organ: organs with fewer usable local samples than
     this are excluded entirely -- below n_validation_per_organ +
@@ -107,7 +138,7 @@ def resolve_sample_selection(
     """
     import random
 
-    visium = load_visium_metadata(metadata_csv, species=species)
+    visium = load_visium_metadata(metadata_csv, species=species, min_nb_genes=min_nb_genes)
     usable = usable_local_ids(hest_data_dir)
     visium = visium[visium["id"].isin(usable)]
 

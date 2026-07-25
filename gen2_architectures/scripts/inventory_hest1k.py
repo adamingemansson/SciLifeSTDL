@@ -55,12 +55,21 @@ def main() -> None:
              "zero-gene-intersection bug that default guards against). Pass 'all' to "
              "keep every species (e.g. to inspect mouse coverage separately).",
     )
+    parser.add_argument(
+        "--min-nb-genes", type=int, default=5000,
+        help="Exclude samples with fewer than this many genes in their real panel "
+             "(real HEST-1k finding, 2026-07-25: 'TENX'-prefixed sample ids carry the "
+             "'Visium' technology label but really have a small ~541-gene targeted "
+             "panel -- every legitimate whole-transcriptome group has 14,808+). Matches "
+             "hest1k_catalog.py::resolve_sample_selection's own default. Pass 0 to disable.",
+    )
     args = parser.parse_args()
     species = None if args.species == "all" else args.species
+    min_nb_genes = None if args.min_nb_genes <= 0 else args.min_nb_genes
 
     hest_data_dir = Path(args.hest_data_dir)
-    print(f"Reading HEST-1k metadata from {args.metadata_csv} (species={args.species}) ...")
-    visium = load_visium_metadata(args.metadata_csv, species=species)
+    print(f"Reading HEST-1k metadata from {args.metadata_csv} (species={args.species}, min_nb_genes={min_nb_genes}) ...")
+    visium = load_visium_metadata(args.metadata_csv, species=species, min_nb_genes=min_nb_genes)
     print(f"Full catalog Visium samples: {len(visium)} across {visium['organ'].nunique()} organs.\n")
 
     st_ids, patch_ids = locally_downloaded_ids(hest_data_dir)

@@ -330,6 +330,30 @@ independently in each one (`data/loaders.py::_pooled_min_cells_filter`).
 See `tests/test_loaders_multi_sample.py` for a synthetic reproduction of
 both the original bug and the fix.
 
+**Third real bug, same server run, immediately after the pooled-min_cells
+fix**: the RAW (pre-QC) intersection across all ~170 samples was ALSO
+exactly zero — confirmed directly (`load_multi_sample`'s error message
+changed to explicitly say "even before any gene-level QC" once the
+above fix landed, isolating this as a genuinely different cause). Real
+diagnosis (grouping real local samples by their HEST-1k source-study id
+prefix and computing pairwise/cumulative raw panel overlap): every group
+(`INT`/`MEND`/`MISC`/`NCBI`/`SPA`/`ZEN`) is real whole-transcriptome
+scale (14,808-36,601 raw genes, `ZEN`'s panel is byte-identical to
+`INT`'s) EXCEPT `TENX`, whose real raw panel is only **541 genes** — a
+small targeted panel despite carrying the same `st_technology ==
+"Visium"` label as everything else, exactly the Visium-vs-Xenium scale
+mismatch this project already knew to avoid (see this section's own
+opening paragraph), just hiding inside "Visium." Excluding `TENX`,
+the real cumulative 6-way intersection is 13,234 genes — a healthy panel
+size. Fixed via `data/hest1k_catalog.py::load_visium_metadata`'s new
+`min_nb_genes` parameter (default 5000, comfortably between TENX's 541
+and every legitimate group's 14,808+): filters on HEST-1k's own real
+`nb_genes` metadata column rather than hardcoding the "TENX" prefix
+(which could miss some other future small-panel study bundled under the
+same label). See `tests/test_hest1k_catalog.py`'s
+`test_min_nb_genes_excludes_small_panel_samples` for a synthetic
+reproduction.
+
 Sample selection is resolved at RUN TIME, not hardcoded — every shipped
 config sets `data.sample_selection` (organs, per-organ sample caps,
 validation/test counts, a split seed) and
