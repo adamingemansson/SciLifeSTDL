@@ -89,8 +89,10 @@ usually just import paths):
 | `models/arch3_stage_b_latent_transformer.py` | `Architecture3StageB` |
 | `models/arch4_stpath_hybrid.py` | `Architecture4` wrapper |
 | `models/eval_compat.py` | Deterministic-model shim so the (stochastic-model-oriented) evaluation harness works for plain regressors |
-| `training/data_prep.py`, `checkpoint.py`, `evaluate.py` | Data loading orchestration, checkpoint save/load, evaluation wiring |
+| `training/data_prep.py`, `checkpoint.py`, `evaluate.py` | Data loading orchestration, checkpoint save/load, evaluation wiring, `apply_sample_selection` |
 | `training/train_local_neighborhood.py`, `train_arch3_stage_a.py`, `train_arch3_stage_b.py` | Training entrypoints |
+| `data/hest1k_catalog.py` | Real HEST-1k metadata query + local-inventory cross-check, `resolve_sample_selection` (config-driven train/validation/test split, section 9) |
+| `scripts/inventory_hest1k.py` | Human-readable local-vs-catalog Visium coverage report by organ |
 
 ## 4. Architecture 1 — GPT-v1 baseline
 
@@ -291,11 +293,39 @@ modality, not a different model or different held-out regions.
 
 ## 9. Training plan
 
-**Data scope**: full HEST-1k, sample list **TBD** — every shipped config
-currently defaults to the 8 Lung samples already confirmed available
-(`TENX72, TENX62, MEND90, MEND89, MEND88, MEND87, MEND86, MEND85`) as a
-safe, immediately-runnable placeholder. Replace with the real full-corpus
-sample list once confirmed what's staged on the server (see section 11).
+**Data scope**: full HEST-1k, Visium only (mixing technologies would
+collapse the shared gene panel to whatever the narrowest targeted panel
+covers, e.g. Xenium's ~few-hundred genes — a real, verified constraint of
+`data/loaders.py::load_multi_sample`'s strict intersection, not a
+convenience choice). Real inventory confirmed 2026-07-25
+(`scripts/inventory_hest1k.py` against the actual server): ~515 usable
+Visium samples (both expression AND image patches present) across ~24
+organs already downloaded — no further downloading needed for the first
+round.
+
+Sample selection is resolved at RUN TIME, not hardcoded — every shipped
+config sets `data.sample_selection` (organs, per-organ sample caps,
+validation/test counts, a split seed) and
+`data/hest1k_catalog.py::resolve_sample_selection` deterministically
+queries the real HEST-1k metadata CSV + local inventory to build
+`train_sample_ids`/`validation_sample_ids`/`test_sample_ids`/
+`organ_by_sample`/`tech_by_sample`/`organ_vocab`/`tech_vocab` from it
+(`training/data_prep.py::apply_sample_selection`, called at the top of
+every training entrypoint). Shipped defaults: `organs: all`,
+`min_samples_per_organ: 5` (excludes organs too small for a real
+train/val/test split), `max_samples_per_organ: 30` (caps the largest
+organs — Brain: 121, Skin/Kidney: 67 each — so epoch size stays tractable
+for a 1-2 day budget), `n_validation_per_organ: 2`, `n_test_per_organ: 2`
+— roughly 17 organs, ~240 training samples with these settings. Architecture
+4 uses `organs: [Lung]` only (its documented single-organ constraint,
+section 7) against the real 38-sample local Lung inventory. Architectures
+1/1b/1c/2/3-Stage-A/3-Stage-B all share the EXACT same `sample_selection`
+block (same organs/caps/seed), which resolves deterministically to the
+same sample split — keeping every comparison in section 8 and the
+Arch1-vs-Arch2 comparison fair (same data, not just the same architecture
+capacity). A literal `data.train_sample_ids` list still works unchanged
+for anyone who wants to bypass this mechanism (`apply_sample_selection` is
+a no-op when `data.sample_selection` is absent).
 
 **Masking**: single hole per training item, `shape: mixed` (each hole
 independently circle/ellipse/irregular), `radius_range` tuned for the Lung
@@ -387,29 +417,31 @@ already contains a checkpoint (checks for `model_config.json`).
 
 ## 11. What you need to fill in before launching
 
-1. **Real full-HEST-1k sample list.** Every config currently uses the
-   8-sample Lung placeholder. Update `data.train_sample_ids`/
-   `validation_sample_ids`/`test_sample_ids`/`organ_by_sample`/
-   `tech_by_sample` once you've confirmed what's staged on the server —
-   same-platform (Visium) first pass across as many organs as the
-   shared-gene-panel intersection tolerates, per
-   `docs/lung_round_gen2_architecture_plan.md` section 1.
-2. **`organ_vocab`/`tech_vocab`** (Architectures 1/2/3, `model.params`) —
-   currently `[Lung]`/`[Visium]`; expand to the real organ/tech set once
-   the sample list is known, or `OrganTechEmbedding` will raise a `KeyError`
-   the first time it sees an organ outside the configured vocabulary
-   (intentional fail-loud, not a bug — see `tests/test_arch1_arch2.py::test_architecture1_unknown_organ_raises`).
+1. ~~Real full-HEST-1k sample list~~ — **done.** Every config now resolves
+   its sample scope from `data.sample_selection` at run time against the
+   real HEST-1k metadata + local inventory (section 9) — no hardcoded IDs
+   left to fill in. Re-run `scripts/inventory_hest1k.py` if you download
+   more samples later and want to raise `max_samples_per_organ` or lower
+   `min_samples_per_organ` to pull in more organs.
+2. ~~`organ_vocab`/`tech_vocab`~~ — **done.** Auto-injected at run time from
+   the resolved `sample_selection` (`training/data_prep.py::apply_sample_selection`).
+   Set them explicitly in a config only to override the auto-detected
+   vocabulary. `OrganTechEmbedding` still fails loudly (`KeyError`) if a
+   later run somehow sees an organ outside whatever vocabulary was
+   resolved at construction time — intentional, not a bug (see
+   `tests/test_arch1_arch2.py::test_architecture1_unknown_organ_raises`).
 3. **`coord_scale`** (every architecture except 4) — currently `1000.0`,
    a guess. `models/components.py::CoordEmbedding` wraps the SAME
    `RandomFourierFeatures` class that had a real, previously-fixed aliasing
    bug at the wrong coordinate scale (see that class's own docstring in
    `models/conditioning.py`) — verify against the real full-HEST-1k
    coordinate spread (not just the Lung pilot's) before the real run, e.g.
-   `coords[:, :2].std()` on a representative sample.
+   `coords[:, :2].std()` on a representative sample across a few different
+   organs (coordinate scale/units can plausibly differ by organ/platform).
 4. **`radius_range`** (every architecture's `masking.params`) — currently
    the Lung-pilot-tuned `[5.0, 8.0]` spot-spacing value; verify it still
-   produces reasonably-sized holes on other platforms/organs before
-   assuming it transfers.
+   produces reasonably-sized holes on other organs before assuming it
+   transfers (spot density can vary by tissue).
 5. **`total_steps`** — every config has a placeholder (100000, or 50000 for
    Architecture 4). Derive a real budget from a smoke run's measured
    steps/sec (see section 12) rather than launching a full 1-2 day run on
@@ -422,8 +454,9 @@ already contains a checkpoint (checks for `model_config.json`).
    `arch3_stage_b_spatial.yaml`'s `model.stage_a_checkpoint_dir` to Stage
    A's `training.checkpoint_dir` once that run completes. `train_arch3_stage_b.py`
    checks the gene COUNT matches and raises if not, but cannot verify gene
-   IDENTITY/order — keep the two configs' `[data]` sections identical by
-   construction (they already are in the shipped configs).
+   IDENTITY/order — keep the two configs' `data.sample_selection` blocks
+   identical by construction (they already are in the shipped configs, so
+   they resolve to the exact same sample split and gene panel).
 
 ## 12. Recommended before the real 1-2 day runs
 
@@ -464,10 +497,11 @@ gen2_architectures/
     loaders.py, masking.py, mask_bank.py, context_features.py, augmentation.py   COPIED
     patch_overlap.py                     COPIED (partial, from slide_context.py)
     masked_item.py                       COPIED+TRIMMED  _build_masked_item, Novae/niche dropped
+    hest1k_catalog.py                    NEW  real metadata + local-inventory query, resolve_sample_selection
   evaluation/
     audit_evaluation.py, metrics.py, cell_type_classifier.py                     COPIED
   training/
-    data_prep.py                         NEW  data loading orchestration, GigaPath caching (ported, bug-fixed logic), scFoundation provider wiring
+    data_prep.py                         NEW  data loading orchestration, GigaPath caching (ported, bug-fixed logic), scFoundation provider wiring, apply_sample_selection
     checkpoint.py                        NEW  trainable-only save/load
     evaluate.py                          NEW  evaluation harness glue
     train_local_neighborhood.py          NEW  training entrypoint for Architectures 1/2/4
@@ -479,7 +513,10 @@ gen2_architectures/
     arch2_scfoundation.yaml
     arch3_stage_a_pretrain.yaml, arch3_stage_b_spatial.yaml
     arch4_stpath_hybrid.yaml
-  tests/                                 41 tests, synthetic data only, no real HEST-1k/GPU required
+  scripts/
+    inventory_hest1k.py                  NEW  human-readable local-vs-catalog Visium coverage report by organ
+  tests/                                 56 tests, synthetic data only, no real HEST-1k/GPU required
     test_components.py, test_arch1_arch2.py, test_arch3.py, test_arch4.py,
-    test_checkpoint.py, test_masked_item.py, test_train_local_neighborhood_integration.py
+    test_checkpoint.py, test_masked_item.py, test_train_local_neighborhood_integration.py,
+    test_hest1k_catalog.py, test_apply_sample_selection.py
 ```

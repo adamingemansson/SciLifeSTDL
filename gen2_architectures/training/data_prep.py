@@ -20,8 +20,71 @@ import numpy as np
 
 from gen2_architectures.data import loaders
 from gen2_architectures.data.context_features import ContextOnlyFeatureProvider
+from gen2_architectures.data.hest1k_catalog import resolve_sample_selection
 from gen2_architectures.data.masked_item import make_context_query_split
 from gen2_architectures.data.mask_bank import cap_context_mask
+
+
+def apply_sample_selection(cfg) -> None:
+    """If cfg.data.sample_selection is present, resolve it against the real
+    HEST-1k metadata + local inventory and OVERWRITE cfg.data's
+    train_sample_ids/validation_sample_ids/test_sample_ids/organ_by_sample/
+    tech_by_sample in place, plus cfg.model.params.organ_vocab/tech_vocab
+    if those aren't already explicitly set. A no-op (does nothing) when
+    sample_selection isn't present, so existing literal-sample-ID configs
+    (e.g. the 8-sample Lung placeholder configs) keep working completely
+    unchanged -- this is purely additive.
+
+    Mutates cfg in place (OmegaConf configs are mutable containers) rather
+    than returning a new one, so every call site just calls this once,
+    early, and continues reading cfg.data.* normally afterward -- no
+    caller needs to know whether the values came from a literal list or a
+    resolved selection.
+    """
+    selection_cfg = cfg.data.get("sample_selection")
+    if selection_cfg is None:
+        return
+    organs = selection_cfg.get("organs", "all")
+    if organs != "all":
+        organs = list(organs)
+    result = resolve_sample_selection(
+        hest_data_dir=cfg.data.hest_data_dir,
+        metadata_csv=selection_cfg.get("metadata_csv", "hf://datasets/MahmoodLab/hest/HEST_v1_3_0.csv"),
+        organs=organs,
+        min_samples_per_organ=int(selection_cfg.get("min_samples_per_organ", 3)),
+        max_samples_per_organ=selection_cfg.get("max_samples_per_organ"),
+        n_validation_per_organ=int(selection_cfg.get("n_validation_per_organ", 1)),
+        n_test_per_organ=int(selection_cfg.get("n_test_per_organ", 1)),
+        split_seed=int(selection_cfg.get("split_seed", 0)),
+    )
+    cfg.data.train_sample_ids = result["train_sample_ids"]
+    cfg.data.validation_sample_ids = result["validation_sample_ids"]
+    cfg.data.test_sample_ids = result["test_sample_ids"]
+    cfg.data.organ_by_sample = result["organ_by_sample"]
+    cfg.data.tech_by_sample = result["tech_by_sample"]
+    n_train, n_val, n_test = len(result["train_sample_ids"]), len(result["validation_sample_ids"]), len(result["test_sample_ids"])
+    print(
+        f"apply_sample_selection: resolved {n_train} train / {n_val} validation / {n_test} test "
+        f"samples across organs {result['organ_vocab']}"
+    )
+    # organ_vocab/tech_vocab are only real constructor params for
+    # Architectures 1/2 (LocalNeighborhoodTransformer) and Architecture 3
+    # Stage B -- NOT Architecture 4 (fixed organ_type/tech_type strings,
+    # a single value not a vocabulary) or Stage A (no organ conditioning
+    # at all). Injecting them unconditionally would pass an unexpected
+    # kwarg into those constructors and crash. Detect which kind of config
+    # this is the same way each training entrypoint already does: an
+    # "architecture" key means 1/2/4 (train_local_neighborhood.py), a
+    # "stage_a_checkpoint_dir" key means Stage B, neither means Stage A.
+    accepts_vocab = (
+        str(cfg.get("model", {}).get("architecture", "")) in ("1", "2")
+        or "stage_a_checkpoint_dir" in cfg.get("model", {})
+    )
+    if accepts_vocab and "params" in cfg.model:
+        if "organ_vocab" not in cfg.model.params or cfg.model.params.organ_vocab is None:
+            cfg.model.params.organ_vocab = result["organ_vocab"]
+        if "tech_vocab" not in cfg.model.params or cfg.model.params.tech_vocab is None:
+            cfg.model.params.tech_vocab = result["tech_vocab"]
 
 
 def _atomic_savez(cache_path: Path, **arrays) -> None:

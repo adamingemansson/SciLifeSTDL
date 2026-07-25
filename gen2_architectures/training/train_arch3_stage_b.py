@@ -48,6 +48,7 @@ def _load_stage_a(stage_a_checkpoint_dir: str, n_genes: int) -> DenoisingTranscr
 
 def main(config_path: str) -> None:
     cfg = OmegaConf.load(config_path)
+    data_prep.apply_sample_selection(cfg)
     device = torch.device(cfg.training.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
 
     train_ids = list(cfg.data.train_sample_ids)

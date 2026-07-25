@@ -30,22 +30,13 @@ Prints:
 from __future__ import annotations
 
 import argparse
-import re
+import sys
 from collections import Counter
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-def _locally_downloaded_ids(hest_data_dir: Path) -> tuple[set[str], set[str]]:
-    """IDs with an expression file (st/*.h5ad) and IDs with a patch file
-    (patches/*.h5), reported separately -- a real, useful distinction
-    since a sample downloaded for expression-only use (e.g. an earlier
-    expression-only pilot) may be missing patches, and every gen2
-    architecture requires both."""
-    st_dir = hest_data_dir / "st"
-    patch_dir = hest_data_dir / "patches"
-    st_ids = {p.stem for p in st_dir.glob("*.h5ad")} if st_dir.is_dir() else set()
-    patch_ids = {p.stem for p in patch_dir.glob("*.h5")} if patch_dir.is_dir() else set()
-    return st_ids, patch_ids
+from gen2_architectures.data.hest1k_catalog import load_visium_metadata, locally_downloaded_ids
 
 
 def main() -> None:
@@ -58,17 +49,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    import pandas as pd
-
     hest_data_dir = Path(args.hest_data_dir)
     print(f"Reading HEST-1k metadata from {args.metadata_csv} ...")
-    meta = pd.read_csv(args.metadata_csv)
-    visium = meta[meta["st_technology"] == "Visium"].copy()
-    visium["organ"] = visium["organ"].fillna("(unlabeled)")
-    print(f"Full catalog: {len(meta)} samples total, {len(visium)} Visium samples across "
-          f"{visium['organ'].nunique()} organs.\n")
+    visium = load_visium_metadata(args.metadata_csv)
+    print(f"Full catalog Visium samples: {len(visium)} across {visium['organ'].nunique()} organs.\n")
 
-    st_ids, patch_ids = _locally_downloaded_ids(hest_data_dir)
+    st_ids, patch_ids = locally_downloaded_ids(hest_data_dir)
     usable_ids = st_ids & patch_ids  # has BOTH expression and image patches
     expr_only_ids = st_ids - patch_ids
     patch_only_ids = patch_ids - st_ids

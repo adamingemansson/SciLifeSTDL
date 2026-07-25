@@ -32,11 +32,18 @@ data:
   expression_target_sum: 10000.0
   scfoundation_repo_path: ${oc.env:SCFOUNDATION_REPO_PATH}
   scfoundation_model_path: ${oc.env:SCFOUNDATION_MODEL_PATH}
-  train_sample_ids: [TENX72, TENX62, MEND90, MEND89, MEND88, MEND87]
-  validation_sample_ids: [MEND86]
-  test_sample_ids: [MEND85]
-  organ_by_sample: {TENX72: Lung, TENX62: Lung, MEND90: Lung, MEND89: Lung, MEND88: Lung, MEND87: Lung, MEND86: Lung, MEND85: Lung}
-  tech_by_sample: {TENX72: Visium, TENX62: Visium, MEND90: Visium, MEND89: Visium, MEND88: Visium, MEND87: Visium, MEND86: Visium, MEND85: Visium}
+  # organs: [Lung] -- matches the fixed organ_type: Lung below (STPath's
+  # own vocabulary is baked in at construction, not per-sample). Real
+  # inventory (2026-07-25): 38 usable Lung Visium samples locally --
+  # max_samples_per_organ: 30 keeps this consistent with the other 3
+  # architectures' per-organ cap.
+  sample_selection:
+    organs: [Lung]
+    metadata_csv: hf://datasets/MahmoodLab/hest/HEST_v1_3_0.csv
+    max_samples_per_organ: 30
+    n_validation_per_organ: 2
+    n_test_per_organ: 2
+    split_seed: 0
 masking:
   strategy: random_dropout_patches
   max_context_points: 3000   # deliberately NOT 80 -- STPath's real pretrained weights were calibrated against a much larger context set; shrinking it to match Architectures 1-3 would itself be an unintended intervention on a component we are NOT trying to change

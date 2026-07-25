@@ -8,13 +8,17 @@
 # combined 1-2 day budget for the pair.
 #
 # IMPORTANT: Stage A and Stage B MUST share the exact same
-# train_sample_ids/min_genes/min_cells/expression_transform (i.e. the exact
-# same resulting gene panel and expression values) -- train_arch3_stage_b.py
-# checks the gene COUNT matches and raises if not, but cannot verify gene
-# IDENTITY/order matches beyond that, so keep this file and
-# arch3_stage_b_spatial.yaml's [data] section identical by construction.
-#
-# PLACEHOLDER SAMPLE LIST -- see arch1_gpt_baseline.yaml's own note.
+# data.sample_selection block (i.e. the exact same resolved train_sample_ids
+# and therefore the exact same shared gene panel and expression values) --
+# train_arch3_stage_b.py checks the gene COUNT matches and raises if not,
+# but cannot verify gene IDENTITY/order matches beyond that, so keep this
+# file and arch3_stage_b_spatial.yaml's [data] section identical by
+# construction (they already are below). Sample scope: same organs/caps as
+# arch1_gpt_baseline.yaml -- see that file's own comment for the reasoning.
+# Note Stage A only ever uses train_sample_ids (pools every observed spot,
+# no context/query split) -- resolve_sample_selection still computes
+# validation/test_sample_ids here too, just unused, so the SAME block can
+# be copy-pasted into Stage B unchanged.
 experiment_name: gen2_arch3_stage_a_pretrain_v1
 data:
   hest_data_dir: data/raw/hest1k
@@ -23,9 +27,14 @@ data:
   min_cells: 3
   expression_transform: normalize_log1p
   expression_target_sum: 10000.0
-  train_sample_ids: [TENX72, TENX62, MEND90, MEND89, MEND88, MEND87]
-  organ_by_sample: {TENX72: Lung, TENX62: Lung, MEND90: Lung, MEND89: Lung, MEND88: Lung, MEND87: Lung}
-  tech_by_sample: {TENX72: Visium, TENX62: Visium, MEND90: Visium, MEND89: Visium, MEND88: Visium, MEND87: Visium}
+  sample_selection:
+    organs: all
+    metadata_csv: hf://datasets/MahmoodLab/hest/HEST_v1_3_0.csv
+    min_samples_per_organ: 5
+    max_samples_per_organ: 30
+    n_validation_per_organ: 2
+    n_test_per_organ: 2
+    split_seed: 0
 model:
   params:
     latent_dim: 256

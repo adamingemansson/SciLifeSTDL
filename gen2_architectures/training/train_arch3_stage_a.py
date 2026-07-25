@@ -23,11 +23,12 @@ from omegaconf import OmegaConf
 from gen2_architectures.models.arch3_stage_a_autoencoder import DenoisingTranscriptomeAutoencoder, corrupt_expression
 from gen2_architectures.models.components import StagedGeneLoss
 from gen2_architectures.data import loaders
-from gen2_architectures.training import checkpoint
+from gen2_architectures.training import checkpoint, data_prep
 
 
 def main(config_path: str) -> None:
     cfg = OmegaConf.load(config_path)
+    data_prep.apply_sample_selection(cfg)
     device = torch.device(cfg.training.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
 
     train_ids = list(cfg.data.train_sample_ids)

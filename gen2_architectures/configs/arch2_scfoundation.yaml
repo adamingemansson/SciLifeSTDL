@@ -11,7 +11,9 @@
 # fails, that's a legitimate, expected finding to report, not a sign the
 # plan was wrong (see README's open-risk note on Architecture 2).
 #
-# PLACEHOLDER SAMPLE LIST -- see arch1_gpt_baseline.yaml's own note.
+# Sample scope: IDENTICAL data.sample_selection block to
+# arch1_gpt_baseline.yaml -- keeps Arch1-vs-Arch2 a fair, same-data
+# comparison (see that file's own comment for the reasoning).
 experiment_name: gen2_arch2_scfoundation_v1
 data:
   hest_data_dir: data/raw/hest1k
@@ -22,11 +24,14 @@ data:
   expression_target_sum: 10000.0
   scfoundation_repo_path: ${oc.env:SCFOUNDATION_REPO_PATH}
   scfoundation_model_path: ${oc.env:SCFOUNDATION_MODEL_PATH}
-  train_sample_ids: [TENX72, TENX62, MEND90, MEND89, MEND88, MEND87]
-  validation_sample_ids: [MEND86]
-  test_sample_ids: [MEND85]
-  organ_by_sample: {TENX72: Lung, TENX62: Lung, MEND90: Lung, MEND89: Lung, MEND88: Lung, MEND87: Lung, MEND86: Lung, MEND85: Lung}
-  tech_by_sample: {TENX72: Visium, TENX62: Visium, MEND90: Visium, MEND89: Visium, MEND88: Visium, MEND87: Visium, MEND86: Visium, MEND85: Visium}
+  sample_selection:
+    organs: all
+    metadata_csv: hf://datasets/MahmoodLab/hest/HEST_v1_3_0.csv
+    min_samples_per_organ: 5
+    max_samples_per_organ: 30
+    n_validation_per_organ: 2
+    n_test_per_organ: 2
+    split_seed: 0
 masking:
   strategy: random_dropout_patches
   max_context_points: 80
@@ -50,8 +55,8 @@ model:
     max_neighbors: 80
     coord_scale: 1000.0
     decoder_hidden_dim: 1024
-    organ_vocab: [Lung]
-    tech_vocab: [Visium]
+    # organ_vocab/tech_vocab auto-injected at run time from
+    # data.sample_selection -- see training/data_prep.py::apply_sample_selection.
     # scfoundation_dim is NOT set here -- it's auto-detected at runtime from
     # a real probe call against the loaded checkpoint (see
     # train_local_neighborhood.py's data_prep._probe_context_feature_dim),
@@ -86,4 +91,4 @@ evaluation:
   image_modes: [target_zero, all_zero]
   k_neighborhood: 8
   pca_n_components: 50
-  fixed_gene_panel_paths: {lung_hest_bench_50: resources/evaluation/hest_bench/LUNG_var_50genes.json}
+  # No fixed_gene_panel_paths -- see arch1_gpt_baseline.yaml's own note.

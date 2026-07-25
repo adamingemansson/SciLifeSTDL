@@ -59,6 +59,7 @@ def _sample_organ_tech(adata) -> tuple[str | None, str | None]:
 
 def main(config_path: str) -> None:
     cfg = OmegaConf.load(config_path)
+    data_prep.apply_sample_selection(cfg)
     architecture = str(cfg.model.architecture)
     device = torch.device(cfg.training.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     needs_scfoundation = architecture in ("2", "4")
