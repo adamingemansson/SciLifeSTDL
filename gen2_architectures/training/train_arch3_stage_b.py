@@ -122,6 +122,7 @@ def main(config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_
     augment = bool(cfg.training.get("augment_coords", False))
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     wall_clock_deadline = data_prep.resolve_wall_clock_deadline(cfg)
+    progress_fn = data_prep.make_progress_fn(wall_clock_deadline, total_steps)
 
     rng = random.Random(int(cfg.training.get("seed", 0)))
     model.train()
@@ -147,7 +148,7 @@ def main(config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_
 
         true_latent = model.true_latent(target)
         latent_loss = torch.nn.functional.mse_loss(out["predicted_latent"], true_latent)
-        progress = step / max(1, total_steps)
+        progress = progress_fn(step)
         gene_result = loss_fn(out["predicted_expression"], target, progress)
         total_loss = latent_loss_weight * latent_loss + gene_result["loss"]
 

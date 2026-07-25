@@ -154,6 +154,32 @@ def resolve_wall_clock_deadline(cfg) -> float | None:
     return time.monotonic() + hours * 3600.0
 
 
+def make_progress_fn(wall_clock_deadline: float | None, total_steps: int):
+    """Returns a step -> progress-in-[0, 1] callable for StagedGeneLoss's
+    stage curriculum (models/components.py).
+
+    2026-07-25 bugfix: progress used to be `step / total_steps` unconditionally
+    in every training script. Now that max_wall_clock_hours is the real
+    stopping mechanism and total_steps is a rarely-hit safety cap (set far
+    larger than any real run should reach -- see the configs), step /
+    total_steps barely moves over an entire real run, so the loss curriculum
+    would never leave stage 1 (pure MSE, no Pearson term). When a wall-clock
+    deadline is set, progress is instead the fraction of the wall-clock
+    budget elapsed -- what's actually governing how far into the run we are.
+    Falls back to step / total_steps when no wall-clock deadline is set."""
+    training_start = time.monotonic()
+    total_wall_clock_seconds = (
+        wall_clock_deadline - training_start if wall_clock_deadline is not None else None
+    )
+
+    def progress_fn(step: int) -> float:
+        if total_wall_clock_seconds is not None and total_wall_clock_seconds > 0:
+            return min(1.0, (time.monotonic() - training_start) / total_wall_clock_seconds)
+        return step / max(1, total_steps)
+
+    return progress_fn
+
+
 def derive_coord_scale(adatas: list) -> float:
     """Auto-derive coord_scale for RandomFourierFeatures-based
     CoordEmbedding from these samples' REAL coordinate spread — ports the

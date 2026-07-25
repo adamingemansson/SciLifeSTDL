@@ -145,6 +145,7 @@ def main(config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_
     context_gex_mode = str(cfg.training.get("context_gex_mode", "full"))
     augment = bool(cfg.training.get("augment_coords", False))
     wall_clock_deadline = data_prep.resolve_wall_clock_deadline(cfg)
+    progress_fn = data_prep.make_progress_fn(wall_clock_deadline, total_steps)
 
     rng = random.Random(int(cfg.training.get("seed", 0)))
     model.train()
@@ -174,7 +175,7 @@ def main(config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_
         if target_idx is not None:
             target = target[:, target_idx]
 
-        progress = step / max(1, total_steps)
+        progress = progress_fn(step)
         result = loss_fn(pred, target, progress)
         optimizer.zero_grad()
         result["loss"].backward()

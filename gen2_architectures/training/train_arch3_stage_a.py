@@ -88,6 +88,7 @@ def main(config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_
     gaussian_std = float(cfg.training.get("gaussian_std", 0.0))
 
     wall_clock_deadline = data_prep.resolve_wall_clock_deadline(cfg)
+    progress_fn = data_prep.make_progress_fn(wall_clock_deadline, total_steps)
     pooled_t = torch.from_numpy(pooled)
     rng = random.Random(int(cfg.training.get("seed", 0)))
     n_spots_total = pooled_t.shape[0]
@@ -101,7 +102,7 @@ def main(config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_
         corrupted = corrupt_expression(clean, seed=step, mask_fraction=mask_fraction, gaussian_std=gaussian_std)
 
         recon = model(corrupted)
-        progress = step / max(1, total_steps)
+        progress = progress_fn(step)
         result = loss_fn(recon, clean, progress)  # reconstruct the CLEAN target from corrupted input
         optimizer.zero_grad()
         result["loss"].backward()

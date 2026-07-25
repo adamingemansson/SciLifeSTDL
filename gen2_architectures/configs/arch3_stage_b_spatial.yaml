@@ -54,7 +54,7 @@ training:
   device: cuda
   seed: 0
   lr: 1.0e-4
-  total_steps: 1000000   # hard safety cap only -- see max_wall_clock_hours below
+  total_steps: 100000000   # hard safety cap only, deliberately far above any real run's reach (2026-07-25: 1,000,000 was too low -- a fast architecture could exhaust it in a few hours, ending the run early despite max_wall_clock_hours below
   max_wall_clock_hours: 28   # standalone-run fallback; when launched via training/train_arch3_combined.py this is OVERRIDDEN by --total_hours * (1 - stage_a_fraction) (README section 12)
   gradient_clip_val: 1.0
   log_every_n_steps: 50

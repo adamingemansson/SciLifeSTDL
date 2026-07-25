@@ -65,7 +65,7 @@ training:
   device: cuda
   seed: 0
   lr: 1.0e-4
-  total_steps: 1000000   # hard safety cap only -- see max_wall_clock_hours below, the real practical stopping point (README section 12)
+  total_steps: 100000000   # hard safety cap only, deliberately far above any real run's reach (2026-07-25: 1,000,000 was too low -- a fast architecture could exhaust it in a few hours, ending the run early despite max_wall_clock_hours below, the real practical stopping point (README section 12)
   max_wall_clock_hours: 36   # ~1.5 days
   gradient_clip_val: 1.0
   log_every_n_steps: 50
