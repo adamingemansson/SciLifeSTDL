@@ -36,13 +36,31 @@ def usable_local_ids(hest_data_dir: str | Path) -> set[str]:
     return st_ids & patch_ids
 
 
-def load_visium_metadata(metadata_csv: str) -> pd.DataFrame:
+def load_visium_metadata(metadata_csv: str, species: str | None = "Homo sapiens") -> pd.DataFrame:
     """Real HEST-1k metadata CSV, filtered to Visium (st_technology).
     metadata_csv is normally the public `hf://datasets/MahmoodLab/hest/
     HEST_v1_3_0.csv` URI (docs/dataset_notes.md), but any local path works
-    identically -- pandas dispatches on the string itself."""
+    identically -- pandas dispatches on the string itself.
+
+    species (real bug found 2026-07-25, first real multi-organ training
+    run on the actual server): HEST-1k genuinely contains two species --
+    421 "Homo sapiens" + 181 "Mus musculus" Visium samples, confirmed
+    against the live CSV's real `species` column values -- and nothing
+    here filtered on it before. A sample_selection spanning "all" organs
+    silently mixed both, and human/mouse gene symbols essentially never
+    match (`ACTB` vs `Actb`), so load_multi_sample's cross-sample gene
+    intersection collapsed to exactly zero shared genes across ~240
+    samples -- not a partial loss, the literal symptom this fix targets.
+    Defaults to human-only (every gene-vocabulary assumption downstream --
+    STPath, scFoundation -- is human-gene-symbol-based); pass
+    species=None to keep every species (e.g. for a deliberate
+    mouse-vs-human comparison run), or an explicit string/list to select
+    otherwise."""
     meta = pd.read_csv(metadata_csv)
     visium = meta[meta["st_technology"] == "Visium"].copy()
+    if species is not None:
+        allowed = {species} if isinstance(species, str) else set(species)
+        visium = visium[visium["species"].isin(allowed)]
     visium["organ"] = visium["organ"].fillna("(unlabeled)")
     return visium
 
@@ -50,6 +68,7 @@ def load_visium_metadata(metadata_csv: str) -> pd.DataFrame:
 def resolve_sample_selection(
     hest_data_dir: str | Path, metadata_csv: str,
     organs: list[str] | str = "all",
+    species: str | list[str] | None = "Homo sapiens",
     min_samples_per_organ: int = 3,
     max_samples_per_organ: int | None = None,
     n_validation_per_organ: int = 1,
@@ -63,6 +82,10 @@ def resolve_sample_selection(
     organs: "all" (every organ with enough local samples) or an explicit
     list of organ names to restrict to (e.g. ["Lung"] for Architecture 4's
     single-organ constraint).
+
+    species: defaults to human-only (see load_visium_metadata's own
+    docstring for the real zero-gene-intersection bug this guards
+    against -- HEST-1k genuinely mixes human and mouse Visium samples).
 
     min_samples_per_organ: organs with fewer usable local samples than
     this are excluded entirely -- below n_validation_per_organ +
@@ -84,7 +107,7 @@ def resolve_sample_selection(
     """
     import random
 
-    visium = load_visium_metadata(metadata_csv)
+    visium = load_visium_metadata(metadata_csv, species=species)
     usable = usable_local_ids(hest_data_dir)
     visium = visium[visium["id"].isin(usable)]
 

@@ -297,11 +297,19 @@ modality, not a different model or different held-out regions.
 collapse the shared gene panel to whatever the narrowest targeted panel
 covers, e.g. Xenium's ~few-hundred genes — a real, verified constraint of
 `data/loaders.py::load_multi_sample`'s strict intersection, not a
-convenience choice). Real inventory confirmed 2026-07-25
-(`scripts/inventory_hest1k.py` against the actual server): ~515 usable
-Visium samples (both expression AND image patches present) across ~24
-organs already downloaded — no further downloading needed for the first
-round.
+convenience choice), **human only** (`species: "Homo sapiens"` — see
+`data/hest1k_catalog.py::load_visium_metadata`'s docstring for the real
+zero-gene-intersection bug found on the first actual multi-organ server
+run, 2026-07-25: HEST-1k genuinely mixes 421 human + 181 mouse Visium
+samples, confirmed against the live CSV, and nothing filtered on species
+before that fix). The ~515-usable-Visium-samples/~24-organs figure
+originally reported here (`scripts/inventory_hest1k.py`, also 2026-07-25)
+was measured BEFORE the species fix and therefore counted some
+now-excluded mouse samples — re-run the inventory script (now
+human-only by default) for the real corrected count before relying on
+specific numbers; the per-organ resolution logic itself (`min_samples_per_organ`,
+`max_samples_per_organ`, below) is unaffected and will simply resolve to
+fewer samples for any organ that had real mouse-only or mixed coverage.
 
 Sample selection is resolved at RUN TIME, not hardcoded — every shipped
 config sets `data.sample_selection` (organs, per-organ sample caps,

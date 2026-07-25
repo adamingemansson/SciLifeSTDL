@@ -47,11 +47,20 @@ def main() -> None:
         help="Public HEST-1k metadata CSV (docs/dataset_notes.md's own source). "
              "Pass a local path instead if you've already downloaded it.",
     )
+    parser.add_argument(
+        "--species", type=str, default="Homo sapiens",
+        help="Filter to this species (real HEST-1k values confirmed 2026-07-25: "
+             "'Homo sapiens' (421 Visium samples), 'Mus musculus' (181) -- matches "
+             "hest1k_catalog.py::resolve_sample_selection's own default and the real "
+             "zero-gene-intersection bug that default guards against). Pass 'all' to "
+             "keep every species (e.g. to inspect mouse coverage separately).",
+    )
     args = parser.parse_args()
+    species = None if args.species == "all" else args.species
 
     hest_data_dir = Path(args.hest_data_dir)
-    print(f"Reading HEST-1k metadata from {args.metadata_csv} ...")
-    visium = load_visium_metadata(args.metadata_csv)
+    print(f"Reading HEST-1k metadata from {args.metadata_csv} (species={args.species}) ...")
+    visium = load_visium_metadata(args.metadata_csv, species=species)
     print(f"Full catalog Visium samples: {len(visium)} across {visium['organ'].nunique()} organs.\n")
 
     st_ids, patch_ids = locally_downloaded_ids(hest_data_dir)

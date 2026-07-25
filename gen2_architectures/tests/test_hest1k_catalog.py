@@ -8,10 +8,15 @@ from gen2_architectures.data.hest1k_catalog import resolve_sample_selection
 
 
 def _make_fake_hest1k(tmp_path: Path, organ_sample_ids: dict[str, list[str]], technology: str = "Visium",
-                       missing_patches: set[str] | None = None) -> tuple[Path, Path]:
+                       missing_patches: set[str] | None = None,
+                       species_by_id: dict[str, str] | None = None) -> tuple[Path, Path]:
     """Build a fake local hest1k dir + matching metadata CSV. missing_patches
-    lets a test simulate a sample with expression but no image patches."""
+    lets a test simulate a sample with expression but no image patches.
+    species_by_id (default: every sample "Homo sapiens") lets a test
+    simulate HEST-1k's real human/mouse mix (see
+    test_species_filter_excludes_mouse_by_default)."""
     missing_patches = missing_patches or set()
+    species_by_id = species_by_id or {}
     hest_dir = tmp_path / "hest1k"
     (hest_dir / "st").mkdir(parents=True)
     (hest_dir / "patches").mkdir(parents=True)
@@ -19,7 +24,10 @@ def _make_fake_hest1k(tmp_path: Path, organ_sample_ids: dict[str, list[str]], te
     rows = []
     for organ, ids in organ_sample_ids.items():
         for sid in ids:
-            rows.append({"id": sid, "organ": organ, "st_technology": technology})
+            rows.append({
+                "id": sid, "organ": organ, "st_technology": technology,
+                "species": species_by_id.get(sid, "Homo sapiens"),
+            })
             (hest_dir / "st" / f"{sid}.h5ad").touch()
             if sid not in missing_patches:
                 (hest_dir / "patches" / f"{sid}.h5").touch()
@@ -127,3 +135,31 @@ def test_organ_by_sample_and_tech_by_sample_cover_every_selected_id():
         for sid in all_selected:
             assert result["organ_by_sample"][sid] == "Lung"
             assert result["tech_by_sample"][sid] == "Visium"
+
+
+def test_species_filter_excludes_mouse_by_default():
+    """Real bug found 2026-07-25 on the actual training server: HEST-1k
+    genuinely mixes 421 human + 181 mouse Visium samples, and nothing
+    filtered on species before this fix -- an "organs: all" run silently
+    combined both, and human/mouse gene symbols essentially never match,
+    so load_multi_sample's cross-sample gene intersection collapsed to
+    exactly zero shared genes. species defaults to human-only now."""
+    with tempfile.TemporaryDirectory() as tmp:
+        mouse_ids = {f"L{i}": "Mus musculus" for i in range(5)}
+        hest_dir, meta_path = _make_fake_hest1k(
+            Path(tmp), {"Lung": [f"L{i}" for i in range(10)]}, species_by_id=mouse_ids,
+        )
+        result = resolve_sample_selection(hest_dir, str(meta_path), organs="all", min_samples_per_organ=3)
+        all_selected = result["train_sample_ids"] + result["validation_sample_ids"] + result["test_sample_ids"]
+        assert set(all_selected) == {f"L{i}" for i in range(5, 10)}, "only the 5 human samples should survive"
+
+
+def test_species_all_keeps_every_species():
+    with tempfile.TemporaryDirectory() as tmp:
+        mouse_ids = {f"L{i}": "Mus musculus" for i in range(5)}
+        hest_dir, meta_path = _make_fake_hest1k(
+            Path(tmp), {"Lung": [f"L{i}" for i in range(10)]}, species_by_id=mouse_ids,
+        )
+        result = resolve_sample_selection(hest_dir, str(meta_path), organs="all", species=None, min_samples_per_organ=3)
+        all_selected = result["train_sample_ids"] + result["validation_sample_ids"] + result["test_sample_ids"]
+        assert len(all_selected) == 10, "species=None must keep both human and mouse samples"

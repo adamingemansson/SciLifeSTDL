@@ -14,7 +14,7 @@ def _fake_hest1k(tmp_path: Path) -> tuple[Path, Path]:
     rows = []
     for organ, ids in {"Lung": [f"L{i}" for i in range(10)], "Kidney": [f"K{i}" for i in range(8)]}.items():
         for sid in ids:
-            rows.append({"id": sid, "organ": organ, "st_technology": "Visium"})
+            rows.append({"id": sid, "organ": organ, "st_technology": "Visium", "species": "Homo sapiens"})
             (hest_dir / "st" / f"{sid}.h5ad").touch()
             (hest_dir / "patches" / f"{sid}.h5").touch()
     meta_path = tmp_path / "meta.csv"

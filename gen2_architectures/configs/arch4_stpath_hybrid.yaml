@@ -33,8 +33,12 @@ data:
   scfoundation_repo_path: ${oc.env:SCFOUNDATION_REPO_PATH}
   scfoundation_model_path: ${oc.env:SCFOUNDATION_MODEL_PATH}
   # organs: [Lung] -- matches the fixed organ_type: Lung below (STPath's
-  # own vocabulary is baked in at construction, not per-sample). Real
-  # inventory (2026-07-25): 38 usable Lung Visium samples locally --
+  # own vocabulary is baked in at construction, not per-sample). Earlier
+  # inventory (2026-07-25) reported 38 usable Lung Visium samples locally,
+  # but that predates the species filter fix (see arch1_gpt_baseline.yaml's
+  # own comment / hest1k_catalog.py::load_visium_metadata's docstring --
+  # HEST-1k mixes human + mouse) -- re-run scripts/inventory_hest1k.py
+  # (human-only by default now) for the real human-only Lung count.
   # max_samples_per_organ: 30 keeps this consistent with the other 3
   # architectures' per-organ cap.
   sample_selection:

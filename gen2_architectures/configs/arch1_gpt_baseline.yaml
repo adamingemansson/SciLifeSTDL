@@ -4,14 +4,19 @@
 #
 # Sample scope resolved at run time from the real HEST-1k Visium inventory
 # (gen2_architectures/data/hest1k_catalog.py::resolve_sample_selection,
-# via data.sample_selection below) rather than a hardcoded ID list --
-# real inventory (2026-07-25, scripts/inventory_hest1k.py against the
-# actual server): ~515 usable Visium samples across ~24 organs already
-# downloaded. min_samples_per_organ=5 keeps only organs with a real
-# train/val/test split; max_samples_per_organ=30 caps the largest organs
-# (Brain: 121, Skin/Kidney: 67 each, ...) so epoch size stays tractable
-# for a 1-2 day budget while still getting real multi-organ diversity --
-# ~17 organs, ~240 training samples with these settings. Tune
+# via data.sample_selection below) rather than a hardcoded ID list.
+# species defaults to "Homo sapiens" inside resolve_sample_selection --
+# real bug found 2026-07-25 on the first actual multi-organ server run:
+# HEST-1k genuinely mixes 421 human + 181 mouse Visium samples, and an
+# earlier unfiltered "organs: all" run collapsed the cross-sample gene
+# intersection to exactly zero (human/mouse gene symbols essentially
+# never match). The ~515-samples/~24-organs figure originally noted here
+# (scripts/inventory_hest1k.py, also 2026-07-25) predates that fix and
+# included some now-excluded mouse samples -- re-run the inventory
+# script for the real human-only count. min_samples_per_organ=5 keeps
+# only organs with a real train/val/test split; max_samples_per_organ=30
+# caps the largest organs so epoch size stays tractable for a 1-2 day
+# budget while still getting real multi-organ diversity. Tune
 # max_samples_per_organ up/down after a smoke run shows real steps/sec.
 experiment_name: gen2_arch1_gpt_baseline_v1
 data:
