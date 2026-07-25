@@ -170,11 +170,27 @@ def apply_coord_scale(cfg, train_adatas: list) -> None:
 def _atomic_savez(cache_path: Path, **arrays) -> None:
     """np.savez, but crash-safe under concurrent writers (e.g. multiple
     GPU processes racing to populate the same cache file the first time).
-    Ported unchanged from src/training/train.py."""
+
+    REGRESSION fixed 2026-07-25 (first real training-server run to
+    actually exercise a cold/uncached GigaPath computation through this
+    copy): this function's docstring used to claim "ported unchanged
+    from src/training/train.py", but it had actually reverted to that
+    file's OWN pre-2026-07-17 buggy version --
+    cache_path.with_suffix(cache_path.suffix + f".tmp{pid}") produces a
+    tmp filename like "INT1.npz.tmp12345", which does NOT end in
+    ".npz" -- np.savez SILENTLY APPENDS ".npz" to any string/Path target
+    that doesn't already end in ".npz" (a well-known numpy gotcha), so it
+    actually wrote "INT1.npz.tmp12345.npz", and the os.replace() below
+    then raised FileNotFoundError looking for the path numpy never
+    created. src/training/train.py's own _atomic_savez already found and
+    fixed this exact bug on 2026-07-17 -- restored that exact fix here
+    (keep ".npz" as the tmp path's real suffix) rather than re-deriving
+    it, per this project's own discipline of reusing already-debugged
+    solutions instead of risking a fresh, differently-wrong one."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = cache_path.with_suffix(cache_path.suffix + f".tmp{os.getpid()}")
+    tmp_path = cache_path.with_name(f"{cache_path.stem}.tmp{os.getpid()}.npz")
     np.savez(tmp_path, **arrays)
-    os.replace(tmp_path, cache_path)
+    os.replace(tmp_path, cache_path)  # atomic on POSIX -- no reader ever sees a partial file
 
 
 def cache_root(cfg) -> Path:
