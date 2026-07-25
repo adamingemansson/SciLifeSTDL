@@ -106,13 +106,22 @@ need the `hest` package's other convenience helpers later (e.g.
 `iter_hest`) — not required for `load_hest_sample()` in
 `src/data/loaders.py`, which reads the `.h5ad` directly via `anndata`.
 
-Or filter by metadata instead of a fixed ID — `technology` column selects the
-platform (`Visium`, `Xenium`, `Visium HD`, legacy `ST`):
+Or filter by metadata instead of a fixed ID — `st_technology` column selects
+the platform (`Visium`, `Xenium`, `Visium HD`, legacy `ST`) — NOT `technology`,
+which this doc previously said; corrected 2026-07-25 after a real
+`KeyError: 'technology'` against the live CSV (28 real columns confirmed:
+`dataset_title, id, image_filename, organ, disease_state, oncotree_code,
+species, patient, st_technology, data_publication_date, license,
+study_link, download_page_link1, inter_spot_dist, spot_diameter,
+spots_under_tissue, preservation_method, nb_genes, treatment_comment,
+pixel_size_um_embedded, pixel_size_um_estimated, magnification,
+fullres_px_width, fullres_px_height, tissue, disease_comment, subseries,
+hest_version_added`):
 ```python
 import pandas as pd
 meta_df = pd.read_csv("hf://datasets/MahmoodLab/hest/HEST_v1_3_0.csv")
 meta_df = meta_df[(meta_df["oncotree_code"] == "IDC") & (meta_df["organ"] == "Breast")
-                   & (meta_df["technology"] == "Visium")]
+                   & (meta_df["st_technology"] == "Visium")]
 ids_to_query = meta_df["id"].values
 allow_patterns = [f"*{id}[_.]**" for id in ids_to_query]
 ```

@@ -63,7 +63,7 @@ def main() -> None:
     hest_data_dir = Path(args.hest_data_dir)
     print(f"Reading HEST-1k metadata from {args.metadata_csv} ...")
     meta = pd.read_csv(args.metadata_csv)
-    visium = meta[meta["technology"] == "Visium"].copy()
+    visium = meta[meta["st_technology"] == "Visium"].copy()
     visium["organ"] = visium["organ"].fillna("(unlabeled)")
     print(f"Full catalog: {len(meta)} samples total, {len(visium)} Visium samples across "
           f"{visium['organ'].nunique()} organs.\n")
