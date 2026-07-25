@@ -413,6 +413,28 @@ every later use (scFoundation provider construction, the eval loops)
 sees only samples that genuinely loaded. See
 `tests/test_load_held_out_samples.py`.
 
+**Sixth real bug, same server run, at the first periodic checkpoint save
+(training had actually reached real steps by this point — loss
+decreasing, diagnostics sane)**: `TypeError: Object of type ListConfig
+is not JSON serializable`. Real cause: `_model_config_dict`/`build_model`
+(and the equivalent lines in `train_arch3_stage_a.py`/
+`train_arch3_stage_b.py`) built model-config-to-save dicts via
+`dict(cfg.model.get("params", {}))` — a SHALLOW conversion. Any
+nested list-valued param (`organ_vocab`/`tech_vocab`, auto-injected by
+`apply_sample_selection`; or a literal YAML list like Stage A's
+`hidden_dims: [4096, 1024]`) stayed as an OmegaConf `ListConfig` object,
+which `json.dump` cannot serialize — every one of the 7 shipped configs
+would have hit this on its first periodic checkpoint save, not just
+Architecture 1's. Fixed by replacing every `dict(cfg.model.get("params",
+{}))` with `OmegaConf.to_container(cfg.model.get("params", {}),
+resolve=True)`, which recursively converts every nested
+`ListConfig`/`DictConfig` into a plain `list`/`dict`. (The project
+already has a more general `_jsonable` helper in `data/mask_bank.py`
+for the same class of problem elsewhere — `OmegaConf.to_container` is
+the more direct fix here since `cfg.model.params` is always a plain
+OmegaConf container, never numpy.) See
+`tests/test_model_config_json_serializable.py`.
+
 Sample selection is resolved at RUN TIME, not hardcoded — every shipped
 config sets `data.sample_selection` (organs, per-organ sample caps,
 validation/test counts, a split seed) and
@@ -827,10 +849,11 @@ gen2_architectures/
   scripts/
     inventory_hest1k.py                  NEW  human-readable local-vs-catalog Visium coverage report by organ
     rollback_checkpoint.py               NEW  operator CLI for checkpoint history (section 13)
-  tests/                                 94 tests, synthetic data only, no real HEST-1k/GPU required
+  tests/                                 95 tests, synthetic data only, no real HEST-1k/GPU required
     test_components.py, test_arch1_arch2.py, test_arch3.py, test_arch4.py,
     test_checkpoint.py, test_diagnostics.py, test_masked_item.py, test_train_local_neighborhood_integration.py,
     test_hest1k_catalog.py, test_apply_sample_selection.py, test_coord_scale_and_smoke_override.py,
     test_loaders_multi_sample.py, test_gene_panel_compatibility.py, test_atomic_savez.py,
-    test_precomputed_spot_feature_provider.py, test_load_held_out_samples.py
+    test_precomputed_spot_feature_provider.py, test_load_held_out_samples.py,
+    test_model_config_json_serializable.py
 ```

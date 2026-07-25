@@ -54,7 +54,12 @@ def main(config_path: str, smoke_steps: int | None = None) -> None:
     ).astype(np.float32)
     print(f"pooled {pooled.shape[0]} spots x {n_genes} genes across {len(adatas)} training slide(s)")
 
-    params = dict(cfg.model.get("params", {}))
+    # OmegaConf.to_container (not dict(...)) -- a shallow dict() leaves
+    # nested list-valued params (e.g. hidden_dims: [4096, 1024]) as
+    # OmegaConf ListConfig objects, which json.dump cannot serialize --
+    # see train_local_neighborhood.py::_model_config_dict's own comment
+    # for the real bug this fixes (hit on the actual training server).
+    params = OmegaConf.to_container(cfg.model.get("params", {}), resolve=True)
     model = DenoisingTranscriptomeAutoencoder(n_genes=n_genes, **params).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Stage A autoencoder built: {n_params:,} parameters")

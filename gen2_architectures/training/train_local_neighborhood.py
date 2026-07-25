@@ -31,13 +31,21 @@ from gen2_architectures.training.validation import move_to_device
 
 
 def _model_config_dict(cfg, scfoundation_dim: int | None) -> dict:
-    params = dict(cfg.model.get("params", {}))
+    # OmegaConf.to_container (not dict(...)) -- real bug found 2026-07-25
+    # on the actual training server: a plain dict(cfg.model.params) is
+    # only a SHALLOW conversion; nested list-valued params (organ_vocab,
+    # tech_vocab, hidden_dims, ...) stay as OmegaConf ListConfig objects,
+    # which json.dump cannot serialize ("Object of type ListConfig is
+    # not JSON serializable") -- crashed the first periodic checkpoint
+    # save. to_container recursively converts every nested
+    # ListConfig/DictConfig into a plain list/dict.
+    params = OmegaConf.to_container(cfg.model.get("params", {}), resolve=True)
     return {"architecture": str(cfg.model.architecture), "params": params, "scfoundation_dim": scfoundation_dim}
 
 
 def build_model(cfg, gene_names: list[str], scfoundation_dim: int | None):
     architecture = str(cfg.model.architecture)
-    params = dict(cfg.model.get("params", {}))
+    params = OmegaConf.to_container(cfg.model.get("params", {}), resolve=True)
     if architecture == "1":
         return Architecture1(n_genes=len(gene_names), **params)
     if architecture == "2":

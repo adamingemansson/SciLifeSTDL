@@ -77,7 +77,12 @@ def main(config_path: str, smoke_steps: int | None = None) -> None:
             held_out_adatas[str(sid)] = (adata, images, split_name)
 
     autoencoder = _load_stage_a(cfg.model.stage_a_checkpoint_dir, len(gene_names)).to(device)
-    params = dict(cfg.model.get("params", {}))
+    # OmegaConf.to_container (not dict(...)) -- a shallow dict() leaves
+    # nested list-valued params (organ_vocab, tech_vocab, ...) as
+    # OmegaConf ListConfig objects, which json.dump cannot serialize --
+    # see train_local_neighborhood.py::_model_config_dict's own comment
+    # for the real bug this fixes (hit on the actual training server).
+    params = OmegaConf.to_container(cfg.model.get("params", {}), resolve=True)
     model = Architecture3StageB(autoencoder, **params).to(device)
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
