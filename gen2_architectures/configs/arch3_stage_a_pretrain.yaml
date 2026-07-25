@@ -48,6 +48,7 @@ training:
   gradient_clip_val: 1.0
   log_every_n_steps: 100
   checkpoint_every_n_steps: 5000
+  checkpoint_keep_last: 1   # this checkpoint's size scales with the shared gene panel width (README section 13) -- kept tighter than the other 6 configs given the 50GB total server budget
   checkpoint_dir: gen2_architectures/results/arch3_stage_a_pretrain
   mask_fraction: 0.2   # GPT's suggested 20% per-row gene masking
   gaussian_std: 0.0    # additive Gaussian noise on top of masking; 0.0 = masking only

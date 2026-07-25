@@ -1,3 +1,4 @@
+import os
 import tempfile
 
 import torch
@@ -5,6 +6,7 @@ import torch.nn as nn
 
 from gen2_architectures.training.checkpoint import (
     save_checkpoint, load_trainable_state, load_training_state,
+    list_checkpoint_history, rollback_checkpoint,
 )
 
 
@@ -81,3 +83,74 @@ def test_load_trainable_state_raises_on_genuine_mismatch():
             assert False, "expected an AssertionError for a genuinely incomplete checkpoint"
         except AssertionError:
             pass
+
+
+def test_checkpoint_history_is_pruned_to_keep_last():
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        for step in (0, 100, 200, 300):
+            with torch.no_grad():
+                m.lin.weight.fill_(float(step))
+            save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=step, keep_last=2)
+        # only the two most recent snapshots survive
+        assert list_checkpoint_history(tmp) == [200, 300]
+        # root ("latest") always reflects the most recent save regardless of pruning
+        assert load_training_state(tmp)["step"] == 300
+
+
+def test_checkpoint_history_disabled_when_keep_last_zero():
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=0, keep_last=0)
+        assert list_checkpoint_history(tmp) == []
+        assert os.path.exists(os.path.join(tmp, "model_config.json"))
+
+
+def test_rollback_checkpoint_restores_an_earlier_known_good_snapshot():
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        with torch.no_grad():
+            m.lin.weight.fill_(1.0)
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=100, keep_last=3)
+        with torch.no_grad():
+            m.lin.weight.fill_(999.0)  # simulate a later step that diverged/corrupted
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=200, keep_last=3)
+
+        rollback_checkpoint(tmp, step=100)
+        assert load_training_state(tmp)["step"] == 100
+        restored = _Tiny()
+        load_trainable_state(restored, tmp)
+        assert torch.allclose(restored.lin.weight, torch.full((4, 4), 1.0))
+
+
+def test_rollback_checkpoint_raises_on_unknown_step():
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=100, keep_last=3)
+        try:
+            rollback_checkpoint(tmp, step=999)
+            assert False, "expected a ValueError listing the real available steps"
+        except ValueError as e:
+            assert "999" in str(e) and "100" in str(e)
+
+
+def test_history_snapshots_survive_root_being_overwritten():
+    """Hard-linking means the root file at a given step gets a NEW inode on
+    the next save (via os.replace) -- the history snapshot's hard link must
+    still point at the OLD data, not silently become the new step's data."""
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        with torch.no_grad():
+            m.lin.weight.fill_(1.0)
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=100, keep_last=5)
+        with torch.no_grad():
+            m.lin.weight.fill_(2.0)
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=200, keep_last=5)
+
+        snapshot_100 = _Tiny()
+        load_trainable_state(snapshot_100, os.path.join(tmp, "history", "step_00000100"))
+        assert torch.allclose(snapshot_100.lin.weight, torch.full((4, 4), 1.0))
+
+        latest = _Tiny()
+        load_trainable_state(latest, tmp)
+        assert torch.allclose(latest.lin.weight, torch.full((4, 4), 2.0))

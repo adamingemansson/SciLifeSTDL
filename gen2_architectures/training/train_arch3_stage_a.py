@@ -23,7 +23,7 @@ from omegaconf import OmegaConf
 from gen2_architectures.models.arch3_stage_a_autoencoder import DenoisingTranscriptomeAutoencoder, corrupt_expression
 from gen2_architectures.models.components import StagedGeneLoss
 from gen2_architectures.data import loaders
-from gen2_architectures.training import checkpoint, data_prep
+from gen2_architectures.training import checkpoint, data_prep, diagnostics
 
 
 def main(config_path: str) -> None:
@@ -67,12 +67,14 @@ def main(config_path: str) -> None:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.training.get("lr", 1e-4)))
     loss_fn = StagedGeneLoss(**dict(cfg.training.get("loss", {})))
+    diag_stats = diagnostics.attach_diagnostic_hooks(model)
 
     total_steps = int(cfg.training.total_steps)
     batch_size = int(cfg.training.get("batch_size", 256))
     grad_clip = float(cfg.training.get("gradient_clip_val", 1.0))
     log_every = int(cfg.training.get("log_every_n_steps", 100))
     checkpoint_every = int(cfg.training.get("checkpoint_every_n_steps", 5000))
+    checkpoint_keep_last = int(cfg.training.get("checkpoint_keep_last", 2))
     mask_fraction = float(cfg.training.get("mask_fraction", 0.2))
     gaussian_std = float(cfg.training.get("gaussian_std", 0.0))
 
@@ -94,16 +96,22 @@ def main(config_path: str) -> None:
         optimizer.step()
 
         if step % log_every == 0:
+            diag = diagnostics.collect_diagnostics(model, diag_stats)
             print(
                 f"step {step}/{total_steps} loss={result['loss'].item():.4f} mse={result['mse'].item():.4f} "
-                f"pearson_penalty={result['pearson_penalty'].item():.4f} pearson_weight={result['pearson_weight']:.2f}"
+                f"pearson_penalty={result['pearson_penalty'].item():.4f} pearson_weight={result['pearson_weight']:.2f} "
+                f"{diagnostics.format_diagnostics(diag)}"
             )
         if step > 0 and step % checkpoint_every == 0:
             checkpoint.save_checkpoint(
                 model, {"n_genes": n_genes, "params": params}, gene_names, checkpoint_dir, step,
+                keep_last=checkpoint_keep_last,
             )
 
-    checkpoint.save_checkpoint(model, {"n_genes": n_genes, "params": params}, gene_names, checkpoint_dir, total_steps)
+    checkpoint.save_checkpoint(
+        model, {"n_genes": n_genes, "params": params}, gene_names, checkpoint_dir, total_steps,
+        keep_last=checkpoint_keep_last,
+    )
     print(f"Stage A pretraining complete. Checkpoint at {checkpoint_dir}")
 
 

@@ -11,15 +11,38 @@ names are saved even when there are literally zero trainable weights (the
 real bug fixed 2026-07-24 in the original codebase: skipping metadata
 entirely whenever there was nothing trainable made a fully-frozen
 checkpoint impossible to reconstruct later).
+
+Checkpoint HISTORY (added 2026-07-25): save_checkpoint() always used to
+overwrite the same fixed filenames in checkpoint_dir's root — only the
+single most recent checkpoint ever existed, so a diverged/corrupted run
+had no earlier state to roll back to. Every root save now additionally
+hard-links (not copies — os.link, falling back to a real copy only if the
+filesystem can't hard-link, e.g. across devices) its files into
+checkpoint_dir/history/step_XXXXXXXX/, then prunes old history entries
+beyond training.checkpoint_keep_last. Hard-linking costs ~zero extra disk
+at save time (it's a second directory entry pointing at the same data
+blocks) — the old data only becomes exclusively "owned" by the history
+copy once the root path is later replaced by a newer save, at which point
+it is disk you were always going to spend on that many kept snapshots
+regardless of hardlink-vs-copy, hardlinking just avoids doing a second
+physical write to get there. With training servers running tight on disk
+(50 GB total was flagged as the real budget for this project's training
+server), keep training.checkpoint_keep_last small (default 2) and watch
+the printed sizes below — trainable-only weights are the cheap part
+(tens of MB typically), but Architecture 3 Stage A's autoencoder can be
+much larger on a wide gene panel (see README's disk budget note).
 """
 from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+
+_CHECKPOINT_FILENAMES = ("trainable_weights.pt", "model_config.json", "gene_names.json", "training_state.json")
 
 
 def _is_frozen_backbone_module(module: nn.Module) -> bool:
@@ -61,9 +84,100 @@ def save_trainable_state(model: nn.Module, checkpoint_dir: str | Path) -> Path |
     return path
 
 
+def _human_size(n_bytes: int) -> str:
+    size = float(n_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024.0 or unit == "GB":
+            return f"{size:.1f}{unit}"
+        size /= 1024.0
+    return f"{size:.1f}GB"
+
+
+def _history_dir(checkpoint_dir: str | Path) -> Path:
+    return Path(checkpoint_dir) / "history"
+
+
+def _snapshot_into_history(checkpoint_dir: str | Path, step: int) -> Path:
+    """Hard-link (falling back to a real copy across filesystems) the just-
+    written root checkpoint files into a step-numbered history snapshot.
+    Root files must already exist by the time this is called."""
+    out_dir = Path(checkpoint_dir)
+    snapshot_dir = _history_dir(checkpoint_dir) / f"step_{int(step):08d}"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    for name in _CHECKPOINT_FILENAMES:
+        src = out_dir / name
+        if not src.is_file():
+            continue
+        dst = snapshot_dir / name
+        if dst.exists():
+            dst.unlink()
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+    return snapshot_dir
+
+
+def _prune_history(checkpoint_dir: str | Path, keep_last: int) -> None:
+    history_dir = _history_dir(checkpoint_dir)
+    if not history_dir.is_dir() or keep_last <= 0:
+        return
+    steps = sorted(list_checkpoint_history(checkpoint_dir))
+    for stale_step in steps[:-keep_last] if keep_last > 0 else []:
+        shutil.rmtree(history_dir / f"step_{stale_step:08d}", ignore_errors=True)
+
+
+def list_checkpoint_history(checkpoint_dir: str | Path) -> list[int]:
+    """Steps with a preserved history snapshot, ascending."""
+    history_dir = _history_dir(checkpoint_dir)
+    if not history_dir.is_dir():
+        return []
+    steps = []
+    for entry in history_dir.iterdir():
+        if entry.is_dir() and entry.name.startswith("step_"):
+            try:
+                steps.append(int(entry.name[len("step_"):]))
+            except ValueError:
+                continue
+    return sorted(steps)
+
+
+def rollback_checkpoint(checkpoint_dir: str | Path, step: int) -> None:
+    """Overwrite the root ("latest", what main()'s resume logic reads)
+    checkpoint with a preserved history snapshot — use this when a run has
+    diverged or corrupted state after a later save and you want the next
+    resume to pick up from a known-good earlier step instead. Raises with
+    the actual available steps if the requested one isn't present (a typo'd
+    step should fail loudly, not silently no-op)."""
+    available = list_checkpoint_history(checkpoint_dir)
+    if step not in available:
+        raise ValueError(
+            f"no history snapshot for step {step} in {checkpoint_dir}/history — "
+            f"available steps: {available}"
+        )
+    snapshot_dir = _history_dir(checkpoint_dir) / f"step_{int(step):08d}"
+    out_dir = Path(checkpoint_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Root previously may have had a trainable_weights.pt that this snapshot
+    # doesn't (a zero-trainable-parameter checkpoint) — remove it first so a
+    # stale weights file from a *later* step never lingers after rollback.
+    for name in _CHECKPOINT_FILENAMES:
+        stale = out_dir / name
+        if stale.is_file() and not (snapshot_dir / name).is_file():
+            stale.unlink()
+    for name in _CHECKPOINT_FILENAMES:
+        src = snapshot_dir / name
+        if not src.is_file():
+            continue
+        tmp_path = out_dir / f"{name}.tmp{os.getpid()}"
+        shutil.copy2(src, tmp_path)
+        os.replace(tmp_path, out_dir / name)
+    print(f"rolled back {out_dir} to step {step} (from history snapshot {snapshot_dir})")
+
+
 def save_checkpoint(
     model: nn.Module, model_config: dict, gene_names: list[str], checkpoint_dir: str | Path,
-    step: int, extra_metadata: dict | None = None,
+    step: int, extra_metadata: dict | None = None, keep_last: int = 2,
 ) -> None:
     weights_path = save_trainable_state(model, checkpoint_dir)
     out_dir = Path(checkpoint_dir)
@@ -77,9 +191,20 @@ def save_checkpoint(
         with open(tmp_path, "w") as f:
             json.dump(payload, f, indent=2)
         os.replace(tmp_path, final_path)
+
+    weights_size = weights_path.stat().st_size if weights_path is not None else 0
+    if keep_last > 0:
+        _snapshot_into_history(checkpoint_dir, step)
+        _prune_history(checkpoint_dir, keep_last)
+    history_steps = list_checkpoint_history(checkpoint_dir)
+    history_size = sum(
+        f.stat().st_size for f in _history_dir(checkpoint_dir).rglob("*") if f.is_file()
+    ) if history_steps else 0
     print(
         f"checkpoint saved to {out_dir} (step {step}"
-        f"{', weights + config + gene names' if weights_path is not None else ', config + gene names only (no trainable weights)'})"
+        f"{', weights + config + gene names' if weights_path is not None else ', config + gene names only (no trainable weights)'}"
+        f", weights={_human_size(weights_size)}"
+        f", history kept={history_steps} total_history_size={_human_size(history_size)})"
     )
 
 

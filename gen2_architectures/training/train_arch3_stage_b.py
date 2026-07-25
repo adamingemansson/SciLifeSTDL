@@ -25,7 +25,7 @@ from gen2_architectures.data.masked_item import build_masked_item
 from gen2_architectures.models.arch3_stage_a_autoencoder import DenoisingTranscriptomeAutoencoder
 from gen2_architectures.models.arch3_stage_b_latent_transformer import Architecture3StageB
 from gen2_architectures.models.components import StagedGeneLoss
-from gen2_architectures.training import checkpoint, data_prep, evaluate
+from gen2_architectures.training import checkpoint, data_prep, diagnostics, evaluate
 from gen2_architectures.training.validation import move_to_device
 
 
@@ -95,11 +95,13 @@ def main(config_path: str) -> None:
     optimizer = torch.optim.AdamW(param_groups)
     loss_fn = StagedGeneLoss(**dict(cfg.training.get("loss", {})))
     latent_loss_weight = float(cfg.training.get("latent_loss_weight", 1.0))
+    diag_stats = diagnostics.attach_diagnostic_hooks(model)
 
     total_steps = int(cfg.training.total_steps)
     grad_clip = float(cfg.training.get("gradient_clip_val", 1.0))
     log_every = int(cfg.training.get("log_every_n_steps", 50))
     checkpoint_every = int(cfg.training.get("checkpoint_every_n_steps", 2000))
+    checkpoint_keep_last = int(cfg.training.get("checkpoint_keep_last", 2))
     eval_every = int(cfg.training.get("eval_every_n_steps", 5000))
     image_mode = str(cfg.training.get("image_mode", "target_zero"))
     context_gex_mode = str(cfg.training.get("context_gex_mode", "full"))
@@ -137,18 +139,26 @@ def main(config_path: str) -> None:
         optimizer.step()
 
         if step % log_every == 0:
+            diag = diagnostics.collect_diagnostics(model, diag_stats)
+            predicted_latent_norm = out["predicted_latent"].detach().float().norm(dim=-1).mean().item()
+            predicted_expression_norm = out["predicted_expression"].detach().float().norm(dim=-1).mean().item()
             print(
                 f"step {step}/{total_steps} n_query={target.shape[0]} total_loss={total_loss.item():.4f} "
                 f"latent_loss={latent_loss.item():.4f} gene_mse={gene_result['mse'].item():.4f} "
-                f"pearson_penalty={gene_result['pearson_penalty'].item():.4f}"
+                f"pearson_penalty={gene_result['pearson_penalty'].item():.4f} "
+                f"predicted_latent_norm={predicted_latent_norm:.3f} predicted_expression_norm={predicted_expression_norm:.3f} "
+                f"{diagnostics.format_diagnostics(diag)}"
             )
         if step > 0 and step % checkpoint_every == 0:
             checkpoint.save_checkpoint(
                 model, {"stage_a_checkpoint_dir": str(cfg.model.stage_a_checkpoint_dir), "params": params},
-                gene_names, checkpoint_dir, step,
+                gene_names, checkpoint_dir, step, keep_last=checkpoint_keep_last,
             )
         if step > 0 and step % eval_every == 0 and validation_ids:
             model.eval()
+            attn_entropy = diagnostics.compute_attention_entropy(model, diag_stats)
+            if attn_entropy is not None:
+                print(f"  [val step {step}] attention_entropy={attn_entropy:.3f} nats")
             for sid in validation_ids:
                 v_adata, v_images, _ = held_out_adatas[str(sid)]
                 metrics = evaluate.evaluate_sample(model, cfg, v_adata, v_images, {}, str(sid), "validation", checkpoint_dir)
@@ -158,7 +168,7 @@ def main(config_path: str) -> None:
 
     checkpoint.save_checkpoint(
         model, {"stage_a_checkpoint_dir": str(cfg.model.stage_a_checkpoint_dir), "params": params},
-        gene_names, checkpoint_dir, total_steps,
+        gene_names, checkpoint_dir, total_steps, keep_last=checkpoint_keep_last,
     )
 
     if test_ids:

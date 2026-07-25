@@ -477,7 +477,145 @@ suggestion) before committing real compute:
 - Use the measured steps/sec to derive a real `total_steps` for the
   intended wall-clock budget, replacing every config's placeholder value.
 
-## 13. File map
+## 13. Checkpoints: history, rollback, and disk budget
+
+Every `save_checkpoint()` call still writes the "latest" files
+(`trainable_weights.pt`, `model_config.json`, `gene_names.json`,
+`training_state.json`) directly under `training.checkpoint_dir` — that's
+what every script's resume logic reads on restart, unchanged. What's new
+(2026-07-25): each save now also preserves a step-numbered snapshot under
+`checkpoint_dir/history/step_XXXXXXXX/`, so a run that diverges or
+corrupts state after a later save can be rolled back to an earlier
+known-good step instead of losing everything since the last manual
+backup.
+
+**Disk cost, and why it's controlled** — the training server's real
+budget is 50 GB total, shared across however many of the 5 configs run
+concurrently, so checkpoint history is deliberately cheap by default:
+
+- History snapshots are **hard-linked**, not copied (`os.link`, falling
+  back to a real copy only if the filesystem can't hard-link across
+  devices) — this avoids a second physical write at save time, though the
+  eventual disk cost of keeping N snapshots is still real (each snapshot's
+  data survives independently once the root path is replaced by the next
+  save; hard-linking saves write I/O, not steady-state space).
+- `training.checkpoint_keep_last` (default **2** if unset) caps how many
+  history snapshots are kept per run — older ones are pruned automatically
+  on every save. Add it explicitly to a config to change it, e.g.
+  `checkpoint_keep_last: 1` to minimize footprint further, or `0` to
+  disable history entirely (root-only, the old always-overwrite
+  behavior).
+- `save_checkpoint()` prints the weights file size and total history size
+  on every save — watch this early in a run (the first few checkpoints)
+  to see the REAL per-architecture cost before it's spent 1-2 days
+  compounding across all 5 configs. Rough expectation: Architectures 1/2/4
+  only save trainable weights (tens of MB — frozen GigaPath/STPath/
+  scFoundation backbones are never re-saved), so history is cheap.
+  Architecture 3 **Stage A**'s full autoencoder (`encoder`+`decoder`, both
+  sides of a `genes -> 4096 -> 1024 -> 256 -> ... -> genes` MLP) is the one
+  checkpoint whose size scales with the shared gene panel width — on a
+  wide multi-organ panel this can run into the hundreds of MB per
+  snapshot, so keep an eye on its printed size specifically and lower its
+  `checkpoint_keep_last` first if the 50 GB budget gets tight.
+
+**Rolling back**, once you've decided (from the loss curve or the
+diagnostics in section 14) that a later checkpoint is bad:
+
+```bash
+# see what's available without changing anything
+python3 -m gen2_architectures.scripts.rollback_checkpoint \
+    --checkpoint_dir gen2_architectures/results/arch1_gpt_baseline --list
+
+# overwrite the root ("latest") checkpoint with an earlier snapshot --
+# the NEXT time you launch that training script, it resumes from here
+python3 -m gen2_architectures.scripts.rollback_checkpoint \
+    --checkpoint_dir gen2_architectures/results/arch1_gpt_baseline --step 42000
+```
+
+Rollback only touches that one `checkpoint_dir` — it doesn't affect other
+architectures' runs, and it doesn't delete any history it wasn't told to
+roll back to. If you request a step with no surviving snapshot (already
+pruned, or a typo), it raises immediately and lists the real available
+steps rather than silently no-op'ing.
+
+## 14. Monitoring a run: what to expect
+
+Every `log_every_n_steps` line now ends with the diagnostics GPT's
+second-round code audit suggested watching ("those five plots can catch
+many silent failures long before validation metrics do"):
+`gene_embedding_norm`, `query_token_norm`, `decoder_output_norm` (and
+`latent_norm` for Architecture 3, where there's a real bottleneck),
+plus `query_token_param_norm` (the learned initial query token's own
+drift). Coverage genuinely differs by architecture — see
+`training/diagnostics.py`'s module docstring for exactly which signal
+means what per architecture; Architecture 4's only trainable component is
+the scFoundation residual, so its diagnostics are reported under the same
+`gene_embedding_norm`/`decoder_output_norm` names but refer to the
+residual encoder/injection, not a full model pass.
+
+**What healthy looks like:**
+- `loss`/`mse` trend down over the first few hundred to few thousand
+  steps, not perfectly monotonically (this is single-sample SGD, not
+  full-batch — expect noise step to step, look at the trend over a
+  moving window).
+- `pearson_penalty` starts near its unpenalized value and shrinks as
+  `pearson_weight` ramps up in stage 2/3 (`components.py::StagedGeneLoss`)
+  — if it's still large/flat once `pearson_weight` is near its max, the
+  model isn't learning gene-gene co-variation structure, only marginal
+  scale.
+- The norm diagnostics should settle into a roughly stable RANGE after
+  an initial adjustment period (first few hundred steps) — some drift is
+  fine, that's training; the failure mode is one of them either collapsing
+  toward 0 (that submodule's output stopped carrying information — a
+  dead/saturated layer) or growing without bound (a sign of an
+  undamped feedback loop, usually preceding a NaN).
+- `query_token_param_norm` (Architecture 1/2/4) grows slowly and smoothly
+  from its small random-init value (`torch.randn(hidden_dim) * 0.02`) —
+  a sudden jump usually means the optimizer just took a large corrective
+  step after something upstream misbehaved.
+- Architecture 4's `decoder_output_norm` (the scFoundation residual
+  injection) starting at exactly 0 is CORRECT and expected —
+  `residual_proj` is zero-initialized by design (`stpath_encoder.py`) so
+  training starts as a safe no-op on top of STPath's frozen predictions;
+  watch that it moves AWAY from 0 over the first checkpoints, not that it
+  starts nonzero.
+
+**What to actually act on:**
+- **NaN/Inf anywhere** (loss or any diagnostic) — stop the run, don't
+  wait for it to "recover." Roll back (section 13) to the last checkpoint
+  before the diagnostics started drifting toward this, lower `lr`, and
+  restart from there.
+- **`decoder_output_norm` flat at (near) 0 for hundreds of steps past
+  init** — the model is predicting a constant/near-zero output regardless
+  of input; check that gradients are actually reaching that submodule
+  (`sum(p.grad.abs().sum() for p in model.parameters() if p.requires_grad)`,
+  same check section 12 already recommends before a full run).
+- **`attention_entropy`** (printed once per `eval_every_n_steps`, not
+  every log step — it's the one opt-in, higher-cost diagnostic, see
+  `diagnostics.py::compute_attention_entropy`'s own docstring for why) —
+  near-zero entropy means the local transformer has collapsed onto
+  attending to a single neighbor for every query, which is a real failure
+  mode for a k=80 neighborhood (the model is throwing away most of its
+  available spatial context); near-`log(k+1)` (maximally uniform) for a
+  long stretch can mean the opposite — attention isn't learning to
+  discriminate neighbors at all yet. Neither is fatal on its own this
+  early, but worth a closer look if validation PCC also stalls at the
+  same time.
+- **Validation PCC/RMSE not improving while training loss keeps
+  dropping** — the usual overfitting signature; check `n_query`/sample
+  counts are what you expect and consider the run may need
+  regularization or simply doesn't need the full `total_steps` budget.
+- **`pcc_raw_log1p`** (Architecture 4's test-eval only, when it appears)
+  is the notebook-comparable metric this session's STPath investigation
+  built — expect it to differ from the normalized-space `pcc` above it;
+  that's real signal-affecting rescaling, not a bug (see this session's
+  earlier STPath preprocessing investigation).
+
+None of these diagnostics change what gets checkpointed or how the loss
+is computed — they're read-only monitoring, safe to ignore entirely if a
+run is behaving and you just want to watch PCC/RMSE at `eval_every_n_steps`.
+
+## 15. File map
 
 ```
 gen2_architectures/
@@ -502,7 +640,8 @@ gen2_architectures/
     audit_evaluation.py, metrics.py, cell_type_classifier.py                     COPIED
   training/
     data_prep.py                         NEW  data loading orchestration, GigaPath caching (ported, bug-fixed logic), scFoundation provider wiring, apply_sample_selection
-    checkpoint.py                        NEW  trainable-only save/load
+    checkpoint.py                        NEW  trainable-only save/load + step-numbered history/rollback (section 13)
+    diagnostics.py                       NEW  per-step monitoring hooks (section 14)
     evaluate.py                          NEW  evaluation harness glue
     train_local_neighborhood.py          NEW  training entrypoint for Architectures 1/2/4
     train_arch3_stage_a.py               NEW  Stage A pretraining entrypoint
@@ -515,8 +654,9 @@ gen2_architectures/
     arch4_stpath_hybrid.yaml
   scripts/
     inventory_hest1k.py                  NEW  human-readable local-vs-catalog Visium coverage report by organ
-  tests/                                 56 tests, synthetic data only, no real HEST-1k/GPU required
+    rollback_checkpoint.py               NEW  operator CLI for checkpoint history (section 13)
+  tests/                                 66 tests, synthetic data only, no real HEST-1k/GPU required
     test_components.py, test_arch1_arch2.py, test_arch3.py, test_arch4.py,
-    test_checkpoint.py, test_masked_item.py, test_train_local_neighborhood_integration.py,
+    test_checkpoint.py, test_diagnostics.py, test_masked_item.py, test_train_local_neighborhood_integration.py,
     test_hest1k_catalog.py, test_apply_sample_selection.py
 ```

@@ -26,7 +26,7 @@ from gen2_architectures.models.arch1_gpt_baseline import Architecture1
 from gen2_architectures.models.arch2_scfoundation import Architecture2
 from gen2_architectures.models.arch4_stpath_hybrid import Architecture4
 from gen2_architectures.models.components import StagedGeneLoss
-from gen2_architectures.training import checkpoint, data_prep, evaluate
+from gen2_architectures.training import checkpoint, data_prep, diagnostics, evaluate
 from gen2_architectures.training.validation import move_to_device
 
 
@@ -116,11 +116,13 @@ def main(config_path: str) -> None:
         )
     optimizer = torch.optim.AdamW(trainable_params, lr=float(cfg.training.get("lr", 1e-4)))
     loss_fn = StagedGeneLoss(**dict(cfg.training.get("loss", {})))
+    diag_stats = diagnostics.attach_diagnostic_hooks(model)
 
     total_steps = int(cfg.training.total_steps)
     grad_clip = float(cfg.training.get("gradient_clip_val", 1.0))
     log_every = int(cfg.training.get("log_every_n_steps", 50))
     checkpoint_every = int(cfg.training.get("checkpoint_every_n_steps", 2000))
+    checkpoint_keep_last = int(cfg.training.get("checkpoint_keep_last", 2))
     eval_every = int(cfg.training.get("eval_every_n_steps", 5000))
     image_mode = str(cfg.training.get("image_mode", "target_zero"))
     context_gex_mode = str(cfg.training.get("context_gex_mode", "full"))
@@ -159,16 +161,23 @@ def main(config_path: str) -> None:
         optimizer.step()
 
         if step % log_every == 0:
+            diag = diagnostics.collect_diagnostics(model, diag_stats)
             print(
                 f"step {step}/{total_steps} sample={sid} n_query={target.shape[0]} "
                 f"loss={result['loss'].item():.4f} mse={result['mse'].item():.4f} "
                 f"pearson_penalty={result['pearson_penalty'].item():.4f} "
-                f"pearson_weight={result['pearson_weight']:.2f}"
+                f"pearson_weight={result['pearson_weight']:.2f} {diagnostics.format_diagnostics(diag)}"
             )
         if step > 0 and step % checkpoint_every == 0:
-            checkpoint.save_checkpoint(model, _model_config_dict(cfg, scfoundation_dim), gene_names, checkpoint_dir, step)
+            checkpoint.save_checkpoint(
+                model, _model_config_dict(cfg, scfoundation_dim), gene_names, checkpoint_dir, step,
+                keep_last=checkpoint_keep_last,
+            )
         if step > 0 and step % eval_every == 0 and validation_ids:
             model.eval()
+            attn_entropy = diagnostics.compute_attention_entropy(model, diag_stats)
+            if attn_entropy is not None:
+                print(f"  [val step {step}] attention_entropy={attn_entropy:.3f} nats")
             for sid in validation_ids:
                 adata, images, _ = held_out_adatas[str(sid)]
                 gene_inputs = {
@@ -180,7 +189,10 @@ def main(config_path: str) -> None:
                 print(f"  [val step {step}] {sid}: PCC={primary['pcc']['mean']:.4f} RMSE={primary['rmse']['mean']:.4f}")
             model.train()
 
-    checkpoint.save_checkpoint(model, _model_config_dict(cfg, scfoundation_dim), gene_names, checkpoint_dir, total_steps)
+    checkpoint.save_checkpoint(
+        model, _model_config_dict(cfg, scfoundation_dim), gene_names, checkpoint_dir, total_steps,
+        keep_last=checkpoint_keep_last,
+    )
 
     if test_ids:
         print("running final held-out test evaluation...")
