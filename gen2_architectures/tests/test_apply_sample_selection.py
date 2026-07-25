@@ -39,6 +39,7 @@ def test_architecture1_gets_organ_vocab_injected():
             "data": {"hest_data_dir": str(hest_dir), "sample_selection": {
                 "organs": "all", "metadata_csv": str(meta_path), "min_samples_per_organ": 3,
                 "n_validation_per_organ": 1, "n_test_per_organ": 1,
+                "check_gene_panel_compatibility": False,
             }},
             "model": {"architecture": "1", "params": {}},
         })
@@ -60,6 +61,7 @@ def test_architecture4_does_not_get_organ_vocab_injected():
         cfg = OmegaConf.create({
             "data": {"hest_data_dir": str(hest_dir), "sample_selection": {
                 "organs": ["Lung"], "metadata_csv": str(meta_path),
+                "check_gene_panel_compatibility": False,
             }},
             "model": {"architecture": "4", "params": {"organ_type": "Lung", "tech_type": "Visium"}},
         })
@@ -75,6 +77,7 @@ def test_stage_a_style_config_does_not_get_organ_vocab_injected():
         cfg = OmegaConf.create({
             "data": {"hest_data_dir": str(hest_dir), "sample_selection": {
                 "organs": "all", "metadata_csv": str(meta_path),
+                "check_gene_panel_compatibility": False,
             }},
             "model": {"params": {}},  # no "architecture", no "stage_a_checkpoint_dir" -> Stage A
         })
@@ -88,6 +91,7 @@ def test_stage_b_style_config_gets_organ_vocab_injected():
         cfg = OmegaConf.create({
             "data": {"hest_data_dir": str(hest_dir), "sample_selection": {
                 "organs": "all", "metadata_csv": str(meta_path),
+                "check_gene_panel_compatibility": False,
             }},
             "model": {"stage_a_checkpoint_dir": "/fake/path", "params": {}},
         })
@@ -101,6 +105,7 @@ def test_explicit_organ_vocab_in_config_is_not_overwritten():
         cfg = OmegaConf.create({
             "data": {"hest_data_dir": str(hest_dir), "sample_selection": {
                 "organs": "all", "metadata_csv": str(meta_path),
+                "check_gene_panel_compatibility": False,
             }},
             "model": {"architecture": "1", "params": {"organ_vocab": ["Custom"], "tech_vocab": ["Custom"]}},
         })

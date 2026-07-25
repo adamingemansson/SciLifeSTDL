@@ -51,6 +51,7 @@ def test_basic_split_respects_counts_and_is_disjoint():
         result = resolve_sample_selection(
             hest_dir, str(meta_path), organs="all",
             min_samples_per_organ=3, n_validation_per_organ=2, n_test_per_organ=2, split_seed=0,
+            check_gene_panel_compatibility=False,
         )
         train, val, test = set(result["train_sample_ids"]), set(result["validation_sample_ids"]), set(result["test_sample_ids"])
         assert not (train & val)
@@ -71,7 +72,7 @@ def test_min_samples_per_organ_excludes_small_organs():
             "Lung": [f"L{i}" for i in range(10)],
             "Embryo": ["E0"],  # single sample -- must be excluded
         })
-        result = resolve_sample_selection(hest_dir, str(meta_path), organs="all", min_samples_per_organ=3)
+        result = resolve_sample_selection(hest_dir, str(meta_path), organs="all", min_samples_per_organ=3, check_gene_panel_compatibility=False)
         assert "Embryo" not in result["organ_vocab"]
         assert not any(s.startswith("E") for s in result["train_sample_ids"] + result["validation_sample_ids"] + result["test_sample_ids"])
 
@@ -79,8 +80,8 @@ def test_min_samples_per_organ_excludes_small_organs():
 def test_max_samples_per_organ_caps_deterministically():
     with tempfile.TemporaryDirectory() as tmp:
         hest_dir, meta_path = _make_fake_hest1k(Path(tmp), {"Brain": [f"B{i}" for i in range(50)]})
-        result_a = resolve_sample_selection(hest_dir, str(meta_path), organs="all", max_samples_per_organ=10, split_seed=42)
-        result_b = resolve_sample_selection(hest_dir, str(meta_path), organs="all", max_samples_per_organ=10, split_seed=42)
+        result_a = resolve_sample_selection(hest_dir, str(meta_path), organs="all", max_samples_per_organ=10, split_seed=42, check_gene_panel_compatibility=False)
+        result_b = resolve_sample_selection(hest_dir, str(meta_path), organs="all", max_samples_per_organ=10, split_seed=42, check_gene_panel_compatibility=False)
         total_a = len(result_a["train_sample_ids"]) + len(result_a["validation_sample_ids"]) + len(result_a["test_sample_ids"])
         assert total_a == 10
         assert result_a["train_sample_ids"] == result_b["train_sample_ids"], "same seed must reproduce the same split"
@@ -89,8 +90,8 @@ def test_max_samples_per_organ_caps_deterministically():
 def test_different_seeds_give_different_splits():
     with tempfile.TemporaryDirectory() as tmp:
         hest_dir, meta_path = _make_fake_hest1k(Path(tmp), {"Brain": [f"B{i}" for i in range(50)]})
-        result_a = resolve_sample_selection(hest_dir, str(meta_path), organs="all", max_samples_per_organ=10, split_seed=1)
-        result_b = resolve_sample_selection(hest_dir, str(meta_path), organs="all", max_samples_per_organ=10, split_seed=2)
+        result_a = resolve_sample_selection(hest_dir, str(meta_path), organs="all", max_samples_per_organ=10, split_seed=1, check_gene_panel_compatibility=False)
+        result_b = resolve_sample_selection(hest_dir, str(meta_path), organs="all", max_samples_per_organ=10, split_seed=2, check_gene_panel_compatibility=False)
         assert result_a["train_sample_ids"] != result_b["train_sample_ids"]
 
 
@@ -100,7 +101,7 @@ def test_explicit_organ_list_restricts_selection():
             "Lung": [f"L{i}" for i in range(10)],
             "Kidney": [f"K{i}" for i in range(10)],
         })
-        result = resolve_sample_selection(hest_dir, str(meta_path), organs=["Lung"])
+        result = resolve_sample_selection(hest_dir, str(meta_path), organs=["Lung"], check_gene_panel_compatibility=False)
         assert result["organ_vocab"] == ["Lung"]
         assert all(s.startswith("L") for s in result["train_sample_ids"])
 
@@ -109,7 +110,7 @@ def test_requesting_an_organ_with_zero_local_coverage_raises():
     with tempfile.TemporaryDirectory() as tmp:
         hest_dir, meta_path = _make_fake_hest1k(Path(tmp), {"Lung": [f"L{i}" for i in range(10)]})
         with pytest.raises(ValueError, match="Kidney"):
-            resolve_sample_selection(hest_dir, str(meta_path), organs=["Kidney"])
+            resolve_sample_selection(hest_dir, str(meta_path), organs=["Kidney"], check_gene_panel_compatibility=False)
 
 
 def test_samples_missing_patches_are_excluded_even_if_expression_exists():
@@ -118,7 +119,7 @@ def test_samples_missing_patches_are_excluded_even_if_expression_exists():
         hest_dir, meta_path = _make_fake_hest1k(
             Path(tmp), {"Lung": ids}, missing_patches={"L0", "L1", "L2"},
         )
-        result = resolve_sample_selection(hest_dir, str(meta_path), organs="all", min_samples_per_organ=3)
+        result = resolve_sample_selection(hest_dir, str(meta_path), organs="all", min_samples_per_organ=3, check_gene_panel_compatibility=False)
         all_selected = result["train_sample_ids"] + result["validation_sample_ids"] + result["test_sample_ids"]
         assert "L0" not in all_selected and "L1" not in all_selected and "L2" not in all_selected
         assert len(all_selected) == 7
@@ -130,13 +131,13 @@ def test_non_visium_samples_are_excluded():
             Path(tmp), {"Breast": [f"X{i}" for i in range(10)]}, technology="Xenium",
         )
         with pytest.raises(ValueError):
-            resolve_sample_selection(hest_dir, str(meta_path), organs="all", min_samples_per_organ=3)
+            resolve_sample_selection(hest_dir, str(meta_path), organs="all", min_samples_per_organ=3, check_gene_panel_compatibility=False)
 
 
 def test_organ_by_sample_and_tech_by_sample_cover_every_selected_id():
     with tempfile.TemporaryDirectory() as tmp:
         hest_dir, meta_path = _make_fake_hest1k(Path(tmp), {"Lung": [f"L{i}" for i in range(10)]})
-        result = resolve_sample_selection(hest_dir, str(meta_path), organs="all")
+        result = resolve_sample_selection(hest_dir, str(meta_path), organs="all", check_gene_panel_compatibility=False)
         all_selected = result["train_sample_ids"] + result["validation_sample_ids"] + result["test_sample_ids"]
         for sid in all_selected:
             assert result["organ_by_sample"][sid] == "Lung"
@@ -155,7 +156,7 @@ def test_species_filter_excludes_mouse_by_default():
         hest_dir, meta_path = _make_fake_hest1k(
             Path(tmp), {"Lung": [f"L{i}" for i in range(10)]}, species_by_id=mouse_ids,
         )
-        result = resolve_sample_selection(hest_dir, str(meta_path), organs="all", min_samples_per_organ=3)
+        result = resolve_sample_selection(hest_dir, str(meta_path), organs="all", min_samples_per_organ=3, check_gene_panel_compatibility=False)
         all_selected = result["train_sample_ids"] + result["validation_sample_ids"] + result["test_sample_ids"]
         assert set(all_selected) == {f"L{i}" for i in range(5, 10)}, "only the 5 human samples should survive"
 
@@ -173,7 +174,7 @@ def test_min_nb_genes_excludes_small_panel_samples():
         hest_dir, meta_path = _make_fake_hest1k(
             Path(tmp), {"Lung": [f"L{i}" for i in range(10)]}, nb_genes_by_id=small_panel_ids,
         )
-        result = resolve_sample_selection(hest_dir, str(meta_path), organs="all", min_samples_per_organ=3)
+        result = resolve_sample_selection(hest_dir, str(meta_path), organs="all", min_samples_per_organ=3, check_gene_panel_compatibility=False)
         all_selected = result["train_sample_ids"] + result["validation_sample_ids"] + result["test_sample_ids"]
         assert set(all_selected) == {f"L{i}" for i in range(5, 10)}, "only the 5 whole-transcriptome samples should survive"
 
@@ -186,6 +187,7 @@ def test_min_nb_genes_none_disables_the_filter():
         )
         result = resolve_sample_selection(
             hest_dir, str(meta_path), organs="all", min_nb_genes=None, min_samples_per_organ=3,
+            check_gene_panel_compatibility=False,
         )
         all_selected = result["train_sample_ids"] + result["validation_sample_ids"] + result["test_sample_ids"]
         assert len(all_selected) == 10, "min_nb_genes=None must keep every sample regardless of panel size"
@@ -197,6 +199,6 @@ def test_species_all_keeps_every_species():
         hest_dir, meta_path = _make_fake_hest1k(
             Path(tmp), {"Lung": [f"L{i}" for i in range(10)]}, species_by_id=mouse_ids,
         )
-        result = resolve_sample_selection(hest_dir, str(meta_path), organs="all", species=None, min_samples_per_organ=3)
+        result = resolve_sample_selection(hest_dir, str(meta_path), organs="all", species=None, min_samples_per_organ=3, check_gene_panel_compatibility=False)
         all_selected = result["train_sample_ids"] + result["validation_sample_ids"] + result["test_sample_ids"]
         assert len(all_selected) == 10, "species=None must keep both human and mouse samples"

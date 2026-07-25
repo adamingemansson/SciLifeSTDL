@@ -40,6 +40,15 @@ def apply_sample_selection(cfg) -> None:
     early, and continues reading cfg.data.* normally afterward -- no
     caller needs to know whether the values came from a literal list or a
     resolved selection.
+
+    species/min_nb_genes/check_gene_panel_compatibility/min_gene_coverage/
+    min_sample_coverage/min_panel_size (all optional keys under
+    sample_selection) pass straight through to resolve_sample_selection,
+    which defaults every one of them safely on its own -- only set these
+    in a config to deliberately override (e.g. species: "all" for a
+    cross-species comparison run). See resolve_sample_selection's own
+    docstring for what each really does and the real HEST-1k bugs they
+    guard against.
     """
     selection_cfg = cfg.data.get("sample_selection")
     if selection_cfg is None:
@@ -47,15 +56,23 @@ def apply_sample_selection(cfg) -> None:
     organs = selection_cfg.get("organs", "all")
     if organs != "all":
         organs = list(organs)
+    species = selection_cfg.get("species", "Homo sapiens")
+    min_nb_genes = selection_cfg.get("min_nb_genes", 5000)
     result = resolve_sample_selection(
         hest_data_dir=cfg.data.hest_data_dir,
         metadata_csv=selection_cfg.get("metadata_csv", "hf://datasets/MahmoodLab/hest/HEST_v1_3_0.csv"),
         organs=organs,
+        species=None if species == "all" else species,
+        min_nb_genes=None if min_nb_genes in (None, 0) else int(min_nb_genes),
         min_samples_per_organ=int(selection_cfg.get("min_samples_per_organ", 3)),
         max_samples_per_organ=selection_cfg.get("max_samples_per_organ"),
         n_validation_per_organ=int(selection_cfg.get("n_validation_per_organ", 1)),
         n_test_per_organ=int(selection_cfg.get("n_test_per_organ", 1)),
         split_seed=int(selection_cfg.get("split_seed", 0)),
+        check_gene_panel_compatibility=bool(selection_cfg.get("check_gene_panel_compatibility", True)),
+        min_gene_coverage=float(selection_cfg.get("min_gene_coverage", 0.9)),
+        min_sample_coverage=float(selection_cfg.get("min_sample_coverage", 0.9)),
+        min_panel_size=int(selection_cfg.get("min_panel_size", 5000)),
     )
     cfg.data.train_sample_ids = result["train_sample_ids"]
     cfg.data.validation_sample_ids = result["validation_sample_ids"]

@@ -354,6 +354,40 @@ same label). See `tests/test_hest1k_catalog.py`'s
 `test_min_nb_genes_excludes_small_panel_samples` for a synthetic
 reproduction.
 
+**Fourth real bug, same server run, immediately after the min_nb_genes
+fix**: TENX samples were STILL in the resolved training set. Real cause,
+confirmed against the live metadata: `nb_genes` is NOT cleanly bimodal —
+real values vary CONTINUOUSLY within every single source-study group,
+including the ones already trusted as "whole-transcriptome": real
+confirmed `TENX` values include 538, 541, 1056, ..., 5001, 10006, 10017
+(some clear a 5000 threshold despite still being a genuinely different,
+incompatible panel), and real `NCBI` — otherwise a clean
+whole-transcriptome group — turned out to ALSO include a 541-gene
+outlier. A numeric size proxy cannot reliably separate compatible from
+incompatible samples here; only real measured gene-IDENTITY overlap can.
+Fixed via `data/hest1k_catalog.py::resolve_compatible_sample_ids`
+(enabled by default in `resolve_sample_selection` as
+`check_gene_panel_compatibility=True`): after the per-organ split, reads
+every resolved sample's REAL var_names directly (`anndata.read_h5ad(...,
+backed="r")` — cheap, doesn't load the expression matrix), builds a
+"core" panel from genes present in ≥90% of the cohort, and drops any
+sample covering <90% of that core — printing exactly which samples got
+excluded and why, rather than silently shrinking or crashing. The final
+shared panel is the EXACT intersection over kept samples (never an
+approximation, never zero-filled). Adds real I/O at the start of every
+training run (reading ~170-240 files' headers) — expect this step to
+take some real wall-clock time before the first training step logs,
+proportional to cohort size; it's a one-time cost per run, not
+per-step. `species`/`min_nb_genes`/`check_gene_panel_compatibility`/
+`min_gene_coverage`/`min_sample_coverage`/`min_panel_size` are all
+overridable from a config's `data.sample_selection` block if the
+defaults ever need tuning for a specific run
+(`training/data_prep.py::apply_sample_selection`). See
+`tests/test_gene_panel_compatibility.py` for synthetic reproductions of
+both the failure mode and the fix, including a deliberately-crafted
+outlier sample whose total gene COUNT clears 5000 but whose real overlap
+with the rest of the cohort does not.
+
 Sample selection is resolved at RUN TIME, not hardcoded — every shipped
 config sets `data.sample_selection` (organs, per-organ sample caps,
 validation/test counts, a split seed) and
