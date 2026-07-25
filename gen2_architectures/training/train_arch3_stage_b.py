@@ -68,8 +68,12 @@ def main(config_path: str, smoke_steps: int | None = None) -> None:
         if not ids:
             continue
         print(f"loading {len(ids)} {split_name} sample(s), aligned to the training gene panel...")
-        adatas, images_list = data_prep.load_multi_sample_with_images(cfg, ids, reference_genes=gene_names)
-        for sid, adata, images in zip(ids, adatas, images_list):
+        kept_ids, adatas, images_list = data_prep.load_held_out_samples_with_images(cfg, ids, gene_names)
+        if split_name == "validation":
+            validation_ids = kept_ids
+        else:
+            test_ids = kept_ids
+        for sid, adata, images in zip(kept_ids, adatas, images_list):
             held_out_adatas[str(sid)] = (adata, images, split_name)
 
     autoencoder = _load_stage_a(cfg.model.stage_a_checkpoint_dir, len(gene_names)).to(device)

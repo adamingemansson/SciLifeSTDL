@@ -388,6 +388,31 @@ both the failure mode and the fix, including a deliberately-crafted
 outlier sample whose total gene COUNT clears 5000 but whose real overlap
 with the rest of the cohort does not.
 
+**Fifth real bug, same server run, after data loading finally reached
+the held-out (validation/test) samples**: `held-out sample 'NCBI1' is
+missing 21 genes from the fit-derived reference panel`, crashing the
+whole run. Not a new mechanism — the expected, previously-flagged edge
+case of `resolve_compatible_sample_ids`' ~90%-coverage compatibility bar
+(bug four, above) being genuinely looser than `load_multi_sample`'s own
+downstream reference_genes path, which requires EXACT (100%, zero
+tolerance) coverage of the train-derived panel by design (a held-out
+sample must never be allowed to shrink or otherwise influence the
+vocabulary — see that function's own docstring). A sample can pass the
+coarser cohort-level check yet still miss a few genes from the specific
+exact panel the TRAIN samples alone ultimately settled on. Fixed via
+`training/data_prep.py::load_held_out_samples_with_images`: loads each
+validation/test sample INDIVIDUALLY, catching just this specific
+"fit-derived reference panel" error per sample and skipping it (with a
+printed warning) instead of losing the whole run to one incompatible
+held-out sample — any other `ValueError` still propagates and fails
+loudly, not silently swallowed. Wired into `train_local_neighborhood.py`
+and `train_arch3_stage_b.py` (Stage A has no held-out expression-panel
+loading, unaffected); `validation_sample_ids`/`test_sample_ids` are
+reassigned to the actually-kept subset immediately after loading, so
+every later use (scFoundation provider construction, the eval loops)
+sees only samples that genuinely loaded. See
+`tests/test_load_held_out_samples.py`.
+
 Sample selection is resolved at RUN TIME, not hardcoded — every shipped
 config sets `data.sample_selection` (organs, per-organ sample caps,
 validation/test counts, a split seed) and
@@ -802,10 +827,10 @@ gen2_architectures/
   scripts/
     inventory_hest1k.py                  NEW  human-readable local-vs-catalog Visium coverage report by organ
     rollback_checkpoint.py               NEW  operator CLI for checkpoint history (section 13)
-  tests/                                 91 tests, synthetic data only, no real HEST-1k/GPU required
+  tests/                                 94 tests, synthetic data only, no real HEST-1k/GPU required
     test_components.py, test_arch1_arch2.py, test_arch3.py, test_arch4.py,
     test_checkpoint.py, test_diagnostics.py, test_masked_item.py, test_train_local_neighborhood_integration.py,
     test_hest1k_catalog.py, test_apply_sample_selection.py, test_coord_scale_and_smoke_override.py,
     test_loaders_multi_sample.py, test_gene_panel_compatibility.py, test_atomic_savez.py,
-    test_precomputed_spot_feature_provider.py
+    test_precomputed_spot_feature_provider.py, test_load_held_out_samples.py
 ```

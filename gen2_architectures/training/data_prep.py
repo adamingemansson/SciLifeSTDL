@@ -288,6 +288,44 @@ def load_multi_sample_with_images(cfg, sample_ids: list[str], reference_genes: l
     return updated_adatas, images_list
 
 
+def load_held_out_samples_with_images(cfg, sample_ids: list[str], reference_genes: list[str]):
+    """Like load_multi_sample_with_images(..., reference_genes=...), but
+    loads each held-out sample INDIVIDUALLY and skips (with a clear
+    warning) any one that doesn't fully cover the train-derived
+    reference panel, instead of raising and losing the whole
+    validation/test batch to one incompatible sample.
+
+    Real bug found 2026-07-25 on the actual training server: a held-out
+    sample can pass resolve_compatible_sample_ids' coarser ~90%-coverage
+    compatibility check (hest1k_catalog.py) yet still be missing a
+    handful of genes from the SPECIFIC exact panel load_multi_sample
+    ultimately derives from the train samples ALONE -- those are
+    genuinely different bars (a statistical "close enough" cohort-level
+    check vs. an exact zero-tolerance per-sample check), and
+    load_multi_sample's reference_genes path correctly raises rather
+    than silently zero-filling or letting held-out data influence the
+    vocabulary (see that function's own docstring on why). Previously
+    that raise propagated all the way up and crashed the whole training
+    run over ONE held-out sample; this function contains it instead.
+
+    Returns (kept_ids, adatas, images_list) -- kept_ids is a SUBSET of
+    sample_ids in the same relative order; callers must use kept_ids,
+    not sample_ids, for everything downstream."""
+    kept_ids, adatas, images_list = [], [], []
+    for sample_id in sample_ids:
+        try:
+            [adata], [images] = load_multi_sample_with_images(cfg, [sample_id], reference_genes=reference_genes)
+        except ValueError as exc:
+            if "fit-derived reference panel" not in str(exc):
+                raise
+            print(f"load_held_out_samples_with_images: skipping {sample_id!r} ({exc})")
+            continue
+        kept_ids.append(sample_id)
+        adatas.append(adata)
+        images_list.append(images)
+    return kept_ids, adatas, images_list
+
+
 def _probe_context_feature_dim(
     cfg, adata, provider: ContextOnlyFeatureProvider | PrecomputedSpotFeatureProvider,
 ) -> int:
