@@ -311,6 +311,25 @@ specific numbers; the per-organ resolution logic itself (`min_samples_per_organ`
 `max_samples_per_organ`, below) is unaffected and will simply resolve to
 fewer samples for any organ that had real mouse-only or mixed coverage.
 
+**Second real bug found on the same server run, after the species fix**:
+even human-only, a ~170-sample multi-organ selection still hit "No genes
+shared across all samples." Real cause, confirmed against actual server
+data: `load_multi_sample` used to apply `sc.pp.filter_genes(min_cells=3)`
+INDEPENDENTLY to each sample before intersecting var_names — requiring a
+gene to survive that per-sample threshold in literally every one of ~170
+samples, spanning multiple HEST-1k source studies that turn out to use
+different underlying reference-genome gene panels (confirmed: real INT1
+has 36,601 raw genes vs real MEND139's 33,538, though their raw pairwise
+overlap is still 87%). Enough independent per-sample QC decisions
+compounded to an empty intersection. Fixed: gene-level QC is no longer
+applied per sample; the shared panel is now the raw intersection across
+samples (reflecting genuine measurement overlap, not per-sample QC
+noise), and `min_cells` is enforced POOLED — a gene needs `min_cells`
+total detected spots summed across the whole training cohort, not
+independently in each one (`data/loaders.py::_pooled_min_cells_filter`).
+See `tests/test_loaders_multi_sample.py` for a synthetic reproduction of
+both the original bug and the fix.
+
 Sample selection is resolved at RUN TIME, not hardcoded — every shipped
 config sets `data.sample_selection` (organs, per-organ sample caps,
 validation/test counts, a split seed) and

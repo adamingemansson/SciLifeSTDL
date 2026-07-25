@@ -308,6 +308,25 @@ def load_hest_sample(hest_data_dir: str | Path, sample_id: str,
     return adata
 
 
+def _pooled_min_cells_filter(adatas: list[ad.AnnData], shared_genes: list[str], min_cells: int) -> list[str]:
+    """Keep genes with real signal SOMEWHERE across the combined multi-
+    sample training set (summed detected-spot count >= min_cells across
+    ALL samples together), rather than requiring independent survival in
+    literally every single sample (see load_multi_sample's own docstring
+    for the real bug this replaces). Detection ("expressed", x > 0) is
+    computed on each sample's already QC/normalize/log1p-transformed X --
+    normalize_total + log1p both preserve the zero/nonzero pattern of the
+    input, so this is exactly equivalent to counting on raw counts."""
+    detected = None
+    for a in adatas:
+        sub = a[:, shared_genes]
+        x = sub.X if isinstance(sub.X, np.ndarray) else sub.X.toarray()
+        counts = np.asarray((x > 0).sum(axis=0)).ravel()
+        detected = counts if detected is None else detected + counts
+    keep = detected >= min_cells
+    return [g for g, k in zip(shared_genes, keep) if k]
+
+
 def load_multi_sample(hest_data_dir: str | Path, sample_ids: list[str],
                        min_genes: int = 200, min_cells: int = 3,
                        organs: list[str] | None = None,
@@ -374,12 +393,24 @@ def load_multi_sample(hest_data_dir: str | Path, sample_ids: list[str],
                               organ=organs[i] if organs is not None else None,
                               tech=techs[i] if techs is not None else None),
             min_genes=min_genes,
-            # A held-out sample must not select the evaluation vocabulary by
-            # expression prevalence. Keep every measured gene, then align to
-            # the training-derived reference panel below. Missing reference
-            # names still raise and therefore distinguish an unmeasured gene
-            # from a measured all-zero/rare gene.
-            min_cells=0 if reference_genes is not None else min_cells,
+            # Gene-level QC is NEVER applied per-sample here anymore (real
+            # bug found 2026-07-25 on the actual training server, first
+            # real multi-organ/many-sample run): sc.pp.filter_genes with
+            # min_cells applied INDEPENDENTLY to each sample, then
+            # requiring literal survival in the intersection across every
+            # one of ~170 samples spanning many organs AND several
+            # different HEST-1k source studies (confirmed to use
+            # different underlying gene panels -- e.g. real INT1 has
+            # 36,601 raw genes vs real MEND139's 33,538, yet their raw
+            # pairwise overlap is 31,915/36,601 = 87%), collapsed the
+            # intersection to exactly zero. min_cells=0 here keeps each
+            # sample's real raw panel (Cell-Ranger-reference differences
+            # aside) so panel intersection reflects genuine measurement
+            # overlap, not per-sample QC noise compounding across many
+            # independent trials. The requested min_cells threshold is
+            # still honored below, applied POOLED across all fit samples
+            # together instead of independently per sample.
+            min_cells=0,
             transform=expression_transform, target_sum=expression_target_sum)
         for i, sid in enumerate(sample_ids)
     ]
@@ -387,10 +418,19 @@ def load_multi_sample(hest_data_dir: str | Path, sample_ids: list[str],
         shared_genes = sorted(set.intersection(*(set(a.var_names) for a in adatas)))
         if not shared_genes:
             raise ValueError(
-                f"No genes shared across all samples {sample_ids!r} after per-sample QC — "
-                "likely mixing different gene panels/platforms (see this function's "
-                "docstring); check the `technology` column in HEST-1k's metadata CSV."
+                f"No genes shared across all samples {sample_ids!r} even before any "
+                "gene-level QC — these samples' raw HEST-1k gene panels have zero "
+                "overlap, likely genuinely different platforms/species; check the "
+                "`st_technology`/`species` columns in HEST-1k's metadata CSV."
             )
+        if min_cells > 0:
+            shared_genes = _pooled_min_cells_filter(adatas, shared_genes, min_cells)
+            if not shared_genes:
+                raise ValueError(
+                    f"No genes passed the pooled min_cells={min_cells} threshold "
+                    f"(summed detected-spot count across all {len(adatas)} fit samples "
+                    f"combined) for samples {sample_ids!r}"
+                )
         panel_source = "fit-sample intersection"
     else:
         # Strict held-out evaluation: the target vocabulary is established
