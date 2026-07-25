@@ -43,7 +43,8 @@ training:
   device: cuda
   seed: 0
   lr: 1.0e-4
-  total_steps: 30000   # placeholder -- pure reconstruction on pooled spots converges much faster than the spatial stage; verify with a smoke run
+  total_steps: 1000000   # hard safety cap only -- see max_wall_clock_hours below
+  max_wall_clock_hours: 8   # standalone-run fallback; when launched via training/train_arch3_combined.py this is OVERRIDDEN by --total_hours * stage_a_fraction (default 20% of the pair's combined budget, README section 12)
   batch_size: 256
   gradient_clip_val: 1.0
   log_every_n_steps: 100

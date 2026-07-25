@@ -532,11 +532,17 @@ python3 -m gen2_architectures.training.train_local_neighborhood \
 python3 -m gen2_architectures.training.train_local_neighborhood \
     --config gen2_architectures/configs/arch2_scfoundation.yaml
 
-# Architecture 3 -- Stage A MUST run before Stage B
-python3 -m gen2_architectures.training.train_arch3_stage_a \
-    --config gen2_architectures/configs/arch3_stage_a_pretrain.yaml
-python3 -m gen2_architectures.training.train_arch3_stage_b \
-    --config gen2_architectures/configs/arch3_stage_b_spatial.yaml
+# Architecture 3 -- Stage A MUST run before Stage B; train_arch3_combined.py
+# (2026-07-25) runs BOTH as one unsupervised job, splitting a single wall-clock
+# budget between them (default 20% Stage A / 80% Stage B -- see its own
+# docstring), so there's no manual "wait for Stage A, then launch Stage B" step:
+python3 -m gen2_architectures.training.train_arch3_combined \
+    --stage_a_config gen2_architectures/configs/arch3_stage_a_pretrain.yaml \
+    --stage_b_config gen2_architectures/configs/arch3_stage_b_spatial.yaml \
+    --total_hours 36
+# (the two stages can still be launched individually if you want more manual
+# control -- see train_arch3_stage_a.py/train_arch3_stage_b.py's own --help;
+# each falls back to its own config's standalone max_wall_clock_hours then)
 
 # Architecture 4 -- requires STPATH_GENE_VOC_PATH/STPATH_MODEL_WEIGHT_PATH
 #                   and SCFOUNDATION_REPO_PATH/SCFOUNDATION_MODEL_PATH
@@ -628,8 +634,29 @@ python3 -m gen2_architectures.training.train_local_neighborhood \
   construction is CPU-bound `torch.cdist`+`topk` — verify it isn't
   bottlenecking the GPU-bound transformer forward pass at real batch
   sizes).
-- Use the measured steps/sec to derive a real `total_steps` for the
-  intended wall-clock budget, replacing every config's placeholder value.
+
+**Setting the real training budget (2026-07-25, revised)**: every
+config's `total_steps` is now a large hard safety cap (1,000,000) that
+should never actually be reached — the real practical stopping point is
+`training.max_wall_clock_hours`, checked every step
+(`training/data_prep.py::resolve_wall_clock_deadline`). This is
+deliberately NOT "measure steps/sec from the smoke run, back-derive
+total_steps" — a short smoke run's early steps include one-time
+GigaPath/scFoundation cache-population overhead that isn't representative
+of steady-state throughput, and per-step cost can drift over a genuinely
+multi-day run (disk I/O contention with other architectures training
+concurrently, etc.). Just say how long you want a run to actually take:
+
+- Architectures 1/1b/1c/2: `max_wall_clock_hours: 36` (~1.5 days) each.
+- Architecture 4: `max_wall_clock_hours: 18` (HALF — see GPT review #6's
+  own risk note in that config).
+- Architecture 3 (Stage A + Stage B): see section 10's combined-run
+  section below — one `--total_hours` flag covers both stages together.
+
+Whichever of `total_steps` or `max_wall_clock_hours` is hit first stops
+training; either way the final checkpoint save and held-out test
+evaluation still run normally (the training loop just `break`s, it
+doesn't exit early). See `tests/test_wall_clock_deadline.py`.
 
 ## 13. Checkpoints: history, rollback, and disk budget
 
@@ -840,6 +867,7 @@ gen2_architectures/
     train_local_neighborhood.py          NEW  training entrypoint for Architectures 1/2/4
     train_arch3_stage_a.py               NEW  Stage A pretraining entrypoint
     train_arch3_stage_b.py               NEW  Stage B training entrypoint
+    train_arch3_combined.py              NEW  runs Stage A+B as one unsupervised job, time-split budget (section 10)
     validation.py                        COPIED  move_to_device, predictive_samples
   configs/
     arch1_gpt_baseline.yaml, arch1b_image_only_baseline.yaml, arch1c_gene_only_baseline.yaml
@@ -849,11 +877,11 @@ gen2_architectures/
   scripts/
     inventory_hest1k.py                  NEW  human-readable local-vs-catalog Visium coverage report by organ
     rollback_checkpoint.py               NEW  operator CLI for checkpoint history (section 13)
-  tests/                                 95 tests, synthetic data only, no real HEST-1k/GPU required
+  tests/                                 102 tests, synthetic data only, no real HEST-1k/GPU required
     test_components.py, test_arch1_arch2.py, test_arch3.py, test_arch4.py,
     test_checkpoint.py, test_diagnostics.py, test_masked_item.py, test_train_local_neighborhood_integration.py,
     test_hest1k_catalog.py, test_apply_sample_selection.py, test_coord_scale_and_smoke_override.py,
     test_loaders_multi_sample.py, test_gene_panel_compatibility.py, test_atomic_savez.py,
     test_precomputed_spot_feature_provider.py, test_load_held_out_samples.py,
-    test_model_config_json_serializable.py
+    test_model_config_json_serializable.py, test_wall_clock_deadline.py, test_train_arch3_combined.py
 ```

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -123,6 +124,34 @@ def apply_smoke_override(cfg, smoke_steps: int | None) -> None:
     cfg.training.eval_every_n_steps = max(1, smoke_steps // 2)
     cfg.training.log_every_n_steps = max(1, min(int(cfg.training.get("log_every_n_steps", 50)), smoke_steps // 10))
     print(f"--smoke_steps {smoke_steps}: total_steps/checkpoint/eval/log intervals overridden for this run only")
+
+
+def resolve_wall_clock_deadline(cfg) -> float | None:
+    """training.max_wall_clock_hours (2026-07-25), if set, gives training
+    scripts a REAL alternative to total_steps for "run for about N hours"
+    -- deliberately preferred over back-deriving total_steps from a short
+    smoke run's measured steps/sec, since a smoke run's early steps
+    include one-time GigaPath/scFoundation cache-population overhead
+    that is not representative of steady-state throughput, and per-step
+    cost can drift over a genuinely long run (disk I/O contention,
+    thermal throttling, etc. -- especially relevant with multiple
+    architectures training concurrently on the same server).
+    total_steps remains a hard safety cap regardless -- whichever limit
+    (step count or wall clock) is hit first stops training; the final
+    checkpoint save and held-out test evaluation still run normally
+    either way, since callers just `break` out of the training loop on
+    deadline, not return/exit early.
+
+    Returns an absolute time.monotonic() deadline, or None if
+    max_wall_clock_hours isn't set (matches every existing config,
+    which relies on total_steps alone -- this is purely additive)."""
+    hours = cfg.training.get("max_wall_clock_hours")
+    if hours is None:
+        return None
+    hours = float(hours)
+    if hours <= 0:
+        raise ValueError(f"training.max_wall_clock_hours must be positive, got {hours}")
+    return time.monotonic() + hours * 3600.0
 
 
 def derive_coord_scale(adatas: list) -> float:

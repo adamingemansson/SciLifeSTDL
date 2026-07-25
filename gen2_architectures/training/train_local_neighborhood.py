@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -141,10 +142,14 @@ def main(config_path: str, smoke_steps: int | None = None) -> None:
     image_mode = str(cfg.training.get("image_mode", "target_zero"))
     context_gex_mode = str(cfg.training.get("context_gex_mode", "full"))
     augment = bool(cfg.training.get("augment_coords", False))
+    wall_clock_deadline = data_prep.resolve_wall_clock_deadline(cfg)
 
     rng = random.Random(int(cfg.training.get("seed", 0)))
     model.train()
     for step in range(start_step, total_steps):
+        if wall_clock_deadline is not None and time.monotonic() >= wall_clock_deadline:
+            print(f"step {step}/{total_steps}: max_wall_clock_hours budget reached, stopping training early")
+            break
         sid_idx = rng.randrange(len(train_ids))
         sid = str(train_ids[sid_idx])
         adata, images = train_adatas[sid_idx], train_images[sid_idx]

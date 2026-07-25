@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -26,10 +27,12 @@ from gen2_architectures.data import loaders
 from gen2_architectures.training import checkpoint, data_prep, diagnostics
 
 
-def main(config_path: str, smoke_steps: int | None = None) -> None:
+def main(config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_override: float | None = None) -> None:
     cfg = OmegaConf.load(config_path)
     data_prep.apply_sample_selection(cfg)
     data_prep.apply_smoke_override(cfg, smoke_steps)
+    if max_wall_clock_hours_override is not None:
+        cfg.training.max_wall_clock_hours = max_wall_clock_hours_override
     device = torch.device(cfg.training.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
 
     train_ids = list(cfg.data.train_sample_ids)
@@ -84,11 +87,15 @@ def main(config_path: str, smoke_steps: int | None = None) -> None:
     mask_fraction = float(cfg.training.get("mask_fraction", 0.2))
     gaussian_std = float(cfg.training.get("gaussian_std", 0.0))
 
+    wall_clock_deadline = data_prep.resolve_wall_clock_deadline(cfg)
     pooled_t = torch.from_numpy(pooled)
     rng = random.Random(int(cfg.training.get("seed", 0)))
     n_spots_total = pooled_t.shape[0]
     model.train()
     for step in range(start_step, total_steps):
+        if wall_clock_deadline is not None and time.monotonic() >= wall_clock_deadline:
+            print(f"step {step}/{total_steps}: max_wall_clock_hours budget reached, stopping training early")
+            break
         idx = torch.tensor(rng.sample(range(n_spots_total), min(batch_size, n_spots_total)))
         clean = pooled_t[idx].to(device)
         corrupted = corrupt_expression(clean, seed=step, mask_fraction=mask_fraction, gaussian_std=gaussian_std)

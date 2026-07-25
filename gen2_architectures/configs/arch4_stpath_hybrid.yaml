@@ -71,7 +71,8 @@ training:
   device: cuda
   seed: 0
   lr: 1.0e-4
-  total_steps: 50000   # HALF of the other 3 architectures' placeholder budget -- see GPT review #6 note above
+  total_steps: 1000000   # hard safety cap only -- see max_wall_clock_hours below, the real practical stopping point (README section 12)
+  max_wall_clock_hours: 18   # HALF of the other 3 architectures' ~36h budget -- see GPT review #6 note above
   gradient_clip_val: 1.0
   log_every_n_steps: 50
   checkpoint_every_n_steps: 2000
