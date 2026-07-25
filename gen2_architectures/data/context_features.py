@@ -6,6 +6,7 @@ not on the complete slide before query expression is hidden.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -157,6 +158,90 @@ class ContextOnlyNovaeProvider:
 # reason (its neighbor-averaging step would otherwise leak hidden query
 # expression through the graph).
 ContextOnlyFeatureProvider = ContextOnlyNovaeProvider
+
+
+@dataclass
+class PrecomputedSpotFeatureProvider:
+    """Like ContextOnlyNovaeProvider, but for feature functions with NO
+    query-leakage risk -- computed independently per spot from that
+    spot's own expression alone, never propagated across a spatial
+    neighbor graph (true for scFoundation, see
+    context_features.py::model_uses_scfoundation's own docstring; NOT
+    true for Novae, which genuinely needs the context-only recomputation
+    ContextOnlyNovaeProvider exists for).
+
+    Real bug found 2026-07-25 on the actual training server (surfaced by
+    a direct question about GigaPath's disk footprint, which led to
+    checking scFoundation's caching too): build_scfoundation_provider
+    used to route scFoundation through ContextOnlyNovaeProvider, whose
+    cache is keyed by a DIGEST OF THE CURRENT MASKING DRAW's context
+    set. Training masking uses seed=step, so a fresh, essentially
+    never-repeated context mask gets drawn on almost every step --
+    meaning that provider wrote a NEW small .npz cache file on nearly
+    every training step, for the life of the run, with near-zero real
+    cache-hit rate. For Architecture 4 (max_context_points=3000,
+    50,000-step budget) this could have accumulated into hundreds of GB
+    before the 50GB real disk budget was ever hit as a hard failure,
+    rather than caught here. scFoundation's own precompute_scfoundation_
+    features docstring already says "ONCE per sample" -- this class
+    actually delivers that: features are computed for EVERY spot in the
+    sample a single time (first call), disk-cached ONE FILE PER SAMPLE
+    (exactly like data_prep.py::_gigapath_cache_path), and every
+    subsequent __call__(context_mask) is a pure O(1) in-memory slice --
+    no redundant scFoundation forward passes, no per-step file growth."""
+
+    adata: object
+    cache_dir: str | Path | None = None
+    sample_id: str = "sample"
+    feature_fn: FeatureFn | None = None
+
+    def __post_init__(self) -> None:
+        self.cache_dir = Path(self.cache_dir) if self.cache_dir is not None else None
+        self._features: np.ndarray | None = None
+        self._output_dim: int | None = None
+
+    @property
+    def output_dim(self) -> int | None:
+        return self._output_dim
+
+    def _ensure_computed(self) -> None:
+        if self._features is not None:
+            return
+        signature = _adata_feature_signature(self.adata, self.feature_fn)
+        cache_path = self.cache_dir / f"{self.sample_id}.npz" if self.cache_dir is not None else None
+        if cache_path is not None and cache_path.exists():
+            cached = np.load(cache_path, allow_pickle=False)
+            cached_signature = str(cached["feature_signature"].item()) if "feature_signature" in cached else ""
+            if cached_signature == signature:
+                self._features = cached["features"].astype(np.float32, copy=False)
+                self._output_dim = int(self._features.shape[1])
+                return
+
+        features = np.asarray(self.feature_fn(self.adata), dtype=np.float32)
+        if features.ndim != 2 or features.shape[0] != self.adata.n_obs:
+            raise ValueError(
+                "feature function must return [n_obs, feature_dim] for the WHOLE sample "
+                f"(this provider has no leakage risk to guard against), got {features.shape} "
+                f"for n_obs={self.adata.n_obs}"
+            )
+        self._features = features
+        self._output_dim = int(features.shape[1])
+
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache_path.with_name(f"{cache_path.stem}.tmp{os.getpid()}.npz")
+            np.savez(tmp, features=features, feature_signature=np.asarray(signature))
+            os.replace(tmp, cache_path)
+
+    def __call__(self, context_mask: np.ndarray) -> np.ndarray:
+        self._ensure_computed()
+        context_mask = np.asarray(context_mask, dtype=bool)
+        if context_mask.shape != (self._features.shape[0],):
+            raise ValueError(
+                f"context mask shape {context_mask.shape} does not match "
+                f"{self._features.shape[0]} observations"
+            )
+        return self._features[context_mask]
 
 
 def model_uses_novae(model_params: dict) -> bool:

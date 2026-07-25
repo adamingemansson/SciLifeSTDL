@@ -70,7 +70,7 @@ usually just import paths):
 | `data/loaders.py` | `src/data/loaders.py` | HEST-1k loading, QC, normalization, the `raw_counts`/library-size stash |
 | `data/masking.py` | `src/data/masking.py` | Hole-drawing strategies |
 | `data/mask_bank.py` | `src/data/mask_bank.py` | Fixed validation/test mask persistence, `cap_context_mask` |
-| `data/context_features.py` | `src/data/context_features.py` | `ContextOnlyFeatureProvider` generic caching engine |
+| `data/context_features.py` | `src/data/context_features.py` | `ContextOnlyFeatureProvider` generic caching engine, PLUS a NEW `PrecomputedSpotFeatureProvider` (2026-07-25) for leakage-free features like scFoundation's — see section 13's disk-cost writeup |
 | `data/patch_overlap.py` | `src/data/slide_context.py` (partial) | Only `nonoverlapping_context_patch_mask` — the WSI-dense-tile mechanism was dropped, unused by any gen2 architecture |
 | `data/masked_item.py` | `src/training/train.py::_build_masked_item` (trimmed) | Novae/niche channels dropped; a generic `context_extra_features` additive channel replaces them |
 | `models/conditioning.py` | `src/models/conditioning.py` | `GigapathPatchEncoder`, `MLPGeneEncoder`, `ScFoundationGeneEncoder`, `RandomFourierFeatures`, `PanelInvariantGeneDecoder`, `OrganTechEmbedding`, etc. |
@@ -645,6 +645,46 @@ roll back to. If you request a step with no surviving snapshot (already
 pruned, or a typo), it raises immediately and lists the real available
 steps rather than silently no-op'ing.
 
+**Feature caches (GigaPath, scFoundation) — the other real disk cost,
+answered directly (2026-07-25)**:
+
+- **GigaPath** (`training/data_prep.py::get_gigapath_features`): cached
+  ONE FILE PER SAMPLE under `<hest_cache_dir>/gigapath_cache/{sample_id}.npz`
+  — 1536 raw floats/spot (6.1 KB/spot). A ~1000-2000-spot sample costs
+  ~6-12 MB; the whole shared training cohort (Architectures 1/1b/1c/2/
+  3-Stage-B all resolve to the SAME sample set by design, section 9) is
+  computed and cached exactly ONCE and reused across every one of those
+  configs, not duplicated per architecture. Real order of magnitude for
+  a few hundred samples: low single-digit GB total. Not a real concern
+  against the 50GB budget.
+- **scFoundation** — real bug found and fixed the same day, directly
+  from a question about GigaPath's footprint: `build_scfoundation_provider`
+  used to route scFoundation through the SAME context-only caching engine
+  built for Novae (`ContextOnlyNovaeProvider`), whose cache is keyed by a
+  digest of the CURRENT masking draw's context set. Training masking
+  uses `seed=step`, so a fresh, essentially never-repeated context mask
+  gets drawn on almost every step — meaning a new small `.npz` file got
+  written on nearly every training step, for the life of the run, with
+  near-zero real cache-hit rate. For Architecture 4
+  (`max_context_points: 3000`, 50,000-step budget) this could plausibly
+  have accumulated into hundreds of GB before the 50GB budget was ever
+  hit as anything other than a training crash. scFoundation's own
+  `precompute_scfoundation_features` docstring already said "ONCE per
+  sample" — it just wasn't actually being called that way. Fixed via
+  `data/context_features.py::PrecomputedSpotFeatureProvider`: computes
+  every spot's scFoundation embedding ONCE (scFoundation has no
+  query-leakage risk to guard against — it's computed per-spot from that
+  spot's own expression alone, unlike Novae's graph propagation, see
+  `model_uses_scfoundation`'s own docstring), disk-cached ONE FILE PER
+  SAMPLE under `<hest_cache_dir>/scfoundation_cache/{sample_id}.npz`
+  (deliberately a new directory name, not reusing the old
+  `scfoundation_context_cache/` — avoids the new provider ever
+  misreading an old per-mask-format file left over from a prior run),
+  and every subsequent call is a pure in-memory slice by the current
+  context mask — no redundant scFoundation forward passes, no per-step
+  file growth. Same order-of-magnitude cost as GigaPath now (one file
+  per sample). See `tests/test_precomputed_spot_feature_provider.py`.
+
 ## 14. Monitoring a run: what to expect
 
 Every `log_every_n_steps` line now ends with the diagnostics GPT's
@@ -762,8 +802,10 @@ gen2_architectures/
   scripts/
     inventory_hest1k.py                  NEW  human-readable local-vs-catalog Visium coverage report by organ
     rollback_checkpoint.py               NEW  operator CLI for checkpoint history (section 13)
-  tests/                                 66 tests, synthetic data only, no real HEST-1k/GPU required
+  tests/                                 91 tests, synthetic data only, no real HEST-1k/GPU required
     test_components.py, test_arch1_arch2.py, test_arch3.py, test_arch4.py,
     test_checkpoint.py, test_diagnostics.py, test_masked_item.py, test_train_local_neighborhood_integration.py,
-    test_hest1k_catalog.py, test_apply_sample_selection.py
+    test_hest1k_catalog.py, test_apply_sample_selection.py, test_coord_scale_and_smoke_override.py,
+    test_loaders_multi_sample.py, test_gene_panel_compatibility.py, test_atomic_savez.py,
+    test_precomputed_spot_feature_provider.py
 ```

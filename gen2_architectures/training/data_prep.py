@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 
 from gen2_architectures.data import loaders
-from gen2_architectures.data.context_features import ContextOnlyFeatureProvider
+from gen2_architectures.data.context_features import ContextOnlyFeatureProvider, PrecomputedSpotFeatureProvider
 from gen2_architectures.data.hest1k_catalog import resolve_sample_selection
 from gen2_architectures.data.masked_item import make_context_query_split
 from gen2_architectures.data.mask_bank import cap_context_mask
@@ -288,11 +288,15 @@ def load_multi_sample_with_images(cfg, sample_ids: list[str], reference_genes: l
     return updated_adatas, images_list
 
 
-def _probe_context_feature_dim(cfg, adata, provider: ContextOnlyFeatureProvider) -> int:
+def _probe_context_feature_dim(
+    cfg, adata, provider: ContextOnlyFeatureProvider | PrecomputedSpotFeatureProvider,
+) -> int:
     """Deterministic probe context mask (fixed seed, never used for real
     training/eval) so a precomputed feature provider's real output width
     can be read before model construction -- same reasoning as the
-    original prepare_scfoundation_inputs (src/training/train.py)."""
+    original prepare_scfoundation_inputs (src/training/train.py). Works
+    for either provider type -- both share the same
+    provider(context_mask) -> [n_context, feature_dim] call contract."""
     coords3d = loaders.get_coords_3d(adata)
     probe_context, probe_query = make_context_query_split(
         coords3d, adata.obs["slice_id"].to_numpy(), cfg.masking, seed=606_061,
@@ -306,17 +310,29 @@ def _probe_context_feature_dim(cfg, adata, provider: ContextOnlyFeatureProvider)
     return int(probe.shape[1])
 
 
-def build_scfoundation_provider(cfg, adata, sample_id: str) -> ContextOnlyFeatureProvider:
-    """One ContextOnlyFeatureProvider computing scFoundation cell
-    embeddings on the observed context subgraph only (never the full
-    slide -- see that class's own docstring on why leaking hidden query
-    expression through a full-slide computation would be invalid for the
-    missing_tissue task; scFoundation itself has no such leakage risk
-    since it's computed per-spot from that spot's own expression alone,
-    but this project's OWN established discipline is to always route
-    precomputed context features through this same context-only engine,
-    both for cache-key consistency and so every gene-feature pathway in
-    this codebase follows one uniform, auditable rule).
+def build_scfoundation_provider(cfg, adata, sample_id: str) -> PrecomputedSpotFeatureProvider:
+    """One PrecomputedSpotFeatureProvider computing scFoundation cell
+    embeddings for every spot in the sample ONCE (never per masking
+    draw), disk-cached one file per sample -- exactly like GigaPath's own
+    cache (_gigapath_cache_path). scFoundation itself has no query-
+    leakage risk (computed per-spot from that spot's own expression
+    alone, not a spatial-neighbor graph -- see
+    data/context_features.py::model_uses_scfoundation's own docstring),
+    so it does NOT need the context-only-per-mask recomputation
+    ContextOnlyNovaeProvider exists for.
+
+    REGRESSION fixed 2026-07-25 (found by directly checking storage
+    behavior after a question about GigaPath's disk footprint): this
+    function used to route scFoundation through ContextOnlyNovaeProvider,
+    whose cache is keyed by a digest of the CURRENT masking draw's
+    context set. Training masking uses seed=step, so a fresh,
+    essentially never-repeated context mask gets drawn on almost every
+    step -- meaning a NEW small .npz cache file got written on nearly
+    every training step, for the life of the run, with near-zero real
+    cache-hit rate. For Architecture 4 (max_context_points=3000,
+    50,000-step budget) this could have accumulated into hundreds of GB
+    against a real 50GB disk budget. See
+    PrecomputedSpotFeatureProvider's own docstring for the full story.
 
     already_normalized_log1p=True: this project's own loaders already
     apply the exact library-size-to-1e4 + log1p transform scFoundation's
@@ -345,7 +361,7 @@ def build_scfoundation_provider(cfg, adata, sample_id: str) -> ContextOnlyFeatur
             already_normalized_log1p=True,
         )
 
-    return ContextOnlyFeatureProvider(
-        adata, cache_dir=cache_root(cfg) / "scfoundation_context_cache",
+    return PrecomputedSpotFeatureProvider(
+        adata, cache_dir=cache_root(cfg) / "scfoundation_cache",
         sample_id=str(sample_id), feature_fn=_feature_fn,
     )
