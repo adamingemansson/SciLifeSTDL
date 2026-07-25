@@ -522,11 +522,23 @@ are the metrics that actually matter for comparing these 4 architectures.
 python3 -m gen2_architectures.training.train_local_neighborhood \
     --config gen2_architectures/configs/arch1_gpt_baseline.yaml
 
-# Architecture 1 ablations
-python3 -m gen2_architectures.training.train_local_neighborhood \
-    --config gen2_architectures/configs/arch1b_image_only_baseline.yaml
-python3 -m gen2_architectures.training.train_local_neighborhood \
-    --config gen2_architectures/configs/arch1c_gene_only_baseline.yaml
+# Architecture 1 ablations -- train_local_neighborhood_sequential.py (2026-07-25)
+# runs Architecture 1 followed by 1b/1c as ONE unsupervised job on the same GPU
+# (no manual "wait for Arch1, then launch 1b" babysitting). Each config keeps
+# its OWN checkpoint_dir (never collide) and its OWN max_wall_clock_hours --
+# 36h for Architecture 1 itself, 12h each for 1b/1c (already set that way in
+# their configs, since the ablations exist to interpret the primary
+# comparison, not to be trained as deeply as it) -- roughly 60h (2.5 days)
+# total for the chain:
+python3 -m gen2_architectures.training.train_local_neighborhood_sequential \
+    --configs gen2_architectures/configs/arch1_gpt_baseline.yaml \
+              gen2_architectures/configs/arch1b_image_only_baseline.yaml \
+              gen2_architectures/configs/arch1c_gene_only_baseline.yaml
+# --max_wall_clock_hours_override, if you want it, overrides EVERY config in
+# the chain uniformly -- do NOT use it here if Architecture 1 needs its own
+# full budget, since it would cap Architecture 1 too, not just the ablations.
+# (or launch each individually via train_local_neighborhood.py if you want them
+# on separate GPUs instead of chained on one)
 
 # Architecture 2 (scFoundation) -- requires SCFOUNDATION_REPO_PATH/SCFOUNDATION_MODEL_PATH
 python3 -m gen2_architectures.training.train_local_neighborhood \
@@ -868,6 +880,7 @@ gen2_architectures/
     train_arch3_stage_a.py               NEW  Stage A pretraining entrypoint
     train_arch3_stage_b.py               NEW  Stage B training entrypoint
     train_arch3_combined.py              NEW  runs Stage A+B as one unsupervised job, time-split budget (section 10)
+    train_local_neighborhood_sequential.py  NEW  chains several train_local_neighborhood.py configs (e.g. Arch1+1b+1c) as one job (section 10)
     validation.py                        COPIED  move_to_device, predictive_samples
   configs/
     arch1_gpt_baseline.yaml, arch1b_image_only_baseline.yaml, arch1c_gene_only_baseline.yaml
@@ -877,11 +890,12 @@ gen2_architectures/
   scripts/
     inventory_hest1k.py                  NEW  human-readable local-vs-catalog Visium coverage report by organ
     rollback_checkpoint.py               NEW  operator CLI for checkpoint history (section 13)
-  tests/                                 102 tests, synthetic data only, no real HEST-1k/GPU required
+  tests/                                 105 tests, synthetic data only, no real HEST-1k/GPU required
     test_components.py, test_arch1_arch2.py, test_arch3.py, test_arch4.py,
     test_checkpoint.py, test_diagnostics.py, test_masked_item.py, test_train_local_neighborhood_integration.py,
     test_hest1k_catalog.py, test_apply_sample_selection.py, test_coord_scale_and_smoke_override.py,
     test_loaders_multi_sample.py, test_gene_panel_compatibility.py, test_atomic_savez.py,
     test_precomputed_spot_feature_provider.py, test_load_held_out_samples.py,
-    test_model_config_json_serializable.py, test_wall_clock_deadline.py, test_train_arch3_combined.py
+    test_model_config_json_serializable.py, test_wall_clock_deadline.py, test_train_arch3_combined.py,
+    test_train_local_neighborhood_sequential.py
 ```

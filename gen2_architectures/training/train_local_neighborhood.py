@@ -66,10 +66,12 @@ def _sample_organ_tech(adata) -> tuple[str | None, str | None]:
     return organ, tech
 
 
-def main(config_path: str, smoke_steps: int | None = None) -> None:
+def main(config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_override: float | None = None) -> None:
     cfg = OmegaConf.load(config_path)
     data_prep.apply_sample_selection(cfg)
     data_prep.apply_smoke_override(cfg, smoke_steps)
+    if max_wall_clock_hours_override is not None:
+        cfg.training.max_wall_clock_hours = max_wall_clock_hours_override
     architecture = str(cfg.model.architecture)
     device = torch.device(cfg.training.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     needs_scfoundation = architecture in ("2", "4")
