@@ -50,12 +50,14 @@ model:
     mlp_ratio: 4.0
     dropout: 0.1
     max_neighbors: 80
-    coord_scale: 1000.0   # verify against this dataset's real coordinate spread before launching -- see README
     decoder_hidden_dim: 1024
-    # organ_vocab/tech_vocab are NOT set here -- auto-injected at run time
-    # from data.sample_selection's actually-resolved organ list (see
-    # training/data_prep.py::apply_sample_selection). Set them explicitly
-    # only if you want to override the auto-detected vocabulary.
+    # coord_scale, organ_vocab, tech_vocab are NOT set here -- all three
+    # are auto-injected at run time from the real resolved training data
+    # (training/data_prep.py::apply_sample_selection for organ_vocab/
+    # tech_vocab, ::apply_coord_scale for coord_scale, ported from the
+    # exact real-data-derivation formula src/training/train.py already
+    # uses). Set any of them explicitly only to override the auto-detected
+    # value.
 training:
   device: cuda
   seed: 0

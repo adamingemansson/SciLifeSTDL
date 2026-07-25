@@ -26,9 +26,10 @@ from gen2_architectures.data import loaders
 from gen2_architectures.training import checkpoint, data_prep, diagnostics
 
 
-def main(config_path: str) -> None:
+def main(config_path: str, smoke_steps: int | None = None) -> None:
     cfg = OmegaConf.load(config_path)
     data_prep.apply_sample_selection(cfg)
+    data_prep.apply_smoke_override(cfg, smoke_steps)
     device = torch.device(cfg.training.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
 
     train_ids = list(cfg.data.train_sample_ids)
@@ -118,5 +119,7 @@ def main(config_path: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--smoke_steps", type=int, default=None,
+                         help="run only this many steps (overriding config), with checkpoint interval scaled down to match -- for a quick real-hardware smoke test before the full run")
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, smoke_steps=args.smoke_steps)

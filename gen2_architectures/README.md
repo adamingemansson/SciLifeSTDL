@@ -430,22 +430,34 @@ already contains a checkpoint (checks for `model_config.json`).
    later run somehow sees an organ outside whatever vocabulary was
    resolved at construction time — intentional, not a bug (see
    `tests/test_arch1_arch2.py::test_architecture1_unknown_organ_raises`).
-3. **`coord_scale`** (every architecture except 4) — currently `1000.0`,
-   a guess. `models/components.py::CoordEmbedding` wraps the SAME
-   `RandomFourierFeatures` class that had a real, previously-fixed aliasing
-   bug at the wrong coordinate scale (see that class's own docstring in
-   `models/conditioning.py`) — verify against the real full-HEST-1k
-   coordinate spread (not just the Lung pilot's) before the real run, e.g.
-   `coords[:, :2].std()` on a representative sample across a few different
-   organs (coordinate scale/units can plausibly differ by organ/platform).
-4. **`radius_range`** (every architecture's `masking.params`) — currently
-   the Lung-pilot-tuned `[5.0, 8.0]` spot-spacing value; verify it still
-   produces reasonably-sized holes on other organs before assuming it
-   transfers (spot density can vary by tissue).
+3. ~~`coord_scale`~~ — **done.** `models/components.py::CoordEmbedding`
+   wraps the SAME `RandomFourierFeatures` class that had a real,
+   previously-fixed aliasing bug at the wrong coordinate scale (see that
+   class's own docstring in `models/conditioning.py`); the earlier
+   hardcoded `1000.0` guess is now auto-derived per run from the REAL
+   training data's own coordinate spread
+   (`training/data_prep.py::derive_coord_scale`/`apply_coord_scale`,
+   porting the exact formula `src/training/train.py` already established
+   and debugged: mean, across training samples, of each sample's per-spot
+   (x, y) std). Set it explicitly in a config only to override the
+   auto-detected value. Architecture 4 (STPathContextEncoder conditions
+   on organ/tech directly, no `CoordEmbedding`) and Stage A (no spatial
+   component) correctly never get this injected — see
+   `tests/test_coord_scale_and_smoke_override.py`.
+4. **`radius_range`** (every architecture's `masking.params`, currently
+   the Lung-pilot-tuned `[5.0, 8.0]`) — lower-risk than it looks: every
+   config already sets `radius_unit: spot_spacing`
+   (`data/masking.py::random_dropout_patches`), which expresses hole
+   radii in median-nearest-neighbor-distance units, not raw coordinates —
+   by construction this already makes hole size comparable across
+   slides/organs with different spot density or pixel scale. Still worth
+   a visual sanity check on a non-Lung organ during the smoke pass (see
+   section 12), but this is not a per-organ guess the way `coord_scale`
+   was.
 5. **`total_steps`** — every config has a placeholder (100000, or 50000 for
-   Architecture 4). Derive a real budget from a smoke run's measured
-   steps/sec (see section 12) rather than launching a full 1-2 day run on
-   an unverified guess.
+   Architecture 4). Use `--smoke_steps N` (section 12) to run a short
+   real pass first and derive a real budget from its measured steps/sec,
+   rather than launching a full 1-2 day run on an unverified guess.
 6. **Environment variables**: `SCFOUNDATION_REPO_PATH`, `SCFOUNDATION_MODEL_PATH`
    (Architectures 2 and 4), `STPATH_GENE_VOC_PATH`, `STPATH_MODEL_WEIGHT_PATH`
    (Architecture 4) — same resources this project's existing STPath/
@@ -461,7 +473,17 @@ already contains a checkpoint (checks for `model_config.json`).
 ## 12. Recommended before the real 1-2 day runs
 
 Budget a short verification pass per architecture (GPT review's own
-suggestion) before committing real compute:
+suggestion) before committing real compute. Every training entrypoint
+accepts `--smoke_steps N` for exactly this — it overrides
+`total_steps` down to `N` and scales `checkpoint_every_n_steps`/
+`eval_every_n_steps`/`log_every_n_steps` down to match, in memory only
+(no config file edits, nothing to remember to revert before the real
+run):
+
+```bash
+python3 -m gen2_architectures.training.train_local_neighborhood \
+    --config gen2_architectures/configs/arch1_gpt_baseline.yaml --smoke_steps 500
+```
 
 - A few hundred to a thousand real steps on real data/hardware.
 - Confirm loss actually decreases, no NaNs/Infs.

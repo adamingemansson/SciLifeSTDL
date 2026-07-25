@@ -53,10 +53,10 @@ model:
     mlp_ratio: 4.0
     dropout: 0.1
     max_neighbors: 80
-    coord_scale: 1000.0
     decoder_hidden_dim: 1024
-    # organ_vocab/tech_vocab auto-injected at run time from
-    # data.sample_selection -- see training/data_prep.py::apply_sample_selection.
+    # coord_scale/organ_vocab/tech_vocab auto-injected at run time from
+    # the real training data -- see
+    # training/data_prep.py::apply_coord_scale/apply_sample_selection.
     # scfoundation_dim is NOT set here -- it's auto-detected at runtime from
     # a real probe call against the loaded checkpoint (see
     # train_local_neighborhood.py's data_prep._probe_context_feature_dim),

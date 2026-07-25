@@ -87,6 +87,69 @@ def apply_sample_selection(cfg) -> None:
             cfg.model.params.tech_vocab = result["tech_vocab"]
 
 
+def apply_smoke_override(cfg, smoke_steps: int | None) -> None:
+    """If smoke_steps is set (from a training script's --smoke_steps CLI
+    flag), override cfg.training.total_steps down to it in place, and
+    scale checkpoint_every_n_steps/eval_every_n_steps/log_every_n_steps
+    down proportionally so a short smoke run actually exercises a
+    checkpoint save and a validation eval before it ends, instead of
+    running out before either ever fires. checkpoint_keep_last is left
+    alone (smoke runs use the same tiny footprint as a real run). A no-op
+    when smoke_steps is None, so real runs are completely unaffected --
+    this exists specifically so a smoke run needs no config file edits
+    (and therefore nothing to remember to revert before the real run)."""
+    if smoke_steps is None:
+        return
+    smoke_steps = int(smoke_steps)
+    cfg.training.total_steps = smoke_steps
+    cfg.training.checkpoint_every_n_steps = max(1, smoke_steps // 4)
+    cfg.training.eval_every_n_steps = max(1, smoke_steps // 2)
+    cfg.training.log_every_n_steps = max(1, min(int(cfg.training.get("log_every_n_steps", 50)), smoke_steps // 10))
+    print(f"--smoke_steps {smoke_steps}: total_steps/checkpoint/eval/log intervals overridden for this run only")
+
+
+def derive_coord_scale(adatas: list) -> float:
+    """Auto-derive coord_scale for RandomFourierFeatures-based
+    CoordEmbedding from these samples' REAL coordinate spread — ports the
+    exact formula already established (and real-bug-fixed, 2026-07-17) in
+    src/training/train.py::inject_coord_scale's own call site: mean, across
+    samples, of each sample's per-point (x, y) std. Real HEST-1k
+    coordinates are pixel-scale and different samples/organs can have
+    different physical pixel resolutions (see
+    models/conditioning.py::RandomFourierFeatures' own docstring for the
+    aliasing failure mode this exists to avoid) — this must be computed
+    from the real training data actually being used, not guessed once and
+    reused across every organ."""
+    stds = [float(np.asarray(adata.obsm["spatial"][:, :2]).std()) for adata in adatas]
+    return float(np.mean(stds))
+
+
+def apply_coord_scale(cfg, train_adatas: list) -> None:
+    """Auto-inject cfg.model.params.coord_scale from the real training
+    data (derive_coord_scale) unless a config already sets it explicitly
+    -- same override discipline, and the same architecture-eligibility
+    condition (only architectures whose constructor actually accepts
+    coord_scale), as apply_sample_selection's organ_vocab/tech_vocab
+    injection: Architectures 1/2 and Stage B build a CoordEmbedding and
+    accept it; Architecture 4 (STPathContextEncoder conditions on
+    organ/tech directly) and Stage A (no spatial component at all) do
+    not, and injecting into either would crash with an unexpected
+    keyword argument -- same real bug class apply_sample_selection's own
+    accepts_vocab guard was written to avoid, see that function's
+    docstring."""
+    accepts_coord_scale = (
+        str(cfg.get("model", {}).get("architecture", "")) in ("1", "2")
+        or "stage_a_checkpoint_dir" in cfg.get("model", {})
+    )
+    if not accepts_coord_scale or "params" not in cfg.model:
+        return
+    if "coord_scale" in cfg.model.params and cfg.model.params.coord_scale is not None:
+        return
+    coord_scale = derive_coord_scale(train_adatas)
+    cfg.model.params.coord_scale = coord_scale
+    print(f"coord_scale auto-derived from real training data: {coord_scale:.2f}")
+
+
 def _atomic_savez(cache_path: Path, **arrays) -> None:
     """np.savez, but crash-safe under concurrent writers (e.g. multiple
     GPU processes racing to populate the same cache file the first time).

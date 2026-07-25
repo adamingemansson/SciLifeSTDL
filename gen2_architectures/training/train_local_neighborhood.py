@@ -57,9 +57,10 @@ def _sample_organ_tech(adata) -> tuple[str | None, str | None]:
     return organ, tech
 
 
-def main(config_path: str) -> None:
+def main(config_path: str, smoke_steps: int | None = None) -> None:
     cfg = OmegaConf.load(config_path)
     data_prep.apply_sample_selection(cfg)
+    data_prep.apply_smoke_override(cfg, smoke_steps)
     architecture = str(cfg.model.architecture)
     device = torch.device(cfg.training.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     needs_scfoundation = architecture in ("2", "4")
@@ -73,6 +74,7 @@ def main(config_path: str) -> None:
     print(f"loading {len(train_ids)} training sample(s)...")
     train_adatas, train_images = data_prep.load_multi_sample_with_images(cfg, train_ids)
     gene_names = train_adatas[0].var_names.tolist()
+    data_prep.apply_coord_scale(cfg, train_adatas)
 
     held_out_adatas: dict[str, tuple] = {}
     for split_name, ids in (("validation", validation_ids), ("test", test_ids)):
@@ -213,5 +215,7 @@ def main(config_path: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--smoke_steps", type=int, default=None,
+                         help="run only this many steps (overriding config), with checkpoint/eval/log intervals scaled down to match -- for a quick real-hardware smoke test before the full run")
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, smoke_steps=args.smoke_steps)

@@ -48,10 +48,10 @@ model:
     mlp_ratio: 4.0
     dropout: 0.1
     max_neighbors: 80
-    coord_scale: 1000.0   # verify against this dataset's real coordinate spread before launching -- see README
     decoder_hidden_dim: 1024
-    # organ_vocab/tech_vocab auto-injected at run time from
-    # data.sample_selection -- see training/data_prep.py::apply_sample_selection.
+    # coord_scale/organ_vocab/tech_vocab auto-injected at run time from
+    # the real training data -- see
+    # training/data_prep.py::apply_coord_scale/apply_sample_selection.
 training:
   device: cuda
   seed: 0
