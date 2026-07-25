@@ -6,10 +6,13 @@
 # raw-count log1p, matching STPath's actual pretrained-weight contract).
 #
 # GPT review's #6 concern (riskiest of the 4 -- STPath's frozen weights may
-# be domain-mismatched outside the organs it was pretrained on) is handled
-# here via HALF the compute budget of the other 3 (total_steps below) --
-# be prepared to stop this one early if a smoke run's loss curve looks
-# flat/stuck rather than pushing the full budget regardless.
+# be domain-mismatched outside the organs it was pretrained on) was
+# originally handled here via HALF the compute budget of the other 3;
+# explicitly overridden back to the full budget (2026-07-25, user's own
+# call, matching the other architectures for a fully fair comparison) --
+# be prepared to stop this one early via checkpoint rollback (README
+# section 13) if a run's loss curve looks flat/stuck, rather than a
+# reduced budget hedging against that automatically.
 #
 # KNOWN LIMITATION (see arch4_stpath_hybrid.py's own module docstring):
 # STPathContextEncoder's organ_type/tech_type are FIXED at construction,
@@ -72,7 +75,7 @@ training:
   seed: 0
   lr: 1.0e-4
   total_steps: 1000000   # hard safety cap only -- see max_wall_clock_hours below, the real practical stopping point (README section 12)
-  max_wall_clock_hours: 18   # HALF of the other 3 architectures' ~36h budget -- see GPT review #6 note above
+  max_wall_clock_hours: 36   # matches the other architectures (2026-07-25, user's own call -- was 18h/half, see comment above)
   gradient_clip_val: 1.0
   log_every_n_steps: 50
   checkpoint_every_n_steps: 2000

@@ -43,8 +43,10 @@ changes; defer the bigger scope additions.
 - Mask/confidence embedding on every spot token — `models/components.py::ConfidenceEmbedding`.
 - Image-only and gene-only ablations completing the 3-way decomposition —
   `configs/arch1b_image_only_baseline.yaml`, `configs/arch1c_gene_only_baseline.yaml`.
-- Architecture 4 given **half** the compute budget of the other 3 (its own
-  review flagged this as the riskiest architecture).
+- Architecture 4 was originally planned with **half** the compute budget of
+  the other 3 (its own review flagged this as the riskiest architecture);
+  explicitly bumped back to the full budget 2026-07-25 (user's own call —
+  see section 12's wall-clock budget writeup).
 
 **Deferred** (explicitly out of v1 scope, per the user's choice — GPT
 itself called these more experimental/"nobody does this"):
@@ -272,10 +274,14 @@ Architectures 1–3's `OrganTechEmbedding` is. This architecture is
 restricted to a single organ/tech (Lung/Visium in the shipped config)
 rather than the full multi-organ HEST-1k corpus the other 3 can use.
 
-**Compute budget**: HALF of the other 3 architectures (GPT review's #6
-concern — STPath's frozen weights may be domain-mismatched outside the
-organs it was pretrained on; be prepared to stop early if a smoke run's
-loss curve looks flat/stuck).
+**Compute budget**: originally planned as HALF of the other 3 architectures
+(GPT review's #6 concern — STPath's frozen weights may be
+domain-mismatched outside the organs it was pretrained on); explicitly
+bumped to the SAME full budget as the others (2026-07-25, user's own
+call, for a fully fair comparison) — be prepared to roll back to an
+earlier checkpoint (README section 13) if a run's loss curve looks
+flat/stuck, rather than a reduced budget hedging against that
+automatically.
 
 ## 8. Ablation baselines (Architecture 1 variants)
 
@@ -525,18 +531,16 @@ python3 -m gen2_architectures.training.train_local_neighborhood \
 # Architecture 1 ablations -- train_local_neighborhood_sequential.py (2026-07-25)
 # runs Architecture 1 followed by 1b/1c as ONE unsupervised job on the same GPU
 # (no manual "wait for Arch1, then launch 1b" babysitting). Each config keeps
-# its OWN checkpoint_dir (never collide) and its OWN max_wall_clock_hours --
-# 36h for Architecture 1 itself, 12h each for 1b/1c (already set that way in
-# their configs, since the ablations exist to interpret the primary
-# comparison, not to be trained as deeply as it) -- roughly 60h (2.5 days)
-# total for the chain:
+# its OWN checkpoint_dir (never collide). --max_wall_clock_hours_overrides gives
+# each config an EXPLICIT share of one ~36h window (26h Arch1 + 5h + 5h below),
+# matching every other GPU's ~36h job -- letting each config use its own full
+# standalone YAML budget instead (omit the flag) would make this chain ~60h,
+# well past the others:
 python3 -m gen2_architectures.training.train_local_neighborhood_sequential \
     --configs gen2_architectures/configs/arch1_gpt_baseline.yaml \
               gen2_architectures/configs/arch1b_image_only_baseline.yaml \
-              gen2_architectures/configs/arch1c_gene_only_baseline.yaml
-# --max_wall_clock_hours_override, if you want it, overrides EVERY config in
-# the chain uniformly -- do NOT use it here if Architecture 1 needs its own
-# full budget, since it would cap Architecture 1 too, not just the ablations.
+              gen2_architectures/configs/arch1c_gene_only_baseline.yaml \
+    --max_wall_clock_hours_overrides 26 5 5
 # (or launch each individually via train_local_neighborhood.py if you want them
 # on separate GPUs instead of chained on one)
 
@@ -659,9 +663,18 @@ of steady-state throughput, and per-step cost can drift over a genuinely
 multi-day run (disk I/O contention with other architectures training
 concurrently, etc.). Just say how long you want a run to actually take:
 
-- Architectures 1/1b/1c/2: `max_wall_clock_hours: 36` (~1.5 days) each.
-- Architecture 4: `max_wall_clock_hours: 18` (HALF — see GPT review #6's
-  own risk note in that config).
+- Architectures 1/2/4: `max_wall_clock_hours: 36` (~1.5 days) each.
+  (Architecture 4 was originally planned at 18h/half, per GPT review's #6
+  risk note in that config — explicitly bumped to the full 36h 2026-07-25,
+  user's own call, for a fully fair comparison; roll back via checkpoint
+  history, section 13, if a run's loss curve looks flat/stuck instead.)
+- Architecture 1's chain with its 1b/1c ablations
+  (`train_local_neighborhood_sequential.py`): give each config its own
+  EXPLICIT share of one shared ~36h window via
+  `--max_wall_clock_hours_overrides` (e.g. `26 5 5`) rather than letting
+  each use its own full standalone budget, which would make the whole
+  chain run much longer than every other GPU's job — see that script's
+  own docstring.
 - Architecture 3 (Stage A + Stage B): see section 10's combined-run
   section below — one `--total_hours` flag covers both stages together.
 
@@ -890,7 +903,7 @@ gen2_architectures/
   scripts/
     inventory_hest1k.py                  NEW  human-readable local-vs-catalog Visium coverage report by organ
     rollback_checkpoint.py               NEW  operator CLI for checkpoint history (section 13)
-  tests/                                 105 tests, synthetic data only, no real HEST-1k/GPU required
+  tests/                                 108 tests, synthetic data only, no real HEST-1k/GPU required
     test_components.py, test_arch1_arch2.py, test_arch3.py, test_arch4.py,
     test_checkpoint.py, test_diagnostics.py, test_masked_item.py, test_train_local_neighborhood_integration.py,
     test_hest1k_catalog.py, test_apply_sample_selection.py, test_coord_scale_and_smoke_override.py,
