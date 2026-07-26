@@ -69,7 +69,7 @@ training:
   log_every_n_steps: 50
   checkpoint_every_n_steps: 2000
   checkpoint_keep_last: 2   # step-numbered history + rollback (README section 13) -- 50GB total server budget, tune down if disk gets tight
-  eval_every_n_steps: 5000
+  eval_every_n_steps: 100000000   # periodic in-training eval skipped (2026-07-26, user call) -- only the final held-out test evaluation runs now
   checkpoint_dir: gen2_architectures/results/arch1b_image_only_baseline
   image_mode: target_zero
   context_gex_mode: zero   # THE ablation: no gene expression signal at all, image-only

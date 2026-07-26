@@ -75,12 +75,12 @@ training:
   seed: 0
   lr: 1.0e-4
   total_steps: 100000000   # hard safety cap only, deliberately far above any real run's reach (2026-07-25: 1,000,000 was too low -- a fast architecture could exhaust it in a few hours, ending the run early despite max_wall_clock_hours below, the real practical stopping point (README section 12)
-  max_wall_clock_hours: 36   # matches the other architectures (2026-07-25, user's own call -- was 18h/half, see comment above)
+  max_wall_clock_hours: 24   # lowered from 36h 2026-07-26, user call
   gradient_clip_val: 1.0
   log_every_n_steps: 50
   checkpoint_every_n_steps: 2000
   checkpoint_keep_last: 2   # step-numbered history + rollback (README section 13) -- 50GB total server budget, tune down if disk gets tight
-  eval_every_n_steps: 5000
+  eval_every_n_steps: 100000000   # periodic in-training eval skipped (2026-07-26, user call) -- only the final held-out test evaluation runs now
   checkpoint_dir: gen2_architectures/results/arch4_stpath_hybrid
   image_mode: target_zero
   context_gex_mode: full
