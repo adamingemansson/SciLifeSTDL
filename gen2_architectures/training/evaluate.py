@@ -41,12 +41,14 @@ def evaluate_sample(
 ) -> dict:
     """Evaluate one held-out sample's test (or validation) mask bank.
 
-    split: "test" or "validation" — controls which records ensure_mask_bank
-    exposes (split_records inside evaluate_model_on_mask_bank always reads
-    the "test" split; validation-time monitoring during training should use
-    a SEPARATE, smaller check via the same mechanism if needed — this
-    function evaluates the immutable test bank, matching the original
-    codebase's own "never train against the actual test split" discipline).
+    split: "test" or "validation" — controls which mask pool actually gets
+    scored (evaluation.n_test_masks vs the smaller evaluation.
+    n_validation_masks). Periodic in-training monitoring should pass
+    "validation" so it stays cheap; the one true held-out report at the end
+    of a run should pass "test" for the full suite. (2026-07-26 bugfix:
+    this used to be ignored downstream — evaluate_model_on_mask_bank always
+    scored the "test" pool regardless, so periodic checks cost exactly as
+    much as the final evaluation.)
     """
     coords3d = loaders.get_coords_3d(adata)
     evaluation_cfg = cfg.get("evaluation", {})
@@ -68,7 +70,7 @@ def evaluate_sample(
     tech = str(adata.obs["tech"].iloc[0]) if "tech" in adata.obs else None
     return evaluate_model_on_mask_bank(
         model, cfg, adata, coords3d, expr, adata.obs["slice_id"].to_numpy(), images, bank,
-        gene_inputs, output_path=Path(output_dir) / f"audit_test_metrics_{sample_id}.json",
+        gene_inputs, output_path=Path(output_dir) / f"audit_{split}_metrics_{sample_id}.json",
         organ=organ, tech=tech,
         gene_panels=resolve_fixed_gene_panels(cfg),
         raw_counts=adata.layers["raw_counts"] if "raw_counts" in adata.layers else None,
@@ -77,4 +79,5 @@ def evaluate_sample(
             if "_scilifestdl_raw_library_size" in adata.obs else None
         ),
         expression_target_sum=float(cfg.data.get("expression_target_sum", 1e4)),
+        split=split,
     )

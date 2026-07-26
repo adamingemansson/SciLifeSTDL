@@ -244,13 +244,29 @@ def evaluate_model_on_mask_bank(
     raw_counts: np.ndarray | None = None,
     raw_library_size: np.ndarray | None = None,
     expression_target_sum: float = 1e4,
+    split: str = "test",
 ) -> dict[str, Any]:
-    """Evaluate predictive means and uncertainty on untouched test masks.
+    """Evaluate predictive means and uncertainty on untouched masks.
 
     Results are reported separately for each image-availability mode. The
     pseudo-label diagnostic is deliberately named ``spatial_domain`` rather
     than ``cell_type`` because the labels are unsupervised Leiden domains from
     the complete slide, not curated biological annotations.
+
+    split (2026-07-26 bugfix): selects which mask-bank pool to score against
+    -- "validation" (evaluation.n_validation_masks, smaller) for periodic
+    in-training monitoring, "test" (evaluation.n_test_masks, the full/final
+    suite) for the one true held-out report at the end of a run. This used
+    to be hardcoded to always read the "test" pool regardless of what the
+    caller passed, so periodic validation-time checks during training cost
+    exactly as much as the final evaluation -- with n_test_masks=16, that
+    meant 16 sequential RandomForestClassifier fits (spatial-domain
+    plausibility) plus a full PCA fit, every eval_every_n_steps, for the
+    life of a run. Real-server observation: a full 16-mask evaluation
+    with 4 concurrent architectures competing for BLAS threads (see
+    threadpool_limits below) still took multiple minutes even after fixing
+    thread oversubscription -- an unavoidable cost for the final report,
+    but wasteful to pay every 5000 steps just to monitor training.
 
     raw_counts/raw_library_size (2026-07-24, notebook-comparability check):
     optional, row/column-aligned with ``expr`` (see
@@ -271,9 +287,9 @@ def evaluate_model_on_mask_bank(
     partial_path = output_path.with_suffix(output_path.suffix + ".partial")
     evaluation_started = time.monotonic()
     evaluation = cfg.get("evaluation", {})
-    records = split_records(bank, "test")
+    records = split_records(bank, split)
     if not records:
-        raise ValueError("mask bank contains no test records")
+        raise ValueError(f"mask bank contains no {split!r} records")
     n_samples = max(1, int(evaluation.get("n_samples", 20)))
     sampling_seed = int(evaluation.get("sampling_seed", 1_200_000))
     image_modes = list(evaluation.get("image_modes", ["full", "target_zero", "all_zero", "shuffled"]))
