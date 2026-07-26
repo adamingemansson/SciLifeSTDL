@@ -753,6 +753,7 @@ class MLPGeneEncoder(nn.Module):
 
 
 _NOVAE_MODEL_CACHE: dict[str, object] = {}
+_SCFOUNDATION_MODEL_CACHE: dict[str, object] = {}
 
 
 # Bumped whenever precompute_scfoundation_features's actual preprocessing
@@ -894,8 +895,22 @@ def precompute_scfoundation_features(
         totals = np.maximum(totals, 1.0)
         normalized = np.log1p(aligned / totals * 1e4)
 
-    pretrainmodel, pretrainconfig = load_model_frommmf(scfoundation_model_path, key="cell")
-    pretrainmodel.eval()
+    # 2026-07-26 bugfix: this used to call load_model_frommmf unconditionally,
+    # reloading the full 100M-parameter checkpoint from disk on EVERY call.
+    # build_scfoundation_provider calls this once per SAMPLE while building
+    # providers for the whole train+validation+test cohort -- for a
+    # multi-organ config (100+ samples) that's 100+ full model reloads
+    # before training even starts (observed: Architecture 2 burned ~28 CPU-
+    # hours with zero checkpoints written, stuck entirely in this phase).
+    # Same reuse-one-model-per-process reasoning as _NOVAE_MODEL_CACHE above.
+    cache_key = str(scfoundation_model_path)
+    cached = _SCFOUNDATION_MODEL_CACHE.get(cache_key)
+    if cached is None:
+        pretrainmodel, pretrainconfig = load_model_frommmf(scfoundation_model_path, key="cell")
+        pretrainmodel.eval()
+        _SCFOUNDATION_MODEL_CACHE[cache_key] = (pretrainmodel, pretrainconfig)
+    else:
+        pretrainmodel, pretrainconfig = cached
     device = next(pretrainmodel.parameters()).device
 
     all_embeddings = []
