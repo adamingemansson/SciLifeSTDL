@@ -396,12 +396,27 @@ def evaluate_model_on_mask_bank(
     if domain_labels is not None:
         from gen2_architectures.evaluation.cell_type_classifier import SpatialDomainPlausibilityClassifier
         n_estimators = int(evaluation.get("spatial_domain_n_estimators", 100))
-        for record in records:
+        # 2026-07-26: this loop used to run fully silent -- a real-server
+        # observation showed it can take many minutes for records=16 (100
+        # trees x 16 sequential fits, n_jobs=1) with ZERO print in between,
+        # which looked identical to a genuine hang from the outside. Added
+        # a progress print per fit, and bumped n_jobs from 1 to a small
+        # bounded value (not unbounded -- that's exactly the BLAS-
+        # oversubscription mistake fixed above for _fixed_pca/kmeans) so
+        # each fit is meaningfully faster even with several architectures
+        # training concurrently on the same server.
+        for fit_index, record in enumerate(records):
             context_mask, _ = record_masks(record, adata.obs_names)
+            fit_started = time.monotonic()
             try:
                 domain_classifiers[int(record["index"])] = SpatialDomainPlausibilityClassifier(
-                    n_estimators=n_estimators, seed=int(record["seed"])
+                    n_estimators=n_estimators, seed=int(record["seed"]), n_jobs=4,
                 ).fit(metric_expr[context_mask], domain_labels[context_mask])
+                print(
+                    f"audit evaluation: spatial-domain classifier {fit_index + 1}/{len(records)} "
+                    f"fit in {time.monotonic() - fit_started:.1f}s",
+                    flush=True,
+                )
             except Exception as exc:
                 print(f"spatial-domain classifier fit failed for mask {record['index']}: {exc}")
 

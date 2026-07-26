@@ -90,13 +90,13 @@ def cluster_pseudo_labels(
 class SpatialDomainPlausibilityClassifier:
     """Classify generated expression into labels learned from real context."""
 
-    def __init__(self, n_estimators: int = 100, seed: int = 0):
+    def __init__(self, n_estimators: int = 100, seed: int = 0, n_jobs: int = 1):
         from sklearn.ensemble import RandomForestClassifier
 
         self.model = RandomForestClassifier(
             n_estimators=int(n_estimators),
             random_state=int(seed),
-            n_jobs=1,
+            n_jobs=int(n_jobs),
         )
 
     def fit(self, expression: np.ndarray, labels: np.ndarray) -> "SpatialDomainPlausibilityClassifier":
