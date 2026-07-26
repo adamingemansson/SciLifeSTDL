@@ -165,8 +165,23 @@ def _resolve_gene_panels(
 
 
 def _fixed_pca(records, obs_names, coords3d, expr, requested_components: int, k: int):
-    """Fit one PCA basis and dimension for the complete test mask bank."""
+    """Fit one PCA basis and dimension for the complete test mask bank.
+
+    2026-07-26: wrapped in threadpoolctl.threadpool_limits -- BLAS
+    (OpenBLAS/MKL) defaults to spawning one thread per core with no
+    awareness of other processes. With 4 architectures training
+    concurrently on the same server, each hitting this PCA fit around the
+    same time caused massive oversubscription (observed directly: `top`
+    showed a single one of these calls consuming ~9700% CPU, ~97 cores, on
+    a box also running 3 other equally CPU-hungry jobs) -- a fit that
+    should take seconds stretched to many hours of real wall-clock time
+    from contention/cache-thrashing alone, not a hang or deadlock (io
+    counters and py-spy-equivalent /proc inspection confirmed the process
+    was genuinely computing, not stuck). n_components here is always small
+    (evaluation.pca_n_components, typically 50), so capping BLAS threads
+    costs essentially nothing in the single-job case."""
     from sklearn.decomposition import PCA
+    from threadpoolctl import threadpool_limits
 
     context_patches = []
     min_query = None
@@ -183,7 +198,9 @@ def _fixed_pca(records, obs_names, coords3d, expr, requested_components: int, k:
     )
     if n_components < 2:
         return None, 0
-    return PCA(n_components=n_components, random_state=0).fit(reference), n_components
+    with threadpool_limits(limits=8):
+        pca = PCA(n_components=n_components, random_state=0).fit(reference)
+    return pca, n_components
 
 
 def _pseudo_domain_labels(adata, evaluation):

@@ -42,23 +42,28 @@ def cluster_pseudo_labels(
     if method == "kmeans":
         from sklearn.cluster import MiniBatchKMeans
         from sklearn.decomposition import PCA
+        from threadpoolctl import threadpool_limits
 
-        x = _dense_expression(adata)
-        max_components = min(50, x.shape[0] - 1, x.shape[1])
-        if max_components >= 2:
-            x = PCA(n_components=max_components, random_state=seed).fit_transform(x)
-        if n_clusters is None:
-            # A modest, data-size-aware domain count.  The resolution multiplier
-            # provides a familiar control without pretending it is identical to
-            # Leiden's resolution parameter.
-            n_clusters = int(round(max(2.0, np.sqrt(adata.n_obs / 2.0)) * float(resolution)))
-        n_clusters = max(2, min(int(n_clusters), adata.n_obs))
-        labels = MiniBatchKMeans(
-            n_clusters=n_clusters,
-            random_state=seed,
-            n_init=10,
-            batch_size=min(1024, max(32, adata.n_obs)),
-        ).fit_predict(x)
+        # 2026-07-26: capped like audit_evaluation.py's _fixed_pca -- same
+        # BLAS-oversubscription reasoning (multiple concurrent training
+        # jobs each spawning one thread per core for this PCA/kmeans call).
+        with threadpool_limits(limits=8):
+            x = _dense_expression(adata)
+            max_components = min(50, x.shape[0] - 1, x.shape[1])
+            if max_components >= 2:
+                x = PCA(n_components=max_components, random_state=seed).fit_transform(x)
+            if n_clusters is None:
+                # A modest, data-size-aware domain count.  The resolution multiplier
+                # provides a familiar control without pretending it is identical to
+                # Leiden's resolution parameter.
+                n_clusters = int(round(max(2.0, np.sqrt(adata.n_obs / 2.0)) * float(resolution)))
+            n_clusters = max(2, min(int(n_clusters), adata.n_obs))
+            labels = MiniBatchKMeans(
+                n_clusters=n_clusters,
+                random_state=seed,
+                n_init=10,
+                batch_size=min(1024, max(32, adata.n_obs)),
+            ).fit_predict(x)
         return labels.astype(str)
 
     if method == "leiden":
