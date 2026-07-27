@@ -73,7 +73,7 @@ training:
     stage3_pearson_weight: 0.3
 evaluation:
   spatial_domain_plausibility: false   # disabled 2026-07-26 -- 16 sequential RandomForestClassifier fits on a ~17k-gene panel made real-server evaluations take many minutes even single-job; this is a secondary diagnostic, not one of the core metrics (PCC/RMSE/ST-FID/ST-MMD are untouched)
-  compute_st_fid_mmd: true   # re-enabled 2026-07-27, user call -- see _fixed_pca's own docstring for the still-unresolved slowness this may reproduce
+  compute_st_fid_mmd: true   # re-enabled 2026-07-27, user call -- the earlier slowness (uncapped BLAS threading in the PCA fit) and the numerical-instability bug (near-singular covariance producing garbage negative "FID" values) are both fixed now, see _fixed_pca/_fid_n_components' own docstrings
   mask_bank_dir: gen2_architectures/results/mask_banks/arch3_stage_b_spatial
   n_validation_masks: 8
   n_test_masks: 16
