@@ -320,9 +320,16 @@ def evaluate_model_on_mask_bank(
         metric_gene_names = [str(adata.var_names[idx]) for idx in idx_np]
         metric_raw_counts = None if raw_counts is None else raw_counts[:, idx_np]
     panel_indices, panel_metadata = _resolve_gene_panels(metric_gene_names, gene_panels)
+    # 2026-07-27: _fixed_pca and _resume_signature (below) are the only two
+    # operations that run ONCE, before the per-mask loop's own progress
+    # prints ever fire -- added timing around both so a still-silent run
+    # shows exactly which one it's stuck in, instead of leaving that as an
+    # unresolved guess between the two.
+    _pca_started = time.monotonic()
     pca, effective_pca = _fixed_pca(
         records, adata.obs_names, coords3d, metric_expr, requested_pca, k
     )
+    print(f"audit evaluation: PCA basis fit in {time.monotonic() - _pca_started:.1f}s", flush=True)
     domain_labels, domain_label_source = _pseudo_domain_labels(adata, evaluation)
 
     model_device = next(model.parameters(), torch.empty(0)).device
@@ -358,7 +365,13 @@ def evaluate_model_on_mask_bank(
         },
     }
 
+    _signature_started = time.monotonic()
     signature = _resume_signature(cfg, records, output_path, gene_panels=gene_panels)
+    print(
+        f"audit evaluation: resume-signature computed in {time.monotonic() - _signature_started:.1f}s "
+        f"(hashes the checkpoint's trainable_weights.pt)",
+        flush=True,
+    )
     if signature is not None and partial_path.is_file():
         try:
             partial = json.loads(partial_path.read_text())
