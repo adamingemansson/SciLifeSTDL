@@ -28,12 +28,23 @@ def _fid_n_components(pca_components: int, context_n: int, context_d: int, query
     embeddings, so the component count must respect both sample counts as
     well as the feature width. The one-component floor is retained for
     backward-compatible diagnostics.
+
+    2026-07-27 bugfix: the query_n term used to only require query_n - 1
+    components -- i.e. just one more sample than dimensions. A covariance
+    matrix estimated from barely-more-samples-than-dimensions is a classic
+    near-singular case; frechet_distance's scipy.linalg.sqrtm of a
+    near-singular matrix product produces garbage, observed directly on a
+    real run as ST-FID values in the thousands, negative (a true FID can
+    never be negative). Tightened to require query_n >= 5x the component
+    count -- a standard rule of thumb for a covariance estimate that isn't
+    dominated by sampling noise -- for every mask, not just the smallest
+    one to merely exceed the component count.
     """
     return max(1, min(
         int(pca_components),
         max(1, int(context_n) - 1),
         max(1, int(context_d)),
-        max(1, int(query_n) - 1),
+        max(1, int(query_n) // 5),
     ))
 
 
