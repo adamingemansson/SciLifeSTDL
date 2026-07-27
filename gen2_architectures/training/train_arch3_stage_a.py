@@ -93,7 +93,9 @@ def main(config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_
     rng = random.Random(int(cfg.training.get("seed", 0)))
     n_spots_total = pooled_t.shape[0]
     model.train()
+    last_step = start_step
     for step in range(start_step, total_steps):
+        last_step = step
         if wall_clock_deadline is not None and time.monotonic() >= wall_clock_deadline:
             print(f"step {step}/{total_steps}: max_wall_clock_hours budget reached, stopping training early")
             break
@@ -130,8 +132,10 @@ def main(config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_
                 keep_last=checkpoint_keep_last,
             )
 
+    # 2026-07-27 bugfix: see train_local_neighborhood.py's own comment --
+    # save the actual last step reached, not the total_steps safety cap.
     checkpoint.save_checkpoint(
-        model, {"n_genes": n_genes, "params": params}, gene_names, checkpoint_dir, total_steps,
+        model, {"n_genes": n_genes, "params": params}, gene_names, checkpoint_dir, last_step,
         keep_last=checkpoint_keep_last,
     )
     print(f"Stage A pretraining complete. Checkpoint at {checkpoint_dir}")

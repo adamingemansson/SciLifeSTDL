@@ -152,7 +152,9 @@ def main(
 
     rng = random.Random(int(cfg.training.get("seed", 0)))
     model.train()
+    last_step = start_step
     for step in range(start_step, total_steps):
+        last_step = step
         if wall_clock_deadline is not None and time.monotonic() >= wall_clock_deadline:
             print(f"step {step}/{total_steps}: max_wall_clock_hours budget reached, stopping training early")
             break
@@ -222,8 +224,16 @@ def main(
                 print(f"  [val step {step}] {sid}: PCC={primary['pcc']['mean']:.4f} RMSE={primary['rmse']['mean']:.4f}")
             model.train()
 
+    # 2026-07-27 bugfix: used to save this labeled `total_steps` (the huge
+    # safety cap, e.g. 100,000,000) instead of the actual step training
+    # stopped at -- harmless under the old step-count-based stopping design
+    # (the loop always ran to exactly total_steps), wrong once
+    # max_wall_clock_hours became the real early-stopping mechanism.
+    # Observed directly: a real checkpoint printed "loaded checkpoint at
+    # step 100000000" instead of the real ~200,000-ish step it actually
+    # reached.
     checkpoint.save_checkpoint(
-        model, _model_config_dict(cfg, scfoundation_dim), gene_names, checkpoint_dir, total_steps,
+        model, _model_config_dict(cfg, scfoundation_dim), gene_names, checkpoint_dir, last_step,
         keep_last=checkpoint_keep_last,
     )
 

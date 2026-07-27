@@ -129,7 +129,9 @@ def main(
 
     rng = random.Random(int(cfg.training.get("seed", 0)))
     model.train()
+    last_step = start_step
     for step in range(start_step, total_steps):
+        last_step = step
         if wall_clock_deadline is not None and time.monotonic() >= wall_clock_deadline:
             print(f"step {step}/{total_steps}: max_wall_clock_hours budget reached, stopping training early")
             break
@@ -196,9 +198,11 @@ def main(
                 print(f"  [val step {step}] {sid}: PCC={primary['pcc']['mean']:.4f} RMSE={primary['rmse']['mean']:.4f}")
             model.train()
 
+    # 2026-07-27 bugfix: see train_local_neighborhood.py's own comment --
+    # save the actual last step reached, not the total_steps safety cap.
     checkpoint.save_checkpoint(
         model, {"stage_a_checkpoint_dir": str(cfg.model.stage_a_checkpoint_dir), "params": params},
-        gene_names, checkpoint_dir, total_steps, keep_last=checkpoint_keep_last,
+        gene_names, checkpoint_dir, last_step, keep_last=checkpoint_keep_last,
     )
 
     if skip_final_eval:

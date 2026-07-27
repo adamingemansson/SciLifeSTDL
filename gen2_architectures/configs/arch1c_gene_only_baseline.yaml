@@ -75,6 +75,7 @@ training:
     stage2_pearson_weight: 0.1
     stage3_pearson_weight: 0.3
 evaluation:
+  spatial_domain_plausibility: false   # disabled 2026-07-26 -- 16 sequential RandomForestClassifier fits on a ~17k-gene panel made real-server evaluations take many minutes even single-job; this is a secondary diagnostic, not one of the core metrics (PCC/RMSE/ST-FID/ST-MMD are untouched)
   # Same mask_bank_dir as arch1_gpt_baseline.yaml/arch1b (identical masking
   # config -> identical held-out masks) so the 3-way decomposition compares
   # the same held-out regions across all three variants.
