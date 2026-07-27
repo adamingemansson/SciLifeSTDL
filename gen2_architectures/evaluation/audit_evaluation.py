@@ -181,6 +181,7 @@ def _fixed_pca(records, obs_names, coords3d, expr, requested_components: int, k:
     (evaluation.pca_n_components, typically 50), so capping BLAS threads
     costs essentially nothing in the single-job case."""
     from sklearn.decomposition import PCA
+    from threadpoolctl import threadpool_limits
 
     # 2026-07-27: fine-grained timing added per sub-step -- the whole
     # function was previously only timed as one opaque block from the
@@ -213,25 +214,23 @@ def _fixed_pca(records, obs_names, coords3d, expr, requested_components: int, k:
     )
     if n_components < 2:
         return None, 0
-    # 2026-07-27: dropped the threadpool_limits(limits=8) wrapper here --
-    # per-sub-step timing (above) pinned a real hang to exactly this
-    # PCA.fit call, with the per-record pooling immediately before it
-    # confirmed fast (0.3s for all 16 records). threadpool_limits +
-    # multiple simultaneously-loaded BLAS backends (numpy's own OpenBLAS
-    # vs. torch's bundled MKL/OpenBLAS, both live in this process since
-    # the model is already on a CUDA device by this point) is a known
-    # source of exactly this kind of silent hang. The original
-    # oversubscription concern (see this function's own docstring) was
-    # about 4 architectures training concurrently and all hitting this
-    # PCA fit around the same time; evaluation now runs as its own
-    # standalone, typically solo process (run_held_out_evaluation.py, or
-    # periodic in-training eval which defaults off), so that risk is much
-    # smaller than a confirmed hang. svd_solver explicitly forced to
-    # "randomized" rather than left on "auto" -- extracting a small
-    # n_components from a wide matrix is exactly what it's for, and this
-    # removes any dependency on sklearn's version-specific auto-heuristic.
+    # 2026-07-27, reversed: removing threadpool_limits entirely (previous
+    # commit) was the wrong direction. Measured directly on the real server
+    # right after that change: this PCA.fit call ran at ~10111% CPU (~101
+    # cores) and burned 655 CPU-MINUTES in ~6 minutes of wall clock for a
+    # (1280, 16979) matrix extracting 50 components -- genuine computation,
+    # not a hang, but wildly disproportionate to the problem size. Letting
+    # BLAS spawn essentially every core on the box for a task this small
+    # means thread-coordination overhead dominates the actual useful work.
+    # Re-capping, but tighter -- limits=1 (fully single-threaded), since a
+    # matrix this size has no realistic use for multiple BLAS threads in
+    # the first place. svd_solver explicitly forced to "randomized" rather
+    # than left on "auto" -- extracting a small n_components from a wide
+    # matrix is exactly what it's for, and this removes any dependency on
+    # sklearn's version-specific auto-heuristic.
     fit_started = time.monotonic()
-    pca = PCA(n_components=n_components, random_state=0, svd_solver="randomized").fit(reference)
+    with threadpool_limits(limits=1):
+        pca = PCA(n_components=n_components, random_state=0, svd_solver="randomized").fit(reference)
     print(
         f"audit evaluation: _fixed_pca's PCA.fit ({n_components} components) "
         f"took {time.monotonic() - fit_started:.1f}s",
