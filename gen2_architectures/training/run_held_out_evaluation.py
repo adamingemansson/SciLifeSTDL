@@ -13,15 +13,17 @@ whenever convenient, as many times as needed (e.g. after a code fix to
 the evaluation harness itself), on a totally separate, disposable process.
 
 Handles Architectures 1/2/4 (train_local_neighborhood.py's checkpoint
-layout). Architecture 3 Stage B has its own model-construction shape
-(needs a loaded Stage A autoencoder) and is not yet supported here.
+layout) AND Architecture 3 Stage B (train_arch3_stage_b.py's checkpoint
+layout -- detected by the saved model_config.json having a
+"stage_a_checkpoint_dir" key instead of an "architecture" key).
 
-Loads gene_names AND the exact trained model_config (architecture +
-params + scfoundation_dim) directly from the checkpoint directory itself
--- NOT by reloading and re-deriving them from the full training sample
-set the way the training scripts do -- so this never needs to touch the
-(often large, multi-organ) training data at all, only the held-out TEST
-samples actually being scored.
+Loads gene_names AND the exact trained model_config directly from the
+checkpoint directory itself -- NOT by reloading and re-deriving them from
+the full training sample set the way the training scripts do -- so this
+never needs to touch the (often large, multi-organ) training data at all,
+only the held-out TEST samples actually being scored. For Stage B this
+also means the Stage A autoencoder checkpoint path comes from the saved
+config (cfg.model.stage_a_checkpoint_dir is never read).
 
 Usage:
     python3 -m gen2_architectures.training.run_held_out_evaluation \\
@@ -40,6 +42,24 @@ from gen2_architectures.training import checkpoint, data_prep, evaluate
 from gen2_architectures.training.train_local_neighborhood import build_model
 
 
+def _load_stage_b_model(saved_model_config: dict, gene_names: list[str], device):
+    from gen2_architectures.models.arch3_stage_a_autoencoder import DenoisingTranscriptomeAutoencoder
+    from gen2_architectures.models.arch3_stage_b_latent_transformer import Architecture3StageB
+
+    stage_a_checkpoint_dir = Path(saved_model_config["stage_a_checkpoint_dir"])
+    stage_a_config = json.loads((stage_a_checkpoint_dir / "model_config.json").read_text())
+    n_genes = len(gene_names)
+    if stage_a_config["n_genes"] != n_genes:
+        raise ValueError(
+            f"Stage A was pretrained on {stage_a_config['n_genes']} genes, but this Stage B "
+            f"checkpoint's gene panel has {n_genes} genes -- mismatched checkpoints"
+        )
+    autoencoder = DenoisingTranscriptomeAutoencoder(n_genes=n_genes, **stage_a_config["params"])
+    checkpoint.load_trainable_state(autoencoder, stage_a_checkpoint_dir)
+    autoencoder = autoencoder.to(device)
+    return Architecture3StageB(autoencoder, **saved_model_config["params"]).to(device)
+
+
 def main(config_path: str) -> None:
     cfg = OmegaConf.load(config_path)
     data_prep.apply_sample_selection(cfg)
@@ -55,9 +75,8 @@ def main(config_path: str) -> None:
         )
     saved_model_config = json.loads(model_config_path.read_text())
     gene_names = json.loads(gene_names_path.read_text())
-    architecture = str(saved_model_config["architecture"])
-    scfoundation_dim = saved_model_config.get("scfoundation_dim")
-    model_cfg = OmegaConf.create({"model": {"architecture": architecture, "params": saved_model_config["params"]}})
+    is_stage_b = "stage_a_checkpoint_dir" in saved_model_config
+    architecture = "3b" if is_stage_b else str(saved_model_config["architecture"])
 
     test_ids = list(cfg.data.get("test_sample_ids", []))
     if not test_ids:
@@ -74,7 +93,13 @@ def main(config_path: str) -> None:
             adata = held_out[str(sid)][0]
             scfoundation_providers[str(sid)] = data_prep.build_scfoundation_provider(cfg, adata, str(sid))
 
-    model = build_model(model_cfg, gene_names, scfoundation_dim).to(device)
+    if is_stage_b:
+        model = _load_stage_b_model(saved_model_config, gene_names, device)
+    else:
+        model_cfg = OmegaConf.create(
+            {"model": {"architecture": architecture, "params": saved_model_config["params"]}}
+        )
+        model = build_model(model_cfg, gene_names, saved_model_config.get("scfoundation_dim")).to(device)
     checkpoint.load_trainable_state(model, checkpoint_dir)
     step = checkpoint.load_training_state(checkpoint_dir).get("step", 0)
     print(f"loaded checkpoint at step {step}, architecture {architecture}, {len(gene_names)} genes")
