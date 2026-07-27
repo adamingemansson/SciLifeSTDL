@@ -6,7 +6,7 @@ from gen2_architectures.training import train_local_neighborhood_sequential
 def test_runs_every_config_in_order(monkeypatch):
     calls = []
 
-    def fake_main(config_path, smoke_steps=None, max_wall_clock_hours_override=None):
+    def fake_main(config_path, smoke_steps=None, max_wall_clock_hours_override=None, **_kwargs):
         calls.append((config_path, smoke_steps, max_wall_clock_hours_override))
 
     monkeypatch.setattr(train_local_neighborhood_sequential.train_local_neighborhood, "main", fake_main)
@@ -20,7 +20,7 @@ def test_smoke_steps_and_hours_override_passed_to_every_config(monkeypatch):
     calls = []
     monkeypatch.setattr(
         train_local_neighborhood_sequential.train_local_neighborhood, "main",
-        lambda config_path, smoke_steps=None, max_wall_clock_hours_override=None:
+        lambda config_path, smoke_steps=None, max_wall_clock_hours_override=None, **_kwargs:
         calls.append((config_path, smoke_steps, max_wall_clock_hours_override)),
     )
 
@@ -32,7 +32,7 @@ def test_smoke_steps_and_hours_override_passed_to_every_config(monkeypatch):
 def test_a_failure_in_one_config_stops_the_chain(monkeypatch):
     calls = []
 
-    def fake_main(config_path, smoke_steps=None, max_wall_clock_hours_override=None):
+    def fake_main(config_path, smoke_steps=None, max_wall_clock_hours_override=None, **_kwargs):
         calls.append(config_path)
         if config_path == "b.yaml":
             raise RuntimeError("real training failure")
@@ -54,7 +54,7 @@ def test_per_config_hours_overrides_give_each_config_a_different_budget(monkeypa
     calls = []
     monkeypatch.setattr(
         train_local_neighborhood_sequential.train_local_neighborhood, "main",
-        lambda config_path, smoke_steps=None, max_wall_clock_hours_override=None:
+        lambda config_path, smoke_steps=None, max_wall_clock_hours_override=None, **_kwargs:
         calls.append((config_path, max_wall_clock_hours_override)),
     )
 
@@ -80,3 +80,16 @@ def test_uniform_and_per_config_overrides_are_mutually_exclusive():
             max_wall_clock_hours_override=10.0,
             max_wall_clock_hours_overrides=[5.0, 5.0],
         )
+
+
+def test_skip_final_eval_passed_through_to_every_config(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        train_local_neighborhood_sequential.train_local_neighborhood, "main",
+        lambda config_path, smoke_steps=None, max_wall_clock_hours_override=None, skip_final_eval=False:
+        calls.append((config_path, skip_final_eval)),
+    )
+
+    train_local_neighborhood_sequential.main(["a.yaml", "b.yaml"], skip_final_eval=True)
+
+    assert calls == [("a.yaml", True), ("b.yaml", True)]

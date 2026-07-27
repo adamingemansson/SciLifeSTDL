@@ -37,6 +37,7 @@ def main(
     config_paths: list[str], smoke_steps: int | None = None,
     max_wall_clock_hours_override: float | None = None,
     max_wall_clock_hours_overrides: list[float] | None = None,
+    skip_final_eval: bool = False,
 ) -> None:
     if max_wall_clock_hours_override is not None and max_wall_clock_hours_overrides is not None:
         raise ValueError(
@@ -58,6 +59,7 @@ def main(
               f"{f' (max_wall_clock_hours={hours_override})' if hours_override is not None else ''} ===")
         train_local_neighborhood.main(
             config_path, smoke_steps=smoke_steps, max_wall_clock_hours_override=hours_override,
+            skip_final_eval=skip_final_eval,
         )
         print(f"=== [{i + 1}/{len(config_paths)}] done: {config_path} ===")
 
@@ -78,8 +80,12 @@ if __name__ == "__main__":
                               "chain) -- use this when the configs need different depths within "
                               "one shared total wall-clock window. Mutually exclusive with "
                               "--max_wall_clock_hours_override.")
+    parser.add_argument("--skip_final_eval", action="store_true",
+                         help="Passed through to every config in the chain -- skip the final "
+                              "held-out test evaluation entirely (the checkpoint is still saved).")
     args = parser.parse_args()
     main(
         args.configs, args.smoke_steps,
         args.max_wall_clock_hours_override, args.max_wall_clock_hours_overrides,
+        skip_final_eval=args.skip_final_eval,
     )

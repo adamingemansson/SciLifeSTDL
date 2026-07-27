@@ -6,10 +6,10 @@ from gen2_architectures.training import train_arch3_combined
 def test_splits_total_hours_and_calls_both_stages_in_order(monkeypatch):
     calls = []
 
-    def fake_stage_a_main(config_path, smoke_steps=None, max_wall_clock_hours_override=None):
+    def fake_stage_a_main(config_path, smoke_steps=None, max_wall_clock_hours_override=None, **_kwargs):
         calls.append(("stage_a", config_path, smoke_steps, max_wall_clock_hours_override))
 
-    def fake_stage_b_main(config_path, smoke_steps=None, max_wall_clock_hours_override=None):
+    def fake_stage_b_main(config_path, smoke_steps=None, max_wall_clock_hours_override=None, **_kwargs):
         calls.append(("stage_b", config_path, smoke_steps, max_wall_clock_hours_override))
 
     monkeypatch.setattr(train_arch3_combined.train_arch3_stage_a, "main", fake_stage_a_main)
@@ -42,10 +42,10 @@ def test_stage_a_runs_before_stage_b(monkeypatch):
 def test_smoke_steps_passed_through_to_both_stages(monkeypatch):
     calls = []
     monkeypatch.setattr(train_arch3_combined.train_arch3_stage_a, "main",
-                         lambda config_path, smoke_steps=None, max_wall_clock_hours_override=None:
+                         lambda config_path, smoke_steps=None, max_wall_clock_hours_override=None, **_kwargs:
                          calls.append(("a", smoke_steps)))
     monkeypatch.setattr(train_arch3_combined.train_arch3_stage_b, "main",
-                         lambda config_path, smoke_steps=None, max_wall_clock_hours_override=None:
+                         lambda config_path, smoke_steps=None, max_wall_clock_hours_override=None, **_kwargs:
                          calls.append(("b", smoke_steps)))
 
     train_arch3_combined.main("a.yaml", "b.yaml", total_hours=10.0, smoke_steps=25)
@@ -57,3 +57,18 @@ def test_invalid_stage_a_fraction_raises():
         train_arch3_combined.main("a.yaml", "b.yaml", total_hours=10.0, stage_a_fraction=1.5)
     with pytest.raises(ValueError, match="stage_a_fraction"):
         train_arch3_combined.main("a.yaml", "b.yaml", total_hours=10.0, stage_a_fraction=0.0)
+
+
+def test_skip_final_eval_passed_through_to_stage_b_only(monkeypatch):
+    calls = []
+    monkeypatch.setattr(train_arch3_combined.train_arch3_stage_a, "main",
+                         lambda config_path, smoke_steps=None, max_wall_clock_hours_override=None, **kwargs:
+                         calls.append(("a", kwargs)))
+    monkeypatch.setattr(train_arch3_combined.train_arch3_stage_b, "main",
+                         lambda config_path, smoke_steps=None, max_wall_clock_hours_override=None, **kwargs:
+                         calls.append(("b", kwargs)))
+
+    train_arch3_combined.main("a.yaml", "b.yaml", total_hours=10.0, skip_final_eval=True)
+
+    assert calls[0] == ("a", {})
+    assert calls[1] == ("b", {"skip_final_eval": True})

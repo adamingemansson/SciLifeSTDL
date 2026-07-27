@@ -66,7 +66,10 @@ def _sample_organ_tech(adata) -> tuple[str | None, str | None]:
     return organ, tech
 
 
-def main(config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_override: float | None = None) -> None:
+def main(
+    config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_override: float | None = None,
+    skip_final_eval: bool = False,
+) -> None:
     cfg = OmegaConf.load(config_path)
     data_prep.apply_sample_selection(cfg)
     data_prep.apply_smoke_override(cfg, smoke_steps)
@@ -216,7 +219,13 @@ def main(config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_
         keep_last=checkpoint_keep_last,
     )
 
-    if test_ids:
+    if skip_final_eval:
+        print(
+            "--skip_final_eval set: skipping the final held-out test evaluation. "
+            "The trained checkpoint above is already saved -- run it separately later "
+            "(e.g. via a standalone evaluation script against this checkpoint_dir)."
+        )
+    elif test_ids:
         print("running final held-out test evaluation...")
         model.eval()
         for sid in test_ids:
@@ -237,5 +246,8 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--smoke_steps", type=int, default=None,
                          help="run only this many steps (overriding config), with checkpoint/eval/log intervals scaled down to match -- for a quick real-hardware smoke test before the full run")
+    parser.add_argument("--skip_final_eval", action="store_true",
+                         help="skip the final held-out test evaluation entirely -- the checkpoint is still saved "
+                              "(saving happens before evaluation), run evaluation separately later against it")
     args = parser.parse_args()
-    main(args.config, smoke_steps=args.smoke_steps)
+    main(args.config, smoke_steps=args.smoke_steps, skip_final_eval=args.skip_final_eval)
