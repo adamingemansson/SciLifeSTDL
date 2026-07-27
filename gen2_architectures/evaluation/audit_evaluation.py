@@ -183,23 +183,45 @@ def _fixed_pca(records, obs_names, coords3d, expr, requested_components: int, k:
     from sklearn.decomposition import PCA
     from threadpoolctl import threadpool_limits
 
+    # 2026-07-27: fine-grained timing added per sub-step -- the whole
+    # function was previously only timed as one opaque block from the
+    # outside, which wasn't enough to tell whether a stuck run was in the
+    # per-record neighbor pooling or the PCA.fit call itself.
+    pool_started = time.monotonic()
     context_patches = []
     min_query = None
-    for record in records:
+    for record_index, record in enumerate(records):
         context_mask, query_mask = record_masks(record, obs_names)
+        patch_started = time.monotonic()
         context_patches.append(
             ev.pool_knn_neighborhood(coords3d[context_mask], expr[context_mask], k=k)
+        )
+        print(
+            f"audit evaluation: _fixed_pca pooled record {record_index + 1}/{len(records)} "
+            f"({int(context_mask.sum())} context points) in {time.monotonic() - patch_started:.2f}s",
+            flush=True,
         )
         n_query = int(query_mask.sum())
         min_query = n_query if min_query is None else min(min_query, n_query)
     reference = np.concatenate(context_patches, axis=0)
+    print(
+        f"audit evaluation: _fixed_pca pooled all {len(records)} records into a "
+        f"{reference.shape} reference matrix in {time.monotonic() - pool_started:.1f}s total",
+        flush=True,
+    )
     n_components = _fid_n_components(
         requested_components, reference.shape[0], reference.shape[1], min_query or 0
     )
     if n_components < 2:
         return None, 0
+    fit_started = time.monotonic()
     with threadpool_limits(limits=8):
         pca = PCA(n_components=n_components, random_state=0).fit(reference)
+    print(
+        f"audit evaluation: _fixed_pca's PCA.fit ({n_components} components) "
+        f"took {time.monotonic() - fit_started:.1f}s",
+        flush=True,
+    )
     return pca, n_components
 
 
