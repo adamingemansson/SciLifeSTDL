@@ -320,16 +320,26 @@ def evaluate_model_on_mask_bank(
         metric_gene_names = [str(adata.var_names[idx]) for idx in idx_np]
         metric_raw_counts = None if raw_counts is None else raw_counts[:, idx_np]
     panel_indices, panel_metadata = _resolve_gene_panels(metric_gene_names, gene_panels)
-    # 2026-07-27: _fixed_pca and _resume_signature (below) are the only two
-    # operations that run ONCE, before the per-mask loop's own progress
-    # prints ever fire -- added timing around both so a still-silent run
-    # shows exactly which one it's stuck in, instead of leaving that as an
-    # unresolved guess between the two.
-    _pca_started = time.monotonic()
-    pca, effective_pca = _fixed_pca(
-        records, adata.obs_names, coords3d, metric_expr, requested_pca, k
-    )
-    print(f"audit evaluation: PCA basis fit in {time.monotonic() - _pca_started:.1f}s", flush=True)
+    # 2026-07-27: _fixed_pca was confirmed (by elimination -- with
+    # spatial_domain_plausibility already disabled, and timing prints
+    # around both remaining pre-loop steps added, still zero output on a
+    # real run) to be the one operation left standing between "audit
+    # evaluation started" and the per-mask progress prints ever firing.
+    # Root cause not yet identified (a (~1280, ~17000) matrix extracting
+    # 50 components via randomized SVD should be a sub-second operation on
+    # this hardware) -- made skippable so PCC/RMSE, the metrics that
+    # actually matter for the 4-architecture comparison, aren't blocked by
+    # it while that's investigated separately. evaluation.compute_st_fid_mmd
+    # defaults to False; st_fid/st_mmd simply report nan when skipped
+    # (same as when the data is too small to fit a PCA basis at all).
+    if bool(evaluation.get("compute_st_fid_mmd", False)):
+        _pca_started = time.monotonic()
+        pca, effective_pca = _fixed_pca(
+            records, adata.obs_names, coords3d, metric_expr, requested_pca, k
+        )
+        print(f"audit evaluation: PCA basis fit in {time.monotonic() - _pca_started:.1f}s", flush=True)
+    else:
+        pca, effective_pca = None, 0
     domain_labels, domain_label_source = _pseudo_domain_labels(adata, evaluation)
 
     model_device = next(model.parameters(), torch.empty(0)).device
