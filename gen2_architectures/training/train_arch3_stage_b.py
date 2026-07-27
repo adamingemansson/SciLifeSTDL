@@ -157,7 +157,15 @@ def main(
 
         optimizer.zero_grad()
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
+        if not data_prep.is_finite_update(total_loss, grad_norm):
+            print(
+                f"step {step}/{total_steps}: non-finite loss/grad_norm "
+                f"(loss={total_loss.item()}, grad_norm={grad_norm.item()}) -- "
+                f"skipping this optimizer step to avoid corrupting the model",
+                flush=True,
+            )
+            continue
         optimizer.step()
 
         if step % log_every == 0:

@@ -106,7 +106,15 @@ def main(config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_
         result = loss_fn(recon, clean, progress)  # reconstruct the CLEAN target from corrupted input
         optimizer.zero_grad()
         result["loss"].backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        if not data_prep.is_finite_update(result["loss"], grad_norm):
+            print(
+                f"step {step}/{total_steps}: non-finite loss/grad_norm "
+                f"(loss={result['loss'].item()}, grad_norm={grad_norm.item()}) -- "
+                f"skipping this optimizer step to avoid corrupting the model",
+                flush=True,
+            )
+            continue
         optimizer.step()
 
         if step % log_every == 0:

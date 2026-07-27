@@ -180,6 +180,22 @@ def make_progress_fn(wall_clock_deadline: float | None, total_steps: int):
     return progress_fn
 
 
+def is_finite_update(loss, grad_norm) -> bool:
+    """True iff both the loss and the (post-clipping) gradient norm are
+    finite -- i.e. it's safe to call optimizer.step().
+
+    2026-07-27 bugfix: torch.nn.utils.clip_grad_norm_ compares the
+    gradient norm against a threshold to decide whether to rescale; a NaN
+    norm fails every such comparison, so a NaN gradient sails straight
+    through UNCLIPPED and optimizer.step() then permanently corrupts
+    every parameter with NaN -- observed directly on a real 24h run
+    (every diagnostic, including a weight's own norm, went NaN and never
+    recovered, since NaN has no way to self-correct). Callers should skip
+    the optimizer.step() entirely (not just clip harder) whenever this
+    returns False."""
+    return bool(loss.isfinite()) and bool(grad_norm.isfinite())
+
+
 def derive_coord_scale(adatas: list) -> float:
     """Auto-derive coord_scale for RandomFourierFeatures-based
     CoordEmbedding from these samples' REAL coordinate spread — ports the
