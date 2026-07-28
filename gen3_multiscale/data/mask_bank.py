@@ -1,0 +1,414 @@
+"""Persistent train/validation/test masking banks keyed by observation names.
+
+2026-07-28: copied VERBATIM from gen2_architectures/data/mask_bank.py at
+commit fd23737 into gen3_multiscale/ -- see hest1k_catalog.py's identical
+copy-provenance note in this same directory for why (handoff's "reuse
+audited data hygiene and cache logic" instruction). Includes
+query_overlap_report, the test-mask-overlap transparency fix from this
+session's audit pass. Do not let this drift from gen2_architectures'
+copy without a deliberate reason.
+"""
+from __future__ import annotations
+
+from hashlib import sha256
+import json
+import os
+from pathlib import Path
+from typing import Iterable
+
+
+import numpy as np
+
+from gen2_architectures.data import masking
+
+
+def _cfg_get(obj, key, default=None):
+    if hasattr(obj, "get"):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def make_split(coords3d: np.ndarray, slice_ids: np.ndarray, masking_cfg, seed: int):
+    """Standalone equivalent of the training split dispatcher."""
+    strategy = _cfg_get(masking_cfg, "strategy")
+    params = _cfg_get(masking_cfg, "params", {})
+    params = dict(params)
+    if strategy == "hold_out_slice":
+        held_out = np.random.default_rng(seed).choice(np.unique(slice_ids))
+        return masking.hold_out_slice(coords3d[:, 2], held_out, slice_ids)
+    if strategy == "random_dropout_patches":
+        return masking.random_dropout_patches(coords3d[:, :2], slice_ids, seed=seed, **params)
+    if strategy == "sparse_spot_dropout":
+        return masking.sparse_spot_dropout(coords3d[:, :2], slice_ids, seed=seed, **params)
+    if strategy == "mixed_dropout":
+        return masking.mixed_dropout(coords3d[:, :2], slice_ids, seed=seed, **params)
+    raise ValueError(f"unknown masking strategy {strategy!r}")
+
+
+def cap_context_mask(
+    context_mask: np.ndarray,
+    max_context_points,
+    seed: int,
+    *,
+    coords3d: np.ndarray | None = None,
+    query_mask: np.ndarray | None = None,
+    selection: str = "random",
+) -> np.ndarray:
+    """Cap context size without changing historical configs silently.
+
+    ``selection="random"`` is the exact legacy behavior.  The opt-in
+    ``nearest_query`` mode keeps the observed spots closest to the missing
+    region.  That is the relevant context for a local reconstruction model
+    and avoids spending a finite context budget on unrelated parts of a
+    slide.  Stable index tie-breaking makes the result deterministic.
+    """
+    if max_context_points is None:
+        return context_mask
+    idx = np.flatnonzero(context_mask)
+    if len(idx) <= int(max_context_points):
+        return context_mask
+    if selection == "random":
+        keep = np.random.default_rng(seed + 3).choice(
+            idx, size=int(max_context_points), replace=False
+        )
+    elif selection == "nearest_query":
+        if coords3d is None or query_mask is None:
+            raise ValueError(
+                "context_selection='nearest_query' requires coords3d and query_mask"
+            )
+        query_idx = np.flatnonzero(np.asarray(query_mask, dtype=bool))
+        if not len(query_idx):
+            raise ValueError("cannot select context nearest an empty query region")
+        from scipy.spatial import cKDTree
+
+        coords = np.asarray(coords3d, dtype=np.float64)[:, :2]
+        distance, _ = cKDTree(coords[query_idx]).query(coords[idx], k=1)
+        order = np.lexsort((idx, distance))
+        keep = idx[order[: int(max_context_points)]]
+    else:
+        raise ValueError(
+            f"unknown context_selection {selection!r}; expected 'random' or 'nearest_query'"
+        )
+    out = np.zeros_like(context_mask, dtype=bool)
+    out[keep] = True
+    return out
+
+
+def dataset_fingerprint(obs_names: Iterable[str]) -> str:
+    names = [str(x) for x in obs_names]
+    return sha256("\n".join(names).encode("utf-8")).hexdigest()
+
+
+def _jsonable(value):
+    """Convert OmegaConf/numpy containers into a stable JSON representation."""
+    if hasattr(value, "items"):
+        return {str(k): _jsonable(v) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    # OmegaConf ListConfig and similar sequence wrappers are iterable but
+    # are not subclasses of list/tuple.
+    if (not isinstance(value, (str, bytes)) and hasattr(value, "__iter__")
+            and not isinstance(value, np.ndarray)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def masking_fingerprint(masking_cfg, split_counts=None, split_seeds=None) -> str:
+    payload = {
+        "masking": _jsonable(masking_cfg),
+        "split_counts": _jsonable(split_counts or {"validation": 4, "test": 8}),
+        "split_seeds": _jsonable(split_seeds or {"validation": 700_000, "test": 900_000}),
+    }
+    return sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def spatial_fingerprint(coords3d: np.ndarray, slice_ids: np.ndarray) -> str:
+    coords = np.ascontiguousarray(np.asarray(coords3d, dtype=np.float64))
+    slices = np.asarray(slice_ids, dtype=str)
+    digest = sha256()
+    digest.update(str(coords.shape).encode())
+    digest.update(coords.tobytes())
+    digest.update("\n".join(slices.tolist()).encode())
+    return digest.hexdigest()
+
+
+def build_mask_bank(
+    coords3d: np.ndarray,
+    slice_ids: np.ndarray,
+    obs_names: Iterable[str],
+    masking_cfg,
+    split_counts: dict[str, int] | None = None,
+    split_seeds: dict[str, int] | None = None,
+) -> dict:
+    """Create reproducible masks and store them by barcode/name, not row index."""
+    split_counts = split_counts or {"validation": 4, "test": 8}
+    split_seeds = split_seeds or {"validation": 700_000, "test": 900_000}
+    names = np.asarray([str(x) for x in obs_names])
+    records = []
+    max_context = _cfg_get(masking_cfg, "max_context_points", None)
+    context_selection = str(_cfg_get(masking_cfg, "context_selection", "random"))
+    for split, count in split_counts.items():
+        base_seed = int(split_seeds[split])
+        for i in range(int(count)):
+            seed = base_seed + i
+            context, query = make_split(coords3d, slice_ids, masking_cfg, seed)
+            context = cap_context_mask(
+                context,
+                max_context,
+                seed,
+                coords3d=coords3d,
+                query_mask=query,
+                selection=context_selection,
+            )
+            if not query.any() or not context.any():
+                raise ValueError(f"mask seed {seed} produced an empty context or query")
+            records.append({
+                "split": split,
+                "index": i,
+                "seed": seed,
+                "context_obs_names": names[context].tolist(),
+                "query_obs_names": names[query].tolist(),
+            })
+    return {
+        "version": 2,
+        "dataset_fingerprint": dataset_fingerprint(names),
+        "spatial_fingerprint": spatial_fingerprint(coords3d, slice_ids),
+        "masking_fingerprint": masking_fingerprint(masking_cfg, split_counts, split_seeds),
+        "masking": _jsonable(masking_cfg),
+        "split_counts": _jsonable(split_counts),
+        "split_seeds": _jsonable(split_seeds),
+        "n_obs": int(len(names)),
+        "records": records,
+    }
+
+
+def save_mask_bank(bank: dict, path: str | Path) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Multiple single-GPU jobs may start together and all request the same
+    # immutable mask bank. Use a process-specific temporary file followed by
+    # atomic os.replace so concurrent writers can never expose partial JSON or
+    # collide on one shared .tmp filename. All writers deterministically build
+    # identical content for the same config/fingerprint.
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(bank, indent=2, sort_keys=True))
+    os.replace(tmp, path)
+    return path
+
+
+def load_mask_bank(
+    path: str | Path,
+    obs_names: Iterable[str],
+    *,
+    coords3d: np.ndarray | None = None,
+    slice_ids: np.ndarray | None = None,
+    masking_cfg=None,
+    split_counts: dict[str, int] | None = None,
+    split_seeds: dict[str, int] | None = None,
+) -> dict:
+    path = Path(path)
+    bank = json.loads(path.read_text())
+    expected = dataset_fingerprint(obs_names)
+    if bank.get("dataset_fingerprint") != expected:
+        raise ValueError(
+            f"mask bank {path} was built for a different observation set; "
+            "regenerate it for this exact QC/alignment result"
+        )
+    supplied = [coords3d is not None, slice_ids is not None, masking_cfg is not None]
+    if any(supplied) and not all(supplied):
+        raise ValueError("coords3d, slice_ids and masking_cfg must be supplied together")
+    if all(supplied):
+        expected_spatial = spatial_fingerprint(coords3d, slice_ids)
+        expected_masking = masking_fingerprint(masking_cfg, split_counts, split_seeds)
+        if bank.get("version", 1) < 2:
+            raise ValueError(
+                f"mask bank {path} predates spatial/config fingerprints; remove it once "
+                "and regenerate so changed masking settings cannot silently reuse stale masks"
+            )
+        if bank.get("spatial_fingerprint") != expected_spatial:
+            raise ValueError(
+                f"mask bank {path} was built for different coordinates or slice IDs; regenerate it"
+            )
+        if bank.get("masking_fingerprint") != expected_masking:
+            raise ValueError(
+                f"mask bank {path} was built with different masking parameters, split counts, "
+                "or split seeds; use a distinct path or regenerate it"
+            )
+    return bank
+
+
+def record_masks(record: dict, obs_names: Iterable[str]) -> tuple[np.ndarray, np.ndarray]:
+    names = np.asarray([str(x) for x in obs_names])
+    context_names = set(record["context_obs_names"])
+    query_names = set(record["query_obs_names"])
+    context = np.asarray([x in context_names for x in names], dtype=bool)
+    query = np.asarray([x in query_names for x in names], dtype=bool)
+    if int(context.sum()) != len(context_names) or int(query.sum()) != len(query_names):
+        raise ValueError("mask bank record contains observation names missing from current data")
+    if np.any(context & query):
+        raise ValueError("mask bank record has overlapping context/query rows")
+    return context, query
+
+
+def split_records(bank: dict, split: str) -> list[dict]:
+    records = [r for r in bank["records"] if r["split"] == split]
+    return sorted(records, key=lambda r: int(r["index"]))
+
+
+def query_overlap_report(records: list[dict]) -> dict:
+    """GPT-audit-flagged (2026-07-27, confirmed and fixed): the mask bank's
+    query spots are NOT required or verified to be disjoint across masks in
+    a split (e.g. the 16 "test" masks) -- audit_evaluation.py has always
+    reported per-mask summary statistics and mean/std across masks as if
+    they were independent replicates, which overstates effective sample
+    size whenever the same spot's prediction is scored more than once
+    across different masks.
+
+    This does not change any metric computation -- it's a purely additive
+    diagnostic, folded into evaluate_model_on_mask_bank's result dict, so a
+    reader can see how much apparent replication is real (distinct spots,
+    distinct local context) vs re-scoring of the same spots under a
+    different mask, and can bootstrap uncertainty by sample rather than by
+    mask if the overlap turns out to be substantial."""
+    query_sets = [set(r["query_obs_names"]) for r in records]
+    total_draws = sum(len(s) for s in query_sets)
+    unique_spots = len(set().union(*query_sets)) if query_sets else 0
+    max_pairwise_overlap_fraction = 0.0
+    for i in range(len(query_sets)):
+        for j in range(i + 1, len(query_sets)):
+            a, b = query_sets[i], query_sets[j]
+            smaller = min(len(a), len(b))
+            if smaller == 0:
+                continue
+            fraction = len(a & b) / smaller
+            max_pairwise_overlap_fraction = max(max_pairwise_overlap_fraction, fraction)
+    return {
+        "n_masks": len(records),
+        "unique_query_spots": unique_spots,
+        "total_query_spot_draws": total_draws,
+        "mean_query_spots_per_mask": total_draws / len(records) if records else 0.0,
+        "max_pairwise_overlap_fraction": max_pairwise_overlap_fraction,
+        "note": (
+            "Masks are not required to have disjoint query spots. "
+            "unique_query_spots < total_query_spot_draws means some spots are scored more "
+            "than once across masks -- per-mask stats should not be treated as fully "
+            "independent replicates; prefer bootstrapping uncertainty by sample."
+        ),
+    }
+
+
+def ensure_mask_bank(
+    path: str | Path,
+    coords3d: np.ndarray,
+    slice_ids: np.ndarray,
+    obs_names: Iterable[str],
+    masking_cfg,
+    split_counts: dict[str, int] | None = None,
+    split_seeds: dict[str, int] | None = None,
+) -> dict:
+    path = Path(path)
+    if path.exists():
+        return load_mask_bank(
+            path, obs_names, coords3d=coords3d, slice_ids=slice_ids,
+            masking_cfg=masking_cfg, split_counts=split_counts, split_seeds=split_seeds,
+        )
+    bank = build_mask_bank(
+        coords3d, slice_ids, obs_names, masking_cfg,
+        split_counts=split_counts, split_seeds=split_seeds,
+    )
+    save_mask_bank(bank, path)
+    # Re-read and validate after the atomic write. If another concurrent job
+    # wrote a differently configured bank to the same path, fail loudly.
+    return load_mask_bank(
+        path, obs_names, coords3d=coords3d, slice_ids=slice_ids,
+        masking_cfg=masking_cfg, split_counts=split_counts, split_seeds=split_seeds,
+    )
+
+
+def build_training_seed_bank(
+    obs_names: Iterable[str], n_items: int, base_seed: int, masking_cfg=None,
+    unique_mask_count: int | None = None,
+) -> dict:
+    """Persist the exact training-mask seed schedule for one observation set.
+
+    Storing every context/query barcode list for tens of thousands of training
+    draws would create multi-gigabyte JSON. A deterministic seed schedule plus
+    the immutable observation fingerprint is lossless: ``make_split`` and
+    context capping are pure functions of the data order, masking config and
+    seed. Validation/test masks remain stored explicitly by barcode.
+    """
+    n_items = int(n_items)
+    base_seed = int(base_seed)
+    if n_items < 1:
+        raise ValueError("training seed bank requires at least one item")
+    unique_mask_count = n_items if unique_mask_count is None else int(unique_mask_count)
+    if unique_mask_count < 1 or unique_mask_count > n_items:
+        raise ValueError(
+            f"unique_mask_count must be in [1, n_items], got {unique_mask_count} for n_items={n_items}"
+        )
+    unique_seeds = list(range(base_seed, base_seed + unique_mask_count))
+    seeds = [unique_seeds[i % unique_mask_count] for i in range(n_items)]
+    names = [str(x) for x in obs_names]
+    return {
+        "version": 2,
+        "kind": "training_seed_schedule",
+        "dataset_fingerprint": dataset_fingerprint(names),
+        "n_obs": len(names),
+        "n_items": n_items,
+        "base_seed": base_seed,
+        "unique_mask_count": unique_mask_count,
+        "masking_fingerprint": (
+            sha256(json.dumps(_jsonable(masking_cfg), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            if masking_cfg is not None else None
+        ),
+        "seeds": seeds,
+    }
+
+
+def ensure_training_seed_bank(
+    path: str | Path,
+    obs_names: Iterable[str],
+    n_items: int,
+    base_seed: int,
+    masking_cfg=None,
+    unique_mask_count: int | None = None,
+) -> tuple[dict, Path]:
+    """Load or atomically create an immutable training seed schedule."""
+    path = Path(path)
+    expected = build_training_seed_bank(
+        obs_names, n_items, base_seed, masking_cfg,
+        unique_mask_count=unique_mask_count,
+    )
+    if path.exists():
+        bank = json.loads(path.read_text())
+        keys = ["kind", "dataset_fingerprint", "n_obs", "n_items", "base_seed"]
+        legacy_unique_count = bank.get("unique_mask_count") is None
+        if not legacy_unique_count or expected["unique_mask_count"] != expected["n_items"]:
+            keys.append("unique_mask_count")
+        # Version-1 training banks contained the same lossless seed list but
+        # no masking fingerprint. They can be upgraded safely after validating
+        # all original fields and the exact schedule; explicit but different
+        # fingerprints still fail below.
+        legacy_without_masking = masking_cfg is not None and bank.get("masking_fingerprint") is None
+        if masking_cfg is not None and not legacy_without_masking:
+            keys.append("masking_fingerprint")
+        for key in keys:
+            if bank.get(key) != expected.get(key):
+                raise ValueError(
+                    f"training seed bank {path} does not match the current data/run "
+                    f"for field {key!r}; use a new path or remove the stale bank"
+                )
+        seeds = [int(x) for x in bank.get("seeds", [])]
+        if seeds != expected["seeds"]:
+            raise ValueError(f"training seed bank {path} contains an altered seed schedule")
+        if legacy_without_masking or legacy_unique_count:
+            save_mask_bank(expected, path)
+            return expected, path
+        bank["seeds"] = seeds
+        return bank, path
+    save_mask_bank(expected, path)
+    return expected, path
