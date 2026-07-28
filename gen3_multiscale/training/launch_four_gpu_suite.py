@@ -196,7 +196,7 @@ def _wait_until(predicate: Callable[[], bool], timeout: float, interval: float =
     return predicate()
 
 
-def _terminate_process_group(proc: subprocess.Popen, timeout: float = 10.0) -> None:
+def _terminate_process_group(proc: subprocess.Popen, pgid: int | None = None, timeout: float = 10.0) -> None:
     """Terminate `proc` and every process in its process group (real,
     confirmed gap -- 7th Codex re-audit of commit 2782ff0: "children that
     ignore SIGTERM... subprocess-owned dataloader workers"). `proc` must
@@ -217,18 +217,40 @@ def _terminate_process_group(proc: subprocess.Popen, timeout: float = 10.0) -> N
     SIGKILL. `_group_gone` below requires BOTH `proc` itself to have
     exited AND `os.killpg(pgid, 0)` to confirm no process remains in its
     group before declaring success; only then does this function return
-    without escalating."""
-    if proc.poll() is not None:
-        return
-    try:
-        pgid = os.getpgid(proc.pid)
-    except (ProcessLookupError, AttributeError):
-        pgid = None
+    without escalating.
+
+    `pgid` should be the group id CAPTURED IMMEDIATELY AFTER `Popen`,
+    while the process is definitely still alive -- real, confirmed gap
+    (9th Codex re-audit of commit a29be53): the previous version both (1)
+    returned immediately on `proc.poll() is not None` (the parent already
+    exited by the time cleanup runs -- entirely plausible if this is
+    called after the wait loop has already reaped some jobs, or simply
+    because cleanup runs some time after the failure that triggered it)
+    WITHOUT EVER attempting group cleanup, even though a surviving
+    descendant could still be running; and (2) looked up the pgid via
+    `os.getpgid(proc.pid)` lazily, which raises `ProcessLookupError` once
+    the LEADER pid no longer exists as a process -- even though the
+    process GROUP itself (identified by that same numeric id) can still
+    have live members and still be validly signalable via `os.killpg`.
+    Passing the pgid in (captured before any of that can happen) makes
+    cleanup work correctly regardless of whether the parent has already
+    exited by the time this function runs. The `pgid=None` fallback
+    (lazy `os.getpgid` lookup) is kept only for callers that never
+    captured one up front."""
+    if pgid is None:
+        try:
+            pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, AttributeError):
+            pgid = None
 
     def _group_gone() -> bool:
         if proc.poll() is None:
             return False
         return pgid is None or not _process_group_alive(pgid)
+
+    if _group_gone():
+        proc.wait()
+        return
 
     if pgid is not None:
         try:
@@ -359,17 +381,27 @@ def launch_suite(
             proc = subprocess.Popen(
                 command, env=env, stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True,
             )
-            pending.append((name, str(gpu), command, log_path, proc))
+            # Captured immediately, while the process is definitely still
+            # alive (real, confirmed gap -- 9th Codex re-audit of commit
+            # a29be53): looking this up LAZILY inside the cleanup handler
+            # (the previous approach) fails once the leader has already
+            # exited by the time cleanup runs, even though the process
+            # GROUP itself can still have live descendants.
+            try:
+                pgid = os.getpgid(proc.pid)
+            except (ProcessLookupError, AttributeError):
+                pgid = None
+            pending.append((name, str(gpu), command, log_path, proc, pgid))
 
-        for name, gpu, command, log_path, proc in pending:
+        for name, gpu, command, log_path, proc, pgid in pending:
             returncode = proc.wait()
             jobs.append(JobResult(
                 name=name, gpu=gpu, command=command, log_path=str(log_path),
                 returncode=returncode, succeeded=returncode == 0,
             ))
     except BaseException:
-        for _, _, _, _, proc in pending:
-            _terminate_process_group(proc)
+        for _, _, _, _, proc, pgid in pending:
+            _terminate_process_group(proc, pgid=pgid)
         raise
     finally:
         for handle in log_handles:

@@ -2363,17 +2363,67 @@ middle of an audit-response pass.
 **No 24-hour run has been started or will be auto-started. This
 document only records fixes to already-written code and tests.**
 
+## 30. Ninth external Codex re-audit (of commit a29be53) — launcher edge case, then the real trainer
+
+A ninth re-audit verified `a29be53` and confirmed the three §29 fixes
+correct for their tested scenarios (`git diff --check` clean). It found
+one more small launcher edge case, explicitly said it "does not justify
+another audit-only round," and gave the productive instruction: fix
+this one item alongside starting the real trainer, then move on.
+
+**"`_terminate_process_group()` immediately returns when the parent has
+already exited before cleanup begins" -- CONFIRMED AND FIXED.** Checked
+directly: the function's first line was `if proc.poll() is not None:
+return` -- if the parent had already exited by the time cleanup ran
+(plausible whenever cleanup runs some time after whatever triggered it,
+not necessarily right after this function's own SIGTERM), it returned
+immediately without ever checking whether the process GROUP still had a
+live member, even though a surviving descendant (a DataLoader worker,
+in the real scenario this whole mechanism exists for) could still be
+running. Separately, the function looked up the pgid LAZILY via
+`os.getpgid(proc.pid)`, which raises `ProcessLookupError` once the
+leader's own pid no longer exists as a process -- even though the
+process group itself (the same numeric id) can still have live members
+and still be validly signaled via `os.killpg`. Fixed both together:
+`launch_suite` now captures each job's pgid via `os.getpgid(proc.pid)`
+**immediately after `Popen`**, while the process is definitely still
+alive, and stores it alongside the job; `_terminate_process_group` now
+accepts that pre-captured `pgid` and always attempts group cleanup
+(checking `_group_gone()`, which requires the group to be CONFIRMED
+empty via `os.killpg(pgid, 0)`, not just the parent's `poll()`)
+regardless of whether the parent has already exited. Verified by a new
+regression test matching the audit's exact scenario: a parent spawns a
+SIGTERM-ignoring child and exits immediately on its own (no signal from
+this launcher at all); cleanup is only invoked once the parent is
+CONFIRMED already dead (`proc.wait()` already returned); the orphaned
+descendant is still killed.
+
+**Then: proceed with the real Gen3 data builder and trainer, per the
+explicit instruction and the 9-step order forwarded** (immutable
+dataset manifest and splits; example builder with physical query
+removal; realized-mask fingerprinting and leakage rejection;
+context-only Novae graphs; real regional/global WSI wiring into
+Architectures 3/4; the trainer itself; a pooled-prediction evaluator;
+mandatory preflight gates; staged testing culminating in the four long
+runs). This is a substantially larger body of work than any single
+audit-response round in this document -- work on it is tracked
+separately from this section (see the CONTRACT.md sections that follow,
+added as each stage lands) rather than folded into this launcher-fix
+entry.
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
 
 ```
-gen3_multiscale/tests/: 341 passed (41 reused-infra + 12 example-schema +
+gen3_multiscale/tests/: 342 passed (41 reused-infra + 12 example-schema +
   11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
   18 transport-head + 10 tokens + 16 attention + 10 global-context +
   7 harmonic + 7 geometry-utils + 9 backbone + 23 architectures +
   9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
-  26 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
   37 mask-schedule)
-gen2_architectures + gen3_multiscale: 510 passed, 1 skipped
+gen2_architectures + gen3_multiscale: 511 passed, 1 skipped
 ```
 
 Note: a full monorepo run (`pytest -q` from the repo root, everything

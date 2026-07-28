@@ -7,6 +7,7 @@ real GPU. See launch_four_gpu_suite.py's module docstring for why
 does not exist yet) is deliberately NOT exercised end-to-end here."""
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -345,6 +346,45 @@ def test_terminate_process_group_kills_a_descendant_that_survives_after_the_pare
         if proc.poll() is None:  # pragma: no cover -- safety net only
             proc.kill()
             proc.wait()
+
+
+def test_terminate_process_group_cleans_up_a_descendant_even_when_the_parent_already_exited_before_cleanup_ran():
+    """Real (not monkeypatched) subprocess test for a real, confirmed gap
+    (9th Codex re-audit of commit a29be53): the previous implementation
+    checked `if proc.poll() is not None: return` FIRST, before doing
+    anything else -- if the parent had ALREADY exited (naturally, or
+    simply because cleanup runs some time after whatever triggered it)
+    by the time _terminate_process_group is called, it returned
+    immediately without ever attempting group cleanup, even though a
+    surviving descendant could still be running. The parent here spawns
+    a SIGTERM-ignoring child and then exits immediately on its own --
+    cleanup is only invoked once the parent is CONFIRMED already dead,
+    exactly the scenario the audit describes. pgid is captured
+    immediately after Popen (mirroring launch_suite's own real fix: look
+    it up while the process is definitely still alive, not lazily inside
+    cleanup, since a lazy os.getpgid(proc.pid) call also fails once the
+    leader pid itself no longer exists)."""
+    parent_code = (
+        "import subprocess, sys;"
+        "subprocess.Popen([sys.executable, '-c', "
+        "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)'])"
+        # the parent exits immediately after spawning its child -- no sleep of its own
+    )
+    proc = subprocess.Popen([sys.executable, "-c", parent_code], start_new_session=True)
+    pgid = os.getpgid(proc.pid)  # captured immediately, while proc is still alive
+    try:
+        proc.wait(timeout=5.0)  # confirm the parent has ALREADY exited before cleanup runs
+        assert proc.poll() is not None
+
+        launch_four_gpu_suite_module._terminate_process_group(proc, pgid=pgid, timeout=2.0)
+
+        with pytest.raises(ProcessLookupError):
+            os.killpg(pgid, 0)  # the surviving descendant, orphaned when its parent exited, is now gone too
+    finally:
+        try:
+            os.killpg(pgid, signal.SIGKILL)  # pragma: no cover -- safety net only
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
 def test_launch_suite_refuses_to_start_any_job_when_the_audit_fails(tmp_path):
