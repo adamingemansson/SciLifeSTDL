@@ -239,12 +239,51 @@ def test_build_stratified_training_seed_bank_is_deterministic():
     assert bank_a == bank_b
 
 
-def test_build_stratified_training_seed_bank_rejects_an_out_of_range_unique_masks_per_stratum():
+def test_build_stratified_training_seed_bank_allows_unique_masks_per_stratum_larger_than_n_items():
+    """Corrected semantics (5th Codex re-audit): unique_masks_per_stratum
+    larger than n_items is legitimate -- it just means this particular
+    call doesn't exhaust the full per-stratum seed pool, not an error.
+    The old validation rejected this based on an incorrect mental model
+    (a global item budget) rather than the actual per-stratum occurrence
+    semantics."""
+    coords3d, slice_ids, obs_names = _training_seed_slide()
+    bank = build_stratified_training_seed_bank(
+        coords3d, slice_ids, obs_names, n_items=4, base_seed=0, strata=_STRATA, unique_masks_per_stratum=99,
+    )
+    assert len(bank["items"]) == 4
+
+
+def test_build_stratified_training_seed_bank_rejects_unique_masks_per_stratum_at_or_above_the_seed_stride():
     coords3d, slice_ids, obs_names = _training_seed_slide()
     with pytest.raises(ValueError, match="unique_masks_per_stratum"):
         build_stratified_training_seed_bank(
-            coords3d, slice_ids, obs_names, n_items=4, base_seed=0, strata=_STRATA, unique_masks_per_stratum=99,
+            coords3d, slice_ids, obs_names, n_items=4, base_seed=0, strata=_STRATA,
+            unique_masks_per_stratum=1_000_000,
         )
+
+
+def test_build_stratified_training_seed_bank_realizes_the_full_promised_unique_seed_pool_per_stratum():
+    """The exact regression test the audit specified: 4 strata, 64 unique
+    masks per stratum, >= 256 items -- must realize exactly 64 unique
+    seeds per stratum and exactly 256 unique (stratum, seed) combinations
+    (reproducing the audit's own worked example, which the old formula
+    failed: it only ever realized 16 of the 64 promised seeds per
+    stratum, confirmed by direct computation before this fix)."""
+    coords3d, slice_ids, obs_names = _synthetic_slide(n=4)
+    four_strata = [
+        {"name": f"stratum_{i}", "radius_range": [1.0, 2.0], "radius_unit": "coordinate", "shape": "circle"}
+        for i in range(4)
+    ]
+    bank = build_stratified_training_seed_bank(
+        coords3d, slice_ids, obs_names, n_items=256, base_seed=0, strata=four_strata, unique_masks_per_stratum=64,
+    )
+    seeds_by_stratum: dict[str, set[int]] = {}
+    for item in bank["items"]:
+        seeds_by_stratum.setdefault(item["stratum"], set()).add(item["seed"])
+    for stratum_name, seeds in seeds_by_stratum.items():
+        assert len(seeds) == 64, f"{stratum_name} realized {len(seeds)} unique seeds, expected 64"
+    all_combinations = {(item["stratum"], item["seed"]) for item in bank["items"]}
+    assert len(all_combinations) == 256
 
 
 def test_build_stratified_training_seed_bank_with_one_unique_mask_per_stratum_still_produces_distinct_combinations():

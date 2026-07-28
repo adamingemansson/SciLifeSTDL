@@ -343,6 +343,65 @@ def test_architecture_4_predictive_distribution_shapes_and_diversity():
     assert not torch.allclose(out["predictive_samples"][0], out["predictive_samples"][1])
 
 
+def test_architecture_4_predictive_std_is_finite_zero_not_nan_for_a_single_sample():
+    """Regression test for a real, confirmed bug (Codex audit finding
+    against commit c02a5d1): torch.Tensor.std()'s default unbiased=True
+    divides by (n_samples - 1), which is zero degrees of freedom for a
+    single sample and returns all-NaN (confirmed directly via
+    torch.randn(1, 5).std(dim=0)). A single draw has a well-defined
+    population std of exactly 0, so predictive_std must be finite and
+    all-zero when n_samples=1, never NaN."""
+    inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    gene_basis, gene_names = _gene_basis_for(n_genes)
+    torch.manual_seed(0)
+    model = Architecture4(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        gene_basis=gene_basis, gene_names=gene_names, n_flow_samples=1, n_ode_steps=2, **_MODEL_KWARGS,
+    )
+    out = model.sample_predictive_distribution(inputs, n_samples=1)
+    assert out["predictive_samples"].shape[0] == 1
+    assert torch.isfinite(out["predictive_std"]).all()
+    assert torch.allclose(out["predictive_std"], torch.zeros_like(out["predictive_std"]))
+
+
+def test_architecture_4_compute_losses_runs_the_conditioner_exactly_once_and_stays_consistent():
+    """Regression test for a real, confirmed bug (Codex audit finding
+    against commit c02a5d1): calling forward() and
+    compute_flow_matching_loss() separately in one training step invokes
+    self.conditioner(inputs) twice; with dropout active, the two calls
+    draw different dropout masks, so the flow loss's deterministic_mean
+    would silently disagree with the mean the reconstruction loss was
+    computed against. compute_losses() must derive both from a single
+    conditioner pass, and (with dropout disabled via eval() so the
+    comparison is meaningful) must produce the same deterministic
+    "expression" that forward() alone would, and the same flow loss
+    compute_flow_matching_loss() alone would (since eval-mode dropout is
+    a no-op, both call patterns become deterministic and comparable)."""
+    inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    gene_basis, gene_names = _gene_basis_for(n_genes)
+    torch.manual_seed(0)
+    model = Architecture4(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        gene_basis=gene_basis, gene_names=gene_names, **_MODEL_KWARGS,
+    )
+    model.eval()
+    target_expression = torch.as_tensor(targets.query_expression)
+
+    torch.manual_seed(1)
+    combined = model.compute_losses(inputs, target_expression)
+    assert "flow_loss" in combined
+    assert torch.isfinite(combined["flow_loss"])
+    assert combined["expression"].shape == target_expression.shape
+
+    torch.manual_seed(1)
+    forward_out = model(inputs)
+    assert torch.allclose(combined["expression"], forward_out["expression"])
+
+    torch.manual_seed(1)
+    separate_flow_loss = model.compute_flow_matching_loss(inputs, target_expression)
+    assert torch.allclose(combined["flow_loss"], separate_flow_loss)
+
+
 def test_architecture_4_registers_the_gene_basis_as_a_buffer_not_a_plain_tensor():
     """Regression test for a real, confirmed device bug (Codex audit
     finding #3 against commit 386bcf4): GeneResidualBasis is a plain

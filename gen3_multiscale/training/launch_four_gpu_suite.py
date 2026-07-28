@@ -276,6 +276,11 @@ def main() -> None:
                          help="Only for local dry runs against a stub entrypoint -- never for a real launch.")
     args = parser.parse_args()
 
+    if len(set(args.gpus)) != 4:
+        raise ValueError(f"--gpus must name four DIFFERENT GPU ids, got {args.gpus!r}")
+    if args.threads_per_job <= 0:
+        raise ValueError(f"--threads-per-job must be positive, got {args.threads_per_job}")
+
     config_paths = {Path(p).stem: Path(p) for p in args.configs}
     if len(config_paths) != 4:
         raise ValueError("--configs must name four DIFFERENT files (by stem)")

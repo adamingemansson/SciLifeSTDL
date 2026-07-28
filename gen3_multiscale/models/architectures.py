@@ -421,6 +421,30 @@ class Architecture4(nn.Module):
         query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32, device=device)
         return flow_matching_loss(self.velocity_network, target_coefficients, query_coords, query_hidden)
 
+    def compute_losses(self, inputs: SpatialFieldInputs, target_expression: torch.Tensor) -> dict:
+        """Runs self.conditioner exactly ONCE and derives both the
+        deterministic conditioner output and the flow-matching loss from
+        that single pass. Calling forward() and compute_flow_matching_loss()
+        separately in the same training step runs self.conditioner twice;
+        with dropout active (the default everywhere in this package) the
+        two calls draw different dropout masks, so the flow loss's
+        deterministic_mean would silently disagree with the mean the
+        reconstruction loss was computed against (Codex audit finding
+        against commit c02a5d1). This method is the one callers needing
+        both losses per step should use; forward() and
+        compute_flow_matching_loss() are kept unchanged for callers that
+        only need one or the other and for the existing tests exercising
+        them independently."""
+        device = next(self.parameters()).device
+        conditioner_out = self.conditioner(inputs)
+        query_hidden = conditioner_out["query_hidden"].detach()
+        deterministic_mean = conditioner_out["expression"].detach()
+        target_residual = target_expression - deterministic_mean
+        target_coefficients = target_residual @ self._gene_basis_matrix.T  # GeneResidualBasis.to_coefficients, device-correct
+        query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32, device=device)
+        flow_loss = flow_matching_loss(self.velocity_network, target_coefficients, query_coords, query_hidden)
+        return {**conditioner_out, "flow_loss": flow_loss}
+
     @torch.no_grad()
     def sample_predictive_distribution(
         self, inputs: SpatialFieldInputs, n_samples: int | None = None, n_steps: int | None = None,
@@ -447,7 +471,13 @@ class Architecture4(nn.Module):
         residual_samples = coefficient_samples @ self._gene_basis_matrix  # GeneResidualBasis.from_coefficients, device-correct  # [S, Nq, G]
         predictive_samples = deterministic_mean[None] + residual_samples
         predictive_mean = predictive_samples.mean(dim=0)
-        predictive_std = predictive_samples.std(dim=0)
+        # unbiased=False: torch's default (unbiased=True, i.e. dividing by
+        # n-1) returns all-NaN with a UserWarning whenever n_samples == 1,
+        # since there are then zero degrees of freedom (confirmed directly:
+        # torch.randn(1, 5).std(dim=0) -> NaN). A single-sample draw has a
+        # well-defined population std of exactly 0, which unbiased=False
+        # (dividing by n) reports correctly for every n_samples >= 1.
+        predictive_std = predictive_samples.std(dim=0, unbiased=False)
         return {
             "expression": predictive_mean,
             "predictive_mean": predictive_mean,

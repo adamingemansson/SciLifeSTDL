@@ -41,6 +41,19 @@ from gen3_multiscale.data import mask_bank
 # 700_000/test=900_000 leaves ample room below this stride).
 _STRATUM_SEED_STRIDE = 1_000_000
 
+# Bumped whenever the mask/seed-GENERATION ALGORITHM itself changes (not
+# when strata/split content changes -- that's already covered by
+# strata_fingerprint/dataset_fingerprint/spatial_fingerprint). Recorded
+# in every bank and validated on load/ensure, so an on-disk schedule
+# built by an OLDER, buggy version of this algorithm gets correctly
+# rejected and regenerated rather than silently reused -- fixes a real
+# gap (5th Codex re-audit of commit c02a5d1): without this, fixing
+# build_stratified_training_seed_bank's seed-collision bug below would
+# have left any already-persisted (buggy) schedule looking identical by
+# every OTHER fingerprint field, since none of dataset/spatial/strata
+# content actually changed -- only the algorithm did.
+_MASK_GENERATION_VERSION = "2"
+
 
 def stratum_to_masking_cfg(stratum: dict, default_n_patches: int = 1) -> dict:
     """Convert one `masking.strata[i]` entry into a `masking_cfg` dict
@@ -131,6 +144,7 @@ def build_stratified_mask_bank(
     names_arr = np.asarray([str(x) for x in obs_names])
     return {
         "version": 1,
+        "mask_generation_version": _MASK_GENERATION_VERSION,
         "kind": "stratified_mask_bank",
         "dataset_fingerprint": mask_bank.dataset_fingerprint(names_arr),
         "spatial_fingerprint": mask_bank.spatial_fingerprint(coords3d, slice_ids),
@@ -204,6 +218,13 @@ def load_stratified_mask_bank(
                 f"stratified mask bank {path} was built with different strata, split counts, "
                 "or split seeds; use a distinct path or regenerate it"
             )
+        if bank.get("mask_generation_version") != _MASK_GENERATION_VERSION:
+            raise ValueError(
+                f"stratified mask bank {path} was built with mask-generation algorithm version "
+                f"{bank.get('mask_generation_version')!r}, but this code is version "
+                f"{_MASK_GENERATION_VERSION!r}; regenerate it -- the underlying generation logic "
+                "changed even though the strata/split content did not"
+            )
     return bank
 
 
@@ -272,21 +293,43 @@ def build_stratified_training_seed_bank(
         )
 
     unique_masks_per_stratum = n_items if unique_masks_per_stratum is None else int(unique_masks_per_stratum)
-    if unique_masks_per_stratum < 1 or unique_masks_per_stratum > n_items:
+    if unique_masks_per_stratum < 1:
+        raise ValueError(f"unique_masks_per_stratum must be positive, got {unique_masks_per_stratum}")
+    if unique_masks_per_stratum >= _STRATUM_SEED_STRIDE:
         raise ValueError(
-            f"unique_masks_per_stratum must be in [1, n_items], got {unique_masks_per_stratum} for n_items={n_items}"
+            f"unique_masks_per_stratum ({unique_masks_per_stratum}) must be < the per-stratum seed "
+            f"stride ({_STRATUM_SEED_STRIDE}), or a stratum's own local seed range would overflow "
+            "into the next stratum's offset block and collide with it"
         )
 
-    unique_seeds = list(range(base_seed, base_seed + unique_masks_per_stratum))
+    # Real, confirmed bug fixed here (5th Codex re-audit of commit
+    # c02a5d1), reproduced exactly as a regression test before fixing:
+    # the previous formula used `i % unique_masks_per_stratum` (the
+    # GLOBAL item index modulo the count) as this stratum's local seed
+    # index. But a given stratum is only visited every n_strata-th item,
+    # so the actual set of values `i % unique_masks_per_stratum` takes
+    # for THAT stratum's i's is a strict subset of
+    # {0, ..., unique_masks_per_stratum-1} whenever n_strata shares a
+    # common factor with unique_masks_per_stratum (e.g. 4 strata and
+    # unique_masks_per_stratum=64 realized only 64/4=16 distinct seeds
+    # per stratum, not 64 -- confirmed by direct computation). Fixed by
+    # tracking `occurrence_in_stratum` -- how many times THIS stratum has
+    # been visited so far, independent of n_strata -- and taking that
+    # modulo unique_masks_per_stratum instead; this correctly cycles
+    # through every one of the unique_masks_per_stratum seeds regardless
+    # of the relationship between n_strata and unique_masks_per_stratum.
     items = []
     for i in range(n_items):
         stratum_index = i % n_strata
-        seed = unique_seeds[i % unique_masks_per_stratum] + stratum_index * _STRATUM_SEED_STRIDE
+        occurrence_in_stratum = i // n_strata
+        local_seed_index = occurrence_in_stratum % unique_masks_per_stratum
+        seed = base_seed + local_seed_index + stratum_index * _STRATUM_SEED_STRIDE
         items.append({"stratum": stratum_names[stratum_index], "seed": seed})
 
     names = [str(x) for x in obs_names]
     return {
         "version": 1,
+        "mask_generation_version": _MASK_GENERATION_VERSION,
         "kind": "stratified_training_seed_schedule",
         "dataset_fingerprint": mask_bank.dataset_fingerprint(names),
         "spatial_fingerprint": mask_bank.spatial_fingerprint(coords3d, slice_ids),
@@ -325,8 +368,8 @@ def ensure_stratified_training_seed_bank(
     if path.exists():
         bank = json.loads(path.read_text())
         for key in (
-            "kind", "dataset_fingerprint", "spatial_fingerprint", "n_obs", "n_items", "base_seed",
-            "unique_masks_per_stratum", "strata_fingerprint",
+            "kind", "mask_generation_version", "dataset_fingerprint", "spatial_fingerprint", "n_obs",
+            "n_items", "base_seed", "unique_masks_per_stratum", "strata_fingerprint",
         ):
             if bank.get(key) != expected.get(key):
                 raise ValueError(

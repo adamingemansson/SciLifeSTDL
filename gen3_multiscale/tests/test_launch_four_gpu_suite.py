@@ -13,7 +13,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from gen3_multiscale.training.launch_four_gpu_suite import (
-    check_required_fingerprints, default_command_builder, launch_suite, run_suite_with_smoke_gate,
+    check_required_fingerprints, default_command_builder, launch_suite, main, run_suite_with_smoke_gate,
     static_config_audit,
 )
 
@@ -220,3 +220,38 @@ def test_default_command_builder_points_at_the_not_yet_implemented_entrypoint():
     command = default_command_builder({}, Path("/tmp/architecture1.yaml"), smoke=True)
     assert "gen3_multiscale.training.train" in command
     assert "--smoke" in command
+
+
+# ---------------------------------------------------------------------------
+# main() -- CLI argument validation. Regression tests for a real, confirmed
+# gap (Codex audit finding against commit c02a5d1): main() previously
+# accepted repeated GPU ids (which would launch two jobs on the same
+# device, silently corrupting the "one job per GPU" isolation the whole
+# launcher is built around) and non-positive --threads-per-job values
+# (which subprocess.Popen would pass straight through as an env var, only
+# failing much later inside the training process itself, if at all).
+# Both must be rejected before any config is loaded or any subprocess is
+# spawned, so real config paths are used but nothing ever actually runs.
+# ---------------------------------------------------------------------------
+def _real_config_paths() -> list[str]:
+    return [str(_CONFIG_DIR / f"{name}.yaml") for name in _REAL_CONFIG_NAMES]
+
+
+def test_main_rejects_duplicate_gpu_ids(tmp_path, monkeypatch):
+    argv = [
+        "launch_four_gpu_suite.py", "--configs", *_real_config_paths(),
+        "--gpus", "0", "1", "1", "3", "--log-root", str(tmp_path),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(ValueError, match="four DIFFERENT GPU ids"):
+        main()
+
+
+def test_main_rejects_non_positive_threads_per_job(tmp_path, monkeypatch):
+    argv = [
+        "launch_four_gpu_suite.py", "--configs", *_real_config_paths(),
+        "--gpus", "0", "1", "2", "3", "--threads-per-job", "0", "--log-root", str(tmp_path),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(ValueError, match="threads-per-job must be positive"):
+        main()

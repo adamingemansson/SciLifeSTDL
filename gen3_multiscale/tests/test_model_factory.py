@@ -18,8 +18,9 @@ from omegaconf import OmegaConf
 
 from gen3_multiscale.models.gene_basis import fit_gene_residual_basis
 from gen3_multiscale.models.model_factory import (
-    build_architecture, load_synchronized_initialization, persist_synchronized_initializations,
-    resolve_model_kwargs, synchronize_four_architecture_initialization, synchronize_shared_initialization,
+    build_architecture, load_ad_hoc_checkpoint_unverified, load_synchronized_initialization,
+    persist_four_architecture_initializations, persist_synchronized_initializations, resolve_model_kwargs,
+    synchronize_four_architecture_initialization, synchronize_shared_initialization,
 )
 
 _CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
@@ -358,11 +359,14 @@ def test_persist_synchronized_initializations_records_the_synchronizers_own_prov
     assert "unsynchronized" not in mapping  # never passed to the synchronizer -- no ground-truth relationship exists
 
 
-def test_persist_synchronized_initializations_records_gene_basis_hash_for_architecture_4(tmp_path):
+def test_persist_synchronized_initializations_records_gene_basis_gene_names_hash_for_architecture_4(tmp_path):
+    """Field renamed from gene_basis_hash (5th Codex re-audit of commit
+    c02a5d1: "is actually only gene_names_hash... does not describe how
+    the basis was fitted") -- the name now says precisely what it is."""
     basis, gene_names = _gene_basis(n_genes=6)
     model4 = build_architecture(_load("architecture4"), n_genes=6, gex_feature_dim=4, gene_basis=basis, gene_names=gene_names)
     manifest = persist_synchronized_initializations({"architecture4": model4}, tmp_path)
-    assert manifest["architectures"]["architecture4"]["gene_basis_hash"] == basis.gene_names_hash
+    assert manifest["architectures"]["architecture4"]["gene_basis_gene_names_hash"] == basis.gene_names_hash
 
 
 def test_persist_and_load_synchronized_initialization_round_trips(tmp_path):
@@ -377,11 +381,26 @@ def test_persist_and_load_synchronized_initialization_round_trips(tmp_path):
     assert torch.equal(fresh.weight, trained_looking.weight)
 
 
-def test_load_synchronized_initialization_without_a_manifest_still_works_unverified(tmp_path):
+def test_load_synchronized_initialization_requires_a_manifest_and_architecture_name():
+    """Regression test for a real, confirmed gap (5th Codex re-audit of
+    commit c02a5d1): manifest/architecture_name used to be optional,
+    which is not what "fail-closed" means -- a caller could accidentally
+    skip verification just by forgetting to pass them. Now a TypeError
+    (missing required positional arguments), not a silent unverified
+    load."""
+    import inspect
+    params = inspect.signature(load_synchronized_initialization).parameters
+    assert params["manifest"].default is inspect.Parameter.empty
+    assert params["architecture_name"].default is inspect.Parameter.empty
+
+
+def test_load_ad_hoc_checkpoint_unverified_is_the_only_way_to_skip_verification(tmp_path):
+    """The old unverified behavior still exists, but only under a
+    separately named function that cannot be reached by accident."""
     trained_looking = torch.nn.Linear(5, 5)
     persist_synchronized_initializations({"architecture1": trained_looking}, tmp_path)
     fresh = torch.nn.Linear(5, 5)
-    load_synchronized_initialization(fresh, tmp_path / "architecture1")  # no manifest -- old, unverified behavior
+    load_ad_hoc_checkpoint_unverified(fresh, tmp_path / "architecture1")
     assert torch.equal(fresh.weight, trained_looking.weight)
 
 
@@ -450,3 +469,61 @@ def test_persist_synchronized_initializations_on_all_four_real_architectures(tmp
             fresh_kwargs.update(gene_basis=basis, gene_names=gene_names)
         fresh = build_architecture(_load(name), **fresh_kwargs)
         load_synchronized_initialization(fresh, tmp_path / name, manifest=manifest, architecture_name=name)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# persist_four_architecture_initializations -- the strict, purpose-built
+# entry point (5th Codex re-audit of commit c02a5d1): "For a function with
+# that name, it should require the exact four architectures, require the
+# two-hop mapping, verify every expected shared tensor is equal, and then
+# persist."
+# ---------------------------------------------------------------------------
+def test_persist_four_architecture_initializations_requires_exactly_the_four_expected_keys(tmp_path):
+    models = _build_all_four()
+    del models["architecture4"]
+    with pytest.raises(ValueError, match="requires exactly"):
+        persist_four_architecture_initializations(models, tmp_path)
+
+
+def test_persist_four_architecture_initializations_synchronizes_persists_and_round_trips(tmp_path):
+    models = _build_all_four()
+    manifest = persist_four_architecture_initializations(models, tmp_path)
+
+    mapping = manifest["shared_parameter_mapping"]
+    assert mapping["architecture3"]["spot_token.image_proj.weight"] == "architecture1.spot_token.image_proj.weight"
+    assert (
+        mapping["architecture4"]["conditioner.gex_pool.inducing_queries"]
+        == "architecture3.gex_pool.inducing_queries"
+    )
+
+    for name in models:
+        fresh_kwargs = dict(n_genes=6, gex_feature_dim=4)
+        if name == "architecture4":
+            basis, gene_names = _gene_basis(n_genes=6)
+            fresh_kwargs.update(gene_basis=basis, gene_names=gene_names)
+        fresh = build_architecture(_load(name), **fresh_kwargs)
+        load_synchronized_initialization(fresh, tmp_path / name, manifest=manifest, architecture_name=name)
+
+
+def test_persist_four_architecture_initializations_refuses_to_persist_an_inconsistent_state(tmp_path, monkeypatch):
+    """Verifies the extra paranoia check actually does something: if
+    synchronization somehow left a "shared" tensor genuinely unequal
+    (simulated here via a monkeypatched synchronizer that lies about what
+    it did), persistence must refuse rather than write a manifest
+    claiming a sharing relationship that isn't true."""
+    import gen3_multiscale.models.model_factory as model_factory_module
+
+    models = _build_all_four()
+    with torch.no_grad():
+        # Force a genuine, deliberate mismatch -- otherwise architecture1
+        # and architecture2's gene_head_logits already coincide by
+        # construction (both built with the same init_seed), which would
+        # make this test pass for the wrong reason.
+        models["architecture2"].transport_head.gene_head_logits.fill_(123.0)
+
+    def _lying_synchronizer(_models):
+        return {"architecture2": {"transport_head.gene_head_logits": "architecture1.transport_head.gene_head_logits"}}
+
+    monkeypatch.setattr(model_factory_module, "synchronize_four_architecture_initialization", _lying_synchronizer)
+    with pytest.raises(ValueError, match="does not match"):
+        model_factory_module.persist_four_architecture_initializations(models, tmp_path)

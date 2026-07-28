@@ -1508,7 +1508,357 @@ build the real data builder and trainer" -- is noted for whenever Adam
 next directs work to continue; this pass fixed the specific findings
 raised, it did not start that larger, separate body of work.
 
+## 26. Response to the fifth external Codex re-audit (of commit c02a5d1)
+
+Adam forwarded a fifth re-audit, dramatically larger than the first four:
+13 numbered launch-blocking findings, a "genuinely fixed" list, a
+16-step implementation order, and 10 required gates before any 24-hour
+run. Verdict: "the system is still not ready for a long run... the
+real builder, trainer, WSI wiring, and held-out evaluator still do not
+exist." Same discipline as every prior round: every claim checked
+against the actual code before any fix; nothing accepted on faith.
+
+**"Genuinely fixed" list -- spot-checked, all ten items hold up.**
+Rather than re-deriving each from scratch, the two most checkable
+claims were verified directly against code: "Query GEX and query H&E
+are not present in the model-forward schema" -- confirmed,
+`SpatialFieldInputs`'s own docstring states this and
+`validate_spatial_field_example` enforces it structurally, not by
+convention. "Patient-disjoint splitting and cross-organ patient
+conflict handling are sensible" -- confirmed,
+`hest1k_catalog.py::_resolve_cross_organ_patient_conflicts` exists and
+does exactly what its name says. The other eight items in the list
+describe fixes from §22-§25 that this document already verified in
+their own rounds; no new action needed on any of them.
+
+**Finding #1, "the training mask diversity fix is still wrong" --
+CONFIRMED AND FIXED.** The exact bug the audit describes: `seed =
+unique_seeds[i % unique_masks_per_stratum] + stratum_offset` only
+visits seed indices congruent to `i`'s own value modulo
+`unique_masks_per_stratum`'s relationship to `n_strata` -- with 4
+strata and `unique_masks_per_stratum=64`, each stratum actually only
+ever saw 16 unique seeds, not 64. Reproduced computationally before
+fixing (`n_strata=4, unique_masks_per_stratum=64, n_items=256` ->
+16 unique seeds/stratum, confirmed by direct calculation). Fixed with
+the audit's own corrected formula: `occurrence_in_stratum = i //
+n_strata` (a genuine per-stratum visit counter, independent of
+`n_strata`) instead of `i % unique_masks_per_stratum`. Also added, as
+specified: `unique_masks_per_stratum >= _STRATUM_SEED_STRIDE` now
+raises (was previously unchecked), and the exact regression test the
+audit specified --
+`test_build_stratified_training_seed_bank_realizes_the_full_promised_unique_seed_pool_per_stratum`
+-- asserting 4 strata x 64 unique masks x 256 items yields exactly 64
+unique seeds per stratum and exactly 256 unique `(stratum, seed)`
+combinations. The `unique_masks_per_stratum > n_items` check (no
+longer a meaningful constraint under the corrected formula) was
+removed.
+
+**Finding #2, "initialization loading is not genuinely fail-closed" --
+CONFIRMED, all three sub-issues fixed.**
+
+1. *`load_synchronized_initialization()`'s `manifest=None`,
+   `architecture_name=None` defaults let verification be silently
+   skipped by omission.* CONFIRMED -- this is a real, fair correction
+   of §25's own overclaim: §25 called this function "genuinely
+   fail-closed," but fail-closed behavior that's opt-in by keyword
+   argument is not actually fail-closed. Fixed: both parameters are now
+   required (no defaults); the old unverified behavior moved to a
+   separately-named `load_ad_hoc_checkpoint_unverified()`, so skipping
+   verification now requires calling a function whose name says so,
+   not merely omitting two keyword arguments. Verified by
+   `test_load_synchronized_initialization_requires_a_manifest_and_architecture_name`,
+   which inspects the function's signature directly (via
+   `inspect.signature`) to confirm neither parameter has a default, and
+   `test_load_ad_hoc_checkpoint_unverified_is_the_only_way_to_skip_verification`.
+2. *`gene_basis_hash` is misleadingly named -- it only ever held
+   `gene_names_hash` (panel identity), not a hash describing how the
+   basis was FITTED (rank, residual source, seed).* CONFIRMED --
+   accurate; `GeneResidualBasis` doesn't currently store any
+   fitting-provenance metadata at all, so no field could have described
+   it. Fixed by renaming the manifest field to
+   `gene_basis_gene_names_hash` and documenting precisely what it does
+   and does not cover (the basis matrix's own numeric content is
+   separately covered by `tensor_hashes`, since `_gene_basis_matrix` is
+   a registered buffer and gets hashed like any other persisted
+   tensor). Fitting-provenance metadata itself (rank, residual source,
+   fitting sample IDs) is not added here -- `GeneResidualBasis` isn't
+   fit by any code in this repository yet, so there is nothing real to
+   record; adding placeholder provenance fields would misrepresent
+   verification strength rather than add it, the same reasoning §25
+   already applied to the resolved-config-hash question.
+3. *`persist_synchronized_initializations()` accepts unsynchronized
+   models and an absent synchronization mapping despite what its name
+   implies.* CONFIRMED. Rather than tightening the general low-level
+   function (still needed in its permissive form by its own toy-module
+   unit tests), added a new strict wrapper,
+   `persist_four_architecture_initializations()`, that: requires
+   exactly the four `architectureN` keys; always calls
+   `synchronize_four_architecture_initialization` itself (never trusts
+   a caller-supplied mapping); verifies every mapped tensor pair is
+   `torch.equal` before persisting anything, raising `ValueError`
+   otherwise. Verified by
+   `test_persist_four_architecture_initializations_refuses_to_persist_an_inconsistent_state`,
+   which monkeypatches in a "lying" synchronizer that claims a sharing
+   relationship without performing any copy, and confirms persistence
+   is refused.
+
+The additional manifest fields the audit lists (resolved effective
+model configuration hash, training cohort/split hash,
+normalization/QC specification hash, GigaPath checkpoint SHA256, code
+commit, mask-generation version, training/validation/test mask-bank
+hashes) are NOT added in this pass -- every one of them describes state
+belonging to a real trainer/data builder that does not exist yet (a
+resolved config, a real cohort split, a real normalization fit, a real
+mask bank). Adding placeholder fields for data nothing yet produces
+would be exactly the kind of "looks more verified than it is" gap this
+whole audit round is about avoiding. This is deferred to whenever the
+real training system (§21) is built, not silently dropped.
+
+**Finding #3, "there is still no real data builder or trainer" --
+CONFIRMED, ALREADY DISCLOSED.** Unchanged from §21/§23/§24/§25's own
+repeated statement of the same fact. The list of things this leaves
+unproven (query leakage, physical overlap removal, patient
+disjointness in an actual run, training-only normalization, four
+subprocesses actually loading synchronized initialization, checkpoint
+resume correctness, AMP/OOM behavior) is accurate and is exactly what
+those sections already say is blocked on the same missing system.
+
+**Finding #4, "Architectures 3 and 4 still do not implement their
+defining WSI context" -- CONFIRMED, ALREADY DISCLOSED.** Checked
+directly: both `use_regional_he` and `use_global_slide` still raise
+`NotImplementedError` when set `True` (§17/§20 already documented this
+exact gap, including the observation that Architecture 3 currently
+means "Architecture 1 plus global observed-GEX inducing tokens," not
+the full hierarchical regional-H&E-plus-WSI-LongNet design the handoff
+specifies).
+
+**Finding #5, "physical image masking is incomplete" -- CONFIRMED,
+DEFERRED.** Checked directly: `SpatialFieldInputs` has no
+`image_available` field and nothing currently zeroes an observed
+patch's image features or excludes WSI tiles intersecting a hole --
+because nothing yet BUILDS a `SpatialFieldInputs` from real masked
+data at all (§19 already lists "physical hole-overlap removal for
+observed image patches" as not covered). This is real, but it is a
+per-example DATA BUILDER concern -- there is no builder to add this
+logic to yet. Implementing it in isolation, with no real hole geometry
+or WSI tile grid to test it against, would produce untested code with
+no way to verify it's actually correct. Deferred to when the real
+builder (implementation-order step 8, which the audit itself groups
+this under) is built.
+
+**Finding #6, "'only completely new masks and no same spots' is not
+enforced yet" -- CONFIRMED, ALREADY DISCLOSED.** Checked directly:
+`mask_bank.py::query_overlap_report`'s own docstring states plainly
+that "query spots are NOT required or verified to be disjoint across
+masks" -- it reports overlap, it does not enforce disjointness, exactly
+as the audit describes. The stricter composite `(sample_id, barcode)`
+identity policy, and failing the launch on any cross-split identity
+collision, both require an actual train/validation/test split and
+actual per-split mask banks to check identities against -- i.e. the
+same missing real data builder/trainer as findings #3-#5. Tracked here,
+not silently ignored, but not buildable as an isolated unit today.
+
+**Finding #7, "the geometry graph can create biologically false edges"
+-- CONFIRMED, DEFERRED (new finding, substantial redesign).** Checked
+directly: `build_knn_adjacency()` always returns a fixed-k, directed
+nearest-neighbor graph over raw coordinates -- no lattice-adjacency
+detection, no symmetry enforcement, no distance-based edge rejection,
+no diagnostic reporting of edge-length quantiles or connected
+components. This is a real, previously-unraised gap: near tissue gaps
+or disconnected fragments, a spot's 6 "nearest" neighbors can include
+ones across empty space simply because they're the closest points
+available. Not fixed in this pass -- this is a genuine boundary-graph
+REDESIGN (symmetric radius graph, lattice-adjacency detection,
+distance-bounded edge rejection, relative-to-hole coordinate units,
+new diagnostic fields), not a contained bug fix, and it changes what
+`extract_boundary_and_local_context` returns for every architecture
+that consumes it. Given how much this single round has already
+changed, redesigning the graph construction underlying every
+architecture's local context deserves explicit sign-off before
+starting, not a unilateral change buried in an audit-response pass.
+
+**Finding #8, "the WSI cache key remains unsafe" -- CONFIRMED, ALREADY
+DISCLOSED, re-confirmed not new.** Checked directly against
+`models/slide_encoder.py`'s `_tensor_digest(coords, namespace)` --
+confirmed accurate, it hashes only tile coordinates and a namespace
+string, never tile-feature values, checkpoint identity, or
+preprocessing version. This is the exact same finding §23 already
+recorded in response to the second audit ("Cache signature scheme...
+not yet implemented as gen3-specific code... only wiring once there's
+a real cache to protect") -- re-confirmed true, still deferred to when
+a real cache actually needs protecting, i.e. when the real trainer
+exists to define what "preprocessing version" and "exact visible mask"
+even mean in production.
+
+**Finding #9, "the 'global GEX' branch is actually multimodal" --
+CONFIRMED, DEFERRED (new finding, design decision).** Checked directly:
+`_SharedFieldArchitecture.forward()` calls `self.gex_pool(observed_tokens,
+...)`, and `observed_tokens` (built by `_observed_tokens()`) already
+fuses GEX, H&E, coordinates, and ring-embedding information before the
+pool ever sees it -- so `InducedGlobalGEXPool`'s attention weights are
+provably influenced by non-GEX signal, exactly as the audit says. This
+is accurate and is a genuine, previously-unraised architectural point,
+not a bug in the sense of violating a stated contract (the handoff
+never specifies the global pool must be GEX-ONLY input, only that it
+produces a "global GEX" summary). Giving it a dedicated GEX-only token
+projection (optionally with relative coordinates, no H&E) is a real
+design change affecting Architecture 3/4's actual learned behavior --
+left as an explicit open decision for Adam, the same treatment §22
+already gave the "shared residual disabled in all four configs"
+finding, rather than resolved unilaterally in either direction.
+
+**Finding #10, "candidate duplication biases transport" -- CONFIRMED,
+ALREADY DISCLOSED.** This is exactly what §15/§17 already call out as
+"Transport candidate pool is concatenated, not deduplicated... a
+query's local neighbors are NOT excluded from the boundary set, so a
+close spot can appear twice (once as a local candidate, once as a
+boundary candidate)... proper deduplication needs per-query masked
+attention, a real follow-up" -- re-confirmed true by re-reading
+`_candidate_pool()`/`forward()` directly, not newly discovered. The
+audit's suggested fix (exclude boundary members from local-only
+candidates, pad, add a candidate mask to the transport softmax) is a
+reasonable design for that follow-up but is not implemented here,
+consistent with §15's own framing of this as already-scoped future
+work rather than a silent gap.
+
+**Finding #11, "the spatial-gradient loss uses target-dependent
+scaling" -- CONFIRMED, ALREADY DISCLOSED.** Checked directly:
+`spatial_gradient_loss`'s own docstring already states this exactly --
+"When None (the common case until a real data builder supplies a
+training-fit scale), this function falls back to the per-gene std of
+target_expression WITHIN THIS CALL -- a documented simplification...
+not a claim that this is the training-set scale." The function already
+accepts an optional `per_gene_scale` parameter specifically so a real
+trainer can pass a training-fit scale once one exists; no caller does
+so today because no trainer exists to fit one. No code change needed;
+this is the same "training-only fitting must happen outside this
+function" limitation §18 already documents for `harmonic.py` and
+`target_gene_scale`.
+
+**Finding #12, "Architecture 4 needs a better training contract" --
+CONFIRMED, PARTIALLY FIXED.**
+
+1. *"The conditioner is evaluated once for reconstruction and again
+   inside `compute_flow_matching_loss()`. With dropout enabled, the two
+   passes are not identical."* CONFIRMED -- verified by reading
+   `forward()` and `compute_flow_matching_loss()`, which independently
+   call `self.conditioner(inputs)`; every config in this repository
+   sets `dropout` > 0, so two separate calls in one training step would
+   draw different dropout masks. Fixed: added `Architecture4.compute_losses()`,
+   which runs `self.conditioner(inputs)` exactly ONCE and derives both
+   the deterministic output and the flow-matching loss from that single
+   pass. `forward()` and `compute_flow_matching_loss()` are kept
+   unchanged (not merged or deprecated) for callers that genuinely only
+   need one or the other, and for the existing tests exercising them
+   independently -- `compute_losses()` is the one a real trainer
+   computing both losses per step should call. Verified by
+   `test_architecture_4_compute_losses_runs_the_conditioner_exactly_once_and_stays_consistent`,
+   which puts the model in `eval()` (so dropout becomes a no-op and the
+   three call patterns are directly comparable) and confirms
+   `compute_losses()`'s output matches calling `forward()` and
+   `compute_flow_matching_loss()` separately.
+2. *"`predictive_std` uses the default unbiased estimator and becomes
+   NaN with one sample."* CONFIRMED -- reproduced directly
+   (`torch.randn(1, 5).std(dim=0)` returns all-NaN with a
+   degrees-of-freedom UserWarning). Fixed: `predictive_std` now uses
+   `std(dim=0, unbiased=False)`, which reports the well-defined
+   population std of exactly 0 for a single sample instead of NaN.
+   Verified by
+   `test_architecture_4_predictive_std_is_finite_zero_not_nan_for_a_single_sample`.
+3. *"Flow coefficient scales are not standardized," "a residual basis
+   fitted on Architecture 3 residuals implies Architecture 3 must
+   already be trained, preventing four clean parallel starts," "add an
+   explicit `flow_weight` to the config."* CONFIRMED, NOT FIXED, blocked
+   on the same missing real trainer/data builder as findings #3-#6:
+   standardizing coefficients requires a training-only coefficient
+   mean/std fit; fitting the basis on training-only centered expression
+   variation (rather than Architecture-3 residuals) is a real,
+   reasonable redesign of how `GeneResidualBasis` gets fit, but there is
+   currently no code anywhere that fits one at all outside tests, so
+   there's no real fitting pipeline to change yet; `flow_weight` belongs
+   in a training config/loop that doesn't exist. Noted for whoever
+   builds the real basis-fitting step and trainer, not silently dropped.
+
+**Finding #13, "evaluation aggregation is not correct for PCC yet" --
+CONFIRMED, DEFERRED (needs the real evaluator).** Checked directly:
+`aggregate_patient_metrics()`'s signature is
+`(per_item_metrics: list[dict[str, float]], patient_ids: list[str])`
+-- it receives ALREADY-COMPUTED per-item metric values and macro-averages
+them within and across patients. It has no access to raw
+predictions/targets at all, so it structurally cannot do the
+statistically correct thing the audit describes (concatenate raw
+predictions within a patient, then compute PCC once over the pooled
+set -- PCC is nonlinear, so averaging per-item PCCs is not equivalent).
+Fixing this correctly means a different function, one that collects
+raw `(patient, sample, barcode, mask, stratum)`-keyed predictions,
+deduplicates repeated spots, and computes per-gene PCC/RMSE from
+concatenated raw values per patient -- which requires an actual
+evaluator collecting real predictions across real held-out items, i.e.
+the same missing real trainer/evaluator as finding #3. Not built here;
+`aggregate_patient_metrics` is left as-is (still useful for its
+current, narrower contract) rather than partially reworked toward a
+signature nothing yet calls correctly.
+
+**Step-by-step implementation order and required gates -- read and
+acknowledged, not executed.** The audit's own framing is explicit:
+"Implement in this exact order and stop expanding unrelated helper
+infrastructure... The next correct step is finishing and auditing the
+data/training protocol -- not another architecture sweep." This is the
+first audit round to explicitly instruct a change in the KIND of work
+that should happen next, not just more fixes within the current scope.
+This pass fixed everything in the 13 findings that was genuinely
+fixable in isolation (findings #1, #2, and parts of #12) and gave every
+remaining finding an explicit, checked verdict rather than silence. It
+did NOT start building `gen3_multiscale.training.train`, a real
+`Gen3DataBundle`/HEST data builder, the WSI/regional-H&E wiring, the
+geometry-graph redesign, the GEX-pool purity redesign, candidate
+deduplication, basis standardization, or the raw-prediction evaluator
+-- each of those is a substantial, independent body of work (the
+audit's own 16-step order spans them across 6 more steps after this
+one), and starting any of them unilaterally, in the middle of an
+audit-response pass, would be exactly the kind of scope creep the
+audit's own closing line warns against. This is surfaced back to Adam
+as the explicit decision point it is, not resolved unilaterally in
+either direction.
+
+**Unrelated, pre-existing test failure noticed while running the full
+suite for this pass: `tests/test_multi_sample.py::test_inject_multi_sample_n_genes`
+fails on this exact commit (`c02a5d1`), before any change in this
+section.** Confirmed via `git stash` -- the failure reproduces
+identically with none of this round's changes applied. This lives in
+the top-level `tests/` directory (not `gen2_architectures/` or
+`gen3_multiscale/`) and concerns `inject_multi_sample_n_genes`, code
+this session has never touched. Out of scope for a `gen3_multiscale/`
+audit-response pass; noted here rather than silently passed over, for
+whoever next works in that area.
+
+**No 24-hour run has been started or will be auto-started. This
+document only records fixes to already-written code and tests.**
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 320 passed (41 reused-infra + 12 example-schema +
+  11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 19 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  19 launch-four-gpu-suite + 31 model-factory + 4 gene-encoder +
+  32 mask-schedule)
+gen2_architectures + gen3_multiscale: 489 passed, 1 skipped
+```
+
+Note: a full monorepo run (`pytest -q` from the repo root, everything
+including the top-level `tests/` directory) shows one additional
+failure, `tests/test_multi_sample.py::test_inject_multi_sample_n_genes`,
+confirmed pre-existing on this exact commit before any change in §26
+(reproduces identically under `git stash`) and unrelated to
+`gen2_architectures/` or `gen3_multiscale/` -- out of scope for this
+pass, not a regression introduced here.
+
+The block immediately below (pre-5th-audit-response test counts) is
+kept for historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 310 passed (41 reused-infra + 12 example-schema +
