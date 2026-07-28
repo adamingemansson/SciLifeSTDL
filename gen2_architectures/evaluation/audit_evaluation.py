@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from gen2_architectures.data.mask_bank import record_masks, split_records
+from gen2_architectures.data.mask_bank import record_masks, split_records, query_overlap_report
 from gen2_architectures.evaluation import metrics as ev
 from gen2_architectures.training.validation import move_to_device, predictive_samples
 
@@ -404,6 +404,7 @@ def evaluate_model_on_mask_bank(
         "experiment_name": str(cfg.experiment_name),
         "n_test_masks": len(records),
         "n_samples_per_mask": n_samples,
+        "mask_overlap": query_overlap_report(records),
         "requested_pca_components": requested_pca,
         "effective_pca_components": effective_pca,
         "n_evaluated_genes": int(metric_expr.shape[1]),
@@ -426,6 +427,11 @@ def evaluate_model_on_mask_bank(
             "gene_panels": (
                 "Evaluation-only slices of the full model output. They do not alter training, "
                 "the loss, input genes, or decoder genes."
+            ),
+            "mask_overlap": (
+                "Query spots are not required to be disjoint across masks -- see the "
+                "mask_overlap block for how much of the per-mask sample size is unique spots "
+                "vs re-scored repeats."
             ),
         },
     }

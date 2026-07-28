@@ -250,6 +250,48 @@ def split_records(bank: dict, split: str) -> list[dict]:
     return sorted(records, key=lambda r: int(r["index"]))
 
 
+def query_overlap_report(records: list[dict]) -> dict:
+    """GPT-audit-flagged (2026-07-27, confirmed and fixed): the mask bank's
+    query spots are NOT required or verified to be disjoint across masks in
+    a split (e.g. the 16 "test" masks) -- audit_evaluation.py has always
+    reported per-mask summary statistics and mean/std across masks as if
+    they were independent replicates, which overstates effective sample
+    size whenever the same spot's prediction is scored more than once
+    across different masks.
+
+    This does not change any metric computation -- it's a purely additive
+    diagnostic, folded into evaluate_model_on_mask_bank's result dict, so a
+    reader can see how much apparent replication is real (distinct spots,
+    distinct local context) vs re-scoring of the same spots under a
+    different mask, and can bootstrap uncertainty by sample rather than by
+    mask if the overlap turns out to be substantial."""
+    query_sets = [set(r["query_obs_names"]) for r in records]
+    total_draws = sum(len(s) for s in query_sets)
+    unique_spots = len(set().union(*query_sets)) if query_sets else 0
+    max_pairwise_overlap_fraction = 0.0
+    for i in range(len(query_sets)):
+        for j in range(i + 1, len(query_sets)):
+            a, b = query_sets[i], query_sets[j]
+            smaller = min(len(a), len(b))
+            if smaller == 0:
+                continue
+            fraction = len(a & b) / smaller
+            max_pairwise_overlap_fraction = max(max_pairwise_overlap_fraction, fraction)
+    return {
+        "n_masks": len(records),
+        "unique_query_spots": unique_spots,
+        "total_query_spot_draws": total_draws,
+        "mean_query_spots_per_mask": total_draws / len(records) if records else 0.0,
+        "max_pairwise_overlap_fraction": max_pairwise_overlap_fraction,
+        "note": (
+            "Masks are not required to have disjoint query spots. "
+            "unique_query_spots < total_query_spot_draws means some spots are scored more "
+            "than once across masks -- per-mask stats should not be treated as fully "
+            "independent replicates; prefer bootstrapping uncertainty by sample."
+        ),
+    }
+
+
 def ensure_mask_bank(
     path: str | Path,
     coords3d: np.ndarray,
