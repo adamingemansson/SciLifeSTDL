@@ -208,8 +208,9 @@ def load_stratified_mask_bank(
 
 
 def build_stratified_training_seed_bank(
-    obs_names: Iterable[str], n_items: int, base_seed: int, strata: list[dict],
-    unique_mask_count: int | None = None,
+    coords3d: np.ndarray, slice_ids: np.ndarray, obs_names: Iterable[str],
+    n_items: int, base_seed: int, strata: list[dict],
+    unique_masks_per_stratum: int | None = None,
 ) -> dict:
     """Stratified equivalent of `mask_bank.build_training_seed_bank`: a
     lossless, deterministic (stratum, seed) schedule for `n_items`
@@ -226,10 +227,30 @@ def build_stratified_training_seed_bank(
     which would reproduce the exact multi-gigabyte-JSON problem
     `build_training_seed_bank`'s own docstring already explains.)
 
-    Round-robin (item i -> stratum i % n_strata), not per-item random
-    stratum sampling, so a small `n_items` still touches every stratum at
-    least once rather than starving one by chance. Each stratum's seed
-    range is offset by the same `_STRATUM_SEED_STRIDE`
+    Two real, confirmed gaps fixed here (4th Codex re-audit of commit
+    0fd46e5):
+    - **Misleading parameter name.** The previous `unique_mask_count`
+      name suggested a GLOBAL unique-mask total, but the value actually
+      meant "unique seeds PER STRATUM" -- e.g. with 4 strata and the old
+      name set to 1, the schedule still produced 4 distinct (stratum,
+      seed) combinations, not 1, because each stratum's seed range is
+      independently offset. Renamed to `unique_masks_per_stratum`, which
+      states the actual semantics directly; no behavior changed.
+    - **Coverage claim without an enforced precondition.** Round-robin
+      (item i -> stratum i % n_strata) genuinely covers every stratum
+      only when `n_items >= len(strata)` -- fewer items than strata
+      deterministically skips the remainder, which is a real
+      precondition, not "starving one by chance" as the previous
+      docstring implied. Now raises instead of silently producing partial
+      coverage a caller didn't ask for.
+    - **No spatial fingerprint.** The schedule used to fingerprint only
+      `obs_names` -- the same barcodes with altered coordinates would
+      silently reuse a schedule whose generated spatial holes would
+      actually differ. `coords3d`/`slice_ids` are now required inputs,
+      fingerprinted via the same `mask_bank.spatial_fingerprint`
+      `build_stratified_mask_bank` already uses.
+
+    Each stratum's seed range is offset by the same `_STRATUM_SEED_STRIDE`
     `build_stratified_mask_bank` uses, so a training draw's seed can
     never collide with a different stratum's draw.
     """
@@ -242,19 +263,25 @@ def build_stratified_training_seed_bank(
     stratum_names = [s.get("name") for s in strata]
     if len(set(stratum_names)) != len(strata) or any(name is None for name in stratum_names):
         raise ValueError("every stratum must have a unique, non-null 'name'")
-
-    unique_mask_count = n_items if unique_mask_count is None else int(unique_mask_count)
-    if unique_mask_count < 1 or unique_mask_count > n_items:
+    n_strata = len(strata)
+    if n_items < n_strata:
         raise ValueError(
-            f"unique_mask_count must be in [1, n_items], got {unique_mask_count} for n_items={n_items}"
+            f"n_items ({n_items}) must be >= the number of strata ({n_strata}) to guarantee every "
+            "stratum is covered at least once -- round-robin assignment cannot cover more strata "
+            "than there are items"
         )
 
-    n_strata = len(strata)
-    unique_seeds = list(range(base_seed, base_seed + unique_mask_count))
+    unique_masks_per_stratum = n_items if unique_masks_per_stratum is None else int(unique_masks_per_stratum)
+    if unique_masks_per_stratum < 1 or unique_masks_per_stratum > n_items:
+        raise ValueError(
+            f"unique_masks_per_stratum must be in [1, n_items], got {unique_masks_per_stratum} for n_items={n_items}"
+        )
+
+    unique_seeds = list(range(base_seed, base_seed + unique_masks_per_stratum))
     items = []
     for i in range(n_items):
         stratum_index = i % n_strata
-        seed = unique_seeds[i % unique_mask_count] + stratum_index * _STRATUM_SEED_STRIDE
+        seed = unique_seeds[i % unique_masks_per_stratum] + stratum_index * _STRATUM_SEED_STRIDE
         items.append({"stratum": stratum_names[stratum_index], "seed": seed})
 
     names = [str(x) for x in obs_names]
@@ -262,10 +289,11 @@ def build_stratified_training_seed_bank(
         "version": 1,
         "kind": "stratified_training_seed_schedule",
         "dataset_fingerprint": mask_bank.dataset_fingerprint(names),
+        "spatial_fingerprint": mask_bank.spatial_fingerprint(coords3d, slice_ids),
         "n_obs": len(names),
         "n_items": n_items,
         "base_seed": base_seed,
-        "unique_mask_count": unique_mask_count,
+        "unique_masks_per_stratum": unique_masks_per_stratum,
         "strata_fingerprint": strata_fingerprint(strata),
         "strata": stratum_names,
         "items": items,
@@ -274,26 +302,31 @@ def build_stratified_training_seed_bank(
 
 def ensure_stratified_training_seed_bank(
     path: str | Path,
+    coords3d: np.ndarray,
+    slice_ids: np.ndarray,
     obs_names: Iterable[str],
     n_items: int,
     base_seed: int,
     strata: list[dict],
-    unique_mask_count: int | None = None,
+    unique_masks_per_stratum: int | None = None,
 ) -> tuple[dict, Path]:
     """Load-or-atomically-create, mirroring `mask_bank.ensure_training_seed_bank`:
     reuse an existing on-disk schedule if every identifying field and the
     exact (stratum, seed) sequence still match, otherwise build and
-    persist a fresh one. Fails closed (raises) on any mismatch rather
-    than silently reusing a stale or altered schedule."""
+    persist a fresh one. Fails closed (raises) on any mismatch -- now
+    including a changed `spatial_fingerprint` (see
+    `build_stratified_training_seed_bank`'s docstring) -- rather than
+    silently reusing a stale or altered schedule."""
     path = Path(path)
     expected = build_stratified_training_seed_bank(
-        obs_names, n_items, base_seed, strata, unique_mask_count=unique_mask_count,
+        coords3d, slice_ids, obs_names, n_items, base_seed, strata,
+        unique_masks_per_stratum=unique_masks_per_stratum,
     )
     if path.exists():
         bank = json.loads(path.read_text())
         for key in (
-            "kind", "dataset_fingerprint", "n_obs", "n_items", "base_seed",
-            "unique_mask_count", "strata_fingerprint",
+            "kind", "dataset_fingerprint", "spatial_fingerprint", "n_obs", "n_items", "base_seed",
+            "unique_masks_per_stratum", "strata_fingerprint",
         ):
             if bank.get(key) != expected.get(key):
                 raise ValueError(

@@ -1404,6 +1404,127 @@ narrower than before this pass -- the checkpoint format and manifest
 exist and are tested; only the LOADING CALL inside a real training loop
 is still missing, because that loop is still missing.
 
+## 25. Response to the fourth external Codex re-audit (of commit 0fd46e5)
+
+Adam forwarded a fourth re-audit, of `0fd46e5` (§24's fixes). Verdict:
+"the two-hop synchronization logic and mask persistence are structurally
+correct... I would accept this commit as progress," with two further
+correction sets before building the trainer. Same discipline as every
+prior round: every claim checked against the actual code before any fix.
+
+**"Hashed initialization checkpoints are not actually verified" --
+CONFIRMED, multiple real sub-issues, all addressed.**
+
+1. *"`load_synchronized_initialization()` ignores the manifest
+   completely."* CONFIRMED -- checked directly, it only ever called
+   `checkpoint.load_trainable_state`. Fixed: `load_synchronized_initialization`
+   now accepts an optional `manifest`/`architecture_name` and, when given,
+   fails closed in two stages -- (1) the checkpoint FILE's own SHA256 must
+   match the manifest before anything is loaded, catching a modified,
+   corrupted, or wrong-architecture-directory checkpoint; (2) after
+   loading, every persisted tensor's hash is recomputed and compared
+   against the manifest, catching a `load_state_dict` that silently
+   dropped or mismatched a key. Verified directly by two new regression
+   tests: a byte-corrupted checkpoint file, and a checkpoint file
+   deliberately copied into the WRONG architecture's directory (a
+   real, plausible operational mistake) -- both now raise instead of
+   silently loading.
+2. *"`shared_hash_groups` groups tensors by raw byte hash. This can group
+   unrelated zero-initialized parameters together and is not a semantic
+   comparison."* CONFIRMED -- a real, valid critique of §24's own design.
+   Fixed by removing hash-collision inference entirely:
+   `synchronize_shared_initialization`/`synchronize_four_architecture_initialization`
+   now return an explicit `(target_name -> "source_model.source_name")`
+   provenance mapping recording the EXACT copies actually performed;
+   `persist_synchronized_initializations` accepts this mapping and
+   writes it into the manifest as `shared_parameter_mapping` -- ground
+   truth, never inferred after the fact. Verified by a regression test
+   using two DELIBERATELY-coincidentally-zero biases that were NEVER
+   synchronized with each other -- proving they no longer appear grouped
+   together the way raw hash-collision grouping would have shown them.
+3. *"The synchronizer also copies parameters only -- not shared buffers.
+   `target_gene_scale`... is not synchronized."* CONFIRMED --
+   `synchronize_shared_initialization` only ever iterated
+   `named_parameters()`. Fixed at the source: it now iterates parameters
+   AND buffers together, using the identical copy/verification logic for
+   both. Verified by a unit test with a plain buffer-only module, and an
+   integration test that deliberately perturbs Architecture 3's
+   `transport_head.target_gene_scale` before synchronizing and confirms
+   the two-hop sync reaches it (this buffer is currently all-ones by
+   default for every architecture, so a before/after check needed a
+   deliberate perturbation to be meaningful -- otherwise-identical
+   defaults would make the test tautological).
+4. *Manifest should store per-tensor shape/dtype, checkpoint file hash,
+   and Architecture 4's gene-basis identity.* All added: every manifest
+   tensor entry now carries `sha256`/`shape`/`dtype`; every architecture
+   entry carries `weights_file_sha256`; Architecture 4's entry carries
+   `gene_basis_hash` (from `gene_basis.gene_names_hash`) whenever the
+   model has a `gene_basis` attribute. **Deliberately NOT added**:
+   resolved-model-config hash and ordered-gene-name hash -- no real
+   trainer exists yet to supply a resolved config or a real gene panel to
+   hash, and a placeholder hash for data that doesn't exist yet would
+   misrepresent verification strength rather than add it.
+
+**"Training mask schedule semantics have edge cases" -- CONFIRMED, all
+three sub-issues fixed.**
+
+1. *`unique_mask_count` naming was misleading -- the audit's own worked
+   example (4 strata, `unique_mask_count=1` still producing 4 distinct
+   combinations) is correct and was reproduced exactly as a regression
+   test before fixing.* Renamed to `unique_masks_per_stratum` throughout
+   (parameter, docstring, stored field); behavior unchanged, only the
+   name now states what the value actually controls.
+2. *"The 'small n_items never starves a stratum' claim is also only true
+   when `n_items >= number_of_strata`."* CONFIRMED -- the previous
+   docstring's phrasing implied protection against chance that round-
+   robin assignment can't actually provide once `n_items < n_strata`.
+   Fixed: `build_stratified_training_seed_bank` now raises `ValueError`
+   in that case instead of silently producing partial coverage a caller
+   didn't ask for.
+3. *"The training seed bank also fingerprints observation names but not
+   coordinates or slice IDs."* CONFIRMED -- `coords3d`/`slice_ids` are
+   now required parameters, fingerprinted via the same
+   `mask_bank.spatial_fingerprint` `build_stratified_mask_bank` already
+   uses, and validated on every `ensure_stratified_training_seed_bank`
+   reload. Verified by a regression test: identical barcodes with
+   coordinates moved keep the same `dataset_fingerprint` but get a
+   DIFFERENT `spatial_fingerprint`, and reloading against moved
+   coordinates now raises.
+
+*"Record the mask-generation implementation/version in the eventual run
+manifest"* -- deliberately deferred, not built now: this is explicitly
+about a RUN manifest for a real training system that doesn't exist yet
+(§21); adding a version tag with nothing yet to consume or compare it
+against would be speculative, not a real fix.
+
+**"Still honestly blocked" list -- re-confirmed accurate, no new
+action.** Every item (no real trainer, no real HEST builder,
+initialization artifacts/mask schedules not consumed by any training
+process, no regional/global WSI context in Architectures 3/4, no
+end-to-end leakage audit, no CUDA/AMP/memory gate, no harmonic caching)
+is exactly what §21/§23/§24 already say. The audit's own closing
+instruction -- "after that, stop expanding infrastructure helpers and
+build the real data builder and trainer" -- is noted for whenever Adam
+next directs work to continue; this pass fixed the specific findings
+raised, it did not start that larger, separate body of work.
+
+## Test status as of this document
+
+```
+gen3_multiscale/tests/: 310 passed (41 reused-infra + 12 example-schema +
+  11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 17 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  17 launch-four-gpu-suite + 27 model-factory + 4 gene-encoder +
+  30 mask-schedule)
+full repo (gen2_architectures + gen3_multiscale): 479 passed, 1 skipped
+```
+
+The block immediately below (pre-4th-audit-response test counts) is kept
+for historical continuity rather than deleted, per this document's
+append-only discipline:
+
 ## Test status as of this document
 
 ```

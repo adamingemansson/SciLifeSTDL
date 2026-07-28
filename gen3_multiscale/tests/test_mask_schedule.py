@@ -203,18 +203,29 @@ def test_ensure_stratified_mask_bank_rejects_a_stale_bank_at_the_same_path(tmp_p
 # build_stratified_training_seed_bank / ensure_stratified_training_seed_bank
 # -- fixes a real, confirmed gap (3rd Codex re-audit of commit ca7cf53):
 # "its default schedule contains validation and test masks only, not
-# training masks."
+# training masks." Further fixed (4th Codex re-audit of commit 0fd46e5):
+# the old unique_mask_count parameter name was misleading (it meant
+# "unique seeds PER STRATUM", not a global total), round-robin coverage
+# was only actually guaranteed when n_items >= n_strata but that wasn't
+# enforced, and the schedule didn't fingerprint coordinates/slice IDs at
+# all (the same barcodes with altered coordinates would silently reuse a
+# schedule whose generated holes would actually differ).
 # ---------------------------------------------------------------------------
+def _training_seed_slide():
+    coords3d, slice_ids, obs_names = _synthetic_slide(n=4)
+    return coords3d, slice_ids, obs_names
+
+
 def test_build_stratified_training_seed_bank_round_robins_across_strata():
-    _obs_names = [f"o{i}" for i in range(4)]
-    bank = build_stratified_training_seed_bank(_obs_names, n_items=6, base_seed=0, strata=_STRATA)
+    coords3d, slice_ids, obs_names = _training_seed_slide()
+    bank = build_stratified_training_seed_bank(coords3d, slice_ids, obs_names, n_items=6, base_seed=0, strata=_STRATA)
     strata_sequence = [item["stratum"] for item in bank["items"]]
     assert strata_sequence == ["small_compact", "large_irregular", "small_compact", "large_irregular", "small_compact", "large_irregular"]
 
 
 def test_build_stratified_training_seed_bank_seeds_never_collide_across_strata():
-    _obs_names = [f"o{i}" for i in range(4)]
-    bank = build_stratified_training_seed_bank(_obs_names, n_items=10, base_seed=0, strata=_STRATA)
+    coords3d, slice_ids, obs_names = _training_seed_slide()
+    bank = build_stratified_training_seed_bank(coords3d, slice_ids, obs_names, n_items=10, base_seed=0, strata=_STRATA)
     seeds_by_stratum: dict[str, set[int]] = {}
     for item in bank["items"]:
         seeds_by_stratum.setdefault(item["stratum"], set()).add(item["seed"])
@@ -222,30 +233,71 @@ def test_build_stratified_training_seed_bank_seeds_never_collide_across_strata()
 
 
 def test_build_stratified_training_seed_bank_is_deterministic():
-    _obs_names = [f"o{i}" for i in range(4)]
-    bank_a = build_stratified_training_seed_bank(_obs_names, n_items=8, base_seed=5, strata=_STRATA)
-    bank_b = build_stratified_training_seed_bank(_obs_names, n_items=8, base_seed=5, strata=_STRATA)
+    coords3d, slice_ids, obs_names = _training_seed_slide()
+    bank_a = build_stratified_training_seed_bank(coords3d, slice_ids, obs_names, n_items=8, base_seed=5, strata=_STRATA)
+    bank_b = build_stratified_training_seed_bank(coords3d, slice_ids, obs_names, n_items=8, base_seed=5, strata=_STRATA)
     assert bank_a == bank_b
 
 
-def test_build_stratified_training_seed_bank_rejects_an_out_of_range_unique_mask_count():
-    _obs_names = [f"o{i}" for i in range(4)]
-    with pytest.raises(ValueError, match="unique_mask_count"):
-        build_stratified_training_seed_bank(_obs_names, n_items=4, base_seed=0, strata=_STRATA, unique_mask_count=99)
+def test_build_stratified_training_seed_bank_rejects_an_out_of_range_unique_masks_per_stratum():
+    coords3d, slice_ids, obs_names = _training_seed_slide()
+    with pytest.raises(ValueError, match="unique_masks_per_stratum"):
+        build_stratified_training_seed_bank(
+            coords3d, slice_ids, obs_names, n_items=4, base_seed=0, strata=_STRATA, unique_masks_per_stratum=99,
+        )
+
+
+def test_build_stratified_training_seed_bank_with_one_unique_mask_per_stratum_still_produces_distinct_combinations():
+    """Regression test locking in the exact scenario the audit gave:
+    unique_masks_per_stratum=1 must NOT mean "1 unique mask overall" --
+    each stratum gets its own offset seed range, so n_items distinct
+    (stratum, seed) combinations still result."""
+    coords3d, slice_ids, obs_names = _training_seed_slide()
+    bank = build_stratified_training_seed_bank(
+        coords3d, slice_ids, obs_names, n_items=4, base_seed=0, strata=_STRATA, unique_masks_per_stratum=1,
+    )
+    combinations = {(item["stratum"], item["seed"]) for item in bank["items"]}
+    assert len(combinations) == 2  # 2 strata x 1 unique seed each -- 4 items round-robin onto these 2 combos
+
+
+def test_build_stratified_training_seed_bank_requires_at_least_one_item_per_stratum_for_coverage():
+    coords3d, slice_ids, obs_names = _training_seed_slide()
+    with pytest.raises(ValueError, match="n_items"):
+        build_stratified_training_seed_bank(coords3d, slice_ids, obs_names, n_items=1, base_seed=0, strata=_STRATA)
+
+
+def test_build_stratified_training_seed_bank_fingerprints_coordinates():
+    coords3d, slice_ids, obs_names = _training_seed_slide()
+    bank_a = build_stratified_training_seed_bank(coords3d, slice_ids, obs_names, n_items=4, base_seed=0, strata=_STRATA)
+    moved_coords3d = coords3d.copy()
+    moved_coords3d[:, 0] += 1000.0  # same barcodes, different spatial layout
+    bank_b = build_stratified_training_seed_bank(moved_coords3d, slice_ids, obs_names, n_items=4, base_seed=0, strata=_STRATA)
+    assert bank_a["dataset_fingerprint"] == bank_b["dataset_fingerprint"]  # same barcodes
+    assert bank_a["spatial_fingerprint"] != bank_b["spatial_fingerprint"]  # but different coordinates
 
 
 def test_ensure_stratified_training_seed_bank_builds_then_reuses(tmp_path):
-    _obs_names = [f"o{i}" for i in range(4)]
+    coords3d, slice_ids, obs_names = _training_seed_slide()
     path = tmp_path / "training_seeds.json"
-    first, _ = ensure_stratified_training_seed_bank(path, _obs_names, n_items=6, base_seed=0, strata=_STRATA)
+    first, _ = ensure_stratified_training_seed_bank(path, coords3d, slice_ids, obs_names, n_items=6, base_seed=0, strata=_STRATA)
     assert path.is_file()
-    second, _ = ensure_stratified_training_seed_bank(path, _obs_names, n_items=6, base_seed=0, strata=_STRATA)
+    second, _ = ensure_stratified_training_seed_bank(path, coords3d, slice_ids, obs_names, n_items=6, base_seed=0, strata=_STRATA)
     assert first == second
 
 
 def test_ensure_stratified_training_seed_bank_rejects_an_altered_schedule_at_the_same_path(tmp_path):
-    _obs_names = [f"o{i}" for i in range(4)]
+    coords3d, slice_ids, obs_names = _training_seed_slide()
     path = tmp_path / "training_seeds.json"
-    ensure_stratified_training_seed_bank(path, _obs_names, n_items=6, base_seed=0, strata=_STRATA)
+    ensure_stratified_training_seed_bank(path, coords3d, slice_ids, obs_names, n_items=6, base_seed=0, strata=_STRATA)
     with pytest.raises(ValueError, match="does not match"):
-        ensure_stratified_training_seed_bank(path, _obs_names, n_items=12, base_seed=0, strata=_STRATA)
+        ensure_stratified_training_seed_bank(path, coords3d, slice_ids, obs_names, n_items=12, base_seed=0, strata=_STRATA)
+
+
+def test_ensure_stratified_training_seed_bank_rejects_changed_coordinates_at_the_same_path(tmp_path):
+    coords3d, slice_ids, obs_names = _training_seed_slide()
+    path = tmp_path / "training_seeds.json"
+    ensure_stratified_training_seed_bank(path, coords3d, slice_ids, obs_names, n_items=6, base_seed=0, strata=_STRATA)
+    moved_coords3d = coords3d.copy()
+    moved_coords3d[:, 0] += 1000.0
+    with pytest.raises(ValueError, match="does not match"):
+        ensure_stratified_training_seed_bank(path, moved_coords3d, slice_ids, obs_names, n_items=6, base_seed=0, strata=_STRATA)

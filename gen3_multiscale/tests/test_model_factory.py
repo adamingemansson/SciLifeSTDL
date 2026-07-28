@@ -136,6 +136,25 @@ def test_synchronize_shared_initialization_copies_matching_named_parameters():
     assert torch.equal(reference.weight, other.weight)
     assert torch.equal(reference.bias, other.bias)
     assert set(synchronized["other"]) == {"weight", "bias"}
+    assert synchronized["other"] == {"weight": "reference.weight", "bias": "reference.bias"}
+
+
+def test_synchronize_shared_initialization_also_synchronizes_buffers():
+    """Regression test for a real, confirmed gap (4th Codex re-audit of
+    commit 0fd46e5): an earlier version only iterated named_parameters(),
+    silently leaving buffers (e.g. GeneValueTransportHead's
+    target_gene_scale, which affects predictions) unsynchronized."""
+    class WithBuffer(torch.nn.Module):
+        def __init__(self, value):
+            super().__init__()
+            self.register_buffer("scale", torch.full((4,), value))
+
+    reference = WithBuffer(1.0)
+    other = WithBuffer(2.0)
+    assert not torch.equal(reference.scale, other.scale)
+    synchronized = synchronize_shared_initialization({"reference": reference, "other": other}, reference="reference")
+    assert torch.equal(reference.scale, other.scale)
+    assert synchronized["other"]["scale"] == "reference.scale"
 
 
 def test_synchronize_shared_initialization_supports_a_name_prefix():
@@ -151,7 +170,7 @@ def test_synchronize_shared_initialization_supports_a_name_prefix():
         models, reference="reference", name_prefixes={"wrapped": "conditioner."},
     )
     assert torch.equal(reference.weight, wrapped.conditioner.weight)
-    assert synchronized["wrapped"] == ["conditioner.weight", "conditioner.bias"]
+    assert synchronized["wrapped"] == {"conditioner.weight": "reference.weight", "conditioner.bias": "reference.bias"}
 
 
 def test_synchronize_shared_initialization_never_touches_parameters_with_a_shape_mismatch():
@@ -204,6 +223,29 @@ def test_synchronize_shared_initialization_alone_cannot_reach_architecture_3_onl
     )
     assert not any(name.startswith("gex_pool.") for name in synchronized["architecture3"])
     assert any(name.startswith("transport_head.") for name in synchronized["architecture3"])
+
+
+def test_synchronize_four_architecture_initialization_also_synchronizes_target_gene_scale_buffer():
+    """The real-architecture-level version of the buffer-sync regression
+    test above: GeneValueTransportHead.target_gene_scale is a buffer, not
+    a parameter, and affects predictions -- deliberately perturbed here
+    (defaults to all-ones for every architecture otherwise, which would
+    make a before/after check meaningless) to prove the two-hop
+    synchronizer reaches it too."""
+    models = _build_all_four()
+    with torch.no_grad():
+        models["architecture3"].transport_head.target_gene_scale.fill_(7.0)
+    assert not torch.equal(
+        models["architecture1"].transport_head.target_gene_scale, models["architecture3"].transport_head.target_gene_scale,
+    )
+    synchronize_four_architecture_initialization(models)
+    assert torch.equal(
+        models["architecture1"].transport_head.target_gene_scale, models["architecture3"].transport_head.target_gene_scale,
+    )
+    assert torch.equal(
+        models["architecture1"].transport_head.target_gene_scale,
+        models["architecture4"].conditioner.transport_head.target_gene_scale,
+    )
 
 
 def test_synchronize_four_architecture_initialization_gives_all_four_real_architectures_identical_shared_parameters():
@@ -286,51 +328,125 @@ def test_persist_synchronized_initializations_writes_weights_and_a_manifest(tmp_
     assert manifest["architectures"]["reference"]["n_parameters"] > 0
 
 
-def test_persist_synchronized_initializations_shared_hash_groups_reflect_real_synchronization(tmp_path):
-    reference = torch.nn.Linear(4, 4)
-    unsynchronized = torch.nn.Linear(4, 4)
-    synchronized = torch.nn.Linear(4, 4)
-    synchronize_shared_initialization({"reference": reference, "synchronized": synchronized}, reference="reference")
+def test_persist_synchronized_initializations_records_the_synchronizers_own_provenance_not_inferred_hashes(tmp_path):
+    """Regression test for a real, confirmed gap (4th Codex re-audit of
+    commit 0fd46e5): an earlier version inferred "sharing" from raw hash
+    COLLISIONS across all parameters, which could mistake two unrelated,
+    coincidentally-identical tensors (e.g. two independently zero-
+    initialized biases) for a real shared-parameter relationship. Two
+    UNSYNCHRONIZED zero-initialized biases are used deliberately here --
+    they WOULD collide under the old hash-grouping approach but must NOT
+    appear in shared_parameter_mapping, since no synchronization actually
+    related them."""
+    reference = torch.nn.Linear(4, 4, bias=True)
+    unsynchronized = torch.nn.Linear(4, 4, bias=True)
+    synchronized = torch.nn.Linear(4, 4, bias=True)
+    with torch.no_grad():
+        reference.bias.zero_()
+        unsynchronized.bias.zero_()  # coincidentally identical to reference.bias -- but never synchronized
+    sync_result = synchronize_shared_initialization(
+        {"reference": reference, "synchronized": synchronized}, reference="reference",
+    )
 
     manifest = persist_synchronized_initializations(
         {"reference": reference, "unsynchronized": unsynchronized, "synchronized": synchronized}, tmp_path,
+        synchronized=sync_result,
     )
-    groups = manifest["shared_hash_groups"]
-    weight_group = next(g for g in groups.values() if any(loc.endswith(".weight") for loc in g))
-    assert "reference.weight" in weight_group
-    assert "synchronized.weight" in weight_group
-    assert "unsynchronized.weight" not in weight_group
+    mapping = manifest["shared_parameter_mapping"]
+    assert mapping["synchronized"]["weight"] == "reference.weight"
+    assert mapping["synchronized"]["bias"] == "reference.bias"
+    assert "unsynchronized" not in mapping  # never passed to the synchronizer -- no ground-truth relationship exists
+
+
+def test_persist_synchronized_initializations_records_gene_basis_hash_for_architecture_4(tmp_path):
+    basis, gene_names = _gene_basis(n_genes=6)
+    model4 = build_architecture(_load("architecture4"), n_genes=6, gex_feature_dim=4, gene_basis=basis, gene_names=gene_names)
+    manifest = persist_synchronized_initializations({"architecture4": model4}, tmp_path)
+    assert manifest["architectures"]["architecture4"]["gene_basis_hash"] == basis.gene_names_hash
 
 
 def test_persist_and_load_synchronized_initialization_round_trips(tmp_path):
     trained_looking = torch.nn.Linear(5, 5)
     with torch.no_grad():
         trained_looking.weight.fill_(3.5)
-    persist_synchronized_initializations({"architecture1": trained_looking}, tmp_path)
+    manifest = persist_synchronized_initializations({"architecture1": trained_looking}, tmp_path)
 
     fresh = torch.nn.Linear(5, 5)  # different random init
     assert not torch.equal(fresh.weight, trained_looking.weight)
-    load_synchronized_initialization(fresh, tmp_path / "architecture1")
+    load_synchronized_initialization(fresh, tmp_path / "architecture1", manifest=manifest, architecture_name="architecture1")
     assert torch.equal(fresh.weight, trained_looking.weight)
 
 
+def test_load_synchronized_initialization_without_a_manifest_still_works_unverified(tmp_path):
+    trained_looking = torch.nn.Linear(5, 5)
+    persist_synchronized_initializations({"architecture1": trained_looking}, tmp_path)
+    fresh = torch.nn.Linear(5, 5)
+    load_synchronized_initialization(fresh, tmp_path / "architecture1")  # no manifest -- old, unverified behavior
+    assert torch.equal(fresh.weight, trained_looking.weight)
+
+
+def test_load_synchronized_initialization_rejects_a_corrupted_checkpoint_file(tmp_path):
+    """Regression test for a real, confirmed gap (4th Codex re-audit):
+    load_synchronized_initialization used to ignore the manifest
+    entirely, so a modified/corrupted checkpoint file would be loaded
+    silently."""
+    trained_looking = torch.nn.Linear(5, 5)
+    manifest = persist_synchronized_initializations({"architecture1": trained_looking}, tmp_path)
+
+    weights_path = tmp_path / "architecture1" / "trainable_weights.pt"
+    weights_path.write_bytes(weights_path.read_bytes() + b"\x00")  # corrupt it
+
+    fresh = torch.nn.Linear(5, 5)
+    with pytest.raises(ValueError, match="does not match its manifest hash"):
+        load_synchronized_initialization(fresh, tmp_path / "architecture1", manifest=manifest, architecture_name="architecture1")
+
+
+def test_load_synchronized_initialization_rejects_a_checkpoint_copied_to_the_wrong_architecture(tmp_path):
+    """The other half of the "corrupted or copied from a different
+    architecture's directory" case -- a real, plausible operational
+    mistake (copying architecture1's checkpoint into architecture2's
+    directory) must be caught, not silently loaded as if it were correct."""
+    model1 = torch.nn.Linear(5, 5)
+    model2 = torch.nn.Linear(5, 5)
+    with torch.no_grad():
+        model2.weight.fill_(9.0)  # deliberately different from model1
+    manifest = persist_synchronized_initializations({"architecture1": model1, "architecture2": model2}, tmp_path)
+
+    # Simulate the mistake: architecture2's directory actually holds architecture1's file.
+    import shutil
+    shutil.copy(tmp_path / "architecture1" / "trainable_weights.pt", tmp_path / "architecture2" / "trainable_weights.pt")
+
+    fresh = torch.nn.Linear(5, 5)
+    with pytest.raises(ValueError, match="does not match its manifest hash"):
+        load_synchronized_initialization(fresh, tmp_path / "architecture2", manifest=manifest, architecture_name="architecture2")
+
+
 def test_persist_synchronized_initializations_on_all_four_real_architectures(tmp_path):
-    """End-to-end: synchronize, persist, and verify the manifest's
-    shared_hash_groups actually contain cross-architecture entries for a
-    genuinely shared module (spot_token), including the previously-
-    unreachable Architecture 3/4 conditioner case."""
+    """End-to-end: synchronize, persist (passing the synchronizer's own
+    provenance), and verify the manifest's shared_parameter_mapping
+    records the previously-unreachable Architecture 3/4 conditioner case
+    (gex_pool) alongside an Architecture-1-shared module (spot_token).
+    Also verifies every persisted architecture round-trips through
+    load_synchronized_initialization's full fail-closed verification."""
     models = _build_all_four()
-    synchronize_four_architecture_initialization(models)
-    manifest = persist_synchronized_initializations(models, tmp_path)
+    sync_result = synchronize_four_architecture_initialization(models)
+    manifest = persist_synchronized_initializations(models, tmp_path, synchronized=sync_result)
 
-    groups = manifest["shared_hash_groups"]
-    spot_token_group = next(
-        g for g in groups.values() if any("architecture1.spot_token.image_proj.weight" == loc for loc in g)
+    mapping = manifest["shared_parameter_mapping"]
+    assert mapping["architecture3"]["spot_token.image_proj.weight"] == "architecture1.spot_token.image_proj.weight"
+    assert (
+        mapping["architecture4"]["conditioner.spot_token.image_proj.weight"]
+        == "architecture3.spot_token.image_proj.weight"
     )
-    assert "architecture3.spot_token.image_proj.weight" in spot_token_group
-    assert "architecture4.conditioner.spot_token.image_proj.weight" in spot_token_group
+    assert (
+        mapping["architecture4"]["conditioner.gex_pool.inducing_queries"]
+        == "architecture3.gex_pool.inducing_queries"
+    )
 
-    gex_pool_group = next(
-        g for g in groups.values() if any("architecture3.gex_pool.inducing_queries" == loc for loc in g)
-    )
-    assert "architecture4.conditioner.gex_pool.inducing_queries" in gex_pool_group
+    for name in models:
+        fresh_kwargs = dict(n_genes=6, gex_feature_dim=4)
+        if name == "architecture4":
+            basis, gene_names = _gene_basis(n_genes=6)
+            fresh_kwargs.update(gene_basis=basis, gene_names=gene_names)
+        fresh = build_architecture(_load(name), **fresh_kwargs)
+        load_synchronized_initialization(fresh, tmp_path / name, manifest=manifest, architecture_name=name)  # must not raise
