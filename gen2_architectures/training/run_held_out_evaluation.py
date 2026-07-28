@@ -39,7 +39,7 @@ import torch
 from omegaconf import OmegaConf
 
 from gen2_architectures.training import checkpoint, data_prep, evaluate
-from gen2_architectures.training.train_local_neighborhood import build_model, _stpath_context_expression
+from gen2_architectures.training.train_local_neighborhood import build_model, _gene_inputs_for
 
 
 def _load_stage_b_model(saved_model_config: dict, gene_names: list[str], device):
@@ -124,11 +124,7 @@ def main(config_path: str) -> None:
 
     for sid in kept_ids:
         adata, images = held_out[str(sid)]
-        gene_inputs = {
-            "context_gene_feature_provider": scfoundation_providers.get(str(sid)) if architecture == "2" else None,
-            "context_gene_features": _stpath_context_expression(adata) if architecture == "4" else None,
-            "context_extra_feature_provider": scfoundation_providers.get(str(sid)) if architecture == "4" else None,
-        }
+        gene_inputs = _gene_inputs_for(architecture, sid, adata, scfoundation_providers)
         metrics = evaluate.evaluate_sample(model, cfg, adata, images, gene_inputs, str(sid), "test", checkpoint_dir)
         primary = metrics["image_modes"][metrics["primary_image_mode"]]["summary"]
         print(f"TEST {sid}: PCC={primary['pcc']['mean']:.4f} RMSE={primary['rmse']['mean']:.4f}")

@@ -90,6 +90,34 @@ def _stpath_context_expression(adata) -> np.ndarray:
     return np.log1p(raw).astype(np.float32)
 
 
+def _gene_inputs_for(architecture: str, sid: str, adata, scfoundation_providers: dict) -> dict:
+    """Single source of truth for the gene_inputs kwargs passed to
+    evaluate.evaluate_sample / build_masked_item's context_gene_features
+    channel -- used by the periodic validation loop AND the final test
+    loop (and mirrored in run_held_out_evaluation.py's standalone
+    evaluator) so a fix here can never again silently apply to only one
+    of them.
+
+    2026-07-27 (GPT-audit-flagged, second-pass re-audit): this exact bug
+    happened once already -- the final test-eval block was hand-written
+    as a near-identical copy of the validation block and, when
+    context_gene_features was added for Architecture 4, only the
+    validation copy was updated (a `replace_all` string edit matched two
+    of the three occurrences because their surrounding text happened to
+    be identical; the final-eval block's surrounding text differed just
+    enough not to match). Architecture 4's automatic end-of-training test
+    metrics were silently computed with library-size-normalized log1p
+    context instead of STPath's expected raw-count log1p -- the exact bug
+    this file's own _stpath_context_expression() was written to fix,
+    reintroduced by duplication. Sharing one function removes the
+    possibility of the two call sites drifting apart again."""
+    return {
+        "context_gene_feature_provider": scfoundation_providers.get(str(sid)) if architecture == "2" else None,
+        "context_gene_features": _stpath_context_expression(adata) if architecture == "4" else None,
+        "context_extra_feature_provider": scfoundation_providers.get(str(sid)) if architecture == "4" else None,
+    }
+
+
 def _sample_organ_tech(adata) -> tuple[str | None, str | None]:
     organ = str(adata.obs["organ"].iloc[0]) if "organ" in adata.obs else None
     tech = str(adata.obs["tech"].iloc[0]) if "tech" in adata.obs else None
@@ -272,11 +300,7 @@ def main(
                 print(f"  [val step {step}] attention_entropy={attn_entropy:.3f} nats")
             for sid in validation_ids:
                 adata, images, _ = held_out_adatas[str(sid)]
-                gene_inputs = {
-                    "context_gene_feature_provider": scfoundation_providers.get(str(sid)) if architecture == "2" else None,
-                    "context_gene_features": _stpath_context_expression(adata) if architecture == "4" else None,
-                    "context_extra_feature_provider": scfoundation_providers.get(str(sid)) if architecture == "4" else None,
-                }
+                gene_inputs = _gene_inputs_for(architecture, sid, adata, scfoundation_providers)
                 metrics = evaluate.evaluate_sample(model, cfg, adata, images, gene_inputs, str(sid), "validation", checkpoint_dir)
                 primary = metrics["image_modes"][metrics["primary_image_mode"]]["summary"]
                 print(f"  [val step {step}] {sid}: PCC={primary['pcc']['mean']:.4f} RMSE={primary['rmse']['mean']:.4f}")
@@ -306,10 +330,7 @@ def main(
         model.eval()
         for sid in test_ids:
             adata, images, _ = held_out_adatas[str(sid)]
-            gene_inputs = {
-                "context_gene_feature_provider": scfoundation_providers.get(str(sid)) if architecture == "2" else None,
-                "context_extra_feature_provider": scfoundation_providers.get(str(sid)) if architecture == "4" else None,
-            }
+            gene_inputs = _gene_inputs_for(architecture, sid, adata, scfoundation_providers)
             metrics = evaluate.evaluate_sample(model, cfg, adata, images, gene_inputs, str(sid), "test", checkpoint_dir)
             primary = metrics["image_modes"][metrics["primary_image_mode"]]["summary"]
             print(f"TEST {sid}: PCC={primary['pcc']['mean']:.4f} RMSE={primary['rmse']['mean']:.4f}")
