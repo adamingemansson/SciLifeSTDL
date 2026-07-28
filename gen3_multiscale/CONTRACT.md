@@ -1,11 +1,10 @@
 # gen3_multiscale — frozen contract and phase log
 
 Implements `CLAUDE_HANDOFF_MULTISCALE_SPATIAL_FIELD_ARCHITECTURES.md`'s
-staged phases. Status: **Phase 0/1/2/3 done**. The shared GEX/transport
-gate (Phase 4), token modules (Phase 5), the four architecture wrappers
-(Phase 6), losses/diagnostics (Phase 7), and configs/launcher (Phase 8)
-are **not yet implemented**. This document is extended, not replaced, as
-later phases land.
+staged phases. Status: **Phase 0/1/2/3/4 done**. Token modules (Phase 5),
+the four architecture wrappers (Phase 6), losses/diagnostics (Phase 7),
+and configs/launcher (Phase 8) are **not yet implemented**. This document
+is extended, not replaced, as later phases land.
 
 ## 1. Base commit
 
@@ -266,28 +265,116 @@ it. 2 tests prove it runs end-to-end against real `boundary_graph.py`
 output (not a pixel/visual-regression test — proof of a clean execution
 path against the real data shapes it will be fed).
 
-## 10. What is still NOT covered
+## 10. Gene-encoder selection (Phase 4 item 1 — a real finding, not a formality)
 
-- No gene-encoder ablation read/selection, no transport-head reuse — Phase 4.
+The handoff says: "Read the current gene-encoder ablation results and
+choose one conditioning encoder by validation evidence, not test
+performance... Choose that encoder from the already implemented full-
+panel alternatives... MLP or the existing weighted-linear encoder."
+
+**Finding**: no such ablation has actually been run. `docs/
+hierarchical_missing_tissue.md` (the authoritative doc for this exact
+model family) states outright, in its own words: "The weighted-linear
+GEX encoder is likewise a STPath-faithful baseline, not a claim that it
+is the best final representation. A follow-up should compare it... — this
+was flagged as FUTURE work, never completed. Every real experiment run
+against `HierarchicalMissingTissueEncoder`/`HierarchicalGeneTransportRegressor`
+(Suite 1, Suite 2, Round 3, Round 4, the C01-C16/O01-O04 recovery suite)
+used `gene_encoder_type="weighted_linear"` throughout; `MLPGeneEncoder`
+(`src/models/conditioning.py`, confirmed to exist and be usable) has
+never actually been run in this task/model combination. Checked directly
+against real docs and code, not assumed from the handoff's phrasing.
+
+**Decision**: freeze `weighted_linear` for all four architectures. This
+is the ONLY option with real held-out validation evidence in this exact
+model family — by the handoff's own stated criterion ("choose... by
+validation evidence"), an option with zero evidence cannot be the
+evidence-based choice, however plausible it might be a priori. This is
+flagged here explicitly rather than silently treated as "the ablation
+was read and this was the answer" — it wasn't; this is the most
+defensible call available given what evidence actually exists, not a
+claim that a real comparison was performed. If Adam wants an actual
+MLP-vs-weighted_linear comparison before committing four 24-hour jobs to
+this choice, that is a small, cheap, separate diagnostic — not implied
+by anything already run.
+
+## 11. Gene-value-preserving transport head (Phase 4 items 2, 4-7 — implemented)
+
+`models/transport_head.py::GeneValueTransportHead` — the transport MATH
+and initialization are extracted from
+`src/models/registry.py::HierarchicalGeneTransportRegressor.sample()`
+(same tensor shapes, same `* 0.02` score-parameter init scale, same
+`1/sqrt(rank)` residual-embedding init, same exact-zero residual-
+projection init, same softmax/entropy formulas) — but NOT the whole
+class, which hard-constructs `HierarchicalMissingTissueEncoder` (the
+older fusion conditioner) inside its own `__init__`. Per the handoff's
+"Do not copy the older fusion design blindly": this module is
+deliberately ENCODER-AGNOSTIC, taking query/candidate hidden states as
+plain tensors so gen3's own spatial-field backbone (Phase 5/6, not yet
+built) can feed it, rather than only ever receiving hidden states from
+the old encoder's `forward_with_neighbors()`.
+
+Deliberate NEW divergence, required by the handoff's fairness matrix:
+the old class ALWAYS blends against an IDW anchor. The handoff instead
+requires Architectures 1/3/4 to have "no computational path from any
+interpolation output to their predictions or losses" — stricter than
+"blend weight near zero." `use_anchor_blend` (default `False`) governs
+this structurally: when `False`, `blend_logit` is never constructed at
+all (`head.blend_logit is None`, verified by test) and `forward()`
+rejects an `anchor_expression` argument outright; when `True`
+(Architecture 2 only), `anchor_expression` is REQUIRED and must be
+computed OUTSIDE this module by a harmonic solver with no learned
+parameters (a Phase 5/6 dependency, not yet built).
+
+14 tests directly exercise the handoff's own named Phase 4 gates:
+noncollapse/gradient flow through the scorer, query/candidate hidden
+states, and gene gates (item 4); untouched real observed values are
+genuinely what gets mixed, verified by swapping in different real
+matrices and checking the output changes, plus a uniform-expression
+exactness check (item 5); Architecture 2's anchor/candidate/blend/
+residual/final outputs are all independently present and distinct in
+the returned dict (item 6); the anchor-free structural guarantee for
+Architectures 1/3/4 (item 7); transport weights and gene gates are
+finite, convex (sum to 1, non-negative), and vary across queries; the
+low-rank residual begins at exactly zero and only diverges once its
+weight is perturbed (never a free per-query-per-gene bias, since its
+gene-side factor has a fixed low rank).
+
+Not yet addressed: Phase 4 item 3 (save normalization, ordered gene
+vocabulary, conditioning panel, training-only per-gene scales) is
+mechanically INHERITED for free from the reused `checkpoint.py`
+(`verify_gene_names`, gene-panel pinning) — but `target_gene_scale`
+itself must be computed from TRAINING data only once a real data builder
+exists; that's a Phase 5/6 concern, not yet implemented. Item 8 (all
+four configs share encoder type/transport heads/gate semantics/residual
+rank/init seed) is a config-level requirement, not meaningful until
+Phase 8 configs exist — tracked, not yet actionable.
+
+## 12. What is still NOT covered
+
 - No token modules, no model code for the spatial-field backbone itself — Phase 5/6.
 - No losses, no diagnostics, no configs, no launcher — Phase 7/8.
 - No real per-sample builder wiring `boundary_graph.py` + `slide_context.py`
-  + real loaded HEST-1k data into a `SpatialFieldExample` yet — that
-  glue code is a natural Phase 4/5 dependency once the transport head and
-  token modules exist to consume it.
+  + `transport_head.py` + real loaded HEST-1k data into a
+  `SpatialFieldExample` and a forward pass yet — that glue code is a
+  natural Phase 5/6 dependency once the token modules and architecture
+  wrappers exist to consume it.
+- No harmonic-solver implementation yet (needed for Architecture 2's
+  `anchor_expression` input) — Phase 5/6.
 - `FrozenGigaPathSlideEncoder`'s actual LongNet forward pass is untested
   here (requires a real checkpoint + CUDA + FlashAttention) — only its
   fail-closed missing-checkpoint behavior is verified.
 - No full leakage/geometry/learning/numerical gate suite — those tests
   only become fully meaningful once there's a real model and a real data
-  builder; Phase 1/2/3's tests cover the schema/geometry/WSI-overlap
-  contract layers those later tests will build on top of (several
-  individual gates are already directly covered, see §8/§9).
+  builder; Phase 1/2/3/4's tests cover the schema/geometry/WSI-overlap/
+  transport contract layers those later tests will build on top of
+  (several individual gates are already directly covered, see §8/§9/§11).
 
 ## Test status as of this document
 
 ```
-gen3_multiscale/tests/: 78 passed (41 reused-infra + 12 example-schema +
-  11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot)
-full repo (gen2_architectures + gen3_multiscale): 247 passed, 1 skipped
+gen3_multiscale/tests/: 92 passed (41 reused-infra + 12 example-schema +
+  11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
+  14 transport-head)
+full repo (gen2_architectures + gen3_multiscale): 261 passed, 1 skipped
 ```
