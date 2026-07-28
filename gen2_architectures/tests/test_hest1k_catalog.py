@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from gen2_architectures.data.hest1k_catalog import resolve_sample_selection
+from gen2_architectures.data.hest1k_catalog import resolve_sample_selection, _resolve_cross_organ_patient_conflicts
 
 
 def _make_fake_hest1k(tmp_path: Path, organ_sample_ids: dict[str, list[str]], technology: str = "Visium",
@@ -259,6 +259,70 @@ def test_split_by_patient_false_reproduces_the_old_sample_level_split():
         # regardless of which patient it happens to belong to
         assert len(result["validation_sample_ids"]) == 1
         assert len(result["test_sample_ids"]) == 1
+
+
+def test_resolve_cross_organ_patient_conflicts_removes_the_train_side_of_a_conflict():
+    """GPT-audit-flagged bug (2026-07-27, second-pass re-audit, confirmed
+    and fixed): the per-organ patient split doesn't see a patient with
+    samples in more than one organ. Patient P1 here has a Lung sample in
+    train and a Kidney sample in test -- must be removed from train."""
+    patient_by_sample = {"L0": "P0", "L1": "P1", "K0": "P1", "K1": "P2"}
+    train_ids, validation_ids, test_ids = _resolve_cross_organ_patient_conflicts(
+        train_ids=["L0", "L1"], validation_ids=[], test_ids=["K0", "K1"],
+        patient_by_sample=patient_by_sample,
+    )
+    assert train_ids == ["L0"]  # L1 (patient P1) removed -- P1 is in test via K0
+    assert test_ids == ["K0", "K1"]  # test is authoritative, never modified
+
+
+def test_resolve_cross_organ_patient_conflicts_removes_the_validation_side_of_a_conflict():
+    patient_by_sample = {"L0": "P0", "K0": "P0"}
+    train_ids, validation_ids, test_ids = _resolve_cross_organ_patient_conflicts(
+        train_ids=[], validation_ids=["L0"], test_ids=["K0"],
+        patient_by_sample=patient_by_sample,
+    )
+    assert validation_ids == []
+    assert test_ids == ["K0"]
+
+
+def test_resolve_cross_organ_patient_conflicts_is_a_no_op_when_already_disjoint():
+    patient_by_sample = {"L0": "P0", "L1": "P1", "K0": "P2", "K1": "P3"}
+    train_ids, validation_ids, test_ids = _resolve_cross_organ_patient_conflicts(
+        train_ids=["L0"], validation_ids=["L1"], test_ids=["K0", "K1"],
+        patient_by_sample=patient_by_sample,
+    )
+    assert train_ids == ["L0"] and validation_ids == ["L1"] and test_ids == ["K0", "K1"]
+
+
+def test_resolve_sample_selection_end_to_end_has_no_patient_spanning_multiple_splits():
+    """Integration-level check through the real per-organ split logic:
+    patient "SHARED" has samples in both Lung and Kidney. Regardless of
+    which organ's rng draw picks it for train/val/test first, the final
+    result must never place the same patient in two different splits."""
+    with tempfile.TemporaryDirectory() as tmp:
+        patient_by_id = {
+            "L0": "SHARED", "L1": "PL1", "L2": "PL2", "L3": "PL3",
+            "K0": "SHARED", "K1": "PK1", "K2": "PK2", "K3": "PK3",
+        }
+        hest_dir, meta_path = _make_fake_hest1k(
+            Path(tmp), {"Lung": ["L0", "L1", "L2", "L3"], "Kidney": ["K0", "K1", "K2", "K3"]},
+            patient_by_id=patient_by_id,
+        )
+        for seed in range(10):  # try several seeds -- the bug is seed-dependent
+            result = resolve_sample_selection(
+                hest_dir, str(meta_path), organs="all", min_samples_per_organ=3,
+                n_validation_per_organ=1, n_test_per_organ=1, split_seed=seed,
+                check_gene_panel_compatibility=False, split_by_patient=True,
+            )
+            patient_of_split = {}
+            for split_name in ("train_sample_ids", "validation_sample_ids", "test_sample_ids"):
+                for sid in result[split_name]:
+                    patient = patient_by_id[sid]
+                    assert patient not in patient_of_split or patient_of_split[patient] == split_name, (
+                        f"seed={seed}: patient {patient!r} appears in both "
+                        f"{patient_of_split.get(patient)!r} and {split_name!r}"
+                    )
+                    patient_of_split[patient] = split_name
 
 
 def test_split_by_patient_falls_back_to_sample_level_when_no_patient_column():

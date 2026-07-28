@@ -167,6 +167,54 @@ def resolve_compatible_sample_ids(
     return kept, shared_genes
 
 
+def _resolve_cross_organ_patient_conflicts(
+    train_ids: list[str], validation_ids: list[str], test_ids: list[str],
+    patient_by_sample: dict[str, str],
+) -> tuple[list[str], list[str], list[str]]:
+    """GPT-audit-flagged bug (2026-07-27, second-pass re-audit, confirmed
+    and fixed): resolve_sample_selection's patient-level split only
+    enforces patient-disjointness WITHIN each organ (computed
+    independently per organ). If the same real patient value has samples
+    in more than one organ, nothing stopped their Lung samples landing in
+    train while their Kidney samples landed in test (or vice versa) -- a
+    genuine cross-organ patient leak a per-organ-only split can't see.
+
+    A small, deliberately conservative post-hoc pass: test is treated as
+    authoritative and never modified. Any patient in BOTH validation and
+    test loses their validation samples (keeps test). Any patient in train
+    AND either held-out split loses their TRAIN samples -- removing a
+    sample from train can only reduce leakage risk, never introduce it, so
+    that's always the safe direction to resolve a train/held-out
+    conflict."""
+    train_patients = {patient_by_sample[sid] for sid in train_ids}
+    val_patients = {patient_by_sample[sid] for sid in validation_ids}
+    test_patients = {patient_by_sample[sid] for sid in test_ids}
+    held_out_patients = val_patients | test_patients
+
+    train_conflicts = train_patients & held_out_patients
+    val_test_conflicts = val_patients & test_patients
+    if train_conflicts:
+        preview = sorted(train_conflicts)[:20]
+        print(
+            f"resolve_sample_selection: {len(train_conflicts)} patient(s) had samples in train "
+            "AND a held-out split across DIFFERENT organs -- removing their samples from train "
+            f"to prevent cross-organ patient leakage: {preview}"
+            f"{', ...' if len(train_conflicts) > len(preview) else ''}"
+        )
+    if val_test_conflicts:
+        preview = sorted(val_test_conflicts)[:20]
+        print(
+            f"resolve_sample_selection: {len(val_test_conflicts)} patient(s) had samples in "
+            "BOTH validation and test across different organs -- removing their samples from "
+            f"validation (test kept as the authoritative held-out split): {preview}"
+            f"{', ...' if len(val_test_conflicts) > len(preview) else ''}"
+        )
+
+    new_train_ids = [sid for sid in train_ids if patient_by_sample[sid] not in held_out_patients]
+    new_validation_ids = [sid for sid in validation_ids if patient_by_sample[sid] not in test_patients]
+    return new_train_ids, new_validation_ids, list(test_ids)
+
+
 def resolve_sample_selection(
     hest_data_dir: str | Path, metadata_csv: str,
     organs: list[str] | str = "all",
@@ -275,6 +323,7 @@ def resolve_sample_selection(
     rng = random.Random(split_seed)
     train_ids, validation_ids, test_ids = [], [], []
     organ_by_sample, tech_by_sample = {}, {}
+    patient_by_sample: dict[str, str] = {}
     kept_organs = []
     has_patient_column = "patient" in visium.columns
     for organ, group in visium.groupby("organ"):
@@ -330,12 +379,34 @@ def resolve_sample_selection(
         for sid in organ_val + organ_test + organ_train:
             organ_by_sample[sid] = organ
             tech_by_sample[sid] = "Visium"
+        patient_by_sample.update(patient_of)
 
     if not train_ids:
         raise ValueError(
             f"no organs had enough usable local samples (min_samples_per_organ={min_samples_per_organ}, "
             f"requested organs={organs}) -- run scripts/inventory_hest1k.py against {hest_data_dir} "
             "to see what's actually available"
+        )
+
+    # 2026-07-27 (GPT-audit-flagged, second-pass re-audit, confirmed and
+    # fixed): the per-organ loop above enforces patient-disjointness only
+    # WITHIN each organ (patient_of/patients/shuffled_patients are all
+    # local to one organ's iteration) -- a real patient value with samples
+    # in more than one organ could still land in train for one organ and a
+    # held-out split for another, a genuine cross-organ leak the per-organ
+    # split alone can't see. Resolve it globally, once, across every organ.
+    train_ids, validation_ids, test_ids = _resolve_cross_organ_patient_conflicts(
+        train_ids, validation_ids, test_ids, patient_by_sample,
+    )
+    kept_ids_after_conflicts = set(train_ids) | set(validation_ids) | set(test_ids)
+    organ_by_sample = {sid: organ for sid, organ in organ_by_sample.items() if sid in kept_ids_after_conflicts}
+    tech_by_sample = {sid: tech for sid, tech in tech_by_sample.items() if sid in kept_ids_after_conflicts}
+    kept_organs = sorted({organ_by_sample[sid] for sid in train_ids})
+    if not train_ids:
+        raise ValueError(
+            "every training sample was excluded by the cross-organ patient-conflict check -- "
+            "every organ's train patients also had held-out samples in a different organ; try "
+            "a different split_seed or split_by_patient=False"
         )
 
     if check_gene_panel_compatibility:
