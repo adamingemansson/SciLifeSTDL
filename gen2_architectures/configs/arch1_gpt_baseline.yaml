@@ -20,6 +20,7 @@
 # max_samples_per_organ up/down after a smoke run shows real steps/sec.
 experiment_name: gen2_arch1_gpt_baseline_v1
 data:
+  strict_broken_region: true   # 2026-07-27, GPT-audit-flagged: without this, context H&E patches near the mask boundary could still contain real pixels from inside the supposedly destroyed query region -- excludes every context patch whose pixels overlap it, not just the query patches themselves (only takes effect when training.image_mode/evaluation.primary_image_mode is target_zero)
   hest_data_dir: data/raw/hest1k
   hest_cache_dir: data/cache/hest1k
   min_genes: 200

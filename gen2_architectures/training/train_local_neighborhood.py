@@ -71,6 +71,7 @@ def main(
     skip_final_eval: bool = False,
 ) -> None:
     cfg = OmegaConf.load(config_path)
+    data_prep.seed_everything(int(cfg.training.get("seed", 0)))
     data_prep.apply_sample_selection(cfg)
     data_prep.apply_smoke_override(cfg, smoke_steps)
     if max_wall_clock_hours_override is not None:
@@ -147,6 +148,15 @@ def main(
     image_mode = str(cfg.training.get("image_mode", "target_zero"))
     context_gex_mode = str(cfg.training.get("context_gex_mode", "full"))
     augment = bool(cfg.training.get("augment_coords", False))
+    # 2026-07-27 (GPT-audit-flagged): masked_item.py has always supported
+    # strict_broken_region (excludes every context H&E patch whose pixels
+    # overlap the query/"destroyed" region, not just the query patches
+    # themselves), but no gen2 config ever enabled it and training never
+    # passed it through -- context patches near the mask boundary could
+    # still see real pixels from inside the supposedly destroyed region.
+    # Read from data.strict_broken_region (matches audit_evaluation.py's
+    # own read of the same key) so evaluation and training agree.
+    strict_broken_region = bool(cfg.get("data", {}).get("strict_broken_region", False))
     wall_clock_deadline = data_prep.resolve_wall_clock_deadline(cfg)
     progress_fn = data_prep.make_progress_fn(wall_clock_deadline, total_steps)
 
@@ -172,6 +182,7 @@ def main(
             context_extra_feature_provider=provider if architecture == "4" else None,
             organ=organ, tech=tech, augment=augment,
             image_mode=image_mode, context_gex_mode=context_gex_mode,
+            strict_broken_region=strict_broken_region,
         )
         item = move_to_device(item, device)
         pred = model(item["context"], item["query"])
@@ -255,8 +266,11 @@ def main(
             metrics = evaluate.evaluate_sample(model, cfg, adata, images, gene_inputs, str(sid), "test", checkpoint_dir)
             primary = metrics["image_modes"][metrics["primary_image_mode"]]["summary"]
             print(f"TEST {sid}: PCC={primary['pcc']['mean']:.4f} RMSE={primary['rmse']['mean']:.4f}")
-            if "pcc_raw_log1p" in primary:
-                print(f"       notebook-comparable PCC (raw log1p space): {primary['pcc_raw_log1p']['mean']:.4f}")
+            if "oracle_library_size_pcc_raw_log1p" in primary:
+                print(
+                    f"       oracle (true-library-size) notebook-comparable PCC (raw log1p space): "
+                    f"{primary['oracle_library_size_pcc_raw_log1p']['mean']:.4f}"
+                )
 
 
 if __name__ == "__main__":

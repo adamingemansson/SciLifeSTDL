@@ -319,13 +319,21 @@ def evaluate_model_on_mask_bank(
     optional, row/column-aligned with ``expr`` (see
     src/data/loaders.py::basic_qc_and_normalize's "raw_counts"/
     "_scilifestdl_raw_library_size" stash). When supplied, an ADDITIONAL
-    ``pcc_raw_log1p`` metric is computed by inverting the model's prediction
-    (which lives in our library-size-normalized log1p space) back to raw-
-    count-log1p space using each query spot's TRUE total count, then
-    comparing against real log1p(raw_counts) ground truth — the exact space
-    STPath's own pretrained weights and the reference notebook evaluate in
-    (see stpath/app/pipeline/inference.py's agent.inference internal log1p-
-    only convention, verified directly against the cloned STPath source).
+    ``oracle_library_size_pcc_raw_log1p`` metric is computed by inverting
+    the model's prediction (which lives in our library-size-normalized
+    log1p space) back to raw-count-log1p space using each query spot's
+    TRUE total count, then comparing against real log1p(raw_counts) ground
+    truth — the exact space STPath's own pretrained weights and the
+    reference notebook evaluate in (see stpath/app/pipeline/inference.py's
+    agent.inference internal log1p-only convention, verified directly
+    against the cloned STPath source).
+
+    2026-07-27 (naming, GPT-audit-flagged): named "oracle_" deliberately --
+    this metric uses the query spot's TRUE total count, information that
+    would not exist for genuinely destroyed tissue. Useful as an oracle
+    upper-bound comparison against STPath's own evaluation convention, but
+    it must never be read as, or promoted to, the primary metric — PCC/RMSE
+    in the model's own native (library-size-normalized log1p) space are.
     None (default) skips this entirely — purely additive, does not change
     any existing metric for any config that doesn't pass it."""
     from gen2_architectures.data.masked_item import build_masked_item as _build_masked_item
@@ -576,9 +584,13 @@ def evaluate_model_on_mask_bank(
                 pred_raw_log1p = np.log1p(pred_counts_est)
                 target_raw_log1p = np.log1p(raw_target)
                 pcc_raw_by_gene = ev.pearson_per_gene(pred_raw_log1p, target_raw_log1p)
-                row["pcc_raw_log1p"] = float(np.nanmean(pcc_raw_by_gene))
-                row["n_pcc_raw_log1p_genes"] = int(np.isfinite(pcc_raw_by_gene).sum())
-                row["rmse_raw_log1p"] = float(ev.rmse(pred_raw_log1p, target_raw_log1p))
+                # "oracle_" prefix: uses the query spot's TRUE total count,
+                # information that would not exist for genuinely destroyed
+                # tissue -- see this function's own docstring. Never treat
+                # this as the primary metric.
+                row["oracle_library_size_pcc_raw_log1p"] = float(np.nanmean(pcc_raw_by_gene))
+                row["n_oracle_library_size_pcc_raw_log1p_genes"] = int(np.isfinite(pcc_raw_by_gene).sum())
+                row["oracle_library_size_rmse_raw_log1p"] = float(ev.rmse(pred_raw_log1p, target_raw_log1p))
             for panel_name, panel_idx in panel_indices.items():
                 panel_pred = pred[:, panel_idx]
                 panel_target = target[:, panel_idx]

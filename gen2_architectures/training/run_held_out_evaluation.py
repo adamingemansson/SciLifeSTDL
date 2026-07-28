@@ -54,6 +54,22 @@ def _load_stage_b_model(saved_model_config: dict, gene_names: list[str], device)
             f"Stage A was pretrained on {stage_a_config['n_genes']} genes, but this Stage B "
             f"checkpoint's gene panel has {n_genes} genes -- mismatched checkpoints"
         )
+    # 2026-07-27 bugfix: see train_arch3_stage_b.py::_load_stage_a's own
+    # comment -- same width isn't the same panel. Compare exact ordered
+    # gene identities too.
+    stage_a_gene_names_path = stage_a_checkpoint_dir / "gene_names.json"
+    if stage_a_gene_names_path.is_file():
+        stage_a_gene_names = json.loads(stage_a_gene_names_path.read_text())
+        if list(stage_a_gene_names) != list(gene_names):
+            first_diff = next(
+                (i for i, (a, b) in enumerate(zip(stage_a_gene_names, gene_names)) if a != b),
+                min(len(stage_a_gene_names), len(gene_names)),
+            )
+            raise ValueError(
+                f"Stage A's gene panel ({stage_a_gene_names_path}) has the same width "
+                f"({n_genes}) as this Stage B checkpoint's, but the ORDERED gene identities "
+                f"differ (first mismatch at index {first_diff})"
+            )
     autoencoder = DenoisingTranscriptomeAutoencoder(n_genes=n_genes, **stage_a_config["params"])
     checkpoint.load_trainable_state(autoencoder, stage_a_checkpoint_dir)
     autoencoder = autoencoder.to(device)
@@ -114,8 +130,11 @@ def main(config_path: str) -> None:
         metrics = evaluate.evaluate_sample(model, cfg, adata, images, gene_inputs, str(sid), "test", checkpoint_dir)
         primary = metrics["image_modes"][metrics["primary_image_mode"]]["summary"]
         print(f"TEST {sid}: PCC={primary['pcc']['mean']:.4f} RMSE={primary['rmse']['mean']:.4f}")
-        if "pcc_raw_log1p" in primary:
-            print(f"       notebook-comparable PCC (raw log1p space): {primary['pcc_raw_log1p']['mean']:.4f}")
+        if "oracle_library_size_pcc_raw_log1p" in primary:
+            print(
+                f"       oracle (true-library-size) notebook-comparable PCC (raw log1p space): "
+                f"{primary['oracle_library_size_pcc_raw_log1p']['mean']:.4f}"
+            )
 
 
 if __name__ == "__main__":

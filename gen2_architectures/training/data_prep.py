@@ -180,6 +180,27 @@ def make_progress_fn(wall_clock_deadline: float | None, total_steps: int):
     return progress_fn
 
 
+def seed_everything(seed: int) -> None:
+    """Seed Python's random module, NumPy, and Torch (CPU + all CUDA
+    devices) from cfg.training.seed.
+
+    2026-07-27 bugfix: training scripts only ever seeded a local
+    random.Random instance used for sample selection (rng.randrange(...)) --
+    torch/numpy were never globally seeded before model construction, so
+    model initialization and dropout could vary between two runs both
+    labeled seed: 0. Call this once, as early as possible (before building
+    the model), for real seed reproducibility."""
+    import random
+
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def is_finite_update(loss, grad_norm) -> bool:
     """True iff both the loss and the (post-clipping) gradient norm are
     finite -- i.e. it's safe to call optimizer.step().

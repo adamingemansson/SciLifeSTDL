@@ -30,11 +30,12 @@ from gen2_architectures.training import checkpoint, data_prep, diagnostics, eval
 from gen2_architectures.training.validation import move_to_device
 
 
-def _load_stage_a(stage_a_checkpoint_dir: str, n_genes: int) -> DenoisingTranscriptomeAutoencoder:
+def _load_stage_a(stage_a_checkpoint_dir: str, gene_names: list[str]) -> DenoisingTranscriptomeAutoencoder:
     import json
 
-    config_path = Path(stage_a_checkpoint_dir) / "model_config.json"
-    stage_a_config = json.loads(config_path.read_text())
+    stage_a_dir = Path(stage_a_checkpoint_dir)
+    stage_a_config = json.loads((stage_a_dir / "model_config.json").read_text())
+    n_genes = len(gene_names)
     if stage_a_config["n_genes"] != n_genes:
         raise ValueError(
             f"Stage A was pretrained on {stage_a_config['n_genes']} genes, but this run's "
@@ -42,6 +43,28 @@ def _load_stage_a(stage_a_checkpoint_dir: str, n_genes: int) -> DenoisingTranscr
             "same gene panel (same train_sample_ids / QC settings) or the autoencoder's "
             "input/output width is meaningless here."
         )
+    # 2026-07-27 bugfix: the count check above only caught a WIDTH mismatch.
+    # Two panels can have the same width but different genes or a different
+    # order -- same n_genes, silently wrong semantics, since the
+    # autoencoder's input/output columns are positional, not name-keyed.
+    # Compare the exact ordered gene list against Stage A's own saved
+    # gene_names.json, not just its width.
+    stage_a_gene_names_path = stage_a_dir / "gene_names.json"
+    if stage_a_gene_names_path.is_file():
+        stage_a_gene_names = json.loads(stage_a_gene_names_path.read_text())
+        if list(stage_a_gene_names) != list(gene_names):
+            first_diff = next(
+                (i for i, (a, b) in enumerate(zip(stage_a_gene_names, gene_names)) if a != b),
+                min(len(stage_a_gene_names), len(gene_names)),
+            )
+            raise ValueError(
+                f"Stage A's gene panel ({stage_a_gene_names_path}) has the same width "
+                f"({n_genes}) as this run's, but the ORDERED gene identities differ "
+                f"(first mismatch at index {first_diff}: "
+                f"{stage_a_gene_names[first_diff] if first_diff < len(stage_a_gene_names) else '<end>'!r} vs "
+                f"{gene_names[first_diff] if first_diff < len(gene_names) else '<end>'!r}). "
+                "Stage A and Stage B must share the exact same ordered gene panel."
+            )
     autoencoder = DenoisingTranscriptomeAutoencoder(n_genes=n_genes, **stage_a_config["params"])
     checkpoint.load_trainable_state(autoencoder, stage_a_checkpoint_dir)
     return autoencoder
@@ -52,6 +75,7 @@ def main(
     skip_final_eval: bool = False,
 ) -> None:
     cfg = OmegaConf.load(config_path)
+    data_prep.seed_everything(int(cfg.training.get("seed", 0)))
     data_prep.apply_sample_selection(cfg)
     data_prep.apply_smoke_override(cfg, smoke_steps)
     if max_wall_clock_hours_override is not None:
@@ -82,7 +106,7 @@ def main(
         for sid, adata, images in zip(kept_ids, adatas, images_list):
             held_out_adatas[str(sid)] = (adata, images, split_name)
 
-    autoencoder = _load_stage_a(cfg.model.stage_a_checkpoint_dir, len(gene_names)).to(device)
+    autoencoder = _load_stage_a(cfg.model.stage_a_checkpoint_dir, gene_names).to(device)
     # OmegaConf.to_container (not dict(...)) -- a shallow dict() leaves
     # nested list-valued params (organ_vocab, tech_vocab, ...) as
     # OmegaConf ListConfig objects, which json.dump cannot serialize --
@@ -123,6 +147,11 @@ def main(
     image_mode = str(cfg.training.get("image_mode", "target_zero"))
     context_gex_mode = str(cfg.training.get("context_gex_mode", "full"))
     augment = bool(cfg.training.get("augment_coords", False))
+    # 2026-07-27 (GPT-audit-flagged): see train_local_neighborhood.py's own
+    # comment -- context patches near the mask boundary could still see
+    # real pixels from inside the supposedly destroyed region unless this
+    # is enabled.
+    strict_broken_region = bool(cfg.get("data", {}).get("strict_broken_region", False))
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     wall_clock_deadline = data_prep.resolve_wall_clock_deadline(cfg)
     progress_fn = data_prep.make_progress_fn(wall_clock_deadline, total_steps)
@@ -146,6 +175,7 @@ def main(
             coords3d, expr, adata.obs["slice_id"].to_numpy(), cfg.masking, images, seed=step,
             organ=organ, tech=tech, augment=augment,
             image_mode=image_mode, context_gex_mode=context_gex_mode,
+            strict_broken_region=strict_broken_region,
         )
         item = move_to_device(item, device)
         out = model(item["context"], item["query"])

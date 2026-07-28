@@ -12,7 +12,7 @@ explicitly deferred out of v1 scope per the curated-subset decision) — so
 model.sample(context, query) here just returns the SAME deterministic
 prediction every call. This is an honest reflection of "this model has no
 predictive uncertainty mechanism," not a bug: reusing the shared harness
-still gives correct PCC/RMSE/nonzero_auc/ST-FID/pcc_raw_log1p (the metrics
+still gives correct PCC/RMSE/nonzero_auc/ST-FID/oracle_library_size_pcc_raw_log1p (the metrics
 that actually matter for comparing these 4 architectures against each
 other and against the notebook), while interval90_coverage/predictive_std
 will trivially read ~1.0/~0.0 for every gen2 config — expected, not

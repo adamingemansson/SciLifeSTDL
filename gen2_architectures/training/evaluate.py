@@ -2,7 +2,7 @@
 
 Thin glue around the copied audit_evaluation.py harness (fixed mask banks,
 predictive-mean/PCC/RMSE/ST-FID/ST-MMD, the notebook-comparable
-pcc_raw_log1p metric) — no evaluation LOGIC lives here, only the plumbing
+oracle_library_size_pcc_raw_log1p metric) — no evaluation LOGIC lives here, only the plumbing
 to call it consistently across architectures 1/2/3B/4.
 """
 from __future__ import annotations
