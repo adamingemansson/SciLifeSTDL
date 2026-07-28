@@ -156,6 +156,7 @@ def main(
             continue
         print(f"loading {len(ids)} {split_name} sample(s), aligned to the training gene panel...")
         kept_ids, adatas, images_list = data_prep.load_held_out_samples_with_images(cfg, ids, gene_names)
+        data_prep.record_evaluated_cohort(cfg.training.checkpoint_dir, split_name, ids, kept_ids)
         if split_name == "validation":
             validation_ids = kept_ids
         else:

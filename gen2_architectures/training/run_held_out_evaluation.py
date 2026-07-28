@@ -113,6 +113,7 @@ def main(config_path: str) -> None:
 
     print(f"loading {len(test_ids)} held-out test sample(s), aligned to the checkpoint's gene panel...")
     kept_ids, adatas, images_list = data_prep.load_held_out_samples_with_images(cfg, test_ids, gene_names)
+    data_prep.record_evaluated_cohort(checkpoint_dir, "test", test_ids, kept_ids)
     held_out = {str(sid): (adata, images) for sid, adata, images in zip(kept_ids, adatas, images_list)}
 
     scfoundation_providers: dict[str, object] = {}

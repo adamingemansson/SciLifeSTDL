@@ -494,6 +494,51 @@ def load_held_out_samples_with_images(cfg, sample_ids: list[str], reference_gene
     return kept_ids, adatas, images_list
 
 
+def record_evaluated_cohort(
+    checkpoint_dir: str | Path, split: str, intended_ids: list[str], kept_ids: list[str],
+) -> None:
+    """GPT-audit-flagged bug (2026-07-27, second-pass re-audit, confirmed
+    and fixed): load_held_out_samples_with_images (see its own docstring)
+    deliberately drops any held-out sample that doesn't cover the exact
+    training-derived gene panel, printing a warning rather than crashing
+    the whole run over one incompatible sample -- a real, intentional
+    design decision from 2026-07-25, kept as-is here. But the pinned split
+    manifest (save_or_verify_split_manifest's sample_split.json) still
+    lists the ORIGINAL, pre-drop cohort resolved by apply_sample_selection
+    -- nothing durably recorded when the actually-evaluated cohort ends up
+    smaller than what was pinned, only a print statement easy to miss in
+    long training-server scrollback. A headline experiment's real,
+    reported cohort size could quietly differ from its declared one.
+
+    Call this once per split (validation/test) right after
+    load_held_out_samples_with_images returns kept_ids, passing the ORIGINAL
+    ids list requested (not kept_ids) as intended_ids. Writes/updates
+    checkpoint_dir/evaluated_cohort.json with intended vs. actually-
+    evaluated vs. dropped sample IDs for that split, and prints a loud
+    warning whenever anything was dropped -- purely additive, does not
+    change which samples get evaluated."""
+    dropped = [sid for sid in intended_ids if sid not in set(kept_ids)]
+    out_dir = Path(checkpoint_dir)
+    path = out_dir / "evaluated_cohort.json"
+    record = json.loads(path.read_text()) if path.is_file() else {}
+    record[split] = {
+        "intended_sample_ids": list(intended_ids),
+        "evaluated_sample_ids": list(kept_ids),
+        "dropped_sample_ids": dropped,
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_dir / f"evaluated_cohort.json.tmp{os.getpid()}"
+    with open(tmp_path, "w") as f:
+        json.dump(record, f, indent=2)
+    os.replace(tmp_path, path)
+    if dropped:
+        print(
+            f"record_evaluated_cohort: {len(dropped)}/{len(intended_ids)} intended {split} "
+            f"sample(s) were silently dropped by load_held_out_samples_with_images (incompatible "
+            f"gene panel) and were NOT evaluated: {dropped} -- durable record at {path}"
+        )
+
+
 def _probe_context_feature_dim(
     cfg, adata, provider: ContextOnlyFeatureProvider | PrecomputedSpotFeatureProvider,
 ) -> int:
