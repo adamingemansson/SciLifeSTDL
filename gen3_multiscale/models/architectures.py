@@ -113,85 +113,130 @@ class _SharedFieldArchitecture(nn.Module):
             target_gene_scale=target_gene_scale, use_anchor_blend=use_anchor_blend,
         )
 
-    def _observed_tokens(self, inputs: SpatialFieldInputs) -> torch.Tensor:
+    def _observed_tokens(self, inputs: SpatialFieldInputs, device: torch.device) -> torch.Tensor:
         n_observed = inputs.observed_coords.shape[0]
         full_ring = scatter_boundary_ring(
-            n_observed, torch.as_tensor(inputs.boundary_idx), torch.as_tensor(inputs.boundary_ring),
+            n_observed,
+            torch.as_tensor(inputs.boundary_idx, device=device),
+            torch.as_tensor(inputs.boundary_ring, device=device),
         )
-        modality_flags = torch.ones(n_observed, 1)  # see module docstring: not yet real per-spot availability
+        # see module docstring: not yet real per-spot availability
+        modality_flags = torch.ones(n_observed, 1, device=device)
         return self.spot_token(
-            image_features=torch.as_tensor(inputs.observed_gigapath_features, dtype=torch.float32),
-            gex_features=torch.as_tensor(inputs.observed_gex_conditioning, dtype=torch.float32),
-            coords=torch.as_tensor(inputs.observed_coords, dtype=torch.float32),
+            image_features=torch.as_tensor(inputs.observed_gigapath_features, dtype=torch.float32, device=device),
+            gex_features=torch.as_tensor(inputs.observed_gex_conditioning, dtype=torch.float32, device=device),
+            coords=torch.as_tensor(inputs.observed_coords, dtype=torch.float32, device=device),
             boundary_ring=full_ring,
             modality_flags=modality_flags,
         )
 
-    def _candidate_pool(self, inputs: SpatialFieldInputs, observed_tokens: torch.Tensor, query_coords: torch.Tensor):
-        observed_coords = torch.as_tensor(inputs.observed_coords, dtype=torch.float32)
-        observed_expr = torch.as_tensor(inputs.observed_full_gene_expression, dtype=torch.float32)
-        local_idx = torch.as_tensor(inputs.query_local_neighbor_idx, dtype=torch.long)
-        boundary_idx = torch.as_tensor(inputs.boundary_idx, dtype=torch.long)
+    def _candidate_pool(
+        self, inputs: SpatialFieldInputs, observed_tokens: torch.Tensor, query_coords: torch.Tensor, device: torch.device,
+    ):
+        """Local candidates are genuinely PER-QUERY (each query's own
+        true local_k nearest observed spots) and stay a dense
+        [Nq, local_k, G] tensor -- local_k is small (32) by construction,
+        so this is cheap. Boundary candidates are the SAME set for every
+        query in the item -- boundary_expr/boundary_hidden are kept
+        UN-broadcast ([n_boundary, G]/[n_boundary, H]) here and handed to
+        GeneValueTransportHead's shared_candidate_* path (models/
+        transport_head.py), which combines them with the per-query local
+        pool via one joint softmax without ever materializing a
+        [Nq, n_boundary, G] tensor. This was a real, confirmed memory bug
+        in an earlier version of this method (broadcasting boundary
+        expression per query before concatenating with local expression --
+        for 500 queries x 500 boundary candidates x ~17,000 genes x 4
+        bytes, roughly 17 GB for that one tensor) caught by an external
+        Codex audit against commit 386bcf4, verified against the actual
+        code before fixing, not accepted on faith. boundary_geometry
+        below IS still [Nq, n_boundary, 3] -- relative geometry
+        legitimately differs per query even though candidate IDENTITY is
+        shared, and 3 floats/candidate is not the memory problem."""
+        observed_coords = torch.as_tensor(inputs.observed_coords, dtype=torch.float32, device=device)
+        observed_expr = torch.as_tensor(inputs.observed_full_gene_expression, dtype=torch.float32, device=device)
+        local_idx = torch.as_tensor(inputs.query_local_neighbor_idx, dtype=torch.long, device=device)
+        boundary_idx = torch.as_tensor(inputs.boundary_idx, dtype=torch.long, device=device)
 
         local_hidden = observed_tokens[local_idx]  # [Nq, local_k, H]
         local_coords = observed_coords[local_idx]  # [Nq, local_k, 2]
         local_geometry = compute_relative_geometry(query_coords, local_coords)
         local_expr = observed_expr[local_idx]  # [Nq, local_k, G]
 
-        boundary_hidden = observed_tokens[boundary_idx]  # [n_boundary, H]
+        boundary_hidden = observed_tokens[boundary_idx]  # [n_boundary, H] -- SHARED, not broadcast
         boundary_coords = observed_coords[boundary_idx]  # [n_boundary, 2]
         boundary_geometry = compute_relative_geometry(query_coords, boundary_coords)  # [Nq, n_boundary, 3]
-        n_query = query_coords.shape[0]
-        boundary_expr = observed_expr[boundary_idx][None].expand(n_query, -1, -1)  # [Nq, n_boundary, G]
-        boundary_hidden_broadcast = boundary_hidden[None].expand(n_query, -1, -1)
+        boundary_expr = observed_expr[boundary_idx]  # [n_boundary, G] -- SHARED, not broadcast
 
-        candidate_hidden = torch.cat([local_hidden, boundary_hidden_broadcast], dim=1)
-        candidate_geometry = torch.cat([local_geometry, boundary_geometry], dim=1)
-        candidate_expression = torch.cat([local_expr, boundary_expr], dim=1)
         return {
-            "candidate_hidden": candidate_hidden,
-            "candidate_geometry": candidate_geometry,
-            "candidate_expression": candidate_expression,
             "local_hidden": local_hidden,
             "local_geometry": local_geometry,
+            "local_expression": local_expr,
             "boundary_hidden": boundary_hidden,
             "boundary_geometry": boundary_geometry,
+            "boundary_expression": boundary_expr,
         }
 
-    def _harmonic_anchor(self, inputs: SpatialFieldInputs, query_coords: torch.Tensor) -> torch.Tensor:
+    def _harmonic_anchor(self, inputs: SpatialFieldInputs, query_coords: torch.Tensor, device: torch.device) -> torch.Tensor:
         anchor = harmonic_interpolation(
             observed_coords=np.asarray(inputs.observed_coords, dtype=np.float64),
             observed_expression=np.asarray(inputs.observed_full_gene_expression, dtype=np.float64),
             query_coords=np.asarray(inputs.query_coords, dtype=np.float64),
             k_neighbors=self.harmonic_k_neighbors,
         )
-        return torch.from_numpy(anchor).to(dtype=query_coords.dtype)
+        return torch.from_numpy(anchor).to(dtype=query_coords.dtype, device=device)
 
     def forward(self, inputs: SpatialFieldInputs) -> dict:
-        query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32)
-        depth = torch.as_tensor(inputs.query_depth_to_boundary, dtype=torch.long)
+        device = next(self.parameters()).device
+        query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32, device=device)
+        depth = torch.as_tensor(inputs.query_depth_to_boundary, dtype=torch.long, device=device)
         hole_geometry = compute_hole_geometry(query_coords)
         query_hidden = self.query_token(query_coords, depth, hole_geometry)
 
-        observed_tokens = self._observed_tokens(inputs)
-        pool = self._candidate_pool(inputs, observed_tokens, query_coords)
+        observed_tokens = self._observed_tokens(inputs, device)
+        pool = self._candidate_pool(inputs, observed_tokens, query_coords, device)
 
         block_kwargs = dict(
             local_hidden=pool["local_hidden"], local_geometry=pool["local_geometry"],
             boundary_hidden=pool["boundary_hidden"], boundary_geometry=pool["boundary_geometry"],
         )
+        # Transport candidates shared across every query in the item
+        # (boundary, and global-GEX inducing candidates below) -- kept
+        # UN-broadcast ([S, G], never [Nq, S, G]) and handed to
+        # GeneValueTransportHead's shared_candidate_* path, which combines
+        # them with the per-query local pool via one joint softmax
+        # without ever materializing a dense [Nq, S, G] tensor. See
+        # _candidate_pool's docstring for the memory-scaling bug this
+        # replaced (confirmed by an external Codex audit, fixed after
+        # verifying against the actual code).
+        shared_hidden_parts = [pool["boundary_hidden"]]
+        shared_geometry_parts = [pool["boundary_geometry"]]
+        shared_expression_parts = [pool["boundary_expression"]]
         if self.use_global_gex:
-            gex_out = self.gex_pool(observed_tokens, torch.as_tensor(inputs.observed_full_gene_expression, dtype=torch.float32))
+            gex_out = self.gex_pool(
+                observed_tokens, torch.as_tensor(inputs.observed_full_gene_expression, dtype=torch.float32, device=device),
+            )
             n_inducing = gex_out["hidden"].shape[0]
             # inducing tokens have no real position -- a sentinel relative
             # geometry (zero direction, a fixed "far" distance) marks them
             # as categorically distinct from real spatial candidates,
             # mirroring HierarchicalGeneTransportRegressor's own
             # use_global_candidate sentinel (src/models/registry.py).
-            sentinel = torch.zeros(query_coords.shape[0], n_inducing, 3)
+            sentinel = torch.zeros(query_coords.shape[0], n_inducing, 3, device=device)
             sentinel[..., 2] = 3.0
             block_kwargs["gex_inducing_hidden"] = gex_out["hidden"]
             block_kwargs["gex_inducing_geometry"] = sentinel
+            # Real bug fixed here (Codex audit finding #6, confirmed):
+            # InducedGlobalGEXPool computes a genuine value-preserving
+            # convex candidate per inducing token (gex_out["expression"]),
+            # but an earlier version of this method only ever forwarded
+            # gex_out["hidden"] into the backbone's attention and never
+            # added gex_out["expression"] to the transport head's own
+            # candidate pool -- the real GEX-mixture candidates were
+            # computed and then silently discarded. Now included as a
+            # third shared-candidate group alongside boundary spots.
+            shared_hidden_parts.append(gex_out["hidden"])
+            shared_geometry_parts.append(sentinel)
+            shared_expression_parts.append(gex_out["expression"])
         if self.use_regional_he:
             raise NotImplementedError(
                 "use_regional_he=True requires regional H&E tokens from Phase 3's WSI path, "
@@ -205,10 +250,13 @@ class _SharedFieldArchitecture(nn.Module):
 
         final_query_hidden = self.backbone(query_hidden, query_coords, **block_kwargs)
 
-        anchor_expression = self._harmonic_anchor(inputs, query_coords) if self.use_anchor_blend else None
+        anchor_expression = self._harmonic_anchor(inputs, query_coords, device) if self.use_anchor_blend else None
         out = self.transport_head(
-            final_query_hidden, pool["candidate_hidden"], pool["candidate_geometry"],
-            pool["candidate_expression"], anchor_expression=anchor_expression,
+            final_query_hidden, pool["local_hidden"], pool["local_geometry"], pool["local_expression"],
+            anchor_expression=anchor_expression,
+            shared_candidate_hidden=torch.cat(shared_hidden_parts, dim=0),
+            shared_candidate_relative_geometry=torch.cat(shared_geometry_parts, dim=1),
+            shared_candidate_expression=torch.cat(shared_expression_parts, dim=0),
         )
         out["query_hidden"] = final_query_hidden
         return out
@@ -308,7 +356,19 @@ class Architecture4(nn.Module):
     ):
         super().__init__()
         verify_gene_residual_basis(gene_basis, gene_names)
-        self.gene_basis = gene_basis
+        self.gene_basis = gene_basis  # metadata only (rank, gene_names, hash) -- see _gene_basis_matrix below
+        # GeneResidualBasis is a plain frozen dataclass, not an nn.Module,
+        # so `gene_basis.basis` would NOT move when this Architecture4
+        # instance is sent to a CUDA device (a real bug, confirmed by an
+        # external Codex audit: a CUDA-resident model would keep calling
+        # self.gene_basis.to_coefficients/from_coefficients against a
+        # CPU-resident tensor). Registering a CLONE as a buffer makes
+        # `.to(device)` move it along with every other tensor in this
+        # module; to_coefficients/from_coefficients below use this buffer
+        # directly (the same `residual @ basis.T` / `coefficients @ basis`
+        # math GeneResidualBasis itself uses) rather than the dataclass's
+        # own (still CPU/original-device) tensor.
+        self.register_buffer("_gene_basis_matrix", gene_basis.basis.clone())
         self.n_flow_samples = n_flow_samples
         self.n_ode_steps = n_ode_steps
 
@@ -336,12 +396,13 @@ class Architecture4(nn.Module):
         return self.conditioner(inputs)
 
     def compute_flow_matching_loss(self, inputs: SpatialFieldInputs, target_expression: torch.Tensor) -> torch.Tensor:
+        device = next(self.parameters()).device
         conditioner_out = self.conditioner(inputs)
         query_hidden = conditioner_out["query_hidden"].detach()
         deterministic_mean = conditioner_out["expression"].detach()
         target_residual = target_expression - deterministic_mean
-        target_coefficients = self.gene_basis.to_coefficients(target_residual)
-        query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32)
+        target_coefficients = target_residual @ self._gene_basis_matrix.T  # GeneResidualBasis.to_coefficients, device-correct
+        query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32, device=device)
         return flow_matching_loss(self.velocity_network, target_coefficients, query_coords, query_hidden)
 
     @torch.no_grad()
@@ -356,17 +417,18 @@ class Architecture4(nn.Module):
         conditioner-only forward()'s output for anything that only reads
         "expression"). Also reports predictive_std (uncertainty) and the
         raw per-sample field for diversity diagnostics (Phase 7)."""
+        device = next(self.parameters()).device
         conditioner_out = self.conditioner(inputs)
         query_hidden = conditioner_out["query_hidden"]
         deterministic_mean = conditioner_out["expression"]
-        query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32)
+        query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32, device=device)
         n_query = query_coords.shape[0]
 
         coefficient_samples = sample_residual_coefficients(
             self.velocity_network, n_query, query_coords, query_hidden,
             n_samples=n_samples or self.n_flow_samples, n_steps=n_steps or self.n_ode_steps,
         )
-        residual_samples = self.gene_basis.from_coefficients(coefficient_samples)  # [S, Nq, G]
+        residual_samples = coefficient_samples @ self._gene_basis_matrix  # GeneResidualBasis.from_coefficients, device-correct  # [S, Nq, G]
         predictive_samples = deterministic_mean[None] + residual_samples
         predictive_mean = predictive_samples.mean(dim=0)
         predictive_std = predictive_samples.std(dim=0)

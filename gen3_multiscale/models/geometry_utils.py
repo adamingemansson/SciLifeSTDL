@@ -49,7 +49,7 @@ def compute_hole_geometry(query_coords: torch.Tensor) -> torch.Tensor:
     distance_to_centroid = torch.linalg.norm(query_coords - centroid, dim=-1, keepdim=True)
     scale = distance_to_centroid.max().clamp_min(1e-6)
     normalized_distance = distance_to_centroid / scale
-    area_proxy = torch.log1p(torch.tensor(float(n_query))) / 10.0
+    area_proxy = torch.log1p(torch.tensor(float(n_query), device=query_coords.device)) / 10.0
     area_feature = area_proxy.expand(n_query, 1)
     return torch.cat([area_feature, normalized_distance], dim=-1)
 
@@ -59,7 +59,7 @@ def scatter_boundary_ring(n_observed: int, boundary_idx: torch.Tensor, boundary_
     boundary_idx, else its real ring value (1/2/3) -- the full per-
     observed-spot ring identity SpotTokenProjection expects, expanded
     from boundary_graph.py's sparse (boundary_idx, boundary_ring) pair."""
-    full = torch.zeros(n_observed, dtype=torch.long)
+    full = torch.zeros(n_observed, dtype=torch.long, device=boundary_idx.device)
     if boundary_idx.numel():
         full[boundary_idx] = boundary_ring.to(torch.long)
     return full

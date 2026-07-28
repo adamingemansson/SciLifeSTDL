@@ -206,3 +206,84 @@ def test_rejects_mismatched_candidate_expression_gene_width():
         assert False, "expected a ValueError"
     except ValueError as exc:
         assert "candidate_expression" in str(exc)
+
+
+# ---------------------------------------------------------------------------
+# Shared-candidate path -- fixes a real, confirmed memory-scaling bug
+# (Codex audit finding #5 against commit 386bcf4): a per-query-broadcast
+# [Nq, S, G] tensor for a large shared (e.g. boundary) candidate pool could
+# allocate tens of GB in one forward pass. shared_candidate_expression
+# below is always [S, G], never [Nq, S, G].
+# ---------------------------------------------------------------------------
+def test_shared_candidate_path_matches_the_dense_per_query_equivalent():
+    """Equivalence proof: the memory-efficient SHARED path must produce
+    EXACTLY the same output as the old dense-broadcast approach
+    (concatenating a per-query-broadcast shared pool into one [Nq, C, G]
+    tensor) -- this is a pure memory-scaling refactor of the audited
+    transport math, not a change to it."""
+    torch.manual_seed(0)
+    head = GeneValueTransportHead(n_genes=8, hidden_dim=16, transport_heads=4)
+    n_query, n_local, n_shared = 5, 3, 4
+    query_hidden = torch.randn(n_query, 16)
+    local_hidden = torch.randn(n_query, n_local, 16)
+    local_geometry = torch.randn(n_query, n_local, 3)
+    local_expr = torch.randn(n_query, n_local, 8)
+    shared_hidden = torch.randn(n_shared, 16)
+    shared_geometry = torch.randn(n_query, n_shared, 3)
+    shared_expr = torch.randn(n_shared, 8)
+
+    out_split = head(
+        query_hidden, local_hidden, local_geometry, local_expr,
+        shared_candidate_hidden=shared_hidden, shared_candidate_relative_geometry=shared_geometry,
+        shared_candidate_expression=shared_expr,
+    )
+
+    dense_hidden = torch.cat([local_hidden, shared_hidden[None].expand(n_query, -1, -1)], dim=1)
+    dense_geometry = torch.cat([local_geometry, shared_geometry], dim=1)
+    dense_expr = torch.cat([local_expr, shared_expr[None].expand(n_query, -1, -1)], dim=1)
+    out_dense = head(query_hidden, dense_hidden, dense_geometry, dense_expr)
+
+    assert torch.allclose(out_split["expression"], out_dense["expression"], atol=1e-5)
+    assert torch.allclose(out_split["head_weights"], out_dense["head_weights"], atol=1e-5)
+    assert torch.allclose(out_split["gene_gates"], out_dense["gene_gates"], atol=1e-5)
+
+
+def test_shared_candidate_expression_shape_never_includes_a_query_dimension():
+    head = GeneValueTransportHead(n_genes=8, hidden_dim=16, transport_heads=4)
+    n_query, n_local, n_shared = 50, 2, 40  # n_shared deliberately large relative to n_query
+    shared_expr = torch.randn(n_shared, 8)
+    out = head(
+        torch.randn(n_query, 16), torch.randn(n_query, n_local, 16), torch.randn(n_query, n_local, 3),
+        torch.randn(n_query, n_local, 8),
+        shared_candidate_hidden=torch.randn(n_shared, 16),
+        shared_candidate_relative_geometry=torch.randn(n_query, n_shared, 3),
+        shared_candidate_expression=shared_expr,
+    )
+    assert shared_expr.shape == (n_shared, 8)  # the argument itself was never [Nq, n_shared, 8]
+    assert out["expression"].shape == (n_query, 8)
+
+
+def test_shared_candidate_arguments_must_be_provided_together():
+    head = GeneValueTransportHead(n_genes=8, hidden_dim=16, transport_heads=4)
+    query_hidden, candidate_hidden, geometry, expr = _inputs()
+    try:
+        head(query_hidden, candidate_hidden, geometry, expr, shared_candidate_hidden=torch.randn(3, 16))
+        assert False, "expected a ValueError"
+    except ValueError as exc:
+        assert "together" in str(exc)
+
+
+def test_shared_candidate_expression_gene_width_is_validated():
+    head = GeneValueTransportHead(n_genes=8, hidden_dim=16, transport_heads=4)
+    query_hidden, candidate_hidden, geometry, expr = _inputs()
+    n_shared = 3
+    try:
+        head(
+            query_hidden, candidate_hidden, geometry, expr,
+            shared_candidate_hidden=torch.randn(n_shared, 16),
+            shared_candidate_relative_geometry=torch.randn(5, n_shared, 3),
+            shared_candidate_expression=torch.randn(n_shared, 999),  # wrong gene width
+        )
+        assert False, "expected a ValueError"
+    except ValueError as exc:
+        assert "shared_candidate_expression" in str(exc)

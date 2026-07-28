@@ -970,7 +970,195 @@ Flagged here explicitly, exactly as every other simplification and gap
 in this document has been, rather than letting "all 8 phases done" read
 as "ready to run."
 
+## 22. Response to the external Codex audit of commit 386bcf4
+
+Adam forwarded an independent Codex audit of the exact remote commit
+`386bcf4` (the Phase 8 tip). Its verdict: do not start the four 24-hour
+runs yet. Every numbered finding below was checked against the actual
+code before any fix was made or declined -- consistent with this
+project's standing discipline of never accepting an audit claim on
+faith. Status: **CONFIRMED AND FIXED**, **CONFIRMED, ALREADY DISCLOSED**
+(no new action -- §21 already said this), or **CONFIRMED, DELIBERATELY
+NOT FIXED** (a real judgment call, not a bug, surfaced rather than
+silently resolved either way).
+
+1. **"No real training system."** CONFIRMED, ALREADY DISCLOSED -- this
+   is exactly what §21 already says in this document, written before the
+   audit arrived. No new action; still true.
+2. **"Architectures 3/4 do not contain the intended whole-slide
+   architecture."** CONFIRMED, ALREADY DISCLOSED -- §15/§17/§19/§20
+   already record that `use_regional_he`/`use_global_slide` raise
+   `NotImplementedError` and that Architecture 3 currently only adds
+   global observed-GEX tokens. No new action; still true.
+3. **"Models are CPU-bound internally and would fail on CUDA."**
+   CONFIRMED AND FIXED. Checked directly: `_observed_tokens`,
+   `_candidate_pool`, `_harmonic_anchor`, `compute_flow_matching_loss`,
+   and `sample_predictive_distribution` all built fresh tensors
+   (`torch.as_tensor`/`torch.zeros`/`torch.ones`) with no `device=`
+   argument -- a model moved to CUDA would still receive CPU-resident
+   coordinates, indices, modality flags, and a CPU-resident harmonic
+   anchor at every forward call. `geometry_utils.py`'s
+   `compute_hole_geometry`/`scatter_boundary_ring` had the identical bug
+   one level down. Architecture 4's `gene_basis.basis` was a plain
+   dataclass tensor, never registered with the module, so `.to(cuda)`
+   would not move it. Fixed: every one of the above now threads
+   `next(self.parameters()).device` (or an already-device-correct
+   tensor's own `.device`) through explicitly; `Architecture4` now
+   registers `_gene_basis_matrix` as a real buffer and computes
+   `to_coefficients`/`from_coefficients` against it directly instead of
+   the dataclass's own tensor. Verified by
+   `test_forward_output_tensors_live_on_the_models_own_device` and
+   `test_architecture_4_flow_and_sampling_output_tensors_live_on_the_models_own_device`
+   (this sandbox has no CUDA to move the model to, but the same code
+   paths are exercised regardless of which device they resolve to) and
+   `test_architecture_4_registers_the_gene_basis_as_a_buffer_not_a_plain_tensor`.
+4. **"Configs cannot directly construct the models."** CONFIRMED AND
+   FIXED. Checked directly: `configs/architectureN.yaml`'s `model.params`
+   includes `gene_encoder_type`/`init_seed` (and Architecture 4 also
+   `gene_basis_rank`), none of which any architecture constructor
+   accepts -- `Architecture1(**config["model"]["params"])` raised
+   `TypeError`. New `models/model_factory.py::build_architecture`/
+   `resolve_model_kwargs` filter a resolved config down to real
+   constructor kwargs, fail closed (raise) on any UNRECOGNIZED field
+   rather than silently dropping it, and construct Architecture 4's
+   extra `gene_basis`/`gene_names` requirement explicitly. Verified
+   directly against all four REAL config files
+   (`test_build_architecture_constructs_a_real_model_from_each_real_config`),
+   not just synthetic fixtures.
+5. **"Full-gene transport will probably run out of memory."** CONFIRMED
+   AND FIXED -- and confirmed to be a real, serious bug: `_candidate_pool`
+   broadcast the shared boundary candidate pool's full-gene expression to
+   `[Nq, n_boundary, G]` before concatenating with the local pool; for
+   500 queries x 500 boundary candidates x ~17,000 genes x 4 bytes that
+   is ~17 GB for one tensor, in one forward pass. Root cause: the audited
+   transport math (`GeneValueTransportHead`, extracted from
+   `HierarchicalGeneTransportRegressor`) only ever accepted one dense
+   per-query candidate pool, with no notion of "this subset of candidates
+   is the same for every query." Fixed properly, not patched around:
+   `GeneValueTransportHead.forward()` gained an optional
+   `shared_candidate_hidden`/`shared_candidate_relative_geometry`/
+   `shared_candidate_expression` path (`shared_candidate_expression` is
+   always `[S, G]`, NEVER `[Nq, S, G]`) that computes ONE joint softmax
+   over the combined local+shared logits (which stay small -- hidden_dim,
+   not gene-dim) and then splits the final gene-value einsum into a
+   per-query term (small, local-only) plus an ordinary matmul against the
+   shared pool (no `[Nq, S, G]` tensor ever materialized). This is a pure
+   memory-scaling refactor of the SAME audited math, not a change to it
+   -- proven by
+   `test_shared_candidate_path_matches_the_dense_per_query_equivalent`,
+   which asserts the split path and the old dense-broadcast path produce
+   numerically identical output on a small, tractable case. All 14
+   pre-existing `transport_head.py` tests (which never use the new
+   shared path) still pass unmodified, confirming full backward
+   compatibility.
+6. **"Global-GEX value candidates are computed and then discarded."**
+   CONFIRMED AND FIXED -- and it fixed naturally alongside #5, since both
+   shared the same underlying broadcast-and-concatenate pattern.
+   Checked directly: `InducedGlobalGEXPool.forward()` genuinely returns a
+   value-preserving `expression` field per inducing token, but an earlier
+   version of `_SharedFieldArchitecture.forward()` only ever read
+   `gex_out["hidden"]` (for the backbone's attention) and never passed
+   `gex_out["expression"]` to the transport head at all -- real GEX
+   candidates were computed and silently thrown away. Fixed: when
+   `use_global_gex=True`, `gex_out["expression"]` is now concatenated
+   into the SAME shared-candidate pool as boundary spots (§5's fix) and
+   reaches the transport head's actual prediction. Verified by
+   `test_architecture_3_uses_global_gex_pool_expression_in_the_transport_candidate_pool`,
+   which monkeypatches the pool to emit two different expression values
+   for the same hidden state and confirms the final prediction changes.
+7. **"The selected GEX encoder is not implemented."** CONFIRMED AND
+   PARTIALLY FIXED. Checked directly: `weighted_linear` was recorded in
+   CONTRACT.md section 10 as the frozen encoder CHOICE, and every config
+   names it, but no module anywhere in `gen3_multiscale/` actually
+   computed `observed_gex_conditioning` from raw expression --
+   `SpatialFieldInputs` only ever documented that field as already-encoded
+   upstream input. Fixed the part that was genuinely just missing:
+   `models/gene_encoder.py::WeightedGeneExpressionEncoder`, copied
+   VERBATIM (same provenance discipline as every other reused module)
+   from `src/models/hierarchical_slide.py`'s identically-named class --
+   a small, self-contained, already-audited `nn.Linear(n_genes,
+   output_dim, bias=False)` module. **NOT fully closed**: nothing yet
+   CALLS this encoder inside a real per-sample data builder to actually
+   populate `observed_gex_conditioning` from raw counts, and
+   training-only normalization/scale-fitting for its input doesn't exist
+   either -- that wiring is part of the still-missing real training
+   system (§21), not something addable in isolation. What was
+   unambiguously true before this fix -- "the encoder implementation
+   doesn't exist in this codebase at all" -- is no longer true; "it
+   isn't wired into a real pipeline yet" remains true and is already
+   covered by §21.
+8. **"The shared residual specified in the design is disabled in all
+   four configs."** CONFIRMED, DELIBERATELY NOT CHANGED -- a real
+   modeling decision, not a bug, and not mine to make unilaterally. The
+   handoff's own wording is permissive: "the output head transports the
+   untouched observed full-gene vectors and MAY add the same
+   zero-initialized low-rank residual in every arm" -- not "must." All
+   four configs agreeing on `use_residual: false` also satisfies the
+   handoff's actual hard requirement ("the SAME... in every arm").
+   Codex's underlying concern is legitimate on its merits, independent of
+   the wording question: with `use_residual: false`, Architectures 1-3
+   are strictly convex transports of observed values (can only ever
+   predict within the convex hull of what's observed, never extrapolate
+   beyond it), and Architecture 4's flow field is the only source of
+   any non-convex correction. Since the residual is zero-initialized
+   either way, flipping this flag currently has NO effect at all (no
+   training loop exists yet to move it away from zero) -- it only
+   matters once real training exists. Left as an explicit open decision
+   for Adam rather than silently resolved in either direction here.
+
+Also addressed, from the audit's "required fix order" list rather than
+its numbered findings:
+
+- **#9, "normalize effective configs before comparing them... guarantee
+  identical shared initialization, not merely identical seeds."**
+  `model_factory.py` (finding #4's fix) makes this checkable at the
+  level that actually matters:
+  `test_build_architecture_from_real_configs_gives_architecture_1_and_2_identical_shared_initialization`
+  constructs REAL Architecture1/2 instances from the REAL config files
+  (via the factory, the same path a real training entrypoint would use)
+  and diffs their actual parameters -- stronger evidence than diffing
+  either raw YAML text or hand-crafted kwargs dictionaries, which is what
+  Phase 6's original identical-initialization tests did. A separate
+  "resolved-kwargs" audit function in the launcher was considered and
+  deliberately not built -- constructing the real models and diffing
+  parameters directly is strictly stronger evidence of the same claim,
+  so a second, weaker mechanism checking the same thing would be
+  redundant, not additive.
+- **#10 (real exact-mask harmonic/IDW/nearest-neighbour baselines plus
+  the full evaluator) and #11 (the mandatory CUDA/leakage/learning/
+  numerical gate suite)** remain blocked on the same missing real
+  training system and real per-sample data builder §21 already
+  describes -- no new code in this pass, not because they're
+  unimportant, but because they are not fixable in isolation from that
+  larger gap.
+
+**What this pass did NOT do**: build the real training entrypoint, the
+real per-sample HEST-1k data builder, real exact-mask baselines, or the
+full evaluator. §21's core verdict is UNCHANGED by this pass: completing
+the 8 named phases plus these fixes is still not the same as being ready
+for a real 24-hour run. What changed is that the code that DOES exist
+had a genuine, confirmed OOM bug, a genuine discarded-computation bug, a
+genuine CUDA-readiness bug, and a genuine config/constructor mismatch --
+all four are now fixed and regression-tested, so whenever the real
+training system is eventually built, it will be built on top of a
+transport head, device handling, and config/model bridge that are
+already correct, rather than inheriting these four bugs silently.
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 261 passed (41 reused-infra + 12 example-schema +
+  11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 16 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  17 launch-four-gpu-suite + 9 model-factory + 4 gene-encoder)
+full repo (gen2_architectures + gen3_multiscale): 430 passed, 1 skipped
+```
+
+The block immediately below (pre-audit-response test counts) is kept for
+historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 239 passed (41 reused-infra + 12 example-schema +

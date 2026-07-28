@@ -144,6 +144,17 @@ class GeneValueTransportHead(nn.Module):
                 torch.randn(n_genes, self.residual_rank) * (1.0 / math.sqrt(self.residual_rank))
             )
 
+    def _score(self, query_hidden: torch.Tensor, hidden: torch.Tensor, geometry: torch.Tensor) -> torch.Tensor:
+        """Shared per-(query, candidate, head) logit computation -- used
+        identically for the per-query-gathered pool and the shared pool
+        below, so there is exactly one scoring formula, not two."""
+        h = self.geometry_encoder(geometry)[:, :, None, :]  # [Nq, C, 1, S]
+        h = h + self.head_embedding[None, None, :, :]  # [1, 1, heads, S]
+        h = h + self.neighbor_projection(hidden)[:, :, None, :]
+        h = h + self.query_score_projection(query_hidden)[:, None, None, :]
+        h = torch.nn.functional.gelu(self.score_norm(h))
+        return torch.einsum("qchd,hd->qch", h, self.head_score_vector)  # [Nq, C, heads]
+
     def forward(
         self,
         query_hidden: torch.Tensor,
@@ -151,7 +162,33 @@ class GeneValueTransportHead(nn.Module):
         candidate_relative_geometry: torch.Tensor,
         candidate_expression: torch.Tensor,
         anchor_expression: torch.Tensor | None = None,
+        shared_candidate_hidden: torch.Tensor | None = None,
+        shared_candidate_relative_geometry: torch.Tensor | None = None,
+        shared_candidate_expression: torch.Tensor | None = None,
     ) -> dict:
+        """candidate_hidden/candidate_relative_geometry/candidate_expression
+        describe a PER-QUERY gathered pool (e.g. each query's own true
+        local_k nearest neighbors) -- candidate_expression is [Nq, C, G].
+
+        shared_candidate_* (all-or-nothing) describe a pool that is the
+        SAME set of candidates for every query in the item (e.g. the
+        complete boundary, or global-GEX inducing candidates) --
+        shared_candidate_expression is [S, G], NEVER broadcast to
+        [Nq, S, G]. This is a real memory-scaling fix, not a convenience:
+        G is ~17,000 genes, so a caller that concatenated a large shared
+        pool (e.g. hundreds of boundary spots) into a per-query dense
+        [Nq, C, G] tensor before calling this head could allocate tens of
+        GB for a single forward pass (confirmed directly: 500 queries x
+        500 shared candidates x 17,000 genes x 4 bytes ~= 17 GB). Routing
+        shared candidates through their own [S, G] (not [Nq, S, G]) path
+        keeps memory linear in (Nq + S), not Nq * S, while producing the
+        EXACT same joint convex combination over the combined candidate
+        set as concatenating everything into one dense per-query pool
+        would -- verified by a direct equivalence test
+        (test_shared_candidate_path_matches_the_dense_per_query_equivalent)
+        comparing this path against the old dense-broadcast computation
+        on a small case where both are tractable.
+        """
         n_query, n_candidates, hidden_dim = candidate_hidden.shape
         if query_hidden.shape[0] != n_query:
             raise ValueError(f"query_hidden has {query_hidden.shape[0]} rows, expected {n_query}")
@@ -179,18 +216,55 @@ class GeneValueTransportHead(nn.Module):
                 "use_anchor_blend=True (Architecture 2 only) to use an anchor."
             )
 
-        hidden = self.geometry_encoder(candidate_relative_geometry)[:, :, None, :]  # [Nq, C, 1, S]
-        hidden = hidden + self.head_embedding[None, None, :, :]  # [1, 1, heads, S]
-        hidden = hidden + self.neighbor_projection(candidate_hidden)[:, :, None, :]
-        hidden = hidden + self.query_score_projection(query_hidden)[:, None, None, :]
-        hidden = torch.nn.functional.gelu(self.score_norm(hidden))
-        logits = torch.einsum("qchd,hd->qch", hidden, self.head_score_vector)  # d==S here, reused as contraction dim
+        shared_args = (shared_candidate_hidden, shared_candidate_relative_geometry, shared_candidate_expression)
+        has_shared = shared_candidate_hidden is not None
+        if has_shared != all(arg is not None for arg in shared_args):
+            raise ValueError(
+                "shared_candidate_hidden/shared_candidate_relative_geometry/shared_candidate_expression "
+                "must be provided together or not at all"
+            )
+        if has_shared:
+            n_shared = shared_candidate_hidden.shape[0]
+            if shared_candidate_hidden.shape[1] != hidden_dim:
+                raise ValueError(
+                    f"shared_candidate_hidden's hidden dim ({shared_candidate_hidden.shape[1]}) must "
+                    f"match candidate_hidden's ({hidden_dim})"
+                )
+            if shared_candidate_relative_geometry.shape != (n_query, n_shared, 3):
+                raise ValueError(
+                    f"shared_candidate_relative_geometry must be [{n_query}, {n_shared}, 3] (still "
+                    f"one relative-geometry value per query even though the candidates are shared), "
+                    f"got {tuple(shared_candidate_relative_geometry.shape)}"
+                )
+            if shared_candidate_expression.shape != (n_shared, self.n_genes):
+                raise ValueError(
+                    f"shared_candidate_expression must be [{n_shared}, {self.n_genes}] -- SHARED "
+                    f"across queries, never broadcast to include a query dimension -- got "
+                    f"{tuple(shared_candidate_expression.shape)}"
+                )
+
+        logits = self._score(query_hidden, candidate_hidden, candidate_relative_geometry)  # [Nq, C, heads]
+        if has_shared:
+            shared_hidden_broadcast = shared_candidate_hidden[None].expand(n_query, -1, -1)  # [Nq, S, H]
+            shared_logits = self._score(query_hidden, shared_hidden_broadcast, shared_candidate_relative_geometry)
+            logits_all = torch.cat([logits, shared_logits], dim=1)  # [Nq, C+S, heads]
+        else:
+            logits_all = logits
+
         head_weights = torch.softmax(
-            logits.transpose(1, 2) / self.transport_temperature, dim=-1
-        )  # [Nq, heads, C], convex per (query, head)
-        head_expression = torch.einsum(
-            "qhc,qcg->qhg", head_weights, candidate_expression
-        )  # [Nq, heads, G]
+            logits_all.transpose(1, 2) / self.transport_temperature, dim=-1
+        )  # [Nq, heads, C(+S)], convex per (query, head) over the FULL combined candidate set
+
+        if has_shared:
+            head_weights_local = head_weights[:, :, :n_candidates]
+            head_weights_shared = head_weights[:, :, n_candidates:]
+            head_expression = torch.einsum(
+                "qhc,qcg->qhg", head_weights_local, candidate_expression
+            ) + torch.einsum(
+                "qhs,sg->qhg", head_weights_shared, shared_candidate_expression
+            )  # [Nq, heads, G] -- the shared term is an ordinary matmul, no [Nq, S, G] tensor ever built
+        else:
+            head_expression = torch.einsum("qhc,qcg->qhg", head_weights, candidate_expression)  # [Nq, heads, G]
 
         base_gate = (
             self.gene_head_logits.expand(self.n_genes, -1)

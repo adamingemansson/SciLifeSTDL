@@ -94,6 +94,88 @@ def test_architecture_3_raises_not_implemented_for_unwired_regional_he():
         assert "regional H&E" in str(exc)
 
 
+def test_architecture_3_uses_global_gex_pool_expression_in_the_transport_candidate_pool():
+    """Regression test for a real, confirmed bug (Codex audit finding #6
+    against commit 386bcf4): InducedGlobalGEXPool computes a genuine
+    value-preserving candidate per inducing token, but an earlier version
+    of _SharedFieldArchitecture.forward() only forwarded its `hidden`
+    output into the backbone's attention and silently discarded
+    `expression` -- the real GEX-mixture candidates were computed and
+    then thrown away, never reaching the transport head. Monkeypatches
+    the pool to return two DIFFERENT expression matrices for the SAME
+    hidden/geometry and asserts the final prediction changes -- proving
+    `expression` is genuinely part of the transport candidate pool now."""
+    inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    torch.manual_seed(0)
+    model = Architecture3(n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim, **_MODEL_KWARGS)
+
+    real_forward = model.gex_pool.forward
+    captured = {}
+
+    def _patched(observed_hidden, observed_expression):
+        out = dict(real_forward(observed_hidden, observed_expression))
+        out["expression"] = captured["expression"]
+        return out
+
+    model.gex_pool.forward = _patched
+    n_inducing = model.gex_pool.n_inducing
+
+    captured["expression"] = torch.full((n_inducing, n_genes), 7.0)
+    out_a = model(inputs)
+    captured["expression"] = torch.full((n_inducing, n_genes), -7.0)
+    out_b = model(inputs)
+
+    assert not torch.allclose(out_a["expression"], out_b["expression"])
+
+
+def test_architecture_3_shared_transport_candidates_are_never_broadcast_per_query():
+    """Regression test for a real, confirmed OOM bug (Codex audit finding
+    #5 against commit 386bcf4): boundary + global-GEX candidates must
+    reach GeneValueTransportHead as SHARED [S, G] tensors, never
+    broadcast to [Nq, S, G] -- for realistic query/boundary/gene counts
+    the broadcast form could allocate tens of GB in one forward pass."""
+    inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    torch.manual_seed(0)
+    model = Architecture3(n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim, **_MODEL_KWARGS)
+
+    real_forward = model.transport_head.forward
+    captured = {}
+
+    def _patched(*args, **kwargs):
+        captured.update(kwargs)
+        return real_forward(*args, **kwargs)
+
+    model.transport_head.forward = _patched
+    model(inputs)
+
+    n_boundary = inputs.boundary_idx.shape[0]
+    n_inducing = model.gex_pool.n_inducing
+    n_shared = n_boundary + n_inducing
+    assert captured["shared_candidate_expression"].shape == (n_shared, n_genes)  # NOT [Nq, n_shared, n_genes]
+    assert captured["shared_candidate_hidden"].shape[0] == n_shared
+
+
+def test_forward_output_tensors_live_on_the_models_own_device():
+    """Regression test for a real, confirmed device bug (Codex audit
+    finding #3 against commit 386bcf4): forward() used to build several
+    tensors (modality flags, boundary-ring scatter, hole-geometry area
+    proxy, the harmonic anchor) without an explicit device, which would
+    silently stay on CPU even for a model moved to CUDA and crash or
+    produce a device-mismatched result. Every intermediate now threads
+    `next(self.parameters()).device` through explicitly -- verified here
+    by checking the actual output device matches the model's own
+    parameter device (this environment has no CUDA to move the model to,
+    but the same code path is exercised regardless of which device it
+    resolves to)."""
+    inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    torch.manual_seed(0)
+    model = Architecture2(n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim, **_MODEL_KWARGS)
+    model_device = next(model.parameters()).device
+    out = model(inputs)
+    assert out["expression"].device == model_device
+    assert out["anchor_expression"].device == model_device
+
+
 def test_gradients_flow_end_to_end_through_architecture_1():
     inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
     torch.manual_seed(0)
@@ -225,6 +307,41 @@ def test_architecture_4_predictive_distribution_shapes_and_diversity():
     assert torch.isfinite(out["predictive_mean"]).all()
     assert (out["predictive_std"] > 0).any()  # samples must actually differ somewhere
     assert not torch.allclose(out["predictive_samples"][0], out["predictive_samples"][1])
+
+
+def test_architecture_4_registers_the_gene_basis_as_a_buffer_not_a_plain_tensor():
+    """Regression test for a real, confirmed device bug (Codex audit
+    finding #3 against commit 386bcf4): GeneResidualBasis is a plain
+    frozen dataclass, not an nn.Module, so gene_basis.basis alone would
+    NOT move when this Architecture4 instance is sent to a CUDA device --
+    every call to compute_flow_matching_loss/sample_predictive_distribution
+    would then silently mix a CPU-resident basis with CUDA-resident
+    activations. Verified structurally: the basis matrix must appear in
+    named_buffers(), matching gene_basis.basis exactly at construction."""
+    n_genes = 6
+    gene_basis, gene_names = _gene_basis_for(n_genes)
+    model = Architecture4(
+        n_genes=n_genes, gex_feature_dim=4, image_feature_dim=8,
+        gene_basis=gene_basis, gene_names=gene_names, **_MODEL_KWARGS,
+    )
+    buffers = dict(model.named_buffers())
+    assert "_gene_basis_matrix" in buffers
+    assert torch.allclose(buffers["_gene_basis_matrix"], gene_basis.basis)
+
+
+def test_architecture_4_flow_and_sampling_output_tensors_live_on_the_models_own_device():
+    inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    gene_basis, gene_names = _gene_basis_for(n_genes)
+    torch.manual_seed(0)
+    model = Architecture4(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        gene_basis=gene_basis, gene_names=gene_names, n_flow_samples=2, n_ode_steps=2, **_MODEL_KWARGS,
+    )
+    model_device = next(model.parameters()).device
+    loss = model.compute_flow_matching_loss(inputs, torch.as_tensor(targets.query_expression))
+    assert loss.device == model_device
+    out = model.sample_predictive_distribution(inputs)
+    assert out["predictive_mean"].device == model_device
 
 
 def test_architecture_4_rejects_a_gene_basis_fit_on_a_different_panel():
