@@ -1,10 +1,10 @@
 # gen3_multiscale — frozen contract and phase log
 
 Implements `CLAUDE_HANDOFF_MULTISCALE_SPATIAL_FIELD_ARCHITECTURES.md`'s
-staged phases. Status: **Phase 0/1/2/3/4 done**. Token modules (Phase 5),
-the four architecture wrappers (Phase 6), losses/diagnostics (Phase 7),
-and configs/launcher (Phase 8) are **not yet implemented**. This document
-is extended, not replaced, as later phases land.
+staged phases. Status: **Phase 0/1/2/3/4/5 done**. The four architecture
+wrappers (Phase 6), losses/diagnostics (Phase 7), and configs/launcher
+(Phase 8) are **not yet implemented**. This document is extended, not
+replaced, as later phases land.
 
 ## 1. Base commit
 
@@ -360,21 +360,120 @@ Phase 8 configs exist — tracked, not yet actionable.
   natural Phase 5/6 dependency once the token modules and architecture
   wrappers exist to consume it.
 - No harmonic-solver implementation yet (needed for Architecture 2's
-  `anchor_expression` input) — Phase 5/6.
+  `anchor_expression` input) — Phase 6.
 - `FrozenGigaPathSlideEncoder`'s actual LongNet forward pass is untested
   here (requires a real checkpoint + CUDA + FlashAttention) — only its
   fail-closed missing-checkpoint behavior is verified.
+- No real per-sample builder wiring everything together (`example.py` +
+  `boundary_graph.py` + `slide_context.py` + real HEST-1k data) into a
+  full forward pass through `tokens.py`/`attention.py`/`transport_head.py`
+  yet — that assembly IS the four architecture wrappers, Phase 6.
 - No full leakage/geometry/learning/numerical gate suite — those tests
   only become fully meaningful once there's a real model and a real data
-  builder; Phase 1/2/3/4's tests cover the schema/geometry/WSI-overlap/
-  transport contract layers those later tests will build on top of
-  (several individual gates are already directly covered, see §8/§9/§11).
+  builder; Phase 1-5's tests cover the schema/geometry/WSI-overlap/
+  transport/token/attention contract layers those later tests will build
+  on top of (many individual gates are already directly covered, see
+  §8/§9/§11/§13).
+
+## 13. Shared token/attention modules (Phase 5 — implemented)
+
+`models/tokens.py`:
+
+- `FourierCoordinateEncoding` — relative/normalized `[*, 2]` coordinates
+  -> log-spaced Fourier features -> a small MLP -> `output_dim` (default
+  64, matching the handoff's "~64 dimensions before final projection").
+  Used by both spot and query tokens below, and nowhere else invents its
+  own coordinate encoding.
+- `SpotTokenProjection` — builds one 512-d (default) context-spot token
+  from the handoff's exact 5-part schema (§4): local GigaPath H&E (256d),
+  compact GEX conditioning (256d), coordinate encoding (~64d), boundary-
+  ring identity (4 categories: 0=non-boundary observed, 1/2/3=Rings 1-3
+  from `boundary_graph.py`, 16d embedding), and modality-availability
+  flags (16d, projected up from a small flag vector, not raw-
+  concatenated). Every branch is normalized/projected independently, THEN
+  concatenated and projected once to the shared hidden width — never
+  summed — per the handoff's explicit "Do not add unrelated modalities
+  together before normalization" instruction.
+- `QueryTokenProjection` — builds one query token from its coordinate
+  encoding, a bucketed depth-to-boundary embedding (from
+  `boundary_graph.py`'s BFS hop counts), a single learned "this is a
+  query" identity parameter (broadcast to every query token in the item),
+  and optional hole-level geometry (area, normalized distance to
+  centroid). Its `forward()` signature structurally cannot carry target
+  GEX or target H&E — verified by test via `inspect.signature`, not just
+  by convention.
+
+10 tests cover shape correctness, the "boundary ring / depth actually
+changes the token" (proves each branch is genuinely used, not silently
+dropped by the projection), full gradient flow through every modality
+branch, and the query-token target-absence guarantee.
+
+`models/attention.py`:
+
+- `RelativeGeometryBias` — the same MLP-on-`(dx, dy, distance)` pattern
+  `transport_head.py::GeneValueTransportHead`'s own scorer already uses
+  (Phase 4), factored out so every attention site in this backbone
+  treats relative geometry identically rather than inventing its own
+  encoding per module.
+- `ChunkedCrossAttention` — boundary cross-attention processed in
+  fixed-size chunks via an online (running) softmax, the same numerical
+  recurrence FlashAttention uses — mathematically EXACT regardless of
+  chunk size, not an approximation. Verified directly by test: the same
+  module, same weights, produces numerically identical output (`atol=
+  1e-4`) across chunk sizes 1/3/10/37/100/1000 on the same 37-item
+  context (deliberately not evenly divisible by any of them). Also
+  verified permutation-invariant to context ordering (handoff's "arbitrary
+  barcode or file order cannot become a positional cue" gate) and
+  fail-closed on `max_context_size` (raises, never truncates — Phase 2's
+  identical policy, reused here).
+- `QueryQuerySelfAttention` — dense O(n²) self-attention at or below
+  `dense_threshold` (default **256**, the handoff's own stated number),
+  sparse k-nearest-query attention above it (reuses
+  `boundary_graph.py::build_knn_adjacency`, default `sparse_k=10`, inside
+  the handoff's stated 8-12 range). `forward()` returns `(output, mode)`
+  so a caller/test can confirm which path actually ran rather than only
+  inferring it from the query count.
+
+11 tests cover both attention modules' shapes, the critical chunked-vs-
+unchunked numerical correctness gate, gradient flow, permutation
+invariance, and dense/sparse mode selection at and above the exact
+threshold.
+
+`models/global_context.py` (Architecture 3/4-specific per the fairness
+matrix, but a Phase 5 shared-module deliverable):
+
+- `InducedGlobalGEXPool` — 16 (default) learned inducing queries cross-
+  attend to all observed GEX tokens; multi-head attention builds each
+  inducing token's hidden (molecular-context) output, while a SINGLE
+  per-inducing-token convex distribution (the mean of the per-head
+  weights — a mean of convex combinations is itself convex) mixes the
+  UNTOUCHED real `observed_expression` into 16 value-preserving
+  candidates. Query exclusion is enforced structurally: `forward()`'s
+  signature (`observed_hidden`, `observed_expression`) has no field a
+  query spot could ever occupy — verified by test via
+  `inspect.signature`, matching `QueryTokenProjection`'s identical
+  discipline above.
+- `GlobalConditioningFiLM` — zero-initialized scale/shift FiLM
+  modulation for injecting the LongNet global token (Phase 3) into the
+  backbone. Zero-init means a freshly-constructed model is
+  mathematically IDENTICAL with or without the global token — verified
+  by test — so Architecture 3/4's later "slide-token zero/swap must
+  measurably change the prediction" diagnostic (Phase 7, not yet built)
+  will have a clean, testable pre-training baseline: any dependence a
+  trained model shows is something training actually learned, never an
+  artifact of initialization.
+
+10 tests cover shape, convexity, untouched-value mixing (identical
+pattern to the transport head's own gate: swapping in a different real
+expression matrix must change the output; a uniform matrix must be
+reproduced exactly), the FiLM identity-at-init property, and structural
+query-exclusion.
 
 ## Test status as of this document
 
 ```
-gen3_multiscale/tests/: 92 passed (41 reused-infra + 12 example-schema +
+gen3_multiscale/tests/: 123 passed (41 reused-infra + 12 example-schema +
   11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
-  14 transport-head)
-full repo (gen2_architectures + gen3_multiscale): 261 passed, 1 skipped
+  14 transport-head + 10 tokens + 11 attention + 10 global-context)
+full repo (gen2_architectures + gen3_multiscale): 292 passed, 1 skipped
 ```
