@@ -548,9 +548,34 @@ def load_synchronized_initialization(
     # mistake -- e.g. an updated gene vocabulary file, same rank, same
     # incidentally-identical values) would previously pass every check
     # here despite predicting into the wrong genes entirely.
+    # Real, confirmed gap (8th Codex re-audit of commit 7b5c267): the §27
+    # check above only fired when BOTH sides had gene-basis metadata --
+    # `if model_gene_basis is not None and expected_gene_basis_hash is not
+    # None`. That silently fails OPEN in either one-sided case: a manifest
+    # missing gene_basis_gene_names_hash entirely (e.g. persisted by
+    # older code, or a corrupted/hand-edited manifest) would skip
+    # verification for a model that DOES use a gene basis, and a model
+    # missing a gene_basis attribute entirely (e.g. built as the wrong
+    # architecture) would skip verification against a manifest that DOES
+    # record one. Verification must be mandatory and symmetric: if EITHER
+    # side has gene-basis metadata, the other side must have it too, and
+    # the hashes must match.
     model_gene_basis = getattr(model, "gene_basis", None)
     expected_gene_basis_hash = entry.get("gene_basis_gene_names_hash")
-    if model_gene_basis is not None and expected_gene_basis_hash is not None:
+    if model_gene_basis is not None or expected_gene_basis_hash is not None:
+        if model_gene_basis is None:
+            raise ValueError(
+                f"manifest for {architecture_name!r} records gene_basis_gene_names_hash "
+                f"{expected_gene_basis_hash!r}, but the freshly-constructed model has no "
+                "gene_basis attribute at all -- architecture/config mismatch"
+            )
+        if expected_gene_basis_hash is None:
+            raise ValueError(
+                f"{architecture_name}'s freshly-constructed model has a gene_basis, but the "
+                "manifest has no gene_basis_gene_names_hash recorded for it -- refusing to "
+                "silently skip gene-identity verification for an architecture that uses a "
+                "gene basis"
+            )
         actual_gene_basis_hash = model_gene_basis.gene_names_hash
         if actual_gene_basis_hash != expected_gene_basis_hash:
             raise ValueError(

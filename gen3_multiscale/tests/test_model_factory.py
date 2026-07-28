@@ -499,6 +499,45 @@ def test_load_synchronized_initialization_rejects_a_permuted_gene_order_for_arch
         load_synchronized_initialization(fresh, tmp_path / "architecture4", manifest=manifest, architecture_name="architecture4")
 
 
+def test_load_synchronized_initialization_rejects_a_manifest_missing_gene_basis_metadata_for_a_model_that_has_one(tmp_path):
+    """Regression test for a real, confirmed gap (8th Codex re-audit of
+    commit 7b5c267): the previous check only fired when BOTH the
+    manifest and the freshly-constructed model had gene-basis metadata
+    (`if model_gene_basis is not None and expected_gene_basis_hash is not
+    None`) -- silently skipping verification whenever the manifest side
+    was missing it (e.g. an older manifest, or one hand-edited/corrupted
+    to drop the field), even though the model being loaded onto
+    genuinely uses a gene basis. Verification must be mandatory, not
+    opportunistic."""
+    models = _build_all_four()
+    manifest = persist_four_architecture_initializations(models, tmp_path)
+    del manifest["architectures"]["architecture4"]["gene_basis_gene_names_hash"]
+
+    fresh = build_architecture(
+        _load("architecture4"), n_genes=6, gex_feature_dim=4,
+        gene_basis=_gene_basis(n_genes=6)[0], gene_names=_gene_basis(n_genes=6)[1],
+    )
+    with pytest.raises(ValueError, match="no gene_basis_gene_names_hash recorded"):
+        load_synchronized_initialization(fresh, tmp_path / "architecture4", manifest=manifest, architecture_name="architecture4")
+
+
+def test_load_synchronized_initialization_rejects_a_model_missing_gene_basis_when_the_manifest_expects_one(tmp_path):
+    """The symmetric other half of the same gap: a manifest that DOES
+    record gene_basis_gene_names_hash, but a freshly-constructed model
+    that has no gene_basis attribute at all (e.g. the wrong architecture
+    class), must also be rejected rather than silently skipped."""
+    models = _build_all_four()
+    manifest = persist_four_architecture_initializations(models, tmp_path)
+
+    fresh = build_architecture(
+        _load("architecture4"), n_genes=6, gex_feature_dim=4,
+        gene_basis=_gene_basis(n_genes=6)[0], gene_names=_gene_basis(n_genes=6)[1],
+    )
+    del fresh.gene_basis
+    with pytest.raises(ValueError, match="has no gene_basis attribute at all"):
+        load_synchronized_initialization(fresh, tmp_path / "architecture4", manifest=manifest, architecture_name="architecture4")
+
+
 def test_persist_synchronized_initializations_on_all_four_real_architectures(tmp_path):
     """End-to-end: synchronize, persist (passing the synchronizer's own
     provenance), and verify the manifest's shared_parameter_mapping

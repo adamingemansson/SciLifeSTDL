@@ -2249,7 +2249,143 @@ regressed.
 **No 24-hour run has been started or will be auto-started. This
 document only records fixes to already-written code and tests.**
 
+## 29. Response to the eighth external Codex re-audit (of commit 7b5c267)
+
+Adam forwarded an eighth re-audit, of `7b5c267` (§28's fixes), again
+verified directly against the real commit. Verdict: "the fixes are
+mostly verified," with 3 more "final contained corrections" requested
+before the audit-helper cycle should stop and the real trainer/data
+builder should be built. Same discipline as every prior round: every
+claim checked against the actual code before any fix.
+
+**Verdict on the four §28 claims -- three re-confirmed correct, one
+(strict seed-pool default) correct in substance with a flagged wording
+slip -- both addressed.**
+
+**Issue #1, "process-group cleanup can still orphan workers" --
+CONFIRMED AND FIXED.** Checked directly: `_terminate_process_group`'s
+success condition was `proc.wait(timeout=timeout)` returning -- i.e.
+only the PARENT process being reaped. If the parent exits promptly on
+SIGTERM (the common, default case -- no custom handler means the
+default disposition terminates it) while a DESCENDANT in the same
+process group (e.g. a DataLoader worker) ignores SIGTERM and keeps
+running, that `wait()` call succeeds and the function returned WITHOUT
+ever checking whether the group had a live member, so SIGKILL was never
+sent -- exactly the audit's described gap. §27's own regression test
+only covered the parent-ignores-SIGTERM case (a single process, its own
+process group, no descendants), which is why this specific scenario
+went unverified. Fixed: added `_process_group_alive(pgid)` (probes via
+`os.killpg(pgid, 0)`, which sends no signal, just checks whether any
+process in the group still exists) and a `_group_gone()` predicate
+requiring BOTH the parent to have exited AND the group to be confirmed
+empty; `_wait_until` polls that predicate, escalating to `SIGKILL` on
+the whole group if it isn't satisfied within `timeout`. Verified by the
+audit's own suggested test: a parent with no custom SIGTERM handler
+(dies immediately) spawns a plain child (inherits the parent's process
+group, since it's not started with its own new session) that installs
+`SIG_IGN` for SIGTERM and keeps running -- confirmed the WHOLE group,
+including the surviving descendant, is gone after cleanup (`os.killpg(pgid,
+0)` now raises `ProcessLookupError`), not just the parent.
+
+**Issue #2, "gene identity still fails open when metadata disappears"
+-- CONFIRMED AND FIXED.** Checked directly: §27's check was `if
+model_gene_basis is not None and expected_gene_basis_hash is not
+None:` -- an AND, not the mandatory/symmetric check the audit correctly
+says this needs. Two real one-sided gaps: a manifest missing
+`gene_basis_gene_names_hash` (older manifest, or corrupted/hand-edited)
+would silently skip verification for a model that DOES use a gene
+basis, and a model missing a `gene_basis` attribute entirely (wrong
+architecture class) would silently skip verification against a manifest
+that DOES record one. Fixed: verification now fires whenever EITHER
+side has gene-basis metadata; if only one side does, that's an explicit
+`ValueError` naming which side is missing, not a skip. Verified by two
+new regression tests, one per side of the asymmetry: a manifest with
+`gene_basis_gene_names_hash` deleted (model still has `gene_basis`) and
+a model with `gene_basis` deleted via `del fresh.gene_basis` (manifest
+still has the hash) -- both now rejected instead of silently passing.
+
+**Issue #3, "stale mask files are not actually repaired" -- CONFIRMED
+AND FIXED.** Checked directly: §27's fix made `ensure_stratified_training_seed_bank`
+return the freshly-recomputed `expected` dict on a validated reuse, but
+the ON-DISK JSON itself was left untouched -- a different reader (a
+concurrent process, or any future code reading the file directly instead
+of through this function) would still see the schema-stale artifact.
+The audit's own framing is correct that a generation-algorithm version
+and an artifact-schema version are distinct concepts; rather than
+introduce a new version field for what's fundamentally a "the disk copy
+lagged behind an in-memory recomputation that's already proven
+equivalent" situation, the simpler and more directly corrective fix was
+chosen: once every identifying field and the exact `items` sequence are
+confirmed identical (the existing checks), the on-disk file is now
+atomically rewritten with the current, schema-complete representation
+via the same `save_stratified_mask_bank` atomic writer already used
+elsewhere in this module. Verified by extending the existing
+schema-backfill regression test to also read the file BACK OFF DISK
+after the reuse and confirm it now matches a fresh build exactly, not
+just checking the in-memory return value.
+
+**Wording nitpick, "floor division... incorrectly call[ed] a
+'ceiling'" -- CONFIRMED AND FIXED.** `n_items // n_strata` is a floor
+(rounds down), and §28's comment called it "the naturally achievable
+ceiling" -- a genuine wording error (a ceiling rounds up). Corrected the
+comment to describe it accurately: the largest value every stratum can
+UNIFORMLY guarantee, via floor division, not an upper rounding bound.
+No behavior changed, only the comment's wording. (Per this document's
+append-only discipline, §27/§28's own prose is left as originally
+written rather than retroactively edited.)
+
+**Issue #4, "unique seeds still do not mean unique masks" -- CONFIRMED,
+ALREADY DISCLOSED/DEFERRED, unchanged from §27 finding #1's first
+sub-point.** This is the same structural point §27 already made in
+depth: `build_stratified_training_seed_bank` deliberately produces a
+lossless (stratum, seed) SCHEDULE, specifically so it never has to
+materialize actual per-item masks (avoiding "the exact multi-gigabyte-
+JSON problem" its own docstring cites). Proving two different seeds
+produce genuinely different REALIZED query-spot sets requires actually
+running the masking algorithm against real coordinates, which this
+module deliberately does not do. The additional items the audit lists
+here (training-mask uniqueness, validation/test-never-used-in-training,
+cross-split query-spot disjointness, cross-sample barcode-collision
+safety) are exactly the composite-identity enforcement §26 finding #6
+and §27 already name as blocked on the still-missing real data builder
+-- restated, not new.
+
+**Closing instruction -- "stop the audit-helper cycle and build the
+real data builder/trainer" -- surfaced as the same open decision point
+already raised in §26/§27/§28, not resolved unilaterally here.** This
+is now the third consecutive audit round ending with this same
+instruction. Every fix in this round is complete, tested, and
+documented; nothing about starting the real trainer/data builder has
+been begun, since that's a substantially larger body of work requiring
+explicit direction on scope, not something to start unilaterally in the
+middle of an audit-response pass.
+
+**No 24-hour run has been started or will be auto-started. This
+document only records fixes to already-written code and tests.**
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 341 passed (41 reused-infra + 12 example-schema +
+  11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 23 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  26 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule)
+gen2_architectures + gen3_multiscale: 510 passed, 1 skipped
+```
+
+Note: a full monorepo run (`pytest -q` from the repo root, everything
+including the top-level `tests/` directory) still shows the same one
+pre-existing failure noted since §26,
+`tests/test_multi_sample.py::test_inject_multi_sample_n_genes`,
+unrelated to `gen2_architectures/` or `gen3_multiscale/`; unchanged and
+still out of scope for this pass.
+
+The block immediately below (pre-8th-audit-response test counts) is
+kept for historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 338 passed (41 reused-infra + 12 example-schema +

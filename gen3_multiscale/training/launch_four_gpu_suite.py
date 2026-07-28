@@ -46,6 +46,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -172,6 +173,29 @@ def default_command_builder(config: dict, config_path: Path, smoke: bool) -> lis
     return command
 
 
+def _process_group_alive(pgid: int) -> bool:
+    """`os.killpg(pgid, 0)` sends no actual signal -- it only probes
+    whether the group still exists (raises ProcessLookupError once every
+    member has exited). A PermissionError means the group DOES still
+    exist (we just can't signal it), so that counts as alive too."""
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _wait_until(predicate: Callable[[], bool], timeout: float, interval: float = 0.02) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
 def _terminate_process_group(proc: subprocess.Popen, timeout: float = 10.0) -> None:
     """Terminate `proc` and every process in its process group (real,
     confirmed gap -- 7th Codex re-audit of commit 2782ff0: "children that
@@ -180,26 +204,55 @@ def _terminate_process_group(proc: subprocess.Popen, timeout: float = 10.0) -> N
     IT spawns, e.g. PyTorch DataLoader worker processes) shares one
     process group distinct from this launcher's own -- signaling that
     whole group, not just `proc`'s own PID, is what actually reaches
-    those worker children. Escalates SIGTERM -> wait(timeout) -> SIGKILL,
-    so a process that ignores SIGTERM (or is itself stuck) still gets
-    reaped rather than left running indefinitely."""
+    those worker children.
+
+    Waits for the ENTIRE GROUP to disappear, not just `proc` itself (real,
+    confirmed gap -- 8th Codex re-audit of commit 7b5c267): the previous
+    version's success condition was `proc.wait(timeout=...)` returning --
+    if the PARENT process exits promptly on SIGTERM (the common case: no
+    custom handler means the default disposition terminates it) while a
+    DESCENDANT in the same group ignores SIGTERM and keeps running, that
+    wait() call succeeds and the function returned WITHOUT ever checking
+    whether the group had any surviving members, let alone escalating to
+    SIGKILL. `_group_gone` below requires BOTH `proc` itself to have
+    exited AND `os.killpg(pgid, 0)` to confirm no process remains in its
+    group before declaring success; only then does this function return
+    without escalating."""
     if proc.poll() is not None:
         return
     try:
         pgid = os.getpgid(proc.pid)
-        os.killpg(pgid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, AttributeError):
+    except (ProcessLookupError, AttributeError):
+        pgid = None
+
+    def _group_gone() -> bool:
+        if proc.poll() is None:
+            return False
+        return pgid is None or not _process_group_alive(pgid)
+
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    else:
         proc.terminate()
-    try:
-        proc.wait(timeout=timeout)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        pgid = os.getpgid(proc.pid)
-        os.killpg(pgid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, AttributeError):
-        proc.kill()
+
+    if not _wait_until(_group_gone, timeout):
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        else:
+            proc.kill()
+        _wait_until(_group_gone, timeout)
+
+    # Unconditional, not `if proc.poll() is None:` -- on a real Popen this
+    # is cheap and non-blocking once poll() has already observed exit
+    # (the returncode is cached), and it guarantees the process is
+    # actually reaped rather than relying on poll()'s internal reaping as
+    # an implementation detail.
     proc.wait()
 
 

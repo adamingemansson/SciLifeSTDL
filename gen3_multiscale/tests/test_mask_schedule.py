@@ -376,6 +376,14 @@ def test_ensure_stratified_training_seed_bank_backfills_a_schema_field_missing_f
     assert "realized_unique_seeds_per_stratum" in reused
     assert reused["items"] == first["items"]  # still the exact same schedule, just schema-complete
 
+    # Real, confirmed gap (8th Codex re-audit of commit 7b5c267):
+    # returning the fresh dict to THIS caller fixed what THIS caller
+    # sees, but left the stale JSON sitting on disk for any OTHER
+    # reader. The on-disk file itself must now be self-healed too.
+    on_disk = json.loads(path.read_text())
+    assert "realized_unique_seeds_per_stratum" in on_disk
+    assert on_disk == build_stratified_training_seed_bank(coords3d, slice_ids, obs_names, n_items=6, base_seed=0, strata=_STRATA)
+
 
 def test_build_stratified_training_seed_bank_with_one_unique_mask_per_stratum_still_produces_distinct_combinations():
     """Regression test locking in the exact scenario the audit gave:

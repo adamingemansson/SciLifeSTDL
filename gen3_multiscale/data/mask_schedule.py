@@ -326,8 +326,12 @@ def build_stratified_training_seed_bank(
         # (a stratum is only ever visited n_items // n_strata times, always
         # less than n_items for n_strata > 1) -- a guaranteed-to-raise
         # footgun, not a real precondition. In strict mode, default to the
-        # naturally achievable ceiling (n_items // n_strata) instead, so
-        # the default trivially satisfies its own guarantee by
+        # largest value every stratum can equally guarantee -- floor
+        # division (n_items // n_strata), NOT a "ceiling" (a wording slip
+        # in an earlier version of this comment the 8th audit correctly
+        # flagged: floor division rounds DOWN, so it's the maximum
+        # UNIFORMLY achievable count, not an upper rounding bound) --
+        # instead, so the default trivially satisfies its own guarantee by
         # construction; the permissive (non-strict) default of n_items is
         # unchanged, preserving the 5th round's "oversized pools are
         # legitimate" decision for the common, non-strict case.
@@ -437,7 +441,18 @@ def ensure_stratified_training_seed_bank(
     `expected` (which is always complete under the CURRENT schema)
     instead of the possibly-schema-stale on-disk dict closes the gap
     without conflating "the seeds changed" with "the reporting schema
-    grew a field"."""
+    grew a field".
+
+    Also ATOMICALLY REWRITES the on-disk file itself with the current
+    representation whenever it's schema-stale (real, confirmed gap --
+    8th Codex re-audit of commit 7b5c267): returning the fresh dict fixes
+    what THIS caller sees, but left the stale JSON sitting on disk for
+    any other reader -- a different process calling this same function
+    concurrently, or any future code that reads the file directly instead
+    of through this function -- to still see it. Since the content is
+    already proven semantically equivalent by the checks above, rewriting
+    it is safe; this makes the on-disk artifact self-healing instead of
+    merely working around it in memory."""
     path = Path(path)
     expected = build_stratified_training_seed_bank(
         coords3d, slice_ids, obs_names, n_items, base_seed, strata,
@@ -457,6 +472,8 @@ def ensure_stratified_training_seed_bank(
                 )
         if bank.get("items") != expected["items"]:
             raise ValueError(f"stratified training seed bank {path} contains an altered schedule")
+        if bank != expected:
+            save_stratified_mask_bank(expected, path)  # self-heal: rewrite the schema-stale file in place
         return expected, path
     save_stratified_mask_bank(expected, path)  # a generic atomic-JSON writer, not mask-bank-specific -- mask_bank.py itself reuses save_mask_bank the same way for its own training seed banks
     return expected, path

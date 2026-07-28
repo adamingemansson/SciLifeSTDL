@@ -6,8 +6,10 @@ real GPU. See launch_four_gpu_suite.py's module docstring for why
 `default_command_builder` itself (pointing at a training entrypoint that
 does not exist yet) is deliberately NOT exercised end-to-end here."""
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -306,6 +308,39 @@ def test_terminate_process_group_escalates_to_sigkill_when_sigterm_is_ignored():
     try:
         launch_four_gpu_suite_module._terminate_process_group(proc, timeout=1.0)
         assert proc.poll() is not None  # reaped via SIGKILL, not left running
+    finally:
+        if proc.poll() is None:  # pragma: no cover -- safety net only
+            proc.kill()
+            proc.wait()
+
+
+def test_terminate_process_group_kills_a_descendant_that_survives_after_the_parent_exits():
+    """Real (not monkeypatched) subprocess test for a real, confirmed gap
+    (8th Codex re-audit of commit 7b5c267): the previous implementation
+    only waited for the PARENT process (via proc.wait()) -- if the parent
+    exits promptly on SIGTERM (the DEFAULT disposition; it installs no
+    custom handler here) while a descendant in the SAME process group
+    explicitly ignores SIGTERM and keeps running, the old code's
+    proc.wait() succeeded and it returned WITHOUT ever checking whether
+    the group still had a live member, so SIGKILL was never sent. The
+    descendant here is spawned as a plain child (not its own new
+    session), so it inherits the parent's process group -- exactly the
+    real DataLoader-worker-child scenario this whole mechanism exists
+    for."""
+    parent_code = (
+        "import subprocess, sys, time;"
+        "subprocess.Popen([sys.executable, '-c', "
+        "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)']);"
+        "time.sleep(30)"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", parent_code], start_new_session=True)
+    pgid = os.getpgid(proc.pid)
+    try:
+        time.sleep(0.5)  # let the parent actually spawn its child before we terminate the group
+        launch_four_gpu_suite_module._terminate_process_group(proc, timeout=2.0)
+        assert proc.poll() is not None  # the parent itself was reaped
+        with pytest.raises(ProcessLookupError):
+            os.killpg(pgid, 0)  # the WHOLE group, including the surviving descendant, is gone
     finally:
         if proc.poll() is None:  # pragma: no cover -- safety net only
             proc.kill()
