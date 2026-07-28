@@ -283,25 +283,37 @@ def save_checkpoint(
 def load_trainable_state(model: nn.Module, checkpoint_dir: str | Path) -> None:
     """Load a previously-saved trainable state onto a freshly-constructed,
     architecturally-identical model. No-op if the checkpoint genuinely has
-    no trainable_weights.pt (a fully-frozen model — verified by asserting
+    no trainable_weights.pt (a fully-frozen model — verified by checking
     the fresh model ALSO has zero trainable parameters, not silently
-    assumed)."""
+    assumed).
+
+    Uses explicit RuntimeError, not `assert` (2026-07-28, real bug fixed
+    -- 6th Codex re-audit of commit 06f5cce): `assert` statements are
+    compiled out entirely under `python -O`/`PYTHONOPTIMIZE`, which would
+    silently turn this fail-closed config-mismatch/incomplete-checkpoint
+    check into a no-op in that mode -- a real gap for something whose
+    whole job is to fail loudly rather than load a wrong or partial
+    state. Same fix applied identically to gen2_architectures/training/
+    checkpoint.py's copy of this function, per this file's own
+    copy-provenance discipline."""
     in_dir = Path(checkpoint_dir)
     weights_path = in_dir / "trainable_weights.pt"
     trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
     if weights_path.is_file():
         state = torch.load(weights_path, map_location="cpu")
         missing_trainable = trainable_names - set(state.keys())
-        assert not missing_trainable, (
-            f"saved weights at {in_dir} are missing trainable parameters this "
-            f"model architecture expects: {missing_trainable} (config mismatch?)"
-        )
+        if missing_trainable:
+            raise RuntimeError(
+                f"saved weights at {in_dir} are missing trainable parameters this "
+                f"model architecture expects: {missing_trainable} (config mismatch?)"
+            )
         model.load_state_dict(state, strict=False)
     else:
-        assert not trainable_names, (
-            f"{weights_path} is missing but this model architecture has trainable "
-            f"parameters {trainable_names}; the checkpoint at {in_dir} looks incomplete"
-        )
+        if trainable_names:
+            raise RuntimeError(
+                f"{weights_path} is missing but this model architecture has trainable "
+                f"parameters {trainable_names}; the checkpoint at {in_dir} looks incomplete"
+            )
 
 
 def load_training_state(checkpoint_dir: str | Path) -> dict:

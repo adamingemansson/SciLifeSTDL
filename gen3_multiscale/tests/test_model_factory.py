@@ -440,6 +440,34 @@ def test_load_synchronized_initialization_rejects_a_checkpoint_copied_to_the_wro
         load_synchronized_initialization(fresh, tmp_path / "architecture2", manifest=manifest, architecture_name="architecture2")
 
 
+def test_load_synchronized_initialization_rejects_a_manifest_claiming_the_wrong_tensor_shape(tmp_path):
+    """Regression test for a real, confirmed gap (6th Codex re-audit of
+    commit 06f5cce): `_tensor_hash` hashes raw tensor bytes only
+    (`tensor.numpy().tobytes()`), which does not encode shape -- e.g. a
+    [2,3] and a [3,2] all-zeros tensor hash identically. shape/dtype were
+    already recorded in the manifest by persist_synchronized_initializations
+    but never checked on load. A manifest entry claiming the wrong shape
+    for a tensor (however it arose) must now be caught explicitly, not
+    silently accepted just because the byte hash happens to match."""
+    trained_looking = torch.nn.Linear(5, 5)
+    manifest = persist_synchronized_initializations({"architecture1": trained_looking}, tmp_path)
+    manifest["architectures"]["architecture1"]["tensor_hashes"]["weight"]["shape"] = [25, 1]
+
+    fresh = torch.nn.Linear(5, 5)
+    with pytest.raises(ValueError, match="has shape"):
+        load_synchronized_initialization(fresh, tmp_path / "architecture1", manifest=manifest, architecture_name="architecture1")
+
+
+def test_load_synchronized_initialization_rejects_a_manifest_claiming_the_wrong_tensor_dtype(tmp_path):
+    trained_looking = torch.nn.Linear(5, 5)
+    manifest = persist_synchronized_initializations({"architecture1": trained_looking}, tmp_path)
+    manifest["architectures"]["architecture1"]["tensor_hashes"]["weight"]["dtype"] = "torch.float64"
+
+    fresh = torch.nn.Linear(5, 5)
+    with pytest.raises(ValueError, match="has dtype"):
+        load_synchronized_initialization(fresh, tmp_path / "architecture1", manifest=manifest, architecture_name="architecture1")
+
+
 def test_persist_synchronized_initializations_on_all_four_real_architectures(tmp_path):
     """End-to-end: synchronize, persist (passing the synchronizer's own
     provenance), and verify the manifest's shared_parameter_mapping

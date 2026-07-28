@@ -6,6 +6,7 @@ exercised together for the first time, not just each piece in isolation."""
 import dataclasses
 
 import numpy as np
+import pytest
 import torch
 
 from gen3_multiscale.data.boundary_graph import extract_boundary_and_local_context
@@ -300,6 +301,55 @@ def test_architecture_4_forward_matches_the_conditioner_contract():
     out = model(inputs)
     assert out["expression"].shape == targets.query_expression.shape
     assert out["anchor_expression"] is None  # Architecture 4 remains anchor-free
+
+
+def test_architecture_4_compute_flow_matching_loss_rejects_a_shape_mismatched_target():
+    """Regression test for a real, confirmed gap (6th Codex re-audit of
+    commit 06f5cce): "Both flow-loss methods should also move and
+    validate target_expression against the model's actual device/dtype
+    and check shape/finiteness." Before this fix, a wrong-shaped target
+    would silently broadcast inside the residual subtraction instead of
+    failing at the point of the actual mistake."""
+    inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    gene_basis, gene_names = _gene_basis_for(n_genes)
+    torch.manual_seed(0)
+    model = Architecture4(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        gene_basis=gene_basis, gene_names=gene_names, **_MODEL_KWARGS,
+    )
+    wrong_shape_target = torch.as_tensor(targets.query_expression)[:, :-1]  # drop one gene column
+    with pytest.raises(ValueError, match="must match"):
+        model.compute_flow_matching_loss(inputs, wrong_shape_target)
+
+
+def test_architecture_4_compute_flow_matching_loss_rejects_a_non_finite_target():
+    inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    gene_basis, gene_names = _gene_basis_for(n_genes)
+    torch.manual_seed(0)
+    model = Architecture4(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        gene_basis=gene_basis, gene_names=gene_names, **_MODEL_KWARGS,
+    )
+    bad_target = torch.as_tensor(targets.query_expression).clone()
+    bad_target[0, 0] = float("nan")
+    with pytest.raises(ValueError, match="non-finite"):
+        model.compute_flow_matching_loss(inputs, bad_target)
+
+
+def test_architecture_4_compute_flow_matching_loss_accepts_a_target_on_a_different_dtype():
+    """A target passed as float64 (a common default from raw numpy/anndata
+    conversion) must be moved onto the model's own dtype, not rejected or
+    silently mismatched deep inside an einsum."""
+    inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    gene_basis, gene_names = _gene_basis_for(n_genes)
+    torch.manual_seed(0)
+    model = Architecture4(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        gene_basis=gene_basis, gene_names=gene_names, **_MODEL_KWARGS,
+    )
+    float64_target = torch.as_tensor(targets.query_expression, dtype=torch.float64)
+    loss = model.compute_flow_matching_loss(inputs, float64_target)
+    assert torch.isfinite(loss)
 
 
 def test_architecture_4_flow_loss_gradients_reach_only_the_velocity_network():

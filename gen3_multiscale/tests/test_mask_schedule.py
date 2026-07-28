@@ -286,6 +286,49 @@ def test_build_stratified_training_seed_bank_realizes_the_full_promised_unique_s
     assert len(all_combinations) == 256
 
 
+def test_build_stratified_training_seed_bank_reports_realized_unique_seeds_per_stratum():
+    """Regression test for a real, confirmed gap (6th Codex re-audit of
+    commit 06f5cce): unique_masks_per_stratum is a CAP on the seed pool,
+    not a promise every seed in it is actually drawn -- the bank must
+    report what was actually realized so a caller can check their
+    coverage intent without redoing the n_items/n_strata arithmetic."""
+    coords3d, slice_ids, obs_names = _training_seed_slide()
+    bank = build_stratified_training_seed_bank(
+        coords3d, slice_ids, obs_names, n_items=4, base_seed=0, strata=_STRATA, unique_masks_per_stratum=99,
+    )
+    # 2 strata, 4 items -> 2 occurrences per stratum -> only 2 of the 99
+    # promised seeds are ever actually realized per stratum.
+    assert bank["realized_unique_seeds_per_stratum"] == {"small_compact": 2, "large_irregular": 2}
+
+
+def test_build_stratified_training_seed_bank_require_full_seed_pool_rejects_an_under_provisioned_schedule():
+    """Regression test for the 6th audit's core complaint: nothing
+    enforced that n_items was large enough to realize the full promised
+    unique_masks_per_stratum pool. require_full_seed_pool=True turns
+    that into a fail-closed precondition for callers that need the
+    guarantee, without changing the permissive default (preserving the
+    5th round's deliberate "oversized pools are legitimate" decision)."""
+    coords3d, slice_ids, obs_names = _training_seed_slide()
+    with pytest.raises(ValueError, match="did not realize the full"):
+        build_stratified_training_seed_bank(
+            coords3d, slice_ids, obs_names, n_items=4, base_seed=0, strata=_STRATA,
+            unique_masks_per_stratum=99, require_full_seed_pool=True,
+        )
+
+
+def test_build_stratified_training_seed_bank_require_full_seed_pool_accepts_a_sufficiently_provisioned_schedule():
+    coords3d, slice_ids, obs_names = _synthetic_slide(n=4)
+    four_strata = [
+        {"name": f"stratum_{i}", "radius_range": [1.0, 2.0], "radius_unit": "coordinate", "shape": "circle"}
+        for i in range(4)
+    ]
+    bank = build_stratified_training_seed_bank(
+        coords3d, slice_ids, obs_names, n_items=256, base_seed=0, strata=four_strata,
+        unique_masks_per_stratum=64, require_full_seed_pool=True,
+    )
+    assert all(count == 64 for count in bank["realized_unique_seeds_per_stratum"].values())
+
+
 def test_build_stratified_training_seed_bank_with_one_unique_mask_per_stratum_still_produces_distinct_combinations():
     """Regression test locking in the exact scenario the audit gave:
     unique_masks_per_stratum=1 must NOT mean "1 unique mask overall" --

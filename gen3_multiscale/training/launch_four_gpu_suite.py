@@ -84,13 +84,36 @@ def _flatten(d: dict, prefix: str = "") -> dict[str, Any]:
 
 def static_config_audit(named_configs: dict[str, dict]) -> dict:
     """Compare N resolved configs (as plain nested dicts); every key
-    present in ALL of them must have an identical value UNLESS it's in
+    shared by two or more of them must have an identical value across
+    those configs that declare it, UNLESS it's in
     `_ALWAYS_ALLOWED_TO_DIFFER` or listed in any config's own
-    `documented_divergences`. Keys absent from some configs (e.g.
-    Architecture 4's flow-only params) are never compared -- a config
+    `documented_divergences`. A key present in only ONE config (e.g.
+    Architecture 4's flow-only params) is never compared -- a config
     with a structurally different parameter set is not itself a
-    violation; only an UNDOCUMENTED disagreement on a key every config
-    claims to share is."""
+    violation; only an UNDOCUMENTED disagreement between configs that
+    BOTH claim to share a key is.
+
+    Compares over the key UNION with a per-key "which configs actually
+    have it" set, not a single intersection across ALL configs (real,
+    confirmed gap -- 6th Codex re-audit of commit 06f5cce): the previous
+    intersection-only version meant that ANY one config lacking a key
+    (e.g. architecture4.yaml genuinely and deliberately has no
+    `model.params.use_regional_he`, since Architecture 4 wraps a full
+    Architecture 3 conditioner rather than accepting that kwarg directly)
+    silently exempted that key from being checked among the OTHER
+    configs too -- so an undocumented divergence between
+    architecture1/2/3.yaml on a field all three genuinely share would
+    have gone completely unflagged, purely because a fourth, structurally
+    different config didn't have the field at all. Now the comparison
+    happens per-key among whichever configs actually declare it, so that
+    3-way (or more) comparison is no longer silently skipped just because
+    a structurally different config elsewhere doesn't have the key.
+
+    NOT built here (a substantially larger redesign, out of scope for
+    this pass): a canonical "effective experiment schema" that explicitly
+    maps Architecture 4's nested conditioner fields onto Architecture 3's
+    flat ones so the "should share" set is asserted positively rather
+    than inferred from which keys happen to co-occur."""
     if len(named_configs) < 2:
         raise ValueError("static_config_audit needs at least two configs to compare")
 
@@ -100,13 +123,17 @@ def static_config_audit(named_configs: dict[str, dict]) -> dict:
     allowed = _ALWAYS_ALLOWED_TO_DIFFER | documented
 
     flattened = {name: _flatten(cfg) for name, cfg in named_configs.items()}
-    shared_keys = set.intersection(*(set(f.keys()) for f in flattened.values()))
+    all_keys = set.union(*(set(f.keys()) for f in flattened.values()))
+    comparable_keys = {
+        key for key in all_keys
+        if sum(1 for f in flattened.values() if key in f) >= 2
+    }
 
     violations = []
-    for key in sorted(shared_keys):
+    for key in sorted(comparable_keys):
         if key in allowed:
             continue
-        values = {name: flattened[name][key] for name in flattened}
+        values = {name: f[key] for name, f in flattened.items() if key in f}
         if len({repr(v) for v in values.values()}) > 1:
             violations.append({"key": key, "values": values})
 
@@ -114,7 +141,7 @@ def static_config_audit(named_configs: dict[str, dict]) -> dict:
         "ok": len(violations) == 0,
         "violations": violations,
         "n_configs": len(named_configs),
-        "n_shared_keys_checked": len(shared_keys - allowed),
+        "n_shared_keys_checked": len(comparable_keys - allowed),
     }
 
 
@@ -180,7 +207,16 @@ def launch_suite(
     CONCURRENTLY -- "one job per GPU" means in parallel, not
     sequentially. Runs the static config audit and (unless explicitly
     skipped) the fail-closed fingerprint check BEFORE spawning anything;
-    either failing means no subprocess is ever started."""
+    either failing means no subprocess is ever started.
+
+    Duplicate-GPU and positive-thread-count validation live HERE, not
+    only in `main()` (real, confirmed gap -- 6th Codex re-audit of
+    commit 06f5cce: "duplicate-GPU and thread validation happens in the
+    CLI, but direct calls to launch_suite() bypass it") -- `main()`
+    still validates early too (before even loading configs), but this is
+    the actual invariant-enforcing location every caller, CLI or direct,
+    goes through.
+    """
     if len(named_configs) != len(gpu_list):
         raise ValueError(
             f"launch_suite requires exactly one GPU per config: got {len(named_configs)} "
@@ -188,6 +224,10 @@ def launch_suite(
         )
     if set(named_configs.keys()) != set(config_paths.keys()):
         raise ValueError("named_configs and config_paths must have the same keys")
+    if len(set(gpu_list)) != len(gpu_list):
+        raise ValueError(f"gpu_list must name DIFFERENT GPU ids, got {gpu_list!r}")
+    if threads_per_job <= 0:
+        raise ValueError(f"threads_per_job must be positive, got {threads_per_job}")
 
     audit = static_config_audit(named_configs)
     if not audit["ok"]:
@@ -202,20 +242,37 @@ def launch_suite(
     log_root = Path(log_root)
     log_root.mkdir(parents=True, exist_ok=True)
 
+    # If a Popen call partway through this loop raises (e.g. a
+    # command_builder produced a command naming a nonexistent
+    # executable), the jobs started in EARLIER iterations must not be
+    # left as orphaned, unmonitored subprocesses with leaked open log
+    # file handles -- real, confirmed gap (6th Codex re-audit of commit
+    # 06f5cce: "add cleanup if Popen succeeds for some arms and then
+    # fails while spawning another: terminate and wait for
+    # already-started children and close all log handles").
     pending = []
     log_handles = []
-    for (name, cfg), gpu in zip(named_configs.items(), gpu_list):
-        command = command_builder(cfg, config_paths[name], smoke_only)
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
-        for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
-            env[var] = str(threads_per_job)
-        env["PYTHONUNBUFFERED"] = "1"
-        log_path = log_root / f"{name}.log"
-        log_file = log_path.open("w")
-        log_handles.append(log_file)
-        proc = subprocess.Popen(command, env=env, stdout=log_file, stderr=subprocess.STDOUT)
-        pending.append((name, str(gpu), command, log_path, proc))
+    try:
+        for (name, cfg), gpu in zip(named_configs.items(), gpu_list):
+            command = command_builder(cfg, config_paths[name], smoke_only)
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+            for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+                env[var] = str(threads_per_job)
+            env["PYTHONUNBUFFERED"] = "1"
+            log_path = log_root / f"{name}.log"
+            log_file = log_path.open("w")
+            log_handles.append(log_file)
+            proc = subprocess.Popen(command, env=env, stdout=log_file, stderr=subprocess.STDOUT)
+            pending.append((name, str(gpu), command, log_path, proc))
+    except Exception:
+        for _, _, _, _, proc in pending:
+            proc.terminate()
+        for _, _, _, _, proc in pending:
+            proc.wait()
+        for handle in log_handles:
+            handle.close()
+        raise
 
     jobs = []
     for name, gpu, command, log_path, proc in pending:

@@ -1835,7 +1835,278 @@ whoever next works in that area.
 **No 24-hour run has been started or will be auto-started. This
 document only records fixes to already-written code and tests.**
 
+## 27. Response to the sixth external Codex re-audit (of commit 06f5cce)
+
+Adam forwarded a sixth re-audit, of `06f5cce` (§26's fixes), this time
+verified against the real commit directly (`git show`/`git diff`
+against `c02a5d1`, extracted into a local checkout) rather than only
+against a pasted summary. Verdict: "the fixes are real... but the code
+is still not ready for the four 24-hour runs," with 4 "remaining
+contained bugs" to fix before starting the real trainer, plus
+re-confirmation of the larger launch blockers. Same discipline as every
+prior round: every claim checked against the actual code before any
+fix.
+
+**"Verified fixes" list -- all eight items independently re-confirmed
+true** by re-reading the relevant code paths directly (occurrence-based
+seed indexing, mandatory manifest/architecture_name,
+`load_ad_hoc_checkpoint_unverified`, `gene_basis_gene_names_hash`,
+`persist_four_architecture_initializations`'s pre-save verification,
+`Architecture4.compute_losses()`, `predictive_std`'s `unbiased=False`,
+launcher CLI validation). No corrections needed to this list.
+
+**Remaining contained bug #1, "seed-pool guarantee is still overstated"
+-- CONFIRMED, FIXED.** The audit's specific complaint is real:
+`build_stratified_training_seed_bank` never enforced
+`n_items >= n_strata * unique_masks_per_stratum`, so a caller could ask
+for e.g. 99 unique masks per stratum with only 4 total items and
+silently get 1. It also correctly flagged that the previous default
+(`unique_masks_per_stratum = n_items`) can never be exhausted once
+`n_strata > 1`, since each stratum is only visited `n_items // n_strata`
+times.
+
+This finding is in real tension with a DELIBERATE decision from §25 (in
+response to the 5th audit's OWN earlier recommendation): the 5th audit
+asked for the opposite of what the 6th now asks for -- it said the
+4th round's rejection of `unique_masks_per_stratum > n_items` was based
+on "an incorrect mental model (a global item budget)" and should be
+REMOVED, which §25 did, with a regression test
+(`test_build_stratified_training_seed_bank_allows_unique_masks_per_stratum_larger_than_n_items`)
+locking in the permissive behavior. Silently flipping that back now
+would contradict a previous deliberate decision the moment a new audit
+happens to prefer the opposite default, which is not a defensible way
+to resolve genuinely competing designs.
+
+Resolution: BOTH audits' legitimate concerns are real, so both are
+served without re-reversing either one. `build_stratified_training_seed_bank`
+now always reports `realized_unique_seeds_per_stratum` (a dict of
+stratum -> actual count of distinct seeds realized) in its output, so
+any caller can verify their coverage intent was met without redoing the
+`n_items`/`n_strata` arithmetic themselves. A new optional
+`require_full_seed_pool: bool = False` parameter (threaded through
+`ensure_stratified_training_seed_bank` too) turns the 6th audit's exact
+recommended check (`n_items >= n_strata * unique_masks_per_stratum`,
+verified against the ACTUAL realized counts, which correctly accounts
+for the off-by-one stratum split when `n_items` isn't evenly divisible
+by `n_strata`) into an opt-in, fail-closed precondition. The permissive
+DEFAULT (`False`) is unchanged, preserving §25's regression test and the
+5th audit's own reasoning; a caller that genuinely needs the guarantee
+(e.g. "validation must show exactly N distinct masks per stratum") now
+has an explicit way to demand it. Verified by three new regression
+tests: `realized_unique_seeds_per_stratum`'s value in the
+under-provisioned case, `require_full_seed_pool=True` rejecting that
+same under-provisioned case, and `require_full_seed_pool=True`
+succeeding on the audit's own 4-strata/64-unique/256-item example.
+
+**Remaining contained bug #2, "checkpoint loading still uses Python
+`assert`" -- CONFIRMED, FIXED.** `checkpoint.py::load_trainable_state`
+used two bare `assert` statements for its fail-closed config-mismatch/
+incomplete-checkpoint checks -- `assert` is compiled out entirely under
+`python -O`/`PYTHONOPTIMIZE`, silently turning fail-closed validation
+into a no-op in that mode. Both replaced with explicit `RuntimeError`.
+Per this file's own copy-provenance discipline ("If a bug is found
+here, check whether gen2_architectures' copy has the same issue"),
+checked `gen2_architectures/training/checkpoint.py` directly -- it has
+the identical `assert` statements -- and applied the identical fix
+there too, keeping the two copies in sync. While fixing this, also
+found and fixed an independent, pre-existing bug in BOTH copies' own
+test (`test_load_trainable_state_raises_on_genuine_mismatch`): it used
+`try: ... assert False, "expected an AssertionError" \n except
+AssertionError: pass`, which could never actually fail the test even if
+`load_trainable_state` stopped raising anything at all, since the
+test's OWN `assert False` fallback raises the same `AssertionError`
+type the `except` block swallows. Replaced with `pytest.raises(RuntimeError,
+match=...)` in both copies.
+
+Additionally, the audit's "verify manifest tensor shape/dtype
+explicitly, not only its byte hash" sub-point is CONFIRMED AND FIXED in
+`model_factory.py::load_synchronized_initialization`:
+`_tensor_hash` hashes raw tensor bytes only
+(`tensor.numpy().tobytes()`), which does not encode shape -- two
+tensors with the same total byte content but different shapes (e.g. a
+`[2,3]` and a `[3,2]` all-zeros buffer, a realistic case for
+zero-initialized residuals/scales) hash identically. Shape/dtype were
+already recorded in the manifest by `persist_synchronized_initializations`
+but never checked on load. Both are now verified explicitly before the
+hash check. (In practice, the on-disk `load_trainable_state` path this
+feeds is itself protected by `load_state_dict`'s own shape enforcement
+on matched keys, so this specific check is defense-in-depth against a
+hand-edited/corrupted manifest or a future direct hash-comparison
+caller bypassing `load_state_dict` -- worth having since the data was
+already computed and sitting unused in the manifest, not because a
+concrete exploit path through the current loader exists today.)
+Verified by two new regression tests that mutate a real manifest's
+`shape`/`dtype` fields and confirm both are rejected.
+
+**Remaining contained bug #3, "launcher validation is only in `main()`"
+-- CONFIRMED, FIXED.** Duplicate-GPU and thread-count validation
+previously lived only in the CLI entrypoint; every test in this file,
+and any real Python caller, invokes `launch_suite()` directly and
+bypassed both checks entirely. Both are now enforced inside
+`launch_suite()` itself (the actual invariant-enforcing location every
+caller goes through); `main()` keeps its own early check too, since
+failing before even loading config YAML files is still a real, harmless
+optimization for the CLI path specifically. Also fixed the audit's
+second half of this finding: a `Popen` call failing partway through the
+spawn loop (e.g. a `command_builder` producing a command naming a
+nonexistent executable) used to leave every earlier-started subprocess
+running unmonitored, with every already-opened log file handle leaked.
+The spawn loop is now wrapped in `try/except`: on any exception, every
+already-started process is `terminate()`d and `wait()`ed, and every
+already-opened log handle is closed, before the original exception is
+re-raised. Verified by three new regression tests: duplicate GPU ids
+rejected by `launch_suite()` directly, non-positive `threads_per_job`
+rejected the same way, and (using a monkeypatched fake `subprocess.Popen`
+to avoid real-process-table timing races) a mid-loop spawn failure
+confirmed to `terminate()`+`wait()` every already-started fake process
+and leave every opened log file closed.
+
+**Remaining contained bug #4, "Architecture 4's safe training path
+remains optional" -- PARTIALLY CONFIRMED, PARTIALLY FIXED, one part
+DISPUTED.**
+
+- *"The old two-pass combination remains callable... the future
+  trainer must exclusively use `compute_losses()`."* CONFIRMED as a
+  factual description, but NOT changed -- this is exactly §26's own
+  explicit, deliberate design choice, not an oversight: `forward()`/
+  `compute_flow_matching_loss()` were kept unchanged specifically so
+  existing callers/tests that only need one loss aren't forced through
+  a two-loss interface. "The future trainer must exclusively use
+  `compute_losses()`" is a constraint on a training LOOP that doesn't
+  exist yet (§21); there is nothing in `gen3_multiscale/` today that
+  calls `forward()` and `compute_flow_matching_loss()` together in one
+  step for it to be wrong on. "Add an integration test at trainer level
+  that counts conditioner calls during a real optimizer step" is
+  correctly identified by the audit itself as belonging to the real
+  trainer, which doesn't exist -- noted for whoever builds it, not
+  fixable in isolation today.
+- *"Both flow-loss methods should also move and validate
+  target_expression against the model's actual device/dtype and check
+  shape/finiteness."* CONFIRMED AND FIXED. Added
+  `Architecture4._prepare_target_expression()`, called from both
+  `compute_flow_matching_loss()` and `compute_losses()`: moves the
+  target onto the conditioner's own device/dtype, then raises
+  `ValueError` on a shape mismatch or any non-finite value, instead of
+  silently broadcasting a wrong shape or letting NaN/Inf poison the flow
+  loss. Verified by three new regression tests: a shape-mismatched
+  target rejected, a non-finite target rejected, and a float64 target
+  (a realistic case from raw numpy/anndata conversion) accepted and
+  correctly moved onto the model's own dtype rather than rejected.
+
+**Real launch blockers #1-4 (no data builder/trainer, WSI context, image
+masking, mask-novelty enforcement) -- re-confirmed accurate, no new
+action; unchanged from §21/§23/§24/§26.**
+
+**Real launch blocker #5, "the static fairness audit is too weak" --
+CONFIRMED, PARTIALLY FIXED.** Checked directly: `static_config_audit`'s
+previous `shared_keys = set.intersection(*(...))` computed the
+intersection across ALL configs being compared. Since
+`architecture4.yaml` genuinely and deliberately lacks
+`model.params.use_regional_he`/`use_global_slide` entirely (Architecture
+4 wraps a full Architecture 3 conditioner rather than accepting those
+kwargs directly -- documented in the config's own header), those keys
+dropped out of the FOUR-WAY intersection entirely -- which meant they
+were never checked even AMONG architecture1/2/3.yaml, which genuinely do
+all three share them. A real, undocumented divergence between just
+those three would have gone completely unflagged, purely because a
+fourth, structurally different config didn't have the key at all --
+exactly the concrete failure mode the audit describes.
+
+Fixed the specific, contained part of this: `static_config_audit` now
+compares each key among whichever configs actually declare it (at least
+two), rather than requiring presence in literally every config passed
+in. A key genuinely unique to one config (Architecture 4's flow-only
+params) is still never compared -- that structural difference is not
+itself a violation -- but a key shared by a SUBSET of the configs is no
+longer silently exempted from comparison just because some OTHER config
+in the batch happens to lack it. Verified by a new regression test:
+4 configs, 3 of which share a field with an undocumented divergence, the
+4th genuinely lacking the field entirely -- the divergence is now
+caught, with the non-participating 4th config correctly excluded from
+the reported violation's `values`.
+
+NOT built (the larger part of this finding, genuinely out of scope for
+a contained fix): a canonical "effective experiment schema" that
+explicitly maps Architecture 4's nested conditioner fields onto
+Architecture 3's flat ones, so the "these fields should agree" set is
+asserted positively rather than inferred from which keys happen to
+co-occur across the configs actually passed in. This is a real,
+reasonable design (it would additionally catch e.g. Architecture 4
+silently having a DIFFERENT effective `use_regional_he` than the
+Architecture 3 conditioner it wraps, which the current per-key
+comparison still cannot see since Architecture 4's config has no such
+key at all), but requires deciding what the canonical schema even
+contains -- a real design question, not a mechanical fix, and one this
+already-large round did not take on unilaterally.
+
+**Real launch blocker #6, "'fingerprints' only check path existence" --
+CONFIRMED, ALREADY DISCLOSED.** Checked directly:
+`check_required_fingerprints` only calls `Path(path).exists()`; it does
+not hash file contents. This is the same underlying gap §26 already
+covered for the initialization manifest specifically (resolved-config
+hash, cohort/split hash, mask-bank hashes, etc. -- "every one of them
+describes state belonging to a real trainer/data builder that does not
+exist yet... adding placeholder fields for data nothing yet produces
+would misrepresent verification strength"). The launcher's
+`required_fingerprints` block is the same class of not-yet-real
+artifact for the same reason -- there is no real gene vocabulary, split,
+or mask bank on disk yet for a content hash to protect, since the real
+data builder that would produce them doesn't exist. Re-confirmed true,
+not newly discovered, still blocked on the same missing system.
+
+**Architectural issues (geometry graph, global-GEX purity, candidate
+duplication, flow training, PCC aggregation, Novae) -- re-confirmed
+accurate, no new action; unchanged from §26's findings #7/#9/#10/#12/#13.**
+The audit's new "Novae" section is a restatement, not a new claim:
+`gen3_multiscale` genuinely has no Novae implementation, uses
+`weighted_linear` instead (§10's recorded, deliberate choice), and the
+"initially establish one clean baseline, then run weighted-linear versus
+Novae as a controlled encoder ablation" recommendation matches §10's own
+framing already. Left as the explicit open decision it already was, not
+resolved unilaterally here.
+
+**"Exact implementation order for Claude" -- read and acknowledged, not
+executed**, for the identical reason §26 gave for the 5th audit's
+16-step order: starting `Gen3DataBundle`, the real trainer, WSI wiring,
+the geometry-graph redesign, or the evaluator unilaterally mid-audit-
+response would be scope creep the audit's own framing warns against.
+This round did complete every step of the order that was genuinely a
+contained fix (steps 1-4 of the 18-step list); step 5 onward remains the
+explicit decision point already surfaced to Adam in §26, unchanged by
+this round.
+
+**No 24-hour run has been started or will be auto-started. This
+document only records fixes to already-written code and tests.**
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 332 passed (41 reused-infra + 12 example-schema +
+  11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 22 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  23 launch-four-gpu-suite + 33 model-factory + 4 gene-encoder +
+  35 mask-schedule)
+gen2_architectures + gen3_multiscale: 501 passed, 1 skipped
+```
+
+Note: this pass also fixed the identical `assert`-based bug (see §27,
+remaining contained bug #2) in `gen2_architectures/training/checkpoint.py`,
+so `gen2_architectures/tests/` is included in the 501 figure with its
+own `test_load_trainable_state_raises_on_genuine_mismatch` updated in
+lockstep.
+
+Note: a full monorepo run (`pytest -q` from the repo root, everything
+including the top-level `tests/` directory) still shows one additional
+pre-existing failure, `tests/test_multi_sample.py::test_inject_multi_sample_n_genes`,
+first noted in §26 as confirmed pre-existing on `c02a5d1` (reproduces
+under `git stash`) and unrelated to `gen2_architectures/` or
+`gen3_multiscale/`; unchanged and still out of scope for this pass.
+
+The block immediately below (pre-6th-audit-response test counts) is
+kept for historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 320 passed (41 reused-infra + 12 example-schema +
@@ -1847,14 +2118,6 @@ gen3_multiscale/tests/: 320 passed (41 reused-infra + 12 example-schema +
   32 mask-schedule)
 gen2_architectures + gen3_multiscale: 489 passed, 1 skipped
 ```
-
-Note: a full monorepo run (`pytest -q` from the repo root, everything
-including the top-level `tests/` directory) shows one additional
-failure, `tests/test_multi_sample.py::test_inject_multi_sample_n_genes`,
-confirmed pre-existing on this exact commit before any change in §26
-(reproduces identically under `git stash`) and unrelated to
-`gen2_architectures/` or `gen3_multiscale/` -- out of scope for this
-pass, not a regression introduced here.
 
 The block immediately below (pre-5th-audit-response test counts) is
 kept for historical continuity rather than deleted, per this document's

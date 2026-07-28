@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from omegaconf import OmegaConf
 
+import gen3_multiscale.training.launch_four_gpu_suite as launch_four_gpu_suite_module
 from gen3_multiscale.training.launch_four_gpu_suite import (
     check_required_fingerprints, default_command_builder, launch_suite, main, run_suite_with_smoke_gate,
     static_config_audit,
@@ -94,6 +95,26 @@ def test_static_config_audit_requires_at_least_two_configs():
         static_config_audit({"only_one": {"a": 1}})
 
 
+def test_static_config_audit_still_catches_a_divergence_among_three_configs_when_a_fourth_lacks_the_key():
+    """Regression test for a real, confirmed gap (6th Codex re-audit of
+    commit 06f5cce): the previous intersection-across-ALL-configs
+    implementation meant that a key missing from just ONE config (e.g.
+    architecture4.yaml's real, deliberate absence of
+    model.params.use_regional_he) silently exempted that key from being
+    checked among the OTHER configs too -- so an undocumented divergence
+    between cfg0/cfg1/cfg2 on a field all three genuinely share would go
+    completely unflagged purely because cfg3 doesn't have it at all."""
+    named_configs, _ = _minimal_named_configs(n=4)
+    named_configs["cfg0"]["shared_field"] = 1
+    named_configs["cfg1"]["shared_field"] = 1
+    named_configs["cfg2"]["shared_field"] = 2  # undocumented divergence from cfg0/cfg1
+    del named_configs["cfg3"]["shared_field"]  # cfg3 structurally lacks this field entirely
+    result = static_config_audit(named_configs)
+    assert result["ok"] is False
+    assert result["violations"][0]["key"] == "shared_field"
+    assert result["violations"][0]["values"] == {"cfg0": 1, "cfg1": 1, "cfg2": 2}  # cfg3 correctly excluded, not compared
+
+
 # ---------------------------------------------------------------------------
 # check_required_fingerprints
 # ---------------------------------------------------------------------------
@@ -125,6 +146,80 @@ def test_launch_suite_requires_exactly_one_gpu_per_config(tmp_path):
     named_configs, config_paths = _minimal_named_configs(n=2)
     with pytest.raises(ValueError, match="one GPU per config"):
         launch_suite(named_configs, config_paths, gpu_list=["0"], log_root=tmp_path, command_builder=_stub_command_builder())
+
+
+def test_launch_suite_rejects_duplicate_gpu_ids(tmp_path):
+    """Regression test for a real, confirmed gap (6th Codex re-audit of
+    commit 06f5cce): duplicate-GPU validation used to live only in
+    main(), so a caller invoking launch_suite() directly (as every test
+    in this file, and any real Python caller, does) bypassed it
+    entirely."""
+    named_configs, config_paths = _minimal_named_configs(n=2)
+    with pytest.raises(ValueError, match="DIFFERENT GPU ids"):
+        launch_suite(
+            named_configs, config_paths, gpu_list=["0", "0"], log_root=tmp_path,
+            command_builder=_stub_command_builder(),
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_launch_suite_rejects_non_positive_threads_per_job(tmp_path):
+    named_configs, config_paths = _minimal_named_configs(n=2)
+    with pytest.raises(ValueError, match="threads_per_job must be positive"):
+        launch_suite(
+            named_configs, config_paths, gpu_list=["0", "1"], log_root=tmp_path, threads_per_job=0,
+            command_builder=_stub_command_builder(),
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_launch_suite_cleans_up_already_spawned_jobs_when_a_later_spawn_fails(tmp_path, monkeypatch):
+    """Regression test for a real, confirmed gap (6th Codex re-audit of
+    commit 06f5cce): "add cleanup if Popen succeeds for some arms and
+    then fails while spawning another: terminate and wait for
+    already-started children and close all log handles." Before this
+    fix, an exception partway through the spawn loop (e.g. a
+    command_builder producing a command naming a nonexistent executable)
+    left every earlier-started subprocess running unmonitored, and every
+    already-opened log file handle leaked. subprocess.Popen itself is
+    monkeypatched here (rather than relying on real process-table timing,
+    which would make this test racy) so the fake processes' terminate()/
+    wait() calls can be asserted directly."""
+    named_configs, config_paths = _minimal_named_configs(n=3)
+
+    class _FakeProc:
+        def __init__(self):
+            self.terminated = False
+            self.waited = False
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self):
+            self.waited = True
+            return 0
+
+    created = []
+
+    def fake_popen(command, env=None, stdout=None, stderr=None):
+        if len(created) == 2:
+            raise FileNotFoundError("simulated: no such file or directory")
+        proc = _FakeProc()
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(launch_four_gpu_suite_module.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(FileNotFoundError):
+        launch_suite(
+            named_configs, config_paths, gpu_list=["0", "1", "2"], log_root=tmp_path,
+            command_builder=_stub_command_builder(),
+        )
+
+    assert len(created) == 2  # cfg0 and cfg1 spawned before cfg2's Popen raised
+    assert all(proc.terminated and proc.waited for proc in created)
+    # All three log files were opened (cfg0, cfg1, cfg2) before the failure.
+    assert {p.name for p in tmp_path.iterdir()} == {"cfg0.log", "cfg1.log", "cfg2.log"}
 
 
 def test_launch_suite_refuses_to_start_any_job_when_the_audit_fails(tmp_path):

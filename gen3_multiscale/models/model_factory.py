@@ -504,6 +504,30 @@ def load_synchronized_initialization(
                 f"{architecture_name!r}, but the freshly-constructed model has no such "
                 "parameter or buffer -- architecture/config mismatch"
             )
+        # Real, confirmed gap (6th Codex re-audit of commit 06f5cce):
+        # _tensor_hash hashes raw bytes only (tensor.numpy().tobytes()),
+        # which does NOT encode shape -- two tensors with the same total
+        # byte content but different shapes (e.g. a [2,3] and a [3,2]
+        # all-zeros/all-same-value buffer, both common for
+        # zero-initialized residuals/scales) would hash identically and
+        # silently pass a hash-only check even though load_state_dict's
+        # own strict=False would have skipped a shape-mismatched key.
+        # Shape/dtype were already recorded in the manifest by
+        # persist_synchronized_initializations; verify them explicitly
+        # here rather than relying on the hash to imply them.
+        actual_shape = list(tensor.shape)
+        if actual_shape != expected["shape"]:
+            raise ValueError(
+                f"{architecture_name}.{tensor_name} has shape {actual_shape} but the manifest "
+                f"expects {expected['shape']} -- architecture/config mismatch, or the checkpoint "
+                "was built for a differently-shaped module"
+            )
+        actual_dtype = str(tensor.dtype)
+        if actual_dtype != expected["dtype"]:
+            raise ValueError(
+                f"{architecture_name}.{tensor_name} has dtype {actual_dtype} but the manifest "
+                f"expects {expected['dtype']}"
+            )
         actual_hash = _tensor_hash(tensor)
         if actual_hash != expected["sha256"]:
             raise ValueError(

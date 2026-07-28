@@ -411,11 +411,36 @@ class Architecture4(nn.Module):
         an Architecture3 one."""
         return self.conditioner(inputs)
 
+    def _prepare_target_expression(self, target_expression: torch.Tensor, deterministic_mean: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """Move `target_expression` onto the model's own device/dtype and
+        validate its shape/finiteness against `deterministic_mean` --
+        real, confirmed gap (6th Codex re-audit of commit 06f5cce): "Both
+        flow-loss methods should also move and validate target_expression
+        against the model's actual device/dtype and check shape/
+        finiteness." Without this, a caller passing a target on the wrong
+        device would previously hit an opaque CUDA/CPU mismatch error
+        deep inside the einsum in `to_coefficients`, a shape mismatch
+        would silently broadcast into a much larger tensor instead of
+        failing at the actual point of the mistake, and a non-finite
+        target (a real, plausible upstream data bug) would silently
+        poison the flow loss with NaN/Inf rather than failing loudly at
+        the boundary where it enters this model."""
+        target_expression = target_expression.to(device=device, dtype=deterministic_mean.dtype)
+        if target_expression.shape != deterministic_mean.shape:
+            raise ValueError(
+                f"target_expression {tuple(target_expression.shape)} must match the conditioner's "
+                f"deterministic_mean shape {tuple(deterministic_mean.shape)}"
+            )
+        if not torch.isfinite(target_expression).all():
+            raise ValueError("target_expression contains non-finite (NaN/Inf) values")
+        return target_expression
+
     def compute_flow_matching_loss(self, inputs: SpatialFieldInputs, target_expression: torch.Tensor) -> torch.Tensor:
         device = next(self.parameters()).device
         conditioner_out = self.conditioner(inputs)
         query_hidden = conditioner_out["query_hidden"].detach()
         deterministic_mean = conditioner_out["expression"].detach()
+        target_expression = self._prepare_target_expression(target_expression, deterministic_mean, device)
         target_residual = target_expression - deterministic_mean
         target_coefficients = target_residual @ self._gene_basis_matrix.T  # GeneResidualBasis.to_coefficients, device-correct
         query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32, device=device)
@@ -439,6 +464,7 @@ class Architecture4(nn.Module):
         conditioner_out = self.conditioner(inputs)
         query_hidden = conditioner_out["query_hidden"].detach()
         deterministic_mean = conditioner_out["expression"].detach()
+        target_expression = self._prepare_target_expression(target_expression, deterministic_mean, device)
         target_residual = target_expression - deterministic_mean
         target_coefficients = target_residual @ self._gene_basis_matrix.T  # GeneResidualBasis.to_coefficients, device-correct
         query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32, device=device)

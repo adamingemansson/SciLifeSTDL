@@ -232,6 +232,7 @@ def build_stratified_training_seed_bank(
     coords3d: np.ndarray, slice_ids: np.ndarray, obs_names: Iterable[str],
     n_items: int, base_seed: int, strata: list[dict],
     unique_masks_per_stratum: int | None = None,
+    require_full_seed_pool: bool = False,
 ) -> dict:
     """Stratified equivalent of `mask_bank.build_training_seed_bank`: a
     lossless, deterministic (stratum, seed) schedule for `n_items`
@@ -274,6 +275,31 @@ def build_stratified_training_seed_bank(
     Each stratum's seed range is offset by the same `_STRATUM_SEED_STRIDE`
     `build_stratified_mask_bank` uses, so a training draw's seed can
     never collide with a different stratum's draw.
+
+    `unique_masks_per_stratum` is a CAP on the per-stratum seed-cycling
+    pool, not automatically a promise that every seed in that pool is
+    actually drawn -- round-robin assignment only visits a given stratum
+    `n_items // n_strata` times (give or take one), so a caller asking
+    for a larger pool than that (e.g. `unique_masks_per_stratum=99` with
+    only 4 items total) legitimately just doesn't exhaust it; this is
+    intentional, matching the corrected semantics from the 5th Codex
+    re-audit of commit c02a5d1 (see
+    `test_build_stratified_training_seed_bank_allows_unique_masks_per_stratum_larger_than_n_items`).
+    The output always reports `realized_unique_seeds_per_stratum` (the
+    ACTUAL count achieved per stratum) so a caller can verify their
+    coverage intent was met without guessing from `n_items`/`n_strata`
+    arithmetic. `require_full_seed_pool=True` (a real, confirmed gap --
+    6th Codex re-audit of commit 06f5cce: "the function does not
+    guarantee that the entire requested pool is realized") turns that
+    same check into a fail-closed precondition: it raises unless every
+    stratum actually realizes the full `unique_masks_per_stratum` seeds,
+    i.e. `n_items >= n_strata * unique_masks_per_stratum`. Defaults to
+    False rather than becoming the unconditional behavior, because
+    flipping the DEFAULT would silently break the 5th-round decision
+    that oversized pools are legitimate, not an error -- callers that
+    genuinely need the guarantee (e.g. "validation must show exactly N
+    distinct masks per stratum") now have an explicit, opt-in way to
+    demand it instead.
     """
     n_items = int(n_items)
     base_seed = int(base_seed)
@@ -319,12 +345,29 @@ def build_stratified_training_seed_bank(
     # through every one of the unique_masks_per_stratum seeds regardless
     # of the relationship between n_strata and unique_masks_per_stratum.
     items = []
+    seeds_by_stratum: dict[str, set[int]] = {name: set() for name in stratum_names}
     for i in range(n_items):
         stratum_index = i % n_strata
         occurrence_in_stratum = i // n_strata
         local_seed_index = occurrence_in_stratum % unique_masks_per_stratum
         seed = base_seed + local_seed_index + stratum_index * _STRATUM_SEED_STRIDE
         items.append({"stratum": stratum_names[stratum_index], "seed": seed})
+        seeds_by_stratum[stratum_names[stratum_index]].add(seed)
+
+    realized_unique_seeds_per_stratum = {name: len(seeds) for name, seeds in seeds_by_stratum.items()}
+    if require_full_seed_pool:
+        short = {
+            name: count for name, count in realized_unique_seeds_per_stratum.items()
+            if count < unique_masks_per_stratum
+        }
+        if short:
+            raise ValueError(
+                f"require_full_seed_pool=True but these strata did not realize the full "
+                f"unique_masks_per_stratum={unique_masks_per_stratum} seed pool: {short} -- "
+                f"increase n_items to at least n_strata * unique_masks_per_stratum "
+                f"({n_strata} * {unique_masks_per_stratum} = {n_strata * unique_masks_per_stratum}), "
+                f"got n_items={n_items}"
+            )
 
     names = [str(x) for x in obs_names]
     return {
@@ -337,6 +380,7 @@ def build_stratified_training_seed_bank(
         "n_items": n_items,
         "base_seed": base_seed,
         "unique_masks_per_stratum": unique_masks_per_stratum,
+        "realized_unique_seeds_per_stratum": realized_unique_seeds_per_stratum,
         "strata_fingerprint": strata_fingerprint(strata),
         "strata": stratum_names,
         "items": items,
@@ -352,6 +396,7 @@ def ensure_stratified_training_seed_bank(
     base_seed: int,
     strata: list[dict],
     unique_masks_per_stratum: int | None = None,
+    require_full_seed_pool: bool = False,
 ) -> tuple[dict, Path]:
     """Load-or-atomically-create, mirroring `mask_bank.ensure_training_seed_bank`:
     reuse an existing on-disk schedule if every identifying field and the
@@ -364,6 +409,7 @@ def ensure_stratified_training_seed_bank(
     expected = build_stratified_training_seed_bank(
         coords3d, slice_ids, obs_names, n_items, base_seed, strata,
         unique_masks_per_stratum=unique_masks_per_stratum,
+        require_full_seed_pool=require_full_seed_pool,
     )
     if path.exists():
         bank = json.loads(path.read_text())

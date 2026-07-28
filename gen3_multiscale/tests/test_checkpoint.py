@@ -68,7 +68,18 @@ def test_load_trainable_state_raises_on_genuine_mismatch():
     """If a model architecture DOES have trainable params but the weights
     file is missing, that's a real incomplete-checkpoint bug, not a
     frozen-by-design case -- must raise loudly, not silently proceed with
-    random weights."""
+    random weights.
+
+    Uses pytest.raises(RuntimeError), not a bare try/except AssertionError
+    (2026-07-28, real bug fixed -- 6th Codex re-audit of commit 06f5cce):
+    load_trainable_state used to raise a Python `assert`, which
+    `python -O` strips entirely, silently turning this fail-closed check
+    into a no-op. It now raises RuntimeError explicitly. The OLD version
+    of this test was also itself broken independently of that: its
+    `assert False, "..."` fallback for the "did not raise" case raised
+    the SAME AssertionError type the except block caught, so the test
+    could never actually fail even if load_trainable_state stopped
+    raising anything at all."""
     m = _Tiny()
     with tempfile.TemporaryDirectory() as tmp:
         # write only the metadata a save_checkpoint call for an ALL-FROZEN
@@ -81,11 +92,8 @@ def test_load_trainable_state_raises_on_genuine_mismatch():
             json.dump({"name": "tiny"}, f)
         with open(os.path.join(tmp, "gene_names.json"), "w") as f:
             json.dump([], f)
-        try:
+        with pytest.raises(RuntimeError, match="looks incomplete"):
             load_trainable_state(m, tmp)
-            assert False, "expected an AssertionError for a genuinely incomplete checkpoint"
-        except AssertionError:
-            pass
 
 
 def test_checkpoint_history_is_pruned_to_keep_last():
