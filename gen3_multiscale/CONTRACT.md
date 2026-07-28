@@ -3011,7 +3011,142 @@ the mask-generation scheme itself.
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 36. Real Gen3 data builder -- Step 4: context-only Novae graphs
+
+`data/novae_graph.py` (new module), Step 4 of the 9-step order: "Build
+context-only Novae graphs", sharpened by the 11th Codex re-audit's Step
+4 decision: "the Novae graph must use all GEX-available context spots
+-- including spots whose H&E patch is unavailable due to overlap --
+while query nodes are physically absent. The cache key and preflight
+report must prove that no query composite identity appears in: graph
+nodes; graph edges; Novae input expression; global/induced pools;
+cached embeddings."
+
+Researched before writing any code (no code changes from this
+research, findings only): `gen3_multiscale` has no prior Novae code at
+all. `gen2_architectures/data/context_features.py`'s
+`ContextOnlyNovaeProvider` -- the existing, already-audited leakage-safe
+pattern for Novae (subsets `adata` to `context_mask`, calls an injected
+`feature_fn`, disk-caches by a mask digest) -- is a caching/injection
+WRAPPER only; it never builds or exposes a graph structure as its own
+artifact, delegating graph construction entirely to the injected
+function. No `novae` or `torch_geometric` package is installed anywhere
+in this repo. This module is the gen3_multiscale analog, adapted to
+this package's barcode-list convention (matching `example_builder.py`)
+and composite-identity leakage discipline (matching
+`mask_fingerprint.py`), and additionally builds the GRAPH STRUCTURE
+itself (nodes, edges) as a first-class, independently-verifiable
+object -- required by the explicit five-way non-leakage proof above,
+which an opaque feature-vector wrapper alone cannot provide.
+
+- `build_context_only_novae_graph(adata, context_barcodes, query_barcodes,
+  *, sample_id, k_neighbors=6) -> NovaeGraphInputs` -- builds a k-NN
+  graph (`boundary_graph.build_knn_adjacency`, reused, not
+  reimplemented) over EVERY barcode in `context_barcodes`, with NO
+  H&E-overlap-based reduction: unlike `example_builder.build_spatial_field_example`
+  (which excludes context spots whose H&E patch physically overlaps the
+  query hole from `observed_*` entirely, both modalities -- CONTRACT.md
+  section 33 finding #4, still deferred to Step 5), Novae is GEX-only
+  and has no H&E constraint, so this function reads directly from the
+  realized mask's `context_barcodes` (physically disjoint from
+  `query_barcodes` -- the only real constraint) and uses every
+  GEX-available spot. `node_barcodes` is sorted (deterministic,
+  independent of the caller's list order); `node_coords`/`node_expression`/
+  `edge_index` are all aligned 1:1 to it by position. `cache_key` is a
+  SHA256 over SORTED context-node composite identities ONLY -- verified
+  directly (`test_cache_key_depends_on_context_but_never_on_query_barcodes`)
+  to be identical across two graphs built from the same context set with
+  DIFFERENT query sets, and to change when the context set itself
+  changes: the cache key structurally cannot leak or vary with which
+  spots were held out. `verify_novae_graph_excludes_query_identities` is
+  called automatically before returning.
+- `verify_novae_graph_excludes_query_identities(graph, query_barcodes) -> dict`
+  -- proves (1) no query composite identity is among `node_composite_ids`,
+  (2) every `edge_index` entry references a real node position in
+  `[0, n_nodes)` (structurally verified, not merely assumed to be safe
+  by construction), and (3) `node_expression`/`node_coords` are row-
+  aligned 1:1 with `node_barcodes` -- which together prove the "Novae
+  input expression" is leakage-free too, since its rows are the same
+  nodes. Verified with an engineered corruption test for each: directly
+  mutating `node_composite_ids[0]` to a query's composite id (frozen
+  dataclass, mutable numpy array contents) is caught; directly
+  corrupting `edge_index` to an out-of-bounds position is caught.
+- `pool_novae_embeddings(node_embeddings) -> np.ndarray` -- the
+  "global/induced pool": mean-pools node-level embeddings into one
+  per-graph summary vector, leakage-safe BY CONSTRUCTION since it only
+  ever operates on an array whose rows are already the context-only
+  node embeddings.
+- `compute_novae_embeddings(graph, novae_feature_fn)` -- calls an
+  INJECTED `novae_feature_fn(node_expression, edge_index) -> [n_nodes, dim]`,
+  matching every other pluggable-feature-function pattern already
+  established in this codebase (`example_builder.image_feature_fn`,
+  `ContextOnlyNovaeProvider`'s own `feature_fn`) -- no real Novae
+  checkpoint dependency. Validates shape and finiteness.
+- `ensure_cached_novae_embeddings(cache_dir, graph, novae_feature_fn,
+  query_barcodes) -> (embeddings, path)` -- atomic disk cache keyed by
+  `graph.cache_key`. Before ever returning a CACHED result, re-verifies
+  the cache file's own recorded `node_composite_ids` against the
+  CURRENT query set and raises if any overlap is found -- proven by a
+  test that hand-tampers a valid cache file's `node_composite_ids` to
+  include a query composite identity and confirms the next load refuses
+  to reuse it, rather than assuming a matching filename/cache_key
+  implies safety.
+- `build_novae_preflight_report(adata, context_barcodes, query_barcodes,
+  novae_feature_fn, *, sample_id, cache_dir) -> dict` /
+  `save_novae_preflight_report` / `load_novae_preflight_report` -- the
+  complete preflight artifact: builds the graph, computes/caches
+  embeddings, pools them, and records an explicit `"checks"` dict with
+  one boolean per one of the five things Step 4's requirement names
+  (graph nodes, graph edges, Novae input expression, the global/induced
+  pool, cached embeddings) -- the artifact Step 8's mandatory preflight
+  gate is meant to require before any real training run touches Novae
+  features. Atomic write, mirroring every other artifact in this
+  package.
+
+**Deliberately NOT built in this step:** the real Novae model/checkpoint
+call itself (no such dependency exists anywhere in this repo; would be
+injected via `novae_feature_fn` exactly like GigaPath's real tile
+encoder is meant to be injected into `example_builder.image_feature_fn`
+-- a separate, later integration task, not this step's); wiring
+`build_novae_preflight_report` into `models/architectures.py`'s
+Architecture 3/4 forward pass (that is Step 5's job, "wire real
+regional/global GigaPath WSI context into Architectures 3/4" -- Novae
+wiring was never part of the original 9-step Step 5 description, so
+whether/how Novae features flow into the architectures is left as an
+open design question for whoever picks that up, not assumed here);
+multi-sample/whole-cohort orchestration of `build_novae_preflight_report`
+across every training sample in a manifest (this module operates on one
+sample at a time, matching `mask_bank.py`'s own established per-sample
+scope; a cohort-level wrapper belongs with Step 8's preflight gates,
+which already need to loop over the whole manifest for other checks
+too).
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 409 passed (45 reused-infra + 12 example-schema +
+  11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 23 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 15 dataset-manifest + 16 example-builder +
+  18 mask-fingerprint + 14 novae-graph)
+gen2_architectures + gen3_multiscale: 582 passed, 1 skipped
+```
+
+Note: a full monorepo run (`pytest -q` from the repo root, everything
+including the top-level `tests/` directory) still shows the same one
+pre-existing failure noted since §26,
+`tests/test_multi_sample.py::test_inject_multi_sample_n_genes`,
+unrelated to `gen2_architectures/` or `gen3_multiscale/`; unchanged and
+still out of scope for this pass.
+
+The block immediately below (pre-Step-4 test counts) is kept for
+historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 395 passed (45 reused-infra + 12 example-schema +
