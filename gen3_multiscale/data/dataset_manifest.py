@@ -78,24 +78,43 @@ def composite_spot_id(sample_id: str, barcode: str) -> str:
     return f"{sample_id}::{barcode}"
 
 
-def _read_sample_barcodes_and_coords(hest_data_dir: str | Path, sample_id: str) -> tuple[list[str], np.ndarray]:
+def _read_sample_barcodes_and_coords(
+    hest_data_dir: str | Path, sample_id: str, min_genes_per_spot: int,
+) -> tuple[list[str], np.ndarray]:
     """Real per-spot barcodes and spatial coordinates for one sample,
-    read WITHOUT loading the full expression matrix (anndata's
-    backed='r' mode still loads obs/obsm eagerly, only X stays lazy --
-    mirrors hest1k_catalog._real_var_names's identical cheap-read
-    pattern). Used for every kept sample (train AND held-out), since
-    identity/coordinate bookkeeping is needed for all of them, not just
-    the train samples whose expression actually gets loaded to derive
-    the gene panel."""
+    AFTER the same per-spot QC filter (`sc.pp.filter_cells(min_genes=...)`)
+    `loaders.basic_qc_and_normalize` applies everywhere else.
+
+    Real, confirmed gap fixed here (found while designing Step 2, before
+    any Step-2 code shipped): an earlier version of this function used a
+    cheap `backed='r'` read with NO QC filtering at all, so a sample's
+    manifest-recorded spot set (barcodes/coords/composite_spot_ids)
+    could silently disagree with the spot set `loaders.load_multi_sample`
+    (used for train samples' gene-panel derivation, and reused again by
+    the real example builder for every sample) actually keeps after
+    `min_genes` filtering -- a spot the manifest declares to exist could
+    turn out to not actually be usable, or vice versa. Applying the
+    IDENTICAL filter here, for every sample (train AND held-out), keeps
+    the manifest's declared spot set authoritative and consistent with
+    what every later consumer actually sees. This costs a real (not
+    backed) per-sample load -- a one-time manifest-build cost, not a
+    per-training-step one."""
     import anndata as ad
+    import scanpy as sc
     path = loaders._resolve_hest_sample_file(hest_data_dir, sample_id, ".h5ad")
-    adata = ad.read_h5ad(path, backed="r")
+    adata = ad.read_h5ad(path)
+    if min_genes_per_spot > 0:
+        sc.pp.filter_cells(adata, min_genes=min_genes_per_spot)
     barcodes = [str(x) for x in adata.obs_names]
     coords = np.asarray(adata.obsm["spatial"], dtype=np.float64)
     if coords.shape[0] != len(barcodes):
         raise ValueError(
             f"{sample_id}: obsm['spatial'] has {coords.shape[0]} rows but obs_names has "
             f"{len(barcodes)} entries -- misaligned real data"
+        )
+    if not barcodes:
+        raise ValueError(
+            f"{sample_id}: no spots survive the min_genes={min_genes_per_spot} per-spot QC filter"
         )
     return barcodes, coords
 
@@ -195,7 +214,7 @@ def build_dataset_manifest(
 
     samples: dict[str, dict] = {}
     for sample_id in all_ids:
-        barcodes, coords = _read_sample_barcodes_and_coords(hest_data_dir, sample_id)
+        barcodes, coords = _read_sample_barcodes_and_coords(hest_data_dir, sample_id, gene_min_genes_per_spot)
         samples[sample_id] = {
             "organ": split["organ_by_sample"][sample_id],
             "tech": split["tech_by_sample"][sample_id],

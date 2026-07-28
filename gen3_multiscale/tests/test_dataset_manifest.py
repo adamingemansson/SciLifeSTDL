@@ -194,6 +194,44 @@ def test_gene_panel_is_derived_from_training_samples_only(tmp_path):
     assert "HELDOUT_ONLY_GENE0" not in manifest["gene_panel"]
 
 
+def test_manifest_excludes_spots_that_fail_the_per_spot_min_genes_filter(tmp_path):
+    """Regression test for a real, confirmed gap (found while designing
+    Step 2, before any Step-2 code shipped): an earlier version of this
+    module recorded RAW, un-QC'd spot barcodes/coordinates, which could
+    silently disagree with the spot set loaders.load_multi_sample (used
+    for the gene panel, and later reused by the real example builder)
+    actually keeps after per-spot min_genes filtering. One deliberately
+    all-zero-expression spot (detects 0 genes) must now be excluded from
+    the manifest, exactly as it would be from real training data."""
+    hest_dir = tmp_path / "hest1k"
+    (hest_dir / "st").mkdir(parents=True)
+    (hest_dir / "patches").mkdir(parents=True)
+    gene_names = [f"GENE{i}" for i in range(6)]
+    barcodes = [f"SPOT{i}-1" for i in range(5)]
+    counts = np.ones((5, 6), dtype=np.float32) * 3.0
+    counts[0, :] = 0.0  # spot 0 detects zero genes -- must fail min_genes=1
+    coords = np.random.default_rng(0).uniform(0, 1000, size=(5, 2))
+    adata = ad.AnnData(
+        X=counts, obs=pd.DataFrame(index=pd.Index(barcodes)), var=pd.DataFrame(index=pd.Index(gene_names)),
+    )
+    adata.obsm["spatial"] = coords
+    adata.write_h5ad(hest_dir / "st" / "L0.h5ad")
+    (hest_dir / "patches" / "L0.h5").touch()
+    meta_path = tmp_path / "meta.csv"
+    pd.DataFrame([
+        {"id": "L0", "organ": "Lung", "st_technology": "Visium", "species": "Homo sapiens", "nb_genes": 6},
+    ]).to_csv(meta_path, index=False)
+
+    manifest = build_dataset_manifest(
+        hest_dir, str(meta_path), organs="all", min_samples_per_organ=1,
+        n_validation_per_organ=0, n_test_per_organ=0, split_seed=0,
+        check_gene_panel_compatibility=False, min_nb_genes=None,
+        gene_min_genes_per_spot=1, gene_min_cells=0,
+    )
+    assert manifest["samples"]["L0"]["n_spots"] == 4
+    assert "SPOT0-1" not in manifest["samples"]["L0"]["barcodes"]
+
+
 def test_wsi_cache_provenance_recorded_when_cache_file_exists(tmp_path):
     hest_dir, meta_path, _ = _make_synthetic_hest1k(tmp_path, {"Lung": ["L0", "L1"]})
     cache_dir = hest_dir / "gigapath_slide_cache"
