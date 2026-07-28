@@ -2811,7 +2811,106 @@ section.
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 34. Real Gen3 data builder -- Step 3: realized-mask fingerprinting and leakage rejection
+
+`data/mask_fingerprint.py` (new module), Step 3 of the 9-step order:
+"Fingerprint sorted realized query identities", sharpened by §33's
+finding #1 discussion and the 10th Codex re-audit's own closing
+instruction: "implement Step 3 using realized composite query
+identities rather than seeds."
+
+The real gap this closes: `mask_bank.py`/`mask_schedule.py`'s training
+seed banks deliberately store only a (stratum, seed) SCHEDULE, not
+every realized context/query barcode list (`build_training_seed_bank`'s
+own docstring: storing every draw explicitly would create multi-
+gigabyte JSON). Their `unique_mask_count`/`unique_masks_per_stratum`
+fields count DISTINCT SEED VALUES and implicitly assume distinct seeds
+always realize distinct masks. `mask_bank.make_split` is a
+deterministic function of (data, masking_cfg, seed), but it is NOT
+proven injective in seed -- nothing before this module ever checked
+whether two different seeds could realize the identical actual
+context/query split.
+
+- `sorted_composite_query_fingerprint(sample_id, query_obs_names)` --
+  SHA256 of the SORTED set of composite (sample_id, spot) identities
+  (`dataset_manifest.composite_spot_id`, Step 1's true globally-unique
+  spot identity) for a realized query set. Order-independent and
+  sample-namespaced, so two different samples sharing a raw barcode
+  string can never collide.
+- `realize_seed_and_fingerprint(coords3d, slice_ids, obs_names,
+  sample_id, masking_cfg, seed)` -- realizes ONE (masking_cfg, seed)
+  draw exactly as `mask_bank.build_mask_bank` does internally (same
+  `make_split` call, same context capping via `cap_context_mask`), then
+  fingerprints the REALIZED query set. Verified to match a direct,
+  independent `mask_bank.make_split` + `cap_context_mask` call.
+- `verify_realized_seed_uniqueness(coords3d, slice_ids, obs_names,
+  sample_id, masking_cfg, seeds)` -- the direct, positive check: realizes
+  every seed in a candidate pool (e.g. one stratum's
+  `unique_masks_per_stratum` seed range from
+  `mask_schedule.build_stratified_training_seed_bank`) and raises,
+  fail-closed, if any two seeds realize an IDENTICAL query composite
+  fingerprint -- naming exactly which seeds collided. Verified two ways:
+  (a) 10 genuinely distinct seeds on a real `random_dropout_patches`
+  config realize 10 distinct masks; (b) a real, engineered, NON-flaky
+  collision using `hold_out_slice` with two candidate slices -- `numpy`'s
+  `rng.choice` over only two options means many different seeds
+  coincidentally pick the identical held-out slice, producing
+  byte-identical masks; a dry run (never a hardcoded guess about the RNG)
+  finds two such seeds first, then confirms the function raises exactly
+  as designed.
+- `realized_query_composite_ids(sample_id, records)` /
+  `verify_no_cross_split_query_leakage(realized_composite_ids_by_split)`
+  -- a real, positive cross-split leakage check: for one sample, a
+  training draw's realized query spots must never coincide with a
+  held-out (validation/test) mask's realized query spots for that same
+  sample, or the model would be evaluated on exactly what it was
+  trained to reconstruct. This is a leak the sample-level
+  train/validation/test split (`dataset_manifest.py`, Step 1) cannot
+  see by construction, since it operates ACROSS samples, not within one
+  sample's own in-sample validation/test masks. Verified: a genuine
+  overlapping query barcode between two splits for the same sample_id
+  raises with the specific overlapping composite identities named; a
+  disjoint case passes; two different samples sharing a raw barcode
+  string never register as an overlap (composite identity, not raw
+  barcode, is what's compared).
+
+**Deliberately NOT built in this step:** wiring `verify_realized_seed_uniqueness`/
+`verify_no_cross_split_query_leakage` into `ensure_stratified_training_seed_bank`
+or a preflight gate as an unconditional, always-run check -- realizing
+every seed in a large production seed pool for every training launch
+would be real, non-trivial per-launch cost (unlike the seed-schedule
+generation itself, which is O(n_items) integer arithmetic, not O(n_items)
+mask realizations). This module provides the verification primitives;
+wiring them into a mandatory, but appropriately-scoped (e.g. run once
+at preflight, not every epoch) gate is Step 8's job ("mandatory
+preflight gates"), not Step 3's.
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 381 passed (45 reused-infra + 12 example-schema +
+  11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 23 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 14 dataset-manifest + 14 example-builder +
+  7 mask-fingerprint)
+gen2_architectures + gen3_multiscale: 554 passed, 1 skipped
+```
+
+Note: a full monorepo run (`pytest -q` from the repo root, everything
+including the top-level `tests/` directory) still shows the same one
+pre-existing failure noted since §26,
+`tests/test_multi_sample.py::test_inject_multi_sample_n_genes`,
+unrelated to `gen2_architectures/` or `gen3_multiscale/`; unchanged and
+still out of scope for this pass.
+
+The block immediately below (pre-Step-3 test counts) is kept for
+historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 374 passed (45 reused-infra + 12 example-schema +
