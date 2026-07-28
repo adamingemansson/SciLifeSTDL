@@ -68,8 +68,8 @@ class SpatialFieldInputs:
 
     Every observed_*/query_* array pair below is POSITION-aligned: row i
     of observed_coords describes the same spot as row i of
-    observed_gex_conditioning, observed_full_gene_expression, and
-    observed_gigapath_features (and observed_barcodes[i] is that spot's
+    observed_full_gene_expression and observed_gigapath_features (and
+    observed_barcodes[i] is that spot's
     original identity, for provenance/debugging only -- never used to
     index anything). query_local_neighbor_idx and boundary_idx are
     positions WITHIN the observed_* arrays (i.e. in [0, n_observed)),
@@ -93,17 +93,17 @@ class SpatialFieldInputs:
 
     # Observed-spot content -- position-aligned with observed_coords/observed_barcodes.
     #
-    # 2nd Codex re-audit finding (of commit 547f51e), confirmed and fixed
-    # differently than initially proposed: _SharedFieldArchitecture no
-    # longer reads this field at all. The real, trainable "weighted_linear"
-    # gene conditioning encoder (models/gene_encoder.py) is now OWNED and
-    # CALLED by the model itself, from observed_full_gene_expression
-    # (below) -- the audit's own recommended fix, "be owned and called
-    # inside the model from raw observed GEX tensors." This field is kept
-    # in the schema (not removed) for backward compatibility and as a
-    # slot for a future PRECOMPUTED/frozen conditioning path, but no
-    # current architecture consumes it.
-    observed_gex_conditioning: np.ndarray  # [n_observed, gex_dim] NOT read by _SharedFieldArchitecture -- see note above
+    # No separate precomputed "conditioning" field: an earlier revision
+    # had one (observed_gex_conditioning), but a 3rd-round Codex re-audit
+    # (of commit ca7cf53) correctly flagged it as a dangerous dead input
+    # once _SharedFieldArchitecture stopped reading it -- "later code may
+    # accidentally start consuming them again." Removed entirely rather
+    # than kept-but-optional, per this project's own standing principle
+    # (delete what's genuinely unused rather than leave a vestigial
+    # field). The real, trainable "weighted_linear" gene conditioning
+    # encoder (models/gene_encoder.py) is owned and called by the model
+    # itself, from observed_full_gene_expression below -- the only gene
+    # array this dataclass carries.
     observed_full_gene_expression: np.ndarray  # [n_observed, n_genes] untouched real values, transported not decoded
     observed_gigapath_features: np.ndarray  # [n_observed, 1536] frozen local H&E tile embeddings
 
@@ -158,7 +158,6 @@ def validate_spatial_field_example(inputs: SpatialFieldInputs, targets: SpatialF
         raise ValueError("query_barcodes contains duplicate spot identities")
 
     for name, arr in (
-        ("observed_gex_conditioning", inputs.observed_gex_conditioning),
         ("observed_full_gene_expression", inputs.observed_full_gene_expression),
         ("observed_gigapath_features", inputs.observed_gigapath_features),
     ):

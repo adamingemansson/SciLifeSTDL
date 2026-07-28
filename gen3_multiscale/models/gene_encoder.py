@@ -9,20 +9,15 @@ commit 386bcf4, verified before fixing): CONTRACT.md section 10 records
 `weighted_linear` as the frozen, evidence-backed gene-encoder choice for
 all four architectures, and every `configs/architectureN.yaml` names it
 via `model.params.gene_encoder_type` -- but until this file existed, no
-module ANYWHERE in `gen3_multiscale/` actually computed
-`observed_gex_conditioning` from raw expression; `SpatialFieldInputs`
-only ever documented that field as already-encoded, upstream input.
-`WeightedGeneExpressionEncoder` is the real, audited, trainable module
-that would do that encoding.
+module ANYWHERE in `gen3_multiscale/` actually computed a compact GEX
+conditioning representation from raw expression at all.
+`WeightedGeneExpressionEncoder` is that real, audited, trainable module.
 
-This file does NOT close the full gap on its own: nothing in
-`gen3_multiscale/` yet CALLS this encoder inside a real per-sample data
-builder to actually populate `observed_gex_conditioning` from raw counts
--- that wiring (plus training-only normalization/scale fitting for the
-encoder's input) is part of the still-missing real training system
-(CONTRACT.md section 21), not something this module can decide on its
-own. What this file provides is the previously entirely-absent
-implementation itself, ready to be called once that wiring exists.
+A follow-up fix (2nd Codex re-audit of commit 547f51e) wired this module
+INTO `_SharedFieldArchitecture` itself (`models/architectures.py`),
+which now owns and calls it on `observed_full_gene_expression` inside
+`forward()` -- so the encoding this file provides is genuinely used by
+every architecture, not merely available.
 """
 from __future__ import annotations
 

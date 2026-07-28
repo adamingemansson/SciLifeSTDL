@@ -26,6 +26,10 @@ features.
 """
 from __future__ import annotations
 
+import json
+import os
+from hashlib import sha256
+from pathlib import Path
 from typing import Iterable
 
 import numpy as np
@@ -57,6 +61,24 @@ def stratum_to_masking_cfg(stratum: dict, default_n_patches: int = 1) -> dict:
             "shape": str(stratum["shape"]),
         },
     }
+
+
+def strata_fingerprint(strata: list[dict], split_counts: dict[str, int] | None = None, split_seeds: dict[str, int] | None = None) -> str:
+    """A single combined fingerprint covering the ORDERED strata
+    definition (plus split counts/seeds) -- fixes a real, confirmed gap
+    (3rd Codex re-audit of commit ca7cf53): "it has no combined
+    fingerprint covering the ordered strata definition", only
+    `per_stratum_masking_fingerprint` entries an unordered dict could
+    reshuffle without changing. Converts every stratum to its real
+    `masking_cfg` (via `stratum_to_masking_cfg`) first, so this
+    fingerprint changes if a stratum's radius/shape/unit changes even if
+    its `name` doesn't."""
+    payload = {
+        "strata": [{"name": s.get("name"), "masking_cfg": stratum_to_masking_cfg(s)} for s in strata],
+        "split_counts": dict(split_counts or {"validation": 4, "test": 8}),
+        "split_seeds": dict(split_seeds or {"validation": 700_000, "test": 900_000}),
+    }
+    return sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def build_stratified_mask_bank(
@@ -112,6 +134,7 @@ def build_stratified_mask_bank(
         "kind": "stratified_mask_bank",
         "dataset_fingerprint": mask_bank.dataset_fingerprint(names_arr),
         "spatial_fingerprint": mask_bank.spatial_fingerprint(coords3d, slice_ids),
+        "strata_fingerprint": strata_fingerprint(strata, split_counts, split_seeds),
         "strata": stratum_names,
         "per_stratum_masking_fingerprint": per_stratum_fingerprints,
         "split_counts": split_counts,
@@ -127,3 +150,186 @@ def stratum_records(bank: dict, split: str, stratum: str) -> list[dict]:
     results can be reported per stratum (CONTRACT.md section 4)."""
     records = [r for r in bank["records"] if r["split"] == split and r["stratum"] == stratum]
     return sorted(records, key=lambda r: int(r["index"]))
+
+
+def save_stratified_mask_bank(bank: dict, path: str | Path) -> Path:
+    """Atomic write, mirroring `mask_bank.save_mask_bank` exactly (same
+    process-specific-temp-file-then-os.replace discipline, for the same
+    reason: concurrent single-GPU jobs may all request the same immutable
+    stratified bank at once)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(bank, indent=2, sort_keys=True))
+    os.replace(tmp, path)
+    return path
+
+
+def load_stratified_mask_bank(
+    path: str | Path,
+    obs_names: Iterable[str],
+    *,
+    coords3d: np.ndarray | None = None,
+    slice_ids: np.ndarray | None = None,
+    strata: list[dict] | None = None,
+    split_counts: dict[str, int] | None = None,
+    split_seeds: dict[str, int] | None = None,
+) -> dict:
+    """Fail-closed staleness validation, mirroring `mask_bank.load_mask_bank`
+    exactly, but checking `strata_fingerprint` (this module's OWN combined
+    ordered-strata fingerprint) rather than a single `masking_fingerprint`
+    -- a stratified bank has no single masking config to fingerprint
+    against."""
+    path = Path(path)
+    bank = json.loads(path.read_text())
+    expected_dataset = mask_bank.dataset_fingerprint(obs_names)
+    if bank.get("dataset_fingerprint") != expected_dataset:
+        raise ValueError(
+            f"stratified mask bank {path} was built for a different observation set; "
+            "regenerate it for this exact QC/alignment result"
+        )
+    supplied = [coords3d is not None, slice_ids is not None, strata is not None]
+    if any(supplied) and not all(supplied):
+        raise ValueError("coords3d, slice_ids and strata must be supplied together")
+    if all(supplied):
+        expected_spatial = mask_bank.spatial_fingerprint(coords3d, slice_ids)
+        expected_strata = strata_fingerprint(strata, split_counts, split_seeds)
+        if bank.get("spatial_fingerprint") != expected_spatial:
+            raise ValueError(
+                f"stratified mask bank {path} was built for different coordinates or slice IDs; "
+                "regenerate it"
+            )
+        if bank.get("strata_fingerprint") != expected_strata:
+            raise ValueError(
+                f"stratified mask bank {path} was built with different strata, split counts, "
+                "or split seeds; use a distinct path or regenerate it"
+            )
+    return bank
+
+
+def build_stratified_training_seed_bank(
+    obs_names: Iterable[str], n_items: int, base_seed: int, strata: list[dict],
+    unique_mask_count: int | None = None,
+) -> dict:
+    """Stratified equivalent of `mask_bank.build_training_seed_bank`: a
+    lossless, deterministic (stratum, seed) schedule for `n_items`
+    training draws, round-robining across strata so the immutable
+    training schedule genuinely covers every predeclared hole-size/shape
+    stratum -- fixes a real, confirmed gap (3rd Codex re-audit of commit
+    ca7cf53): "its default schedule contains validation and test masks
+    only, not training masks." (`build_stratified_mask_bank` above
+    correctly only ever covered validation/test -- explicit per-record
+    storage -- matching `mask_bank.py`'s own existing split between
+    explicit validation/test records and a lossless TRAINING seed
+    schedule; this is that same split's stratified counterpart, not a
+    naive third split_counts entry bolted onto the explicit-record path,
+    which would reproduce the exact multi-gigabyte-JSON problem
+    `build_training_seed_bank`'s own docstring already explains.)
+
+    Round-robin (item i -> stratum i % n_strata), not per-item random
+    stratum sampling, so a small `n_items` still touches every stratum at
+    least once rather than starving one by chance. Each stratum's seed
+    range is offset by the same `_STRATUM_SEED_STRIDE`
+    `build_stratified_mask_bank` uses, so a training draw's seed can
+    never collide with a different stratum's draw.
+    """
+    n_items = int(n_items)
+    base_seed = int(base_seed)
+    if n_items < 1:
+        raise ValueError("training seed bank requires at least one item")
+    if not strata:
+        raise ValueError("strata must be a non-empty list")
+    stratum_names = [s.get("name") for s in strata]
+    if len(set(stratum_names)) != len(strata) or any(name is None for name in stratum_names):
+        raise ValueError("every stratum must have a unique, non-null 'name'")
+
+    unique_mask_count = n_items if unique_mask_count is None else int(unique_mask_count)
+    if unique_mask_count < 1 or unique_mask_count > n_items:
+        raise ValueError(
+            f"unique_mask_count must be in [1, n_items], got {unique_mask_count} for n_items={n_items}"
+        )
+
+    n_strata = len(strata)
+    unique_seeds = list(range(base_seed, base_seed + unique_mask_count))
+    items = []
+    for i in range(n_items):
+        stratum_index = i % n_strata
+        seed = unique_seeds[i % unique_mask_count] + stratum_index * _STRATUM_SEED_STRIDE
+        items.append({"stratum": stratum_names[stratum_index], "seed": seed})
+
+    names = [str(x) for x in obs_names]
+    return {
+        "version": 1,
+        "kind": "stratified_training_seed_schedule",
+        "dataset_fingerprint": mask_bank.dataset_fingerprint(names),
+        "n_obs": len(names),
+        "n_items": n_items,
+        "base_seed": base_seed,
+        "unique_mask_count": unique_mask_count,
+        "strata_fingerprint": strata_fingerprint(strata),
+        "strata": stratum_names,
+        "items": items,
+    }
+
+
+def ensure_stratified_training_seed_bank(
+    path: str | Path,
+    obs_names: Iterable[str],
+    n_items: int,
+    base_seed: int,
+    strata: list[dict],
+    unique_mask_count: int | None = None,
+) -> tuple[dict, Path]:
+    """Load-or-atomically-create, mirroring `mask_bank.ensure_training_seed_bank`:
+    reuse an existing on-disk schedule if every identifying field and the
+    exact (stratum, seed) sequence still match, otherwise build and
+    persist a fresh one. Fails closed (raises) on any mismatch rather
+    than silently reusing a stale or altered schedule."""
+    path = Path(path)
+    expected = build_stratified_training_seed_bank(
+        obs_names, n_items, base_seed, strata, unique_mask_count=unique_mask_count,
+    )
+    if path.exists():
+        bank = json.loads(path.read_text())
+        for key in (
+            "kind", "dataset_fingerprint", "n_obs", "n_items", "base_seed",
+            "unique_mask_count", "strata_fingerprint",
+        ):
+            if bank.get(key) != expected.get(key):
+                raise ValueError(
+                    f"stratified training seed bank {path} does not match the current data/run "
+                    f"for field {key!r}; use a new path or remove the stale bank"
+                )
+        if bank.get("items") != expected["items"]:
+            raise ValueError(f"stratified training seed bank {path} contains an altered schedule")
+        return bank, path
+    save_stratified_mask_bank(expected, path)  # a generic atomic-JSON writer, not mask-bank-specific -- mask_bank.py itself reuses save_mask_bank the same way for its own training seed banks
+    return expected, path
+
+
+def ensure_stratified_mask_bank(
+    path: str | Path,
+    coords3d: np.ndarray,
+    slice_ids: np.ndarray,
+    obs_names: Iterable[str],
+    strata: list[dict],
+    split_counts: dict[str, int] | None = None,
+    split_seeds: dict[str, int] | None = None,
+) -> dict:
+    """Load-or-atomically-create, mirroring `mask_bank.ensure_mask_bank`
+    exactly: reuse an existing on-disk bank if its fingerprints match,
+    otherwise build and persist a fresh one, then re-read and validate
+    after the atomic write (so a concurrent job writing a differently
+    configured bank to the same path is caught, not silently trusted)."""
+    path = Path(path)
+    if path.exists():
+        return load_stratified_mask_bank(
+            path, obs_names, coords3d=coords3d, slice_ids=slice_ids, strata=strata,
+            split_counts=split_counts, split_seeds=split_seeds,
+        )
+    bank = build_stratified_mask_bank(coords3d, slice_ids, obs_names, strata, split_counts=split_counts, split_seeds=split_seeds)
+    save_stratified_mask_bank(bank, path)
+    return load_stratified_mask_bank(
+        path, obs_names, coords3d=coords3d, slice_ids=slice_ids, strata=strata,
+        split_counts=split_counts, split_seeds=split_seeds,
+    )

@@ -11,7 +11,7 @@ from gen3_multiscale.data.example import (
 )
 
 
-def _valid_example(n_observed=6, n_query=3, n_genes=5, gex_dim=4, local_k=2):
+def _valid_example(n_observed=6, n_query=3, n_genes=5, local_k=2):
     rng = np.random.default_rng(0)
     inputs = SpatialFieldInputs(
         sample_id="s1", patient_id="p1",
@@ -19,7 +19,6 @@ def _valid_example(n_observed=6, n_query=3, n_genes=5, gex_dim=4, local_k=2):
         query_barcodes=np.array([f"q{i}" for i in range(n_query)]),
         observed_coords=rng.normal(size=(n_observed, 2)).astype(np.float32),
         query_coords=rng.normal(size=(n_query, 2)).astype(np.float32),
-        observed_gex_conditioning=rng.normal(size=(n_observed, gex_dim)).astype(np.float32),
         observed_full_gene_expression=rng.normal(size=(n_observed, n_genes)).astype(np.float32),
         observed_gigapath_features=rng.normal(size=(n_observed, 1536)).astype(np.float32),
         query_local_neighbor_idx=rng.integers(0, n_observed, size=(n_query, local_k)),
@@ -49,7 +48,6 @@ def test_rejects_empty_observed_set():
     inputs, targets = _valid_example()
     bad_inputs = _replace(
         inputs, observed_coords=np.zeros((0, 2), dtype=np.float32), observed_barcodes=np.array([]),
-        observed_gex_conditioning=np.zeros((0, inputs.observed_gex_conditioning.shape[1]), dtype=np.float32),
         observed_full_gene_expression=np.zeros((0, inputs.observed_full_gene_expression.shape[1]), dtype=np.float32),
         observed_gigapath_features=np.zeros((0, 1536), dtype=np.float32),
     )

@@ -1283,7 +1283,143 @@ real error-handling bug is fixed. Nothing here builds the missing
 training entrypoint, real data builder, real baselines, or GPU-dependent
 gates -- those remain exactly where §21 left them.
 
+## 24. Response to the third external Codex re-audit (of commit ca7cf53)
+
+Adam forwarded a third re-audit, of `ca7cf53` (§23's fixes). Verdict:
+"another meaningful improvement... but Claude's statement that shared
+initialization is now guaranteed 'across all four real architectures' is
+premature, and the mask schedule is only a tested generator -- not yet
+the schedule used by an experiment." Same discipline as every prior
+round: every claim checked against the actual code before any fix.
+
+**Accepted without dispute** (build_architecture validation order, gene
+encoder wiring/gradients, `observed_gex_conditioning` no longer
+influencing predictions, mask-strata-to-`random_dropout_patches`
+conversion, CUDA/transport-memory/global-GEX fixes remaining intact) --
+no new action needed for these; re-confirmed accurate.
+
+**"Shared initialization is not guaranteed in the real four-GPU
+experiment" -- CONFIRMED, two real sub-issues, both addressed.**
+
+1. *"The launcher starts four separate subprocesses... and never calls
+   the synchronizer."* Correct: `synchronize_shared_initialization`
+   only ever proved something within one Python process. Added
+   `model_factory.py::persist_synchronized_initializations`, which
+   writes each architecture's (already-synchronized) weights to its own
+   checkpoint directory via the existing, audited
+   `training/checkpoint.py::save_trainable_state`, plus one manifest
+   recording a SHA256 hash of every parameter AND a `shared_hash_groups`
+   section listing every set of architecture.param_name locations that
+   turn out to be byte-identical -- "a manifest containing SHA256 hashes
+   and the exact shared-parameter comparison," per the audit's own
+   suggested fix. `load_synchronized_initialization` is the loading
+   counterpart. **Honestly scoped, not overclaimed**: this produces the
+   durable, cross-process ARTIFACT a training entrypoint could load; it
+   cannot make that entrypoint actually load it, because that entrypoint
+   still doesn't exist (§21). "Require each training subprocess to load
+   its assigned initialization checkpoint before constructing the
+   optimizer" remains unenforced until a real trainer exists to enforce
+   it -- flagged explicitly, not glossed over.
+2. *"The 'all four' test... does not verify Architecture 3-specific
+   parameters against Architecture 4's matching conditioner parameters,
+   because those parameters do not exist in Architecture 1."* Checked
+   directly and confirmed: a single `reference="architecture1"` call can
+   never even ATTEMPT to copy `gex_pool.*` (Architecture 3/4-only,
+   e.g. the global-GEX inducing pool) because no name in Architecture
+   1's parameter dict can ever match it -- a structural limit, not a
+   bug in the sync function itself. Fixed with
+   `synchronize_four_architecture_initialization`, a two-hop
+   synchronization (architecture1 -> architecture2/architecture3, then
+   architecture3 -> architecture4's conditioner) that transitively
+   reaches every genuinely shared parameter, including `gex_pool.*`.
+   Verified directly: `test_synchronize_four_architecture_initialization_gives_all_four_real_architectures_identical_shared_parameters`
+   confirms `gex_pool.inducing_queries` matches between Architecture 3
+   and Architecture 4's conditioner (impossible to check with the old
+   single-hop call), and a companion test
+   (`test_synchronize_shared_initialization_alone_cannot_reach_architecture_3_only_modules`)
+   locks in exactly why the single-hop version could never reach it, so
+   this can't silently regress back to the narrower guarantee.
+
+**"The mask schedule is generatable, but not yet operational" --
+CONFIRMED, addressed as far as buildable without a real trainer.**
+Every specific technical point checked:
+- *"nothing outside its tests calls it"* -- still true; unchanged,
+  since nothing calls it until a real training entrypoint exists (§21).
+- *"no ensure/load/save path"* -- CONFIRMED AND FIXED. Added
+  `save_stratified_mask_bank`/`load_stratified_mask_bank`/
+  `ensure_stratified_mask_bank`, mirroring `mask_bank.py`'s own
+  `save_mask_bank`/`load_mask_bank`/`ensure_mask_bank` exactly (same
+  atomic-temp-file-then-`os.replace` write, same fail-closed staleness
+  validation on reload).
+- *"its combined bank is version 1 and incompatible with the existing
+  version-2 `load_mask_bank()` staleness validation"* -- correct
+  diagnosis, and a deliberately DIFFERENT dedicated trio rather than a
+  forced fit: a stratified bank has no single `masking_fingerprint`
+  (it has one per stratum), so reusing `mask_bank.load_mask_bank`
+  directly was never the right target; `load_stratified_mask_bank`
+  validates against `strata_fingerprint` instead (see next point).
+- *"it has no combined fingerprint covering the ordered strata
+  definition"* -- CONFIRMED AND FIXED. Added `strata_fingerprint()`,
+  hashing the ORDERED list of converted `masking_cfg`s (plus split
+  counts/seeds) -- verified sensitive to both content changes AND
+  stratum reordering.
+- *"its default schedule contains validation and test masks only, not
+  training masks"* -- the underlying observation is correct, but the
+  fix is NOT a third `split_counts` entry on the explicit-record path:
+  `mask_bank.py`'s own existing design already splits this way on
+  purpose (`build_training_seed_bank`'s docstring: storing millions of
+  explicit training records "would create multi-gigabyte JSON," so
+  training masks use a lossless SEED SCHEDULE instead of per-record
+  storage). Added `build_stratified_training_seed_bank`/
+  `ensure_stratified_training_seed_bank`, the stratified counterpart of
+  that existing pattern: round-robins training draws across strata
+  (never starving one by chance for small `n_items`) with the same
+  per-stratum seed-offset discipline `build_stratified_mask_bank` uses.
+- *"the config's `train_mask_bank`, `validation_mask_bank`, and
+  `test_mask_bank` remain `null`"* -- unchanged; these stay null until a
+  real training run resolves real output paths, which is downstream of
+  the still-missing training system, not something to fake here.
+
+**"The unused conditioning field should be removed or optional" --
+CONFIRMED AND FIXED, choosing removal.** `observed_gex_conditioning`
+is gone from `SpatialFieldInputs` entirely (not kept-but-optional): the
+codebase's own standing principle is to delete what's genuinely unused
+rather than leave a vestigial field a future change could silently start
+reading again ("dead inputs are dangerous," per the audit itself). Every
+reference across `data/example.py`, `evaluation/diagnostics.py`
+(`zero_observed_gex`/`shuffle_observed_gex`/`shuffle_boundary_gex`
+now touch only `observed_full_gene_expression`), and every affected test
+fixture (`test_architectures.py`, `test_boundary_graph.py`,
+`test_diagnostics.py`, `test_example.py`) was updated; a test whose
+entire premise was "the field exists but is unread" was removed as moot
+rather than kept as dead test code.
+
+**"The main blockers are unchanged" -- re-confirmed accurate, no new
+action.** Every item in that list (no real HEST builder, no trainer/
+evaluator, no executable initialization loading, no global/regional WSI
+inputs in Architectures 3/4, no complete leakage proof, no harmonic
+caching, no realistic CUDA/AMP/memory gate) is exactly what §21/§23
+already say. "No executable initialization loading" specifically is now
+narrower than before this pass -- the checkpoint format and manifest
+exist and are tested; only the LOADING CALL inside a real training loop
+is still missing, because that loop is still missing.
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 300 passed (41 reused-infra + 12 example-schema +
+  11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 17 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  17 launch-four-gpu-suite + 21 model-factory + 4 gene-encoder +
+  26 mask-schedule)
+full repo (gen2_architectures + gen3_multiscale): 469 passed, 1 skipped
+```
+
+The block immediately below (pre-3rd-audit-response test counts) is kept
+for historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 281 passed (41 reused-infra + 12 example-schema +

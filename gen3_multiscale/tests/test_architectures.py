@@ -32,7 +32,6 @@ def _synthetic_inputs(n_genes=6, gex_dim=4, image_dim=8, seed=0):
         query_barcodes=np.array([f"q{i}" for i in range(n_query)]),
         observed_coords=observed_coords.astype(np.float32),
         query_coords=query_coords.astype(np.float32),
-        observed_gex_conditioning=rng.normal(size=(n_observed, gex_dim)).astype(np.float32),
         observed_full_gene_expression=rng.normal(size=(n_observed, n_genes)).astype(np.float32),
         observed_gigapath_features=rng.normal(size=(n_observed, image_dim)).astype(np.float32),
         query_local_neighbor_idx=result.query_local_neighbor_idx,
@@ -181,16 +180,16 @@ def test_forward_output_tensors_live_on_the_models_own_device():
 def test_gene_encoder_is_genuinely_wired_into_the_model():
     """Regression test for a real, confirmed bug (2nd Codex re-audit of
     commit 547f51e): the trainable WeightedGeneExpressionEncoder module
-    existed but nothing called it -- observed_gex_conditioning was a
-    plain numpy array with no gradient path into any encoder, and
-    gene_encoder_type: weighted_linear in every config had no effect on
-    the constructed model at all. Fixed: the encoder is now owned and
-    called by the model itself, from observed_full_gene_expression.
-    Verified two ways: (1) gradients reach gene_encoder.projection.weight
-    from a full forward+backward pass; (2) changing
-    observed_full_gene_expression while leaving observed_gex_conditioning
-    fixed still changes the output (proving conditioning is genuinely
-    DERIVED from the former now, not read from the latter)."""
+    existed but nothing called it, and gene_encoder_type: weighted_linear
+    in every config had no effect on the constructed model at all. Fixed:
+    the encoder is now owned and called by the model itself, from
+    observed_full_gene_expression -- the only gene array
+    SpatialFieldInputs carries (a 3rd-round audit flagged and this
+    project then removed the interim separate, unused conditioning
+    field entirely -- see SpatialFieldInputs' own docstring). Verified:
+    (1) gradients reach gene_encoder.projection.weight from a full
+    forward+backward pass; (2) changing observed_full_gene_expression
+    changes the output."""
     inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
     torch.manual_seed(0)
     model = Architecture1(n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim, **_MODEL_KWARGS)
@@ -209,26 +208,6 @@ def test_gene_encoder_is_genuinely_wired_into_the_model():
     with torch.no_grad():
         out_perturbed = model(perturbed)
     assert not torch.allclose(out["expression"], out_perturbed["expression"])
-
-
-def test_observed_gex_conditioning_field_no_longer_affects_the_model():
-    """The flip side of the wiring fix above: since the model now derives
-    conditioning entirely from observed_full_gene_expression, changing
-    ONLY observed_gex_conditioning (leaving everything else identical)
-    must NOT change the output -- proving the field really is unread,
-    not merely underused."""
-    inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
-    torch.manual_seed(0)
-    model = Architecture1(n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim, **_MODEL_KWARGS)
-    model.eval()  # dropout must be off, or two forward calls would differ from dropout noise alone
-
-    perturbed = dataclasses.replace(
-        inputs, observed_gex_conditioning=inputs.observed_gex_conditioning * 0.0 + 999.0,
-    )
-    with torch.no_grad():
-        out = model(inputs)
-        out_perturbed = model(perturbed)
-    assert torch.allclose(out["expression"], out_perturbed["expression"])
 
 
 def test_gradients_flow_end_to_end_through_architecture_1():

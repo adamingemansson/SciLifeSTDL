@@ -35,7 +35,6 @@ def _synthetic_inputs(n_genes=6, gex_dim=4, image_dim=8, seed=0):
         query_barcodes=np.array([f"q{i}" for i in range(n_query)]),
         observed_coords=observed_coords.astype(np.float32),
         query_coords=query_coords.astype(np.float32),
-        observed_gex_conditioning=rng.normal(size=(n_observed, gex_dim)).astype(np.float32),
         observed_full_gene_expression=rng.normal(size=(n_observed, n_genes)).astype(np.float32),
         observed_gigapath_features=rng.normal(size=(n_observed, image_dim)).astype(np.float32),
         query_local_neighbor_idx=result.query_local_neighbor_idx,
@@ -63,7 +62,6 @@ def test_zero_observed_gex_produces_a_valid_example_and_changes_the_prediction()
     inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
     perturbed = zero_observed_gex(inputs)
     validate_spatial_field_example(perturbed, targets)
-    assert np.allclose(perturbed.observed_gex_conditioning, 0.0)
     assert np.allclose(perturbed.observed_full_gene_expression, 0.0)
 
     baseline = _forward(inputs, n_genes, gex_dim, image_dim)
@@ -129,7 +127,6 @@ def test_shuffle_boundary_gex_leaves_locally_referenced_and_non_boundary_spots_u
         query_barcodes=np.array(["q0"]),
         observed_coords=observed_coords,
         query_coords=np.array([[10.0, 0.0]], dtype=np.float32),
-        observed_gex_conditioning=full_expr[:, :2].copy(),
         observed_full_gene_expression=full_expr,
         observed_gigapath_features=np.zeros((n_observed, 4), dtype=np.float32),
         query_local_neighbor_idx=np.array([[0, 1]]),  # local positions {0, 1}
@@ -164,7 +161,6 @@ def test_shuffle_boundary_gex_is_a_noop_when_fewer_than_two_shufflable_positions
         query_barcodes=np.array(["q0"]),
         observed_coords=np.arange(n_observed, dtype=np.float32)[:, None] * np.array([1.0, 0.0], dtype=np.float32),
         query_coords=np.array([[10.0, 0.0]], dtype=np.float32),
-        observed_gex_conditioning=np.zeros((n_observed, 2), dtype=np.float32),
         observed_full_gene_expression=np.arange(n_observed * 2, dtype=np.float32).reshape(n_observed, 2),
         observed_gigapath_features=np.zeros((n_observed, 4), dtype=np.float32),
         query_local_neighbor_idx=np.array([[0, 1, 2]]),  # local covers everything boundary has

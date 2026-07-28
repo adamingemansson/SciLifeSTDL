@@ -138,7 +138,7 @@ def test_output_integrates_cleanly_into_the_shared_example_object():
     observed, query = _split_by_circular_hole(grid, radius=2.5)
     result = extract_boundary_and_local_context(observed, query, k_neighbors=6, local_k=6, max_rings=3)
 
-    n_observed, n_query, n_genes, gex_dim = observed.shape[0], query.shape[0], 5, 4
+    n_observed, n_query, n_genes = observed.shape[0], query.shape[0], 5
     rng = np.random.default_rng(0)
     inputs = SpatialFieldInputs(
         sample_id="s1", patient_id="p1",
@@ -146,7 +146,6 @@ def test_output_integrates_cleanly_into_the_shared_example_object():
         query_barcodes=np.array([f"q{i}" for i in range(n_query)]),
         observed_coords=observed.astype(np.float32),
         query_coords=query.astype(np.float32),
-        observed_gex_conditioning=rng.normal(size=(n_observed, gex_dim)).astype(np.float32),
         observed_full_gene_expression=rng.normal(size=(n_observed, n_genes)).astype(np.float32),
         observed_gigapath_features=rng.normal(size=(n_observed, 1536)).astype(np.float32),
         query_local_neighbor_idx=result.query_local_neighbor_idx,

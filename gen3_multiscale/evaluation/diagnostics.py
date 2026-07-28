@@ -40,14 +40,11 @@ from gen3_multiscale.data.example import SpatialFieldInputs
 
 
 def zero_observed_gex(inputs: SpatialFieldInputs) -> SpatialFieldInputs:
-    """"All observed GEX zeroed" -- both the compact conditioning
-    features and the untouched full-gene values every candidate's
-    transport weight is scored against."""
-    return replace(
-        inputs,
-        observed_gex_conditioning=np.zeros_like(inputs.observed_gex_conditioning),
-        observed_full_gene_expression=np.zeros_like(inputs.observed_full_gene_expression),
-    )
+    """"All observed GEX zeroed" -- the untouched full-gene values every
+    candidate's transport weight is scored against AND (since the real
+    trainable gene encoder now derives conditioning from this same array
+    inside the model, see architectures.py) every conditioning token."""
+    return replace(inputs, observed_full_gene_expression=np.zeros_like(inputs.observed_full_gene_expression))
 
 
 def shuffle_observed_gex(inputs: SpatialFieldInputs, seed: int = 0) -> SpatialFieldInputs:
@@ -60,11 +57,7 @@ def shuffle_observed_gex(inputs: SpatialFieldInputs, seed: int = 0) -> SpatialFi
         return inputs
     rng = np.random.default_rng(seed)
     perm = rng.permutation(n_observed)
-    return replace(
-        inputs,
-        observed_gex_conditioning=inputs.observed_gex_conditioning[perm],
-        observed_full_gene_expression=inputs.observed_full_gene_expression[perm],
-    )
+    return replace(inputs, observed_full_gene_expression=inputs.observed_full_gene_expression[perm])
 
 
 def zero_he(inputs: SpatialFieldInputs) -> SpatialFieldInputs:
@@ -99,10 +92,8 @@ def shuffle_boundary_gex(inputs: SpatialFieldInputs, seed: int = 0) -> SpatialFi
     rng = np.random.default_rng(seed)
     permuted = rng.permutation(shuffle_only)
     new_full = np.array(inputs.observed_full_gene_expression, copy=True)
-    new_cond = np.array(inputs.observed_gex_conditioning, copy=True)
     new_full[shuffle_only] = inputs.observed_full_gene_expression[permuted]
-    new_cond[shuffle_only] = inputs.observed_gex_conditioning[permuted]
-    return replace(inputs, observed_full_gene_expression=new_full, observed_gex_conditioning=new_cond)
+    return replace(inputs, observed_full_gene_expression=new_full)
 
 
 def permute_boundary_order(inputs: SpatialFieldInputs, seed: int = 0) -> SpatialFieldInputs:

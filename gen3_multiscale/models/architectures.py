@@ -97,14 +97,13 @@ class _SharedFieldArchitecture(nn.Module):
         # The real, trainable "weighted_linear" gene conditioning encoder
         # (CONTRACT.md section 10's frozen choice) -- fixes a real,
         # confirmed gap (2nd Codex re-audit of commit 547f51e): the
-        # module existed (models/gene_encoder.py) but nothing called it,
-        # and SpatialFieldInputs.observed_gex_conditioning was a plain
-        # numpy array populated BEFORE forward() with no gradient path
-        # back into any encoder. Sourced from observed_full_gene_expression
-        # (already a required, always-populated field -- no schema
-        # change needed) rather than observed_gex_conditioning, which is
-        # no longer read by this class (see SpatialFieldInputs' own
-        # docstring for that field).
+        # module existed (models/gene_encoder.py) but nothing called it.
+        # Sourced from observed_full_gene_expression (the untouched real
+        # values, always-populated) -- SpatialFieldInputs never had a
+        # separate precomputed conditioning field to begin with (a 3rd-
+        # round Codex re-audit of commit ca7cf53 flagged the interim
+        # version of that field as a dangerous unused input; removed
+        # entirely rather than kept-but-optional).
         self.gene_encoder = WeightedGeneExpressionEncoder(n_genes, gex_feature_dim)
         self.spot_token = SpotTokenProjection(
             hidden_dim=hidden_dim, image_feature_dim=image_feature_dim, gex_feature_dim=gex_feature_dim,
@@ -136,10 +135,8 @@ class _SharedFieldArchitecture(nn.Module):
         # see module docstring: not yet real per-spot availability
         modality_flags = torch.ones(n_observed, 1, device=device)
         # gex_features is computed HERE by the real trainable gene
-        # encoder from the untouched observed_full_gene_expression --
-        # observed_gex_conditioning is intentionally NOT read (see
-        # SpatialFieldInputs' own docstring for that field and the
-        # module-level note on self.gene_encoder above).
+        # encoder from the untouched observed_full_gene_expression (see
+        # the module-level note on self.gene_encoder above).
         observed_expr = torch.as_tensor(inputs.observed_full_gene_expression, dtype=torch.float32, device=device)
         return self.spot_token(
             image_features=torch.as_tensor(inputs.observed_gigapath_features, dtype=torch.float32, device=device),
