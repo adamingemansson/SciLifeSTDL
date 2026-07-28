@@ -440,6 +440,19 @@ def _probe_context_feature_dim(
     return int(probe.shape[1])
 
 
+def _cheap_file_identity(path: str | Path) -> str:
+    """A cheap (no full-file hashing) identity string for a possibly-large
+    model checkpoint file: path + mtime + size. Changes whenever the file
+    at that path is replaced/updated, without paying the cost of hashing
+    a potentially multi-GB checkpoint on every provider construction."""
+    p = Path(path)
+    try:
+        stat = p.stat()
+        return f"{p}:{stat.st_mtime_ns}:{stat.st_size}"
+    except OSError:
+        return str(p)
+
+
 def build_scfoundation_provider(cfg, adata, sample_id: str) -> PrecomputedSpotFeatureProvider:
     """One PrecomputedSpotFeatureProvider computing scFoundation cell
     embeddings for every spot in the sample ONCE (never per masking
@@ -491,7 +504,17 @@ def build_scfoundation_provider(cfg, adata, sample_id: str) -> PrecomputedSpotFe
             already_normalized_log1p=True,
         )
 
+    # 2026-07-27 (GPT-audit-flagged): the disk cache's signature used to be
+    # keyed only by the feature FUNCTION's name (_feature_fn's
+    # module.qualname), which is identical regardless of which checkpoint
+    # scfoundation_model_path actually points to -- swapping in an updated
+    # checkpoint at the same path would silently reuse stale cached
+    # embeddings. Fold a cheap checkpoint identity (path + mtime + size,
+    # not a full hash of a potentially multi-GB file) into the cache
+    # signature so a changed checkpoint invalidates the cache.
+    model_signature = _cheap_file_identity(model_path)
+
     return PrecomputedSpotFeatureProvider(
         adata, cache_dir=cache_root(cfg) / "scfoundation_cache",
-        sample_id=str(sample_id), feature_fn=_feature_fn,
+        sample_id=str(sample_id), feature_fn=_feature_fn, model_signature=model_signature,
     )

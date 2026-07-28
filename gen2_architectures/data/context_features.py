@@ -25,7 +25,7 @@ def _mask_digest(obs_names: np.ndarray, context_mask: np.ndarray) -> str:
     return sha256(payload).hexdigest()[:20]
 
 
-def _adata_feature_signature(adata, feature_fn: FeatureFn) -> str:
+def _adata_feature_signature(adata, feature_fn: FeatureFn, extra_signature: str = "") -> str:
     """Fingerprint data/model inputs that can change graph-derived features.
 
     The historical cache key used only context barcodes. That could silently
@@ -34,6 +34,16 @@ def _adata_feature_signature(adata, feature_fn: FeatureFn) -> str:
     observation order and spatial coordinates. This is intentionally stronger
     than the historical per-gene-sum fingerprint: two matrices can have
     identical column sums while assigning expression to different spots.
+
+    extra_signature (2026-07-27, GPT-audit-flagged): fn_name below is only
+    the feature FUNCTION's name (module.qualname) -- for a closure like
+    build_scfoundation_provider's _feature_fn, that name is IDENTICAL
+    regardless of which scfoundation_model_path is bound inside it.
+    Swapping the checkpoint file at the same path while code stays the
+    same would silently reuse stale cached embeddings. Callers that wrap a
+    real model checkpoint should pass a cheap identity string for it here
+    (e.g. f"{path}:{mtime}:{size}") so a changed checkpoint invalidates
+    the cache even though the function name never changes.
     """
     x = adata.X
     uns = getattr(adata, "uns", {})
@@ -67,6 +77,8 @@ def _adata_feature_signature(adata, feature_fn: FeatureFn) -> str:
         digest.update(memoryview(spatial).cast("B"))
     digest.update(json.dumps(preprocessing, sort_keys=True, default=str).encode())
     digest.update(fn_name.encode())
+    digest.update(b"\0extra:")
+    digest.update(str(extra_signature).encode())
     return digest.hexdigest()[:24]
 
 
@@ -194,6 +206,7 @@ class PrecomputedSpotFeatureProvider:
     cache_dir: str | Path | None = None
     sample_id: str = "sample"
     feature_fn: FeatureFn | None = None
+    model_signature: str = ""
 
     def __post_init__(self) -> None:
         self.cache_dir = Path(self.cache_dir) if self.cache_dir is not None else None
@@ -207,7 +220,7 @@ class PrecomputedSpotFeatureProvider:
     def _ensure_computed(self) -> None:
         if self._features is not None:
             return
-        signature = _adata_feature_signature(self.adata, self.feature_fn)
+        signature = _adata_feature_signature(self.adata, self.feature_fn, extra_signature=self.model_signature)
         cache_path = self.cache_dir / f"{self.sample_id}.npz" if self.cache_dir is not None else None
         if cache_path is not None and cache_path.exists():
             cached = np.load(cache_path, allow_pickle=False)

@@ -103,3 +103,41 @@ def test_stale_cache_is_recomputed_when_the_feature_signature_changes():
         out = p2(np.ones(6, dtype=bool))
         assert len(calls) == 1, "a changed feature_signature must trigger a real recompute, not a stale cache hit"
         assert np.array_equal(out, np.full((6, 2), 9.0, dtype=np.float32))
+
+
+def test_model_signature_change_invalidates_the_cache_even_with_identical_function_name():
+    """GPT-audit-flagged real gap (2026-07-27): the feature function's
+    NAME (module.qualname) never changes when a closure's bound checkpoint
+    path/file does -- e.g. build_scfoundation_provider's _feature_fn is
+    identically named regardless of which scfoundation_model_path is
+    bound inside it. model_signature exists so callers can fold in a
+    cheap checkpoint identity (see data_prep.py::_cheap_file_identity) and
+    have a swapped checkpoint actually invalidate the cache."""
+    def feature_fn(a):
+        return np.ones((a.n_obs, 2), dtype=np.float32)
+
+    adata = _fake_adata(n_obs=6)
+    with tempfile.TemporaryDirectory() as tmp:
+        cache_dir = Path(tmp)
+        p1 = PrecomputedSpotFeatureProvider(
+            adata, cache_dir=cache_dir, sample_id="S1", feature_fn=feature_fn, model_signature="checkpoint-v1",
+        )
+        p1(np.ones(6, dtype=bool))
+
+        calls = []
+
+        def feature_fn_same_name(a):
+            calls.append(1)
+            return np.full((a.n_obs, 2), 9.0, dtype=np.float32)
+
+        feature_fn_same_name.__name__ = feature_fn.__name__
+        feature_fn_same_name.__qualname__ = feature_fn.__qualname__
+        feature_fn_same_name.__module__ = feature_fn.__module__
+
+        p2 = PrecomputedSpotFeatureProvider(
+            adata, cache_dir=cache_dir, sample_id="S1", feature_fn=feature_fn_same_name,
+            model_signature="checkpoint-v2",
+        )
+        out = p2(np.ones(6, dtype=bool))
+        assert len(calls) == 1, "a changed model_signature must invalidate the cache even with an identical fn name"
+        assert np.array_equal(out, np.full((6, 2), 9.0, dtype=np.float32))
