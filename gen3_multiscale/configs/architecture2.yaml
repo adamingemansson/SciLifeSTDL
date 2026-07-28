@@ -1,0 +1,108 @@
+# Architecture 2: Harmonic-Residual Full Boundary Field.
+#
+# Exactly Architecture 1's conditioner (architecture1.yaml) plus the
+# explicit, non-learned harmonic residual anchor inside the transport
+# head (use_anchor_blend: true) -- the SINGLE predeclared harmonic-anchor
+# experiment, per the handoff. See architecture1.yaml's header comment
+# for the shared-field/static-config-audit contract and the KNOWN GAP
+# note (no real training entrypoint or data builder exists yet -- this
+# config is not runnable today).
+
+experiment_name: gen3_architecture2_harmonic_residual_v1
+
+documented_divergences:
+  - model.architecture
+  - model.params.use_anchor_blend
+  - model.params.use_regional_he
+  - model.params.use_global_gex
+  - model.params.use_global_slide
+  - training.checkpoint_dir
+
+model:
+  architecture: "2"
+  params:
+    n_genes: null
+    gex_feature_dim: null
+    image_feature_dim: 1536
+    hidden_dim: 512
+    n_heads: 8
+    n_blocks: 4
+    dense_threshold: 256
+    sparse_k: 10
+    chunk_size: 1024
+    max_boundary_size: null
+    transport_heads: 8
+    transport_temperature: 1.0
+    gene_gate_mode: per_gene
+    use_query_gate: true
+    use_residual: false
+    residual_rank: 32
+    use_anchor_blend: true      # the one difference from Architecture 1 -- CONTRACT.md section 15
+    use_regional_he: false
+    use_global_gex: false
+    use_global_slide: false
+    global_slide_dim: 768
+    n_gex_inducing: 16
+    harmonic_k_neighbors: 6
+    gene_encoder_type: weighted_linear
+    init_seed: 0
+
+loss:
+  gradient_weight: 0.05
+  k_neighbors: 6
+
+masking:
+  strata:
+    - name: small_compact
+      radius_range: [3.0, 5.0]
+      radius_unit: spot_spacing
+      shape: circle
+    - name: medium_compact
+      radius_range: [5.0, 8.0]
+      radius_unit: spot_spacing
+      shape: circle
+    - name: large_compact
+      radius_range: [8.0, 12.0]
+      radius_unit: spot_spacing
+      shape: circle
+    - name: medium_irregular
+      radius_range: [5.0, 8.0]
+      radius_unit: spot_spacing
+      shape: mixed
+
+data:
+  hest_data_dir: data/raw/hest1k
+  hest_cache_dir: data/cache/hest1k
+  sample_selection:
+    organs: all
+    metadata_csv: hf://datasets/MahmoodLab/hest/HEST_v1_3_0.csv
+    min_samples_per_organ: 5
+    max_samples_per_organ: 30
+    n_validation_per_organ: 2
+    n_test_per_organ: 2
+    split_seed: 0
+
+evaluation:
+  gene_panels:
+    CCRCC_var_50genes: resources/evaluation/hest_bench/CCRCC_var_50genes.json
+  compute_st_fid_mmd: false
+  patient_level_aggregation: true
+
+required_fingerprints:
+  gigapath_checkpoint: null
+  gene_vocabulary: null
+  train_mask_bank: null
+  validation_mask_bank: null
+  test_mask_bank: null
+
+training:
+  device: cuda
+  seed: 0
+  lr: 1.0e-4
+  total_steps: 100000000
+  max_wall_clock_hours: 24
+  gradient_clip_val: 1.0
+  log_every_n_steps: 50
+  checkpoint_every_n_steps: 2000
+  checkpoint_dir: gen3_multiscale/results/architecture2
+  eval_every_n_steps: 2000

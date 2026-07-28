@@ -1,11 +1,15 @@
 # gen3_multiscale — frozen contract and phase log
 
 Implements `CLAUDE_HANDOFF_MULTISCALE_SPATIAL_FIELD_ARCHITECTURES.md`'s
-staged phases. Status: **Phase 0-7 done** — all four architectures run
-real, tested, end-to-end forward passes on synthetic data, and now have a
-full loss/metrics/diagnostics layer (Phase 7). Configs/launcher (Phase 8)
-are **not yet implemented**. This document is extended, not replaced, as
-later phases land.
+staged phases. Status: **All 8 named phases have been implemented and
+tested.** All four architectures run real, tested, end-to-end forward
+passes on synthetic data, with a full loss/metrics/diagnostics layer
+(Phase 7) and four fairness-matrix configs plus a tested launcher (Phase
+8). **This is NOT the same as being ready for a real 24-hour run** — see
+§20 below: no real gen3_multiscale training entrypoint or real per-sample
+HEST-1k data builder exists anywhere in this package, a gap larger in
+scope than any single named phase and not assigned to any of them. This
+document is extended, not replaced, as further work lands.
 
 ## 1. Base commit
 
@@ -827,13 +831,153 @@ check for, not a one-off).
   deltas" end to end yet (a natural Phase 8 launcher/report concern, not
   a Phase 7 one per the handoff's own phase split).
 
+## 20. Four configs and a launcher (Phase 8 — implemented)
+
+`configs/architecture{1,2,3,4}.yaml` — one resolved config per
+architecture, matching the fairness matrix exactly: architecture1/2/3
+share `_SharedFieldArchitecture`'s constructor shape (`model.params`
+mirrors `architectures.py::Architecture1/2/3` kwargs field-for-field);
+architecture2 differs only in `use_anchor_blend: true`; architecture3
+differs only in `use_global_gex: true` (its `use_regional_he`/
+`use_global_slide` stay `false` with an explicit header comment pointing
+at the real reason — §15/§17/§19's NotImplementedError gap — never
+silently downgrading the fairness matrix's "Yes" cells without saying
+so). architecture4.yaml has a genuinely different `model.params` shape
+(no `use_anchor_blend`/`use_regional_he`/`use_global_slide` keys at all,
+since `Architecture4.__init__` doesn't accept them — they're fixed by
+its internal `Architecture3` construction) plus flow-only fields
+(`n_flow_blocks`, `n_flow_samples`, `n_ode_steps`, `gene_basis_rank`).
+Every config declares `documented_divergences`, an explicit dotted-key
+allow-list for the fields it's intentionally different on, which
+`launch_four_gpu_suite.py::static_config_audit` reads back and enforces
+— "All fields not shown in [the fairness matrix] table must remain
+identical unless a difference is structurally required and documented"
+is machine-checked, not just asserted in prose. Verified directly: the
+real four YAML files, loaded through the same `OmegaConf.load` +
+`OmegaConf.to_container(resolve=True)` path `gen2_architectures`'s own
+training entrypoints use, pass `static_config_audit` with zero
+violations (`test_static_config_audit_passes_for_the_real_four_configs`).
+
+`training/launch_four_gpu_suite.py`:
+
+- `static_config_audit(named_configs)` — flattens each config to dotted
+  keys, compares every key present in ALL configs being audited, and
+  flags any that differ without appearing in the fixed
+  `_ALWAYS_ALLOWED_TO_DIFFER` set or a config's own
+  `documented_divergences`. Keys present in only SOME configs (e.g.
+  Architecture 4's flow-only params) are never compared — a different
+  parameter SHAPE is not itself a violation, only an undocumented
+  disagreement on a key every config claims to share.
+- `check_required_fingerprints(config)` — "refuse to start if any
+  required checkpoint, vocabulary, cache, split, or mask-bank fingerprint
+  is absent." Reads a config's own `required_fingerprints: {name: path}`
+  block and fails closed on both a `null` path and a path that doesn't
+  exist on disk.
+- `launch_suite(...)` — one job per GPU via `CUDA_VISIBLE_DEVICES`, CPU
+  threads capped via `OMP_NUM_THREADS`/`MKL_NUM_THREADS`/
+  `OPENBLAS_NUM_THREADS`/`NUMEXPR_NUM_THREADS` (same env-var discipline
+  `scripts/run_gene_aware_job.py` already uses elsewhere in this repo,
+  not a new convention). Runs `static_config_audit` and (unless
+  explicitly skipped) `check_required_fingerprints` on every config
+  BEFORE spawning any subprocess — either failing means nothing is ever
+  started, verified by asserting the log directory stays empty. All jobs
+  are started with `Popen` before any is waited on, so "one job per GPU"
+  genuinely means concurrent, not sequential. Writes one log file per
+  job plus one machine-readable `suite_summary.json`; `SuiteResult.ok` is
+  `False` if any job's exit code is nonzero — "preserve nonzero exit
+  status and stop promotion if any arm fails."
+- `run_suite_with_smoke_gate(...)` — runs the smoke variant of every
+  config first; the full run is only started if every smoke job
+  succeeded, returning `(smoke_result, None)` rather than starting
+  anything when the gate fails — "run fail-closed smoke tests before
+  full training."
+- `main()` — the only code path that can start a real subprocess against
+  a real GPU, guarded by `if __name__ == "__main__":`. Nothing in this
+  module runs on import; every test drives the library functions
+  directly with a stub `command_builder` (a `python -c` one-liner that
+  echoes its env/argv and exits 0 or 1 on command) — never a real
+  training job. This is how "do not automatically launch the 24-hour
+  jobs as part of implementation" is satisfied structurally rather than
+  by only not calling `main()` in a test file.
+
+17 tests (`tests/test_launch_four_gpu_suite.py`), including the audit
+running against the real config files (not just synthetic fixtures), a
+proof that a failed audit/fingerprint-check leaves the log directory
+completely empty (nothing spawned), GPU-pinning/thread-capping verified
+by reading back what the stub subprocess actually saw in its own
+environment, and the smoke-gate's "full run never starts" behavior
+verified by asserting the `full/` log subdirectory doesn't even get
+created.
+
+## 21. The gap Phase 8 alone cannot close — no real training entrypoint
+
+**This is the single most important thing to flag before any Codex
+audit or real run, and is deliberately NOT buried in a bullet list.**
+
+The handoff's Phase 8 says "create exactly four primary configs
+corresponding to the fairness matrix" and "one launcher" — both are done
+and tested (§20). But a launcher only launches something. No phase of
+this project (0 through 7) built a real gen3_multiscale TRAINING
+ENTRYPOINT: nothing wires an optimizer loop, checkpoint save/load, and a
+real per-sample HEST-1k data loader together into a runnable
+`gen3_multiscale/training/train.py` the way `gen2_architectures` has for
+its own four (different) architectures. Concretely, still missing:
+
+- **A real per-sample data builder.** Every one of Phases 1-6's tests
+  (and Phase 7's) runs against a SYNTHETIC square coordinate grid
+  (`_synthetic_inputs`, repeated per test file). Nothing yet loads a real
+  HEST-1k sample, applies a mask-bank record, and calls
+  `boundary_graph.extract_boundary_and_local_context` +
+  `slide_context.visible_slide_context` + real loaded GEX/GigaPath
+  features to construct an actual `SpatialFieldExample`. §7/§17/§19
+  already flagged this gap after Phase 1/6; it is UNCHANGED by Phase 7
+  or 8 — nothing in either phase touched it, because neither phase was
+  scoped to.
+- **A real optimizer/training loop.** No code anywhere in
+  `gen3_multiscale/` calls `.backward()` outside a test, builds an
+  optimizer, or iterates over epochs/steps. `models/losses.py`'s
+  functions are ready to be called by one; nothing calls them from a
+  loop yet.
+- **Checkpoint wiring.** `training/checkpoint.py` (copied verbatim from
+  `gen2_architectures`, §2) can save/load state dicts, but nothing
+  constructs an `Architecture1/2/3/4` instance from a resolved config and
+  hands it to `checkpoint.save`/`checkpoint.load` — the glue is missing,
+  not the mechanism.
+- **`default_command_builder`'s target module,
+  `gen3_multiscale.training.train`, does not exist.** `launch_four_gpu_suite.py`
+  names it explicitly as the intended entrypoint and its own module
+  docstring flags this; every launcher test exercises the launcher's
+  OWN mechanics through a stub command instead, precisely because the
+  real target isn't buildable from what exists today.
+- **Consequently, none of the handoff's own "Deliverables for the Codex
+  audit" that require a RUN are producible yet**: item 9 ("tiny-overfit
+  and held-out smoke results for all four arms"), item 10 ("parameter
+  counts... peak GPU memory, and measured steps per hour" — parameter
+  counts ARE producible right now by just constructing each architecture
+  from its resolved config, but peak memory/steps-per-hour need a real
+  step to execute), and the "Mandatory pre-run gates"' Learning/
+  Numerical/Operational sections (one-slide overfit, resume-reproduces-
+  next-loss, mixed-precision NaN check, etc.) all need a real training
+  loop to run against, which does not exist.
+
+None of Phases 0-8 as literally named in the handoff was "build the
+training loop" — Phase 8 presupposes one already exists to be launched.
+Building it (a real data builder plus a real train.py) is a substantial,
+separate body of work, comparable in scope to `gen2_architectures`'s own
+`training/data_prep.py` + `train_local_neighborhood.py` (tasks #43/#48/
+#49 in this session's own history) — not a small addendum to Phase 8.
+Flagged here explicitly, exactly as every other simplification and gap
+in this document has been, rather than letting "all 8 phases done" read
+as "ready to run."
+
 ## Test status as of this document
 
 ```
-gen3_multiscale/tests/: 222 passed (41 reused-infra + 12 example-schema +
+gen3_multiscale/tests/: 239 passed (41 reused-infra + 12 example-schema +
   11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
   14 transport-head + 10 tokens + 16 attention + 10 global-context +
   7 harmonic + 7 geometry-utils + 9 backbone + 11 architectures +
-  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics)
-full repo (gen2_architectures + gen3_multiscale): 391 passed, 1 skipped
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  17 launch-four-gpu-suite)
+full repo (gen2_architectures + gen3_multiscale): 408 passed, 1 skipped
 ```

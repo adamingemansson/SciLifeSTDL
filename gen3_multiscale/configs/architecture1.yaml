@@ -1,0 +1,124 @@
+# Architecture 1: Anchor-Free Full Boundary Field.
+#
+# Phase 8 of the multiscale spatial-field handoff. `model.params` mirrors
+# gen3_multiscale/models/architectures.py::Architecture1's constructor
+# kwargs exactly. Every section below except `documented_divergences`
+# must be BYTE-IDENTICAL across all four architectureN.yaml files
+# (enforced automatically by
+# gen3_multiscale/training/launch_four_gpu_suite.py::static_config_audit)
+# unless the differing key is listed in `documented_divergences` --
+# "All fields not shown in [the fairness matrix] table must remain
+# identical unless a difference is structurally required and
+# documented."
+#
+# KNOWN GAP (CONTRACT.md Phase 8 section): n_genes/gex_feature_dim are
+# null below because no real per-sample HEST-1k data builder exists yet
+# to resolve them from an actual gene panel/conditioning encoder --
+# mirrors gen2_architectures' own runtime-auto-injected fields
+# (organ_vocab, tech_vocab, coord_scale). required_fingerprints below are
+# also null for the same reason: there is nothing real to point them at
+# yet. A real training entrypoint does not exist in gen3_multiscale --
+# this config is not runnable today; it exists to make the fairness
+# matrix and static config audit concrete and testable now.
+
+experiment_name: gen3_architecture1_anchor_free_v1
+
+documented_divergences:
+  - model.architecture
+  - model.params.use_anchor_blend
+  - model.params.use_regional_he
+  - model.params.use_global_gex
+  - model.params.use_global_slide
+  - training.checkpoint_dir
+
+model:
+  architecture: "1"
+  params:
+    n_genes: null              # resolved at run time from data.gene_panel once a real data builder exists
+    gex_feature_dim: null      # resolved at run time from the shared GEX conditioning encoder
+    image_feature_dim: 1536
+    hidden_dim: 512
+    n_heads: 8
+    n_blocks: 4
+    dense_threshold: 256
+    sparse_k: 10
+    chunk_size: 1024
+    max_boundary_size: null    # fail closed if exceeded, never silently truncated (data/boundary_graph.py)
+    transport_heads: 8
+    transport_temperature: 1.0
+    gene_gate_mode: per_gene
+    use_query_gate: true
+    use_residual: false
+    residual_rank: 32
+    use_anchor_blend: false
+    use_regional_he: false     # NotImplementedError if set true -- Phase 3 WSI path not wired into forward() yet
+    use_global_gex: false
+    use_global_slide: false    # NotImplementedError if set true -- see above
+    global_slide_dim: 768
+    n_gex_inducing: 16
+    harmonic_k_neighbors: 6
+    gene_encoder_type: weighted_linear   # Phase 4 item 1's frozen decision -- CONTRACT.md section 10
+    init_seed: 0                # shared across all four configs -- Phase 4 item 8 / Phase 6 item 4
+
+loss:
+  gradient_weight: 0.05
+  k_neighbors: 6
+
+masking:
+  # Phase 0 item 7: predeclared hole-size/shape strata, identical across
+  # all four architectures (one immutable training-mask schedule shared
+  # across arms, per the handoff's training-schedule section).
+  strata:
+    - name: small_compact
+      radius_range: [3.0, 5.0]
+      radius_unit: spot_spacing
+      shape: circle
+    - name: medium_compact
+      radius_range: [5.0, 8.0]
+      radius_unit: spot_spacing
+      shape: circle
+    - name: large_compact
+      radius_range: [8.0, 12.0]
+      radius_unit: spot_spacing
+      shape: circle
+    - name: medium_irregular
+      radius_range: [5.0, 8.0]
+      radius_unit: spot_spacing
+      shape: mixed
+
+data:
+  hest_data_dir: data/raw/hest1k
+  hest_cache_dir: data/cache/hest1k
+  sample_selection:
+    organs: all
+    metadata_csv: hf://datasets/MahmoodLab/hest/HEST_v1_3_0.csv
+    min_samples_per_organ: 5
+    max_samples_per_organ: 30
+    n_validation_per_organ: 2
+    n_test_per_organ: 2
+    split_seed: 0
+
+evaluation:
+  gene_panels:
+    CCRCC_var_50genes: resources/evaluation/hest_bench/CCRCC_var_50genes.json
+  compute_st_fid_mmd: false
+  patient_level_aggregation: true
+
+required_fingerprints:
+  gigapath_checkpoint: null   # unused by this architecture (use_global_slide/use_regional_he are false) -- left null deliberately
+  gene_vocabulary: null       # pinned ordered gene-name JSON, once Phase 0's real data builder exists
+  train_mask_bank: null
+  validation_mask_bank: null
+  test_mask_bank: null
+
+training:
+  device: cuda
+  seed: 0
+  lr: 1.0e-4
+  total_steps: 100000000      # hard safety cap only, far above any real run's reach
+  max_wall_clock_hours: 24
+  gradient_clip_val: 1.0
+  log_every_n_steps: 50
+  checkpoint_every_n_steps: 2000
+  checkpoint_dir: gen3_multiscale/results/architecture1
+  eval_every_n_steps: 2000

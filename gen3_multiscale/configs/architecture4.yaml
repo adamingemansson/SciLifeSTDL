@@ -1,0 +1,120 @@
+# Architecture 4: Hierarchical Residual Flow Field.
+#
+# Exactly Architecture 3's anchor-free conditioner and deterministic
+# transport mean plus a stopped-gradient low-rank residual flow.
+# Architecture4's constructor (models/architectures.py) wraps a full,
+# unmodified Architecture3 instance internally -- it does NOT accept
+# use_anchor_blend/use_regional_he/use_global_slide kwargs directly (they
+# are fixed by construction to Architecture3's own defaults), so this
+# file's `model.params` intentionally has a different shape from
+# architecture{1,2,3}.yaml rather than a synthetic "matching" set of
+# keys that the real class would reject. static_config_audit only
+# compares keys present in ALL FOUR configs, so Architecture 4's extra/
+# missing keys are not a violation -- see architecture1.yaml's header for
+# the shared-field/static-config-audit contract and the KNOWN GAP note
+# (no real training entrypoint or data builder exists yet).
+
+experiment_name: gen3_architecture4_hierarchical_residual_flow_v1
+
+documented_divergences:
+  - model.architecture
+  - model.params.n_flow_blocks
+  - model.params.n_flow_samples
+  - model.params.n_ode_steps
+  - model.params.gene_basis_rank
+  - training.checkpoint_dir
+
+model:
+  architecture: "4"
+  params:
+    n_genes: null
+    gex_feature_dim: null
+    image_feature_dim: 1536
+    hidden_dim: 512
+    n_heads: 8
+    n_blocks: 4               # conditioner block count -- must match architecture3.yaml's n_blocks (Phase 6: "Use exactly the Architecture 3 conditioner ... do not change its width, number of blocks")
+    n_flow_blocks: 2          # velocity-network-only, no equivalent in architecture{1,2,3}.yaml
+    dense_threshold: 256
+    sparse_k: 10
+    chunk_size: 1024
+    max_boundary_size: null
+    transport_heads: 8
+    transport_temperature: 1.0
+    gene_gate_mode: per_gene
+    use_query_gate: true
+    use_residual: false
+    residual_rank: 32
+    n_gex_inducing: 16
+    harmonic_k_neighbors: 6
+    gene_encoder_type: weighted_linear
+    init_seed: 0
+    gene_basis_rank: 64       # rank of the fixed low-rank gene-residual basis (models/gene_basis.py) -- fit offline on TRAINING-split residuals only, before this config is used
+    n_flow_samples: 8
+    n_ode_steps: 20
+
+loss:
+  gradient_weight: 0.05
+  k_neighbors: 6
+
+masking:
+  strata:
+    - name: small_compact
+      radius_range: [3.0, 5.0]
+      radius_unit: spot_spacing
+      shape: circle
+    - name: medium_compact
+      radius_range: [5.0, 8.0]
+      radius_unit: spot_spacing
+      shape: circle
+    - name: large_compact
+      radius_range: [8.0, 12.0]
+      radius_unit: spot_spacing
+      shape: circle
+    - name: medium_irregular
+      radius_range: [5.0, 8.0]
+      radius_unit: spot_spacing
+      shape: mixed
+
+data:
+  hest_data_dir: data/raw/hest1k
+  hest_cache_dir: data/cache/hest1k
+  sample_selection:
+    organs: all
+    metadata_csv: hf://datasets/MahmoodLab/hest/HEST_v1_3_0.csv
+    min_samples_per_organ: 5
+    max_samples_per_organ: 30
+    n_validation_per_organ: 2
+    n_test_per_organ: 2
+    split_seed: 0
+
+evaluation:
+  gene_panels:
+    CCRCC_var_50genes: resources/evaluation/hest_bench/CCRCC_var_50genes.json
+  compute_st_fid_mmd: false
+  patient_level_aggregation: true
+  # Architecture-4-specific reporting (Phase 7): 90% interval coverage,
+  # predictive std, sample diversity, deterministic-vs-sampled mean,
+  # uncertainty stratified by depth-to-boundary/hole size -- computed
+  # from sample_predictive_distribution's own output plus
+  # evaluation/metrics.py's boundary_interior_bins/hole_size_bins (both
+  # already support binning any per-query/per-item scalar).
+
+required_fingerprints:
+  gigapath_checkpoint: null
+  gene_vocabulary: null
+  gene_residual_basis: null   # fit_gene_residual_basis output, TRAINING-split only (models/gene_basis.py)
+  train_mask_bank: null
+  validation_mask_bank: null
+  test_mask_bank: null
+
+training:
+  device: cuda
+  seed: 0
+  lr: 1.0e-4
+  total_steps: 100000000
+  max_wall_clock_hours: 24    # "Architecture 4 may require additional compute for flow; report both optimizer steps and wall time rather than hiding the difference"
+  gradient_clip_val: 1.0
+  log_every_n_steps: 50
+  checkpoint_every_n_steps: 2000
+  checkpoint_dir: gen3_multiscale/results/architecture4
+  eval_every_n_steps: 2000
