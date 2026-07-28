@@ -71,12 +71,22 @@ def main(config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_
 
     checkpoint_dir = Path(cfg.training.checkpoint_dir)
     start_step = 0
+    prior_wall_clock_seconds = 0.0
     resumed = (checkpoint_dir / "model_config.json").exists()
     if resumed:
+        # 2026-07-27 (GPT-audit-flagged, second-pass re-audit): verify the
+        # gene panel before loading weights onto it -- see
+        # train_local_neighborhood.py's identical comment.
+        checkpoint.verify_gene_names(checkpoint_dir, gene_names)
         checkpoint.load_trainable_state(model, checkpoint_dir)
+        training_state = checkpoint.load_training_state(checkpoint_dir)
         # 2026-07-27 (GPT-audit-flagged): +1 -- see train_local_neighborhood.
         # py's identical comment, the saved step was already fully processed.
-        start_step = checkpoint.load_training_state(checkpoint_dir).get("step", 0) + 1
+        start_step = training_state.get("step", 0) + 1
+        # 2026-07-27 (GPT-audit-flagged, second-pass re-audit): carry the
+        # wall-clock budget/curriculum forward -- see train_local_
+        # neighborhood.py's identical comment.
+        prior_wall_clock_seconds = float(training_state.get("cumulative_wall_clock_seconds", 0.0))
         print(f"resumed from checkpoint, continuing at step {start_step}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.training.get("lr", 1e-4)))
@@ -92,8 +102,15 @@ def main(config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_
     mask_fraction = float(cfg.training.get("mask_fraction", 0.2))
     gaussian_std = float(cfg.training.get("gaussian_std", 0.0))
 
-    wall_clock_deadline = data_prep.resolve_wall_clock_deadline(cfg)
-    progress_fn = data_prep.make_progress_fn(wall_clock_deadline, total_steps)
+    wall_clock_deadline = data_prep.resolve_wall_clock_deadline(cfg, already_elapsed_seconds=prior_wall_clock_seconds)
+    progress_fn = data_prep.make_progress_fn(
+        wall_clock_deadline, total_steps, already_elapsed_seconds=prior_wall_clock_seconds,
+    )
+    this_launch_start = time.monotonic()
+
+    def _cumulative_wall_clock_seconds() -> float:
+        return prior_wall_clock_seconds + (time.monotonic() - this_launch_start)
+
     pooled_t = torch.from_numpy(pooled)
     rng = random.Random(int(cfg.training.get("seed", 0)))
     if resumed:
@@ -143,6 +160,7 @@ def main(config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_
             checkpoint.save_checkpoint(
                 model, {"n_genes": n_genes, "params": params}, gene_names, checkpoint_dir, step,
                 keep_last=checkpoint_keep_last, optimizer=optimizer, rng=rng,
+                extra_metadata={"cumulative_wall_clock_seconds": _cumulative_wall_clock_seconds()},
             )
 
     # 2026-07-27 bugfix: see train_local_neighborhood.py's own comment --
@@ -150,6 +168,7 @@ def main(config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_
     checkpoint.save_checkpoint(
         model, {"n_genes": n_genes, "params": params}, gene_names, checkpoint_dir, last_step,
         keep_last=checkpoint_keep_last, optimizer=optimizer, rng=rng,
+        extra_metadata={"cumulative_wall_clock_seconds": _cumulative_wall_clock_seconds()},
     )
     print(f"Stage A pretraining complete. Checkpoint at {checkpoint_dir}")
 

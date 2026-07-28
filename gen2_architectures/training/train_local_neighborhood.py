@@ -183,15 +183,29 @@ def main(
 
     checkpoint_dir = Path(cfg.training.checkpoint_dir)
     start_step = 0
+    prior_wall_clock_seconds = 0.0
     resumed = (checkpoint_dir / "model_config.json").exists()
     if resumed:
+        # 2026-07-27 (GPT-audit-flagged, second-pass re-audit): verify the
+        # gene panel BEFORE loading weights onto it -- trainable_weights.pt
+        # is positional, not gene-name-keyed, so a same-shaped but
+        # different/reordered panel (e.g. sample_selection re-resolved
+        # differently between launches) would load without error and
+        # silently corrupt the run.
+        checkpoint.verify_gene_names(checkpoint_dir, gene_names)
         checkpoint.load_trainable_state(model, checkpoint_dir)
+        training_state = checkpoint.load_training_state(checkpoint_dir)
         # 2026-07-27 (GPT-audit-flagged): the saved step is the step that
         # was already fully processed (used as its own build_masked_item
         # seed) and checkpointed -- resuming at range(start_step, ...)
         # silently re-ran that exact step a second time. +1 to actually
         # continue, not repeat.
-        start_step = checkpoint.load_training_state(checkpoint_dir).get("step", 0) + 1
+        start_step = training_state.get("step", 0) + 1
+        # 2026-07-27 (GPT-audit-flagged, second-pass re-audit): carry the
+        # wall-clock budget/curriculum forward across the resume -- see
+        # data_prep.resolve_wall_clock_deadline/make_progress_fn's own
+        # already_elapsed_seconds docstrings for why this matters.
+        prior_wall_clock_seconds = float(training_state.get("cumulative_wall_clock_seconds", 0.0))
         print(f"resumed from checkpoint, continuing at step {start_step}")
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -222,8 +236,14 @@ def main(
     # Read from data.strict_broken_region (matches audit_evaluation.py's
     # own read of the same key) so evaluation and training agree.
     strict_broken_region = bool(cfg.get("data", {}).get("strict_broken_region", False))
-    wall_clock_deadline = data_prep.resolve_wall_clock_deadline(cfg)
-    progress_fn = data_prep.make_progress_fn(wall_clock_deadline, total_steps)
+    wall_clock_deadline = data_prep.resolve_wall_clock_deadline(cfg, already_elapsed_seconds=prior_wall_clock_seconds)
+    progress_fn = data_prep.make_progress_fn(
+        wall_clock_deadline, total_steps, already_elapsed_seconds=prior_wall_clock_seconds,
+    )
+    this_launch_start = time.monotonic()
+
+    def _cumulative_wall_clock_seconds() -> float:
+        return prior_wall_clock_seconds + (time.monotonic() - this_launch_start)
 
     rng = random.Random(int(cfg.training.get("seed", 0)))
     if resumed:
@@ -292,6 +312,7 @@ def main(
             checkpoint.save_checkpoint(
                 model, _model_config_dict(cfg, scfoundation_dim), gene_names, checkpoint_dir, step,
                 keep_last=checkpoint_keep_last, optimizer=optimizer, rng=rng,
+                extra_metadata={"cumulative_wall_clock_seconds": _cumulative_wall_clock_seconds()},
             )
         if step > 0 and step % eval_every == 0 and validation_ids:
             model.eval()
@@ -317,6 +338,7 @@ def main(
     checkpoint.save_checkpoint(
         model, _model_config_dict(cfg, scfoundation_dim), gene_names, checkpoint_dir, last_step,
         keep_last=checkpoint_keep_last, optimizer=optimizer, rng=rng,
+        extra_metadata={"cumulative_wall_clock_seconds": _cumulative_wall_clock_seconds()},
     )
 
     if skip_final_eval:

@@ -177,7 +177,7 @@ def apply_smoke_override(cfg, smoke_steps: int | None) -> None:
     print(f"--smoke_steps {smoke_steps}: total_steps/checkpoint/eval/log intervals overridden for this run only")
 
 
-def resolve_wall_clock_deadline(cfg) -> float | None:
+def resolve_wall_clock_deadline(cfg, already_elapsed_seconds: float = 0.0) -> float | None:
     """training.max_wall_clock_hours (2026-07-25), if set, gives training
     scripts a REAL alternative to total_steps for "run for about N hours"
     -- deliberately preferred over back-deriving total_steps from a short
@@ -193,6 +193,16 @@ def resolve_wall_clock_deadline(cfg) -> float | None:
     either way, since callers just `break` out of the training loop on
     deadline, not return/exit early.
 
+    already_elapsed_seconds (2026-07-27, GPT-audit-flagged, second-pass
+    re-audit): wall-clock time already spent training THIS checkpoint
+    across any PRIOR launches (persisted in training_state.json's
+    cumulative_wall_clock_seconds, read by a resuming script and passed
+    in here). Without this, every resume silently granted itself a FRESH
+    max_wall_clock_hours budget rather than continuing the same overall
+    budget a single uninterrupted run would have had -- see
+    make_progress_fn's identical parameter for the other half of this fix
+    (the loss-stage curriculum resetting to stage 1 on every resume).
+
     Returns an absolute time.monotonic() deadline, or None if
     max_wall_clock_hours isn't set (matches every existing config,
     which relies on total_steps alone -- this is purely additive)."""
@@ -202,10 +212,11 @@ def resolve_wall_clock_deadline(cfg) -> float | None:
     hours = float(hours)
     if hours <= 0:
         raise ValueError(f"training.max_wall_clock_hours must be positive, got {hours}")
-    return time.monotonic() + hours * 3600.0
+    remaining_seconds = hours * 3600.0 - float(already_elapsed_seconds)
+    return time.monotonic() + max(0.0, remaining_seconds)
 
 
-def make_progress_fn(wall_clock_deadline: float | None, total_steps: int):
+def make_progress_fn(wall_clock_deadline: float | None, total_steps: int, already_elapsed_seconds: float = 0.0):
     """Returns a step -> progress-in-[0, 1] callable for StagedGeneLoss's
     stage curriculum (models/components.py).
 
@@ -217,15 +228,29 @@ def make_progress_fn(wall_clock_deadline: float | None, total_steps: int):
     would never leave stage 1 (pure MSE, no Pearson term). When a wall-clock
     deadline is set, progress is instead the fraction of the wall-clock
     budget elapsed -- what's actually governing how far into the run we are.
-    Falls back to step / total_steps when no wall-clock deadline is set."""
+    Falls back to step / total_steps when no wall-clock deadline is set.
+
+    already_elapsed_seconds (2026-07-27, GPT-audit-flagged, second-pass
+    re-audit): without this, progress was always computed relative to
+    THIS launch's own training_start, so every resume reset the curriculum
+    back to stage 1 (pure MSE) even after the model had trained long
+    enough to reach a later stage (e.g. with the Pearson penalty engaged)
+    before the restart -- a resumed run's loss shape visibly regressed
+    right after every resume, despite optimizer/RNG state now being
+    correctly restored. Pass the SAME already_elapsed_seconds given to
+    resolve_wall_clock_deadline (which shrinks the deadline by it) so the
+    two combine back into the ORIGINAL total budget here, and progress
+    continues climbing smoothly across a resume instead of restarting."""
     training_start = time.monotonic()
     total_wall_clock_seconds = (
-        wall_clock_deadline - training_start if wall_clock_deadline is not None else None
+        (wall_clock_deadline - training_start) + float(already_elapsed_seconds)
+        if wall_clock_deadline is not None else None
     )
 
     def progress_fn(step: int) -> float:
         if total_wall_clock_seconds is not None and total_wall_clock_seconds > 0:
-            return min(1.0, (time.monotonic() - training_start) / total_wall_clock_seconds)
+            elapsed = float(already_elapsed_seconds) + (time.monotonic() - training_start)
+            return min(1.0, elapsed / total_wall_clock_seconds)
         return step / max(1, total_steps)
 
     return progress_fn

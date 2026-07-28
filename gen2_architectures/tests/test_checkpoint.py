@@ -2,13 +2,14 @@ import os
 import random
 import tempfile
 
+import pytest
 import torch
 import torch.nn as nn
 
 from gen2_architectures.training.checkpoint import (
     save_checkpoint, load_trainable_state, load_training_state,
     list_checkpoint_history, rollback_checkpoint,
-    load_optimizer_and_rng_state,
+    load_optimizer_and_rng_state, verify_gene_names,
 )
 
 
@@ -200,3 +201,30 @@ def test_load_optimizer_and_rng_state_is_a_no_op_for_a_checkpoint_saved_without_
         save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=1)  # no optimizer= passed
 
         assert load_optimizer_and_rng_state(optimizer, tmp) is False
+
+
+def test_verify_gene_names_passes_silently_when_panels_match():
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(m, {"name": "tiny"}, ["g1", "g2"], tmp, step=1)
+        verify_gene_names(tmp, ["g1", "g2"])  # must not raise
+
+
+def test_verify_gene_names_raises_on_a_reordered_panel():
+    """GPT-audit-flagged bug (2026-07-27, second-pass re-audit): a resumed
+    run rebuilt the model from a freshly-derived gene panel and loaded
+    weights onto it with no check that this panel matched the checkpoint's
+    -- trainable_weights.pt is positional, not gene-name-keyed, so a same-
+    width but reordered panel would load without error and silently
+    corrupt the run."""
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(m, {"name": "tiny"}, ["g1", "g2", "g3"], tmp, step=1)
+        with pytest.raises(ValueError, match="different gene panel"):
+            verify_gene_names(tmp, ["g1", "g3", "g2"])
+
+
+def test_verify_gene_names_raises_when_gene_names_json_is_missing():
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(ValueError, match="gene_names.json"):
+            verify_gene_names(tmp, ["g1"])

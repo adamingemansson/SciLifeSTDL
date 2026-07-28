@@ -303,6 +303,43 @@ def load_training_state(checkpoint_dir: str | Path) -> dict:
     return json.loads(path.read_text())
 
 
+def verify_gene_names(checkpoint_dir: str | Path, gene_names: list[str]) -> None:
+    """GPT-audit-flagged bug (2026-07-27, second-pass re-audit): resuming a
+    training run rebuilt the model from the CURRENT run's freshly-derived
+    gene panel and loaded weights onto it with no check that this panel
+    matches the one the checkpoint was actually trained on. trainable_
+    weights.pt's tensors are positional, not gene-name-keyed -- a same-
+    shaped but reordered/different gene panel (e.g. a changed
+    sample_selection or QC setting between launches) would load without
+    error and silently produce a model whose weights and gene identities
+    no longer correspond, corrupting the run without any visible symptom
+    until metrics look wrong. Call this once at resume time, right after
+    confirming a checkpoint exists, before load_trainable_state -- mirrors
+    the exact same ordered-identity check already used for Stage A/Stage B
+    (train_arch3_stage_b.py::_load_stage_a)."""
+    path = Path(checkpoint_dir) / "gene_names.json"
+    if not path.is_file():
+        raise ValueError(
+            f"checkpoint at {checkpoint_dir} has no gene_names.json -- cannot verify its gene "
+            "panel matches this run's before loading weights onto it. This looks like an "
+            "incomplete checkpoint."
+        )
+    saved_gene_names = json.loads(path.read_text())
+    if list(saved_gene_names) != list(gene_names):
+        first_diff = next(
+            (i for i, (a, b) in enumerate(zip(saved_gene_names, gene_names)) if a != b),
+            min(len(saved_gene_names), len(gene_names)),
+        )
+        raise ValueError(
+            f"checkpoint at {checkpoint_dir} was trained on a different gene panel than this "
+            f"run just resolved (first mismatch at index {first_diff}: "
+            f"{saved_gene_names[first_diff] if first_diff < len(saved_gene_names) else '<end>'!r} vs "
+            f"{gene_names[first_diff] if first_diff < len(gene_names) else '<end>'!r}) -- refusing "
+            "to load these weights onto a mismatched gene vocabulary. If this is a deliberate "
+            "re-derivation (e.g. changed sample_selection), resume from a fresh checkpoint_dir."
+        )
+
+
 def load_optimizer_and_rng_state(
     optimizer: torch.optim.Optimizer, checkpoint_dir: str | Path, rng: random.Random | None = None,
 ) -> bool:
