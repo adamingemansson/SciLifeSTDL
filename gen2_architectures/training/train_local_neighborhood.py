@@ -155,10 +155,16 @@ def main(
 
     checkpoint_dir = Path(cfg.training.checkpoint_dir)
     start_step = 0
-    if (checkpoint_dir / "model_config.json").exists():
+    resumed = (checkpoint_dir / "model_config.json").exists()
+    if resumed:
         checkpoint.load_trainable_state(model, checkpoint_dir)
-        start_step = checkpoint.load_training_state(checkpoint_dir).get("step", 0)
-        print(f"resumed from checkpoint at step {start_step}")
+        # 2026-07-27 (GPT-audit-flagged): the saved step is the step that
+        # was already fully processed (used as its own build_masked_item
+        # seed) and checkpointed -- resuming at range(start_step, ...)
+        # silently re-ran that exact step a second time. +1 to actually
+        # continue, not repeat.
+        start_step = checkpoint.load_training_state(checkpoint_dir).get("step", 0) + 1
+        print(f"resumed from checkpoint, continuing at step {start_step}")
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     if not trainable_params:
@@ -192,6 +198,14 @@ def main(
     progress_fn = data_prep.make_progress_fn(wall_clock_deadline, total_steps)
 
     rng = random.Random(int(cfg.training.get("seed", 0)))
+    if resumed:
+        if checkpoint.load_optimizer_and_rng_state(optimizer, checkpoint_dir, rng=rng):
+            print("resumed optimizer momentum + RNG state (deterministic continuation)")
+        else:
+            print(
+                "no optimizer_rng_state.pt in this checkpoint (older checkpoint, or first "
+                "save under this fix) -- resuming with fresh optimizer momentum + RNG state"
+            )
     model.train()
     last_step = start_step
     for step in range(start_step, total_steps):
@@ -249,7 +263,7 @@ def main(
         if step > 0 and step % checkpoint_every == 0:
             checkpoint.save_checkpoint(
                 model, _model_config_dict(cfg, scfoundation_dim), gene_names, checkpoint_dir, step,
-                keep_last=checkpoint_keep_last,
+                keep_last=checkpoint_keep_last, optimizer=optimizer, rng=rng,
             )
         if step > 0 and step % eval_every == 0 and validation_ids:
             model.eval()
@@ -278,7 +292,7 @@ def main(
     # reached.
     checkpoint.save_checkpoint(
         model, _model_config_dict(cfg, scfoundation_dim), gene_names, checkpoint_dir, last_step,
-        keep_last=checkpoint_keep_last,
+        keep_last=checkpoint_keep_last, optimizer=optimizer, rng=rng,
     )
 
     if skip_final_eval:

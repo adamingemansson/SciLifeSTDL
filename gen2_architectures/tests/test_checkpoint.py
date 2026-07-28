@@ -1,4 +1,5 @@
 import os
+import random
 import tempfile
 
 import torch
@@ -7,6 +8,7 @@ import torch.nn as nn
 from gen2_architectures.training.checkpoint import (
     save_checkpoint, load_trainable_state, load_training_state,
     list_checkpoint_history, rollback_checkpoint,
+    load_optimizer_and_rng_state,
 )
 
 
@@ -154,3 +156,47 @@ def test_history_snapshots_survive_root_being_overwritten():
         latest = _Tiny()
         load_trainable_state(latest, tmp)
         assert torch.allclose(latest.lin.weight, torch.full((4, 4), 2.0))
+
+
+def test_optimizer_and_rng_state_round_trips_when_saved():
+    """GPT-audit-flagged bug (2026-07-27, confirmed and fixed): checkpoints
+    used to save ONLY model weights -- no AdamW momentum, no RNG state --
+    so a "resumed" run was a warm restart with reset optimization
+    dynamics, not a real continuation."""
+    m = _Tiny()
+    optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
+    # take a real step so the optimizer actually has non-zero momentum/
+    # variance state to round-trip (a freshly-constructed optimizer's
+    # state dict is empty and would pass trivially even with a broken
+    # save/load path)
+    loss = m.lin(torch.randn(2, 4)).sum()
+    loss.backward()
+    optimizer.step()
+    saved_momentum = optimizer.state_dict()["state"][0]["exp_avg"].clone()
+
+    loop_rng = random.Random(0)
+    loop_rng.random()  # advance state away from the fresh seed=0 state
+    draw_before_save = loop_rng.random()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=1, optimizer=optimizer, rng=loop_rng)
+
+        m2 = _Tiny()
+        optimizer2 = torch.optim.AdamW(m2.parameters(), lr=1e-3)
+        loop_rng2 = random.Random(999)  # deliberately different seed pre-load
+        loaded = load_optimizer_and_rng_state(optimizer2, tmp, rng=loop_rng2)
+
+        assert loaded is True
+        assert torch.allclose(optimizer2.state_dict()["state"][0]["exp_avg"], saved_momentum)
+        # loop_rng2 must now continue exactly where loop_rng left off, not
+        # where its own (different) seed would have taken it
+        assert loop_rng2.random() == loop_rng.random()
+
+
+def test_load_optimizer_and_rng_state_is_a_no_op_for_a_checkpoint_saved_without_one():
+    m = _Tiny()
+    optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=1)  # no optimizer= passed
+
+        assert load_optimizer_and_rng_state(optimizer, tmp) is False

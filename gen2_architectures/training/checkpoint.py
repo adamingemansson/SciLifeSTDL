@@ -31,18 +31,32 @@ server), keep training.checkpoint_keep_last small (default 2) and watch
 the printed sizes below — trainable-only weights are the cheap part
 (tens of MB typically), but Architecture 3 Stage A's autoencoder can be
 much larger on a wide gene panel (see README's disk budget note).
+
+Optimizer + RNG state (added 2026-07-27, GPT-audit-flagged fix #6):
+save_checkpoint's optional optimizer=/rng= arguments additionally save
+AdamW's momentum/variance buffers and every RNG stream (python/numpy/
+torch/CUDA + the training loop's own sample-draw random.Random instance)
+to optimizer_rng_state.pt, restorable via load_optimizer_and_rng_state().
+Without this, a "resumed" run kept the trained weights but reset
+optimizer momentum to zero and re-seeded every RNG from scratch — a warm
+restart with different optimization dynamics, not a real continuation.
 """
 from __future__ import annotations
 
 import json
 import os
+import random
 import shutil
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 
-_CHECKPOINT_FILENAMES = ("trainable_weights.pt", "model_config.json", "gene_names.json", "training_state.json")
+_CHECKPOINT_FILENAMES = (
+    "trainable_weights.pt", "model_config.json", "gene_names.json", "training_state.json",
+    "optimizer_rng_state.pt",
+)
 
 
 def _is_frozen_backbone_module(module: nn.Module) -> bool:
@@ -175,9 +189,45 @@ def rollback_checkpoint(checkpoint_dir: str | Path, step: int) -> None:
     print(f"rolled back {out_dir} to step {step} (from history snapshot {snapshot_dir})")
 
 
+def _rng_state_blob(rng: random.Random | None) -> dict:
+    """Every source of randomness that affects a training run's future
+    trajectory: the module-level python `random` (seeded once by
+    seed_everything but mutated by any incidental use), numpy's global
+    RNG, torch's CPU RNG, torch's per-GPU CUDA RNGs (if any), and the
+    training loop's OWN independent `random.Random(seed)` instance (each
+    training script keeps its sample-draw RNG separate from the global
+    one specifically so it isn't perturbed by unrelated random calls
+    elsewhere — see e.g. train_local_neighborhood.py's `rng =
+    random.Random(...)`)."""
+    blob = {
+        "python_random": random.getstate(),
+        "numpy_random": np.random.get_state(),
+        "torch_random": torch.get_rng_state(),
+    }
+    if rng is not None:
+        blob["loop_random"] = rng.getstate()
+    if torch.cuda.is_available():
+        blob["torch_cuda_random"] = torch.cuda.get_rng_state_all()
+    return blob
+
+
+def _restore_rng_state(blob: dict, rng: random.Random | None) -> None:
+    if "python_random" in blob:
+        random.setstate(blob["python_random"])
+    if "numpy_random" in blob:
+        np.random.set_state(blob["numpy_random"])
+    if "torch_random" in blob:
+        torch.set_rng_state(blob["torch_random"])
+    if rng is not None and "loop_random" in blob:
+        rng.setstate(blob["loop_random"])
+    if torch.cuda.is_available() and "torch_cuda_random" in blob:
+        torch.cuda.set_rng_state_all(blob["torch_cuda_random"])
+
+
 def save_checkpoint(
     model: nn.Module, model_config: dict, gene_names: list[str], checkpoint_dir: str | Path,
     step: int, extra_metadata: dict | None = None, keep_last: int = 2,
+    optimizer: torch.optim.Optimizer | None = None, rng: random.Random | None = None,
 ) -> None:
     weights_path = save_trainable_state(model, checkpoint_dir)
     out_dir = Path(checkpoint_dir)
@@ -191,6 +241,20 @@ def save_checkpoint(
         with open(tmp_path, "w") as f:
             json.dump(payload, f, indent=2)
         os.replace(tmp_path, final_path)
+
+    # 2026-07-27 (GPT-audit-flagged, fix #6): checkpoints used to save
+    # ONLY model weights -- no AdamW optimizer state (momentum/variance
+    # buffers reset to zero on resume) and no RNG state (python/numpy/
+    # torch/CUDA, plus each training loop's own sample-draw RNG) -- a
+    # "resumed" run was actually a warm restart with different
+    # optimization dynamics, not a deterministic continuation. Optional:
+    # a caller that truly doesn't care (e.g. a one-off inference/eval
+    # rebuild) can simply not pass optimizer, and no file is written.
+    if optimizer is not None:
+        opt_path = out_dir / "optimizer_rng_state.pt"
+        opt_tmp_path = out_dir / f"optimizer_rng_state.pt.tmp{os.getpid()}"
+        torch.save({"optimizer": optimizer.state_dict(), **_rng_state_blob(rng)}, opt_tmp_path)
+        os.replace(opt_tmp_path, opt_path)
 
     weights_size = weights_path.stat().st_size if weights_path is not None else 0
     if keep_last > 0:
@@ -237,3 +301,26 @@ def load_training_state(checkpoint_dir: str | Path) -> dict:
     if not path.is_file():
         return {"step": 0}
     return json.loads(path.read_text())
+
+
+def load_optimizer_and_rng_state(
+    optimizer: torch.optim.Optimizer, checkpoint_dir: str | Path, rng: random.Random | None = None,
+) -> bool:
+    """Restore optimizer momentum/variance buffers and every RNG stream
+    saved by save_checkpoint's optimizer=/rng= arguments. Returns False
+    (a no-op) for a checkpoint saved before this fix existed, or any
+    checkpoint saved without an optimizer (e.g. a fully-frozen model) —
+    callers should treat that as "fresh optimizer state, resume anyway"
+    rather than an error, since older/lighter checkpoints are still
+    otherwise valid to resume from."""
+    path = Path(checkpoint_dir) / "optimizer_rng_state.pt"
+    if not path.is_file():
+        return False
+    # weights_only=False: this file isn't a bare state_dict, it also
+    # carries numpy's RNG state (a plain ndarray inside a tuple) which
+    # torch's default weights_only unpickler (PyTorch >=2.6) refuses to
+    # load. Always our own locally-written file, never untrusted input.
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    optimizer.load_state_dict(blob["optimizer"])
+    _restore_rng_state(blob, rng)
+    return True
