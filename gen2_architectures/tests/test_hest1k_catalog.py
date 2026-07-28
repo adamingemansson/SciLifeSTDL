@@ -10,7 +10,8 @@ from gen2_architectures.data.hest1k_catalog import resolve_sample_selection
 def _make_fake_hest1k(tmp_path: Path, organ_sample_ids: dict[str, list[str]], technology: str = "Visium",
                        missing_patches: set[str] | None = None,
                        species_by_id: dict[str, str] | None = None,
-                       nb_genes_by_id: dict[str, int] | None = None) -> tuple[Path, Path]:
+                       nb_genes_by_id: dict[str, int] | None = None,
+                       patient_by_id: dict[str, str] | None = None) -> tuple[Path, Path]:
     """Build a fake local hest1k dir + matching metadata CSV. missing_patches
     lets a test simulate a sample with expression but no image patches.
     species_by_id (default: every sample "Homo sapiens") lets a test
@@ -18,7 +19,10 @@ def _make_fake_hest1k(tmp_path: Path, organ_sample_ids: dict[str, list[str]], te
     test_species_filter_excludes_mouse_by_default). nb_genes_by_id
     (default: every sample 20000, comfortably whole-transcriptome-scale)
     lets a test simulate HEST-1k's real small-targeted-panel-mislabeled-
-    Visium finding (see test_min_nb_genes_excludes_small_panel_samples)."""
+    Visium finding (see test_min_nb_genes_excludes_small_panel_samples).
+    patient_by_id (default: no `patient` column at all, matching most of
+    this file's other fixtures) lets a test simulate HEST-1k's real
+    `patient` metadata column (see test_split_by_patient_*)."""
     missing_patches = missing_patches or set()
     species_by_id = species_by_id or {}
     nb_genes_by_id = nb_genes_by_id or {}
@@ -29,11 +33,14 @@ def _make_fake_hest1k(tmp_path: Path, organ_sample_ids: dict[str, list[str]], te
     rows = []
     for organ, ids in organ_sample_ids.items():
         for sid in ids:
-            rows.append({
+            row = {
                 "id": sid, "organ": organ, "st_technology": technology,
                 "species": species_by_id.get(sid, "Homo sapiens"),
                 "nb_genes": nb_genes_by_id.get(sid, 20000),
-            })
+            }
+            if patient_by_id is not None:
+                row["patient"] = patient_by_id.get(sid, sid)
+            rows.append(row)
             (hest_dir / "st" / f"{sid}.h5ad").touch()
             if sid not in missing_patches:
                 (hest_dir / "patches" / f"{sid}.h5").touch()
@@ -202,3 +209,71 @@ def test_species_all_keeps_every_species():
         result = resolve_sample_selection(hest_dir, str(meta_path), organs="all", species=None, min_samples_per_organ=3, check_gene_panel_compatibility=False)
         all_selected = result["train_sample_ids"] + result["validation_sample_ids"] + result["test_sample_ids"]
         assert len(all_selected) == 10, "species=None must keep both human and mouse samples"
+
+
+def test_split_by_patient_keeps_every_sample_from_a_held_out_patient_together():
+    """GPT-audit-flagged bug (2026-07-27, confirmed and fixed): HEST-1k's
+    real metadata has a `patient` column -- multiple Visium samples can
+    come from the same donor. Splitting at the sample level could put two
+    slides from the same patient on opposite sides of train/test, leaking
+    patient identity into what's supposed to be a clean held-out eval."""
+    with tempfile.TemporaryDirectory() as tmp:
+        # 3 patients x 3 slides each = 9 samples, one organ.
+        patient_by_id = {f"L{i}": f"P{i // 3}" for i in range(9)}
+        hest_dir, meta_path = _make_fake_hest1k(
+            Path(tmp), {"Lung": [f"L{i}" for i in range(9)]}, patient_by_id=patient_by_id,
+        )
+        result = resolve_sample_selection(
+            hest_dir, str(meta_path), organs="all", min_samples_per_organ=3,
+            n_validation_per_organ=1, n_test_per_organ=1, split_seed=0,
+            check_gene_panel_compatibility=False, split_by_patient=True,
+        )
+        train, val, test = result["train_sample_ids"], result["validation_sample_ids"], result["test_sample_ids"]
+        assert not (set(train) & set(val)) and not (set(train) & set(test)) and not (set(val) & set(test))
+
+        def patient_of(sid):
+            return patient_by_id[sid]
+
+        # val/test each pull one whole 3-slide patient (patients move
+        # together, never split across the train/val/test boundary)
+        assert len({patient_of(sid) for sid in val}) == 1
+        assert len({patient_of(sid) for sid in test}) == 1
+        assert len(val) == 3 and len(test) == 3  # the whole 3-slide patient moved together
+        # the held-out patients' samples never appear in train
+        assert not ({patient_of(sid) for sid in val} & {patient_of(sid) for sid in train})
+        assert not ({patient_of(sid) for sid in test} & {patient_of(sid) for sid in train})
+
+
+def test_split_by_patient_false_reproduces_the_old_sample_level_split():
+    with tempfile.TemporaryDirectory() as tmp:
+        patient_by_id = {f"L{i}": f"P{i // 3}" for i in range(9)}
+        hest_dir, meta_path = _make_fake_hest1k(
+            Path(tmp), {"Lung": [f"L{i}" for i in range(9)]}, patient_by_id=patient_by_id,
+        )
+        result = resolve_sample_selection(
+            hest_dir, str(meta_path), organs="all", min_samples_per_organ=3,
+            n_validation_per_organ=1, n_test_per_organ=1, split_seed=0,
+            check_gene_panel_compatibility=False, split_by_patient=False,
+        )
+        # sample-level split: exactly 1 sample in validation/test each,
+        # regardless of which patient it happens to belong to
+        assert len(result["validation_sample_ids"]) == 1
+        assert len(result["test_sample_ids"]) == 1
+
+
+def test_split_by_patient_falls_back_to_sample_level_when_no_patient_column():
+    """No `patient` column in the metadata at all (most of this file's
+    fixtures) -- split_by_patient=True must not crash, and must behave
+    exactly like the old sample-level split (this file's other tests all
+    already assert exact sample-level counts with split_by_patient
+    defaulted to True, so this just documents the fallback explicitly)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        hest_dir, meta_path = _make_fake_hest1k(Path(tmp), {"Lung": [f"L{i}" for i in range(10)]})
+        result = resolve_sample_selection(
+            hest_dir, str(meta_path), organs="all", min_samples_per_organ=3,
+            n_validation_per_organ=2, n_test_per_organ=2, split_seed=0,
+            check_gene_panel_compatibility=False, split_by_patient=True,
+        )
+        assert len(result["validation_sample_ids"]) == 2
+        assert len(result["test_sample_ids"]) == 2
+        assert len(result["train_sample_ids"]) == 6

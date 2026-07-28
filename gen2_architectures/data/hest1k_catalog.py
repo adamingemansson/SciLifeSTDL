@@ -181,6 +181,7 @@ def resolve_sample_selection(
     min_gene_coverage: float = 0.9,
     min_sample_coverage: float = 0.9,
     min_panel_size: int = 5000,
+    split_by_patient: bool = True,
 ) -> dict:
     """Deterministically resolve train/validation/test sample IDs from the
     real HEST-1k Visium catalog, restricted to what's ACTUALLY downloaded
@@ -229,6 +230,25 @@ def resolve_sample_selection(
     samples) without silently favoring whichever samples happen to sort
     first.
 
+    split_by_patient (2026-07-27, GPT-audit-flagged, default True): HEST-1k's
+    real metadata CSV has a confirmed `patient` column (docs/dataset_notes.md,
+    28 real columns verified against the live CSV) -- multiple Visium
+    samples/slides can come from the SAME donor. Splitting at the sample
+    level (the old, and until now only, behavior) could put two slides
+    from the same patient on opposite sides of the held-out boundary,
+    leaking patient-specific signal into what's supposed to be a clean
+    held-out evaluation -- exactly the failure mode src/'s own training
+    pipeline already guards against. When True (default), validation/
+    test are chosen by randomly holding out n_validation_per_organ /
+    n_test_per_organ whole PATIENTS per organ (every sample belonging to
+    a held-out patient moves together), not individual sample IDs. A
+    sample whose patient value is missing/blank, or when the metadata
+    CSV has no `patient` column at all (e.g. this function's own test
+    fixtures), falls back to treating that sample as its own single-
+    sample "patient" -- identical to the old sample-level behavior, so
+    this is purely a leakage fix, not a behavior change, whenever real
+    patient identity isn't available.
+
     Returns a dict: train_sample_ids, validation_sample_ids, test_sample_ids
     (all list[str]), organ_by_sample, tech_by_sample (both dict[str, str]),
     organ_vocab, tech_vocab (both list[str], sorted-unique -- ready to pass
@@ -256,26 +276,58 @@ def resolve_sample_selection(
     train_ids, validation_ids, test_ids = [], [], []
     organ_by_sample, tech_by_sample = {}, {}
     kept_organs = []
+    has_patient_column = "patient" in visium.columns
     for organ, group in visium.groupby("organ"):
         ids = sorted(group["id"].tolist())
         if len(ids) < min_samples_per_organ:
             continue
-        if len(ids) < n_validation_per_organ + n_test_per_organ + 1:
-            continue  # not enough left over for a real training set after holding out val/test
-        shuffled = list(ids)
-        rng.shuffle(shuffled)
+
+        if split_by_patient and has_patient_column:
+            patient_of = {}
+            for sid, patient in zip(group["id"], group["patient"]):
+                patient_of[str(sid)] = (
+                    str(sid) if pd.isna(patient) or str(patient).strip() == "" else str(patient)
+                )
+        else:
+            patient_of = {sid: sid for sid in ids}
+        samples_by_patient: dict[str, list[str]] = {}
+        for sid, patient in patient_of.items():
+            samples_by_patient.setdefault(patient, []).append(sid)
+        patients = sorted(samples_by_patient)
+
+        if len(patients) < n_validation_per_organ + n_test_per_organ + 1:
+            continue  # not enough distinct patients left over for a real train/val/test split
+        shuffled_patients = list(patients)
+        rng.shuffle(shuffled_patients)
         if max_samples_per_organ is not None:
-            shuffled = shuffled[:max_samples_per_organ]
-            if len(shuffled) < n_validation_per_organ + n_test_per_organ + 1:
-                continue  # the cap itself left too few samples for this organ
-        organ_val = shuffled[:n_validation_per_organ]
-        organ_test = shuffled[n_validation_per_organ:n_validation_per_organ + n_test_per_organ]
-        organ_train = shuffled[n_validation_per_organ + n_test_per_organ:]
+            # Cap by total SAMPLE count (matches the pre-patient-split
+            # contract other callers rely on) while keeping every patient's
+            # samples together -- greedily add whole patients until the
+            # next one would exceed the budget, never split a patient
+            # across the cap boundary.
+            capped_patients: list[str] = []
+            total_samples = 0
+            for patient in shuffled_patients:
+                n_patient_samples = len(samples_by_patient[patient])
+                if capped_patients and total_samples + n_patient_samples > max_samples_per_organ:
+                    break
+                capped_patients.append(patient)
+                total_samples += n_patient_samples
+            shuffled_patients = capped_patients
+            if len(shuffled_patients) < n_validation_per_organ + n_test_per_organ + 1:
+                continue  # the cap itself left too few patients for this organ
+
+        val_patients = set(shuffled_patients[:n_validation_per_organ])
+        test_patients = set(shuffled_patients[n_validation_per_organ:n_validation_per_organ + n_test_per_organ])
+        train_patients = set(shuffled_patients[n_validation_per_organ + n_test_per_organ:])
+        organ_val = sorted(sid for sid, patient in patient_of.items() if patient in val_patients)
+        organ_test = sorted(sid for sid, patient in patient_of.items() if patient in test_patients)
+        organ_train = sorted(sid for sid, patient in patient_of.items() if patient in train_patients)
         validation_ids.extend(organ_val)
         test_ids.extend(organ_test)
         train_ids.extend(organ_train)
         kept_organs.append(organ)
-        for sid in shuffled:
+        for sid in organ_val + organ_test + organ_train:
             organ_by_sample[sid] = organ
             tech_by_sample[sid] = "Visium"
 

@@ -44,13 +44,15 @@ def apply_sample_selection(cfg) -> None:
     resolved selection.
 
     species/min_nb_genes/check_gene_panel_compatibility/min_gene_coverage/
-    min_sample_coverage/min_panel_size (all optional keys under
-    sample_selection) pass straight through to resolve_sample_selection,
-    which defaults every one of them safely on its own -- only set these
-    in a config to deliberately override (e.g. species: "all" for a
-    cross-species comparison run). See resolve_sample_selection's own
-    docstring for what each really does and the real HEST-1k bugs they
-    guard against.
+    min_sample_coverage/min_panel_size/split_by_patient (all optional keys
+    under sample_selection) pass straight through to
+    resolve_sample_selection, which defaults every one of them safely on
+    its own -- only set these in a config to deliberately override (e.g.
+    species: "all" for a cross-species comparison run, or
+    split_by_patient: false to reproduce the old sample-level split for
+    an exact apples-to-apples rerun of an earlier experiment). See
+    resolve_sample_selection's own docstring for what each really does and
+    the real HEST-1k bugs they guard against.
     """
     selection_cfg = cfg.data.get("sample_selection")
     if selection_cfg is None:
@@ -75,6 +77,7 @@ def apply_sample_selection(cfg) -> None:
         min_gene_coverage=float(selection_cfg.get("min_gene_coverage", 0.9)),
         min_sample_coverage=float(selection_cfg.get("min_sample_coverage", 0.9)),
         min_panel_size=int(selection_cfg.get("min_panel_size", 5000)),
+        split_by_patient=bool(selection_cfg.get("split_by_patient", True)),
     )
     cfg.data.train_sample_ids = result["train_sample_ids"]
     cfg.data.validation_sample_ids = result["validation_sample_ids"]
