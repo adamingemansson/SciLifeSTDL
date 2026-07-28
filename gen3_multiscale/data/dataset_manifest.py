@@ -21,11 +21,22 @@ describing exactly what data a Gen3 training run will use:
     unique and are reused across different samples/slides, a gap
     repeatedly confirmed across this project's audit rounds (most
     recently CONTRACT.md section 26 finding #6)
-  - lightweight WSI/cache provenance (path, size, mtime -- the same
-    cheap "identity" convention slide_context.py already uses for its
-    own runtime cache key, NOT a full-file content hash, which would be
-    prohibitively slow to compute for many large per-sample GigaPath
-    tile caches at manifest-build time)
+  - real SHA256 content provenance for the metadata CSV and every kept
+    sample's h5ad/patch-h5 files (and its WSI tile cache, if present) --
+    NOT the cheap path/size/mtime "identity" slide_context.py's own
+    runtime cache key uses, which the 10th Codex re-audit of commit
+    9592d9e (finding #2, confirmed) correctly flagged as insufficient
+    for the MANIFEST's own immutability claim (a runtime cache key only
+    needs to detect *most* changes cheaply; an immutability record needs
+    to actually identify the bytes it describes). Hashing full file
+    content at manifest-build time is a real, non-trivial cost for large
+    per-sample files, so it is memoized in an on-disk "digest database"
+    (see _cached_file_content_hash/load_digest_cache/save_digest_cache
+    below) keyed by each file's own path+size+mtime -- exactly the
+    mitigation the audit itself proposed ("hashing can be cached via a
+    separately-verified digest database for the one-time cost"): a cache
+    hit still re-verifies size/mtime against the real file before ever
+    trusting a memoized digest.
 
 Every later step in the real data builder (example construction, mask-
 realization fingerprinting, Novae graphs, WSI wiring, the trainer and
@@ -128,16 +139,62 @@ def gene_panel_hash(gene_names: list[str]) -> str:
     return sha256("\n".join(str(g) for g in gene_names).encode("utf-8")).hexdigest()
 
 
-def _wsi_cache_provenance(hest_cache_dir: str | Path, sample_id: str) -> dict | None:
-    """Lightweight provenance for one sample's dense GigaPath WSI tile
-    cache (path/size/mtime -- the same cheap "identity" convention
-    slide_context.py's own load_slide_context already uses for its
-    runtime cache key, NOT a full-file SHA256 content hash, which would
-    be prohibitively slow to compute for many large per-sample tile
-    caches at manifest-build time). Returns None (not an error) when the
-    cache file doesn't exist yet -- WSI conditioning may not be enabled
-    for every organ/run, and Step 8's preflight gates (not this module)
-    are where "required but missing" becomes fail-closed."""
+def _sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
+    """Stream a file's real content through SHA256 without loading it
+    entirely into memory -- safe for large h5ad/patch/WSI-cache files."""
+    h = sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _cached_file_content_hash(path: Path, digest_cache: dict) -> str:
+    """SHA256 content hash of `path`, memoized in `digest_cache` (an
+    in-memory dict backed by load_digest_cache/save_digest_cache below)
+    keyed by the file's own path+size+mtime identity. A cache hit still
+    re-verifies size/mtime against the real file on disk before ever
+    trusting a memoized digest -- never trusts a stale key alone."""
+    stat = path.stat()
+    key = str(path.resolve())
+    cached = digest_cache.get(key)
+    if (
+        cached is not None
+        and cached.get("size_bytes") == stat.st_size
+        and cached.get("mtime_ns") == stat.st_mtime_ns
+    ):
+        return cached["sha256"]
+    digest = _sha256_file(path)
+    digest_cache[key] = {
+        "size_bytes": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns), "sha256": digest,
+    }
+    return digest
+
+
+def load_digest_cache(path: str | Path) -> dict:
+    path = Path(path)
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def save_digest_cache(digest_cache: dict, path: str | Path) -> Path:
+    """Atomic write, mirroring save_dataset_manifest -- multiple
+    concurrent manifest builds may share and update the same digest
+    database."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(digest_cache, indent=2, sort_keys=True))
+    os.replace(tmp, path)
+    return path
+
+
+def _wsi_cache_provenance(hest_cache_dir: str | Path, sample_id: str, digest_cache: dict) -> dict | None:
+    """Real content provenance for one sample's dense GigaPath WSI tile
+    cache: path/size/mtime plus a real SHA256 content hash (memoized via
+    digest_cache -- see module docstring). Returns None (not an error)
+    when the cache file doesn't exist yet -- WSI conditioning may not be
+    enabled for every organ/run, and Step 8's preflight gates (not this
+    module) are where "required but missing" becomes fail-closed."""
     path = Path(hest_cache_dir) / "gigapath_slide_cache" / f"{sample_id}.npz"
     if not path.is_file():
         return None
@@ -146,6 +203,35 @@ def _wsi_cache_provenance(hest_cache_dir: str | Path, sample_id: str) -> dict | 
         "path": str(path.resolve()),
         "size_bytes": int(stat.st_size),
         "mtime_ns": int(stat.st_mtime_ns),
+        "sha256": _cached_file_content_hash(path, digest_cache),
+    }
+
+
+def _sample_content_provenance(hest_data_dir: str | Path, sample_id: str, digest_cache: dict) -> dict:
+    """Real SHA256 content provenance for one sample's h5ad expression
+    file and its patch h5 file. Both are required to exist here:
+    resolve_sample_selection only ever returns sample_ids that passed
+    hest1k_catalog.usable_local_ids's BOTH-expression-AND-patches
+    filter, so a kept sample missing either real file on disk is a real
+    invariant violation, not an expected scope boundary -- it fails
+    loudly (via _resolve_hest_sample_file's own FileNotFoundError)
+    rather than silently recording None. (The documented ~4.5% HEST-1k
+    gap is about individual SPOTS within an existing patch file lacking
+    a matching tile -- loaders.align_patches_to_adata's concern, not
+    this function's.)"""
+    h5ad_path = loaders._resolve_hest_sample_file(hest_data_dir, sample_id, ".h5ad")
+    patch_path = loaders._resolve_hest_sample_file(
+        hest_data_dir, sample_id, ".h5", required_path_part="patches",
+    )
+    return {
+        "h5ad": {
+            "path": str(h5ad_path.resolve()),
+            "sha256": _cached_file_content_hash(h5ad_path, digest_cache),
+        },
+        "patch_h5": {
+            "path": str(patch_path.resolve()),
+            "sha256": _cached_file_content_hash(patch_path, digest_cache),
+        },
     }
 
 
@@ -171,14 +257,20 @@ def build_dataset_manifest(
     expression_transform: str = "normalize_log1p",
     expression_target_sum: float = 1e4,
     hest_cache_dir: str | Path | None = None,
+    digest_cache_path: str | Path | None = None,
 ) -> dict:
-    """Build the complete, in-memory dataset manifest. Pure function of
-    its inputs (and the real files on disk) -- no persistence here (see
-    save_dataset_manifest/ensure_dataset_manifest below for the atomic-
-    write/fail-closed-reuse pair every other artifact in this package
-    already follows)."""
+    """Build the complete, in-memory dataset manifest. A pure function of
+    its inputs and the real files on disk EXCEPT for one deliberate side
+    effect: it reads and updates the on-disk content-digest cache (see
+    module docstring) at `digest_cache_path` (default:
+    `hest_cache_dir/content_digest_cache.json`) so repeated manifest
+    builds don't re-hash unchanged large files. No other persistence
+    happens here (see save_dataset_manifest/ensure_dataset_manifest
+    below for the manifest's own atomic-write/fail-closed-reuse pair)."""
     hest_data_dir = Path(hest_data_dir)
     hest_cache_dir = Path(hest_cache_dir) if hest_cache_dir is not None else hest_data_dir
+    digest_cache_path = Path(digest_cache_path) if digest_cache_path is not None else hest_cache_dir / "content_digest_cache.json"
+    digest_cache = load_digest_cache(digest_cache_path)
 
     split = resolve_sample_selection(
         hest_data_dir, metadata_csv, organs=organs, species=species, min_nb_genes=min_nb_genes,
@@ -228,13 +320,21 @@ def build_dataset_manifest(
             "barcodes": barcodes,
             "composite_spot_ids": [composite_spot_id(sample_id, b) for b in barcodes],
             "coords": coords.tolist(),
-            "wsi_cache": _wsi_cache_provenance(hest_cache_dir, sample_id),
+            "content_provenance": _sample_content_provenance(hest_data_dir, sample_id, digest_cache),
+            "wsi_cache": _wsi_cache_provenance(hest_cache_dir, sample_id, digest_cache),
         }
+
+    metadata_csv_provenance = {
+        "path": str(Path(metadata_csv).resolve()),
+        "sha256": _cached_file_content_hash(Path(metadata_csv), digest_cache),
+    }
+    save_digest_cache(digest_cache, digest_cache_path)
 
     return {
         "version": _MANIFEST_VERSION,
         "hest_data_dir": str(hest_data_dir.resolve()),
         "metadata_csv": str(metadata_csv),
+        "metadata_csv_provenance": metadata_csv_provenance,
         "build_args": {
             "organs": organs, "species": species, "min_nb_genes": min_nb_genes,
             "min_samples_per_organ": min_samples_per_organ, "max_samples_per_organ": max_samples_per_organ,

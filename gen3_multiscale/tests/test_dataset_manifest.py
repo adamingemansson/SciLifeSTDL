@@ -11,9 +11,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import hashlib
+
 from gen3_multiscale.data.dataset_manifest import (
     all_composite_spot_ids, build_dataset_manifest, composite_spot_id, ensure_dataset_manifest,
-    gene_panel_hash, load_dataset_manifest, save_dataset_manifest,
+    gene_panel_hash, load_dataset_manifest, load_digest_cache, save_dataset_manifest, save_digest_cache,
 )
 
 _SMALL_BUILD_KWARGS = dict(
@@ -246,6 +248,77 @@ def test_wsi_cache_provenance_recorded_when_cache_file_exists(tmp_path):
     assert manifest["samples"]["L0"]["wsi_cache"] is not None
     assert manifest["samples"]["L0"]["wsi_cache"]["size_bytes"] == len(b"fake cache content")
     assert manifest["samples"]["L1"]["wsi_cache"] is None
+
+
+def test_content_provenance_records_real_sha256_hashes_not_just_path_size_mtime(tmp_path):
+    """10th Codex re-audit of commit 9592d9e, finding #2 (CRITICAL,
+    confirmed): the manifest's "immutability" claim used to rest on
+    path/size/mtime alone for large caches and NOTHING at all for the
+    metadata CSV / h5ad / patch files -- insufficient to actually
+    identify the bytes it describes. Regression: every recorded sha256
+    must match an independently-computed hash of the real file bytes on
+    disk."""
+    hest_dir, meta_path, _ = _make_synthetic_hest1k(tmp_path, {"Lung": ["L0", "L1", "L2"]})
+    manifest = build_dataset_manifest(
+        hest_dir, str(meta_path), organs="all", min_samples_per_organ=3,
+        n_validation_per_organ=0, n_test_per_organ=0, split_seed=0,
+        **_SMALL_BUILD_KWARGS,
+    )
+    assert manifest["metadata_csv_provenance"]["sha256"] == hashlib.sha256(meta_path.read_bytes()).hexdigest()
+    for sid in ("L0", "L1", "L2"):
+        provenance = manifest["samples"][sid]["content_provenance"]
+        h5ad_path = hest_dir / "st" / f"{sid}.h5ad"
+        patch_path = hest_dir / "patches" / f"{sid}.h5"
+        assert provenance["h5ad"]["sha256"] == hashlib.sha256(h5ad_path.read_bytes()).hexdigest()
+        assert provenance["patch_h5"]["sha256"] == hashlib.sha256(patch_path.read_bytes()).hexdigest()
+
+
+def test_content_hash_changes_when_real_file_content_changes(tmp_path):
+    hest_dir, meta_path, _ = _make_synthetic_hest1k(tmp_path, {"Lung": ["L0", "L1", "L2"]})
+    build_kwargs = dict(
+        hest_data_dir=hest_dir, metadata_csv=str(meta_path), organs="all", min_samples_per_organ=3,
+        n_validation_per_organ=0, n_test_per_organ=0, split_seed=0,
+        **_SMALL_BUILD_KWARGS,
+    )
+    before = build_dataset_manifest(**build_kwargs)["samples"]["L0"]["content_provenance"]["h5ad"]["sha256"]
+
+    # Genuinely mutate the real file's bytes (and therefore its mtime).
+    h5ad_path = hest_dir / "st" / "L0.h5ad"
+    with open(h5ad_path, "ab") as f:
+        f.write(b"\x00extra-bytes-that-change-the-real-content")
+
+    after = build_dataset_manifest(**build_kwargs)["samples"]["L0"]["content_provenance"]["h5ad"]["sha256"]
+    assert before != after
+
+
+def test_content_digest_cache_is_consulted_on_repeat_builds(tmp_path):
+    """The digest cache (the 10th audit's own proposed mitigation for
+    hashing cost: "cached via a separately-verified digest database")
+    must actually be READ on a repeat build, not just written. Proven by
+    tampering the cached digest for an UNCHANGED file (same size/mtime)
+    and observing the tampered value come back out of the next build --
+    if the cache weren't consulted, the real (untampered) hash would
+    have been recomputed instead."""
+    hest_dir, meta_path, _ = _make_synthetic_hest1k(tmp_path, {"Lung": ["L0", "L1", "L2"]})
+    digest_cache_path = tmp_path / "digest_cache.json"
+    build_kwargs = dict(
+        hest_data_dir=hest_dir, metadata_csv=str(meta_path), organs="all", min_samples_per_organ=3,
+        n_validation_per_organ=0, n_test_per_organ=0, split_seed=0,
+        digest_cache_path=digest_cache_path,
+        **_SMALL_BUILD_KWARGS,
+    )
+    manifest = build_dataset_manifest(**build_kwargs)
+    real_hash = manifest["samples"]["L0"]["content_provenance"]["h5ad"]["sha256"]
+    assert digest_cache_path.is_file()
+
+    digest_cache = load_digest_cache(digest_cache_path)
+    h5ad_path = str((hest_dir / "st" / "L0.h5ad").resolve())
+    assert digest_cache[h5ad_path]["sha256"] == real_hash
+    digest_cache[h5ad_path]["sha256"] = "0" * 64  # tamper -- size/mtime left untouched
+    save_digest_cache(digest_cache, digest_cache_path)
+
+    rebuilt = build_dataset_manifest(**build_kwargs)
+    assert rebuilt["samples"]["L0"]["content_provenance"]["h5ad"]["sha256"] == "0" * 64
 
 
 def test_save_and_load_dataset_manifest_round_trips(tmp_path):

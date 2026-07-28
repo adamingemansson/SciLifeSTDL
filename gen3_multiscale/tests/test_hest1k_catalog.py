@@ -11,7 +11,8 @@ def _make_fake_hest1k(tmp_path: Path, organ_sample_ids: dict[str, list[str]], te
                        missing_patches: set[str] | None = None,
                        species_by_id: dict[str, str] | None = None,
                        nb_genes_by_id: dict[str, int] | None = None,
-                       patient_by_id: dict[str, str] | None = None) -> tuple[Path, Path]:
+                       patient_by_id: dict[str, str] | None = None,
+                       study_link_by_id: dict[str, str] | None = None) -> tuple[Path, Path]:
     """Build a fake local hest1k dir + matching metadata CSV. missing_patches
     lets a test simulate a sample with expression but no image patches.
     species_by_id (default: every sample "Homo sapiens") lets a test
@@ -22,7 +23,10 @@ def _make_fake_hest1k(tmp_path: Path, organ_sample_ids: dict[str, list[str]], te
     Visium finding (see test_min_nb_genes_excludes_small_panel_samples).
     patient_by_id (default: no `patient` column at all, matching most of
     this file's other fixtures) lets a test simulate HEST-1k's real
-    `patient` metadata column (see test_split_by_patient_*)."""
+    `patient` metadata column (see test_split_by_patient_*).
+    study_link_by_id (default: no `study_link` column at all) lets a
+    test simulate HEST-1k's real `study_link` metadata column (see
+    test_patient_identity_is_namespaced_by_study_link)."""
     missing_patches = missing_patches or set()
     species_by_id = species_by_id or {}
     nb_genes_by_id = nb_genes_by_id or {}
@@ -40,6 +44,8 @@ def _make_fake_hest1k(tmp_path: Path, organ_sample_ids: dict[str, list[str]], te
             }
             if patient_by_id is not None:
                 row["patient"] = patient_by_id.get(sid, sid)
+            if study_link_by_id is not None:
+                row["study_link"] = study_link_by_id.get(sid, "")
             rows.append(row)
             (hest_dir / "st" / f"{sid}.h5ad").touch()
             if sid not in missing_patches:
@@ -265,6 +271,57 @@ def test_resolve_sample_selection_returns_patient_by_sample():
         assert set(result["patient_by_sample"].keys()) == all_kept
         for sid in all_kept:
             assert result["patient_by_sample"][sid] == patient_by_id[sid]
+
+
+def test_patient_identity_is_namespaced_by_study_link():
+    """10th Codex re-audit of commit 9592d9e, finding #3 (confirmed):
+    raw HEST-1k `patient` values are not proven globally unique ACROSS
+    different contributing studies -- two unrelated real patients from
+    two different studies could share the literal string "P0" and get
+    incorrectly merged into one "patient" for the disjointness
+    guarantee. Regression: two samples from study S1 both labeled
+    patient "P0" must resolve to the SAME namespaced identity (still
+    correctly clustered); two OTHER samples from study S2 also labeled
+    patient "P0" must resolve to a DIFFERENT identity than S1's "P0" --
+    the raw label alone must never be trusted across studies."""
+    with tempfile.TemporaryDirectory() as tmp:
+        patient_by_id = {"A0": "P0", "A1": "P0", "B0": "P0", "B1": "P0"}
+        study_link_by_id = {
+            "A0": "https://example.org/study-s1", "A1": "https://example.org/study-s1",
+            "B0": "https://example.org/study-s2", "B1": "https://example.org/study-s2",
+        }
+        hest_dir, meta_path = _make_fake_hest1k(
+            Path(tmp), {"Lung": ["A0", "A1", "B0", "B1"]},
+            patient_by_id=patient_by_id, study_link_by_id=study_link_by_id,
+        )
+        result = resolve_sample_selection(
+            hest_dir, str(meta_path), organs="all", min_samples_per_organ=3,
+            n_validation_per_organ=0, n_test_per_organ=0, split_seed=0,
+            check_gene_panel_compatibility=False, split_by_patient=True,
+        )
+        pbs = result["patient_by_sample"]
+        assert pbs["A0"] == pbs["A1"]  # same study + same raw patient value -- still clustered
+        assert pbs["B0"] == pbs["B1"]
+        assert pbs["A0"] != pbs["B0"]  # same raw patient value, DIFFERENT study -- must not collide
+        assert pbs["A0"] != "P0" and pbs["B0"] != "P0"  # namespaced, not the bare raw value
+
+
+def test_patient_identity_falls_back_to_bare_value_without_a_study_link_column():
+    """When the metadata has no `study_link` column at all (this file's
+    other patient-column fixtures), namespacing must not be fabricated
+    -- behavior stays exactly the pre-existing, already-tested
+    sample-level-patient-value clustering."""
+    with tempfile.TemporaryDirectory() as tmp:
+        patient_by_id = {"A0": "P0", "A1": "P0"}
+        hest_dir, meta_path = _make_fake_hest1k(
+            Path(tmp), {"Lung": ["A0", "A1"]}, patient_by_id=patient_by_id,
+        )
+        result = resolve_sample_selection(
+            hest_dir, str(meta_path), organs="all", min_samples_per_organ=2,
+            n_validation_per_organ=0, n_test_per_organ=0, split_seed=0,
+            check_gene_panel_compatibility=False, split_by_patient=True,
+        )
+        assert result["patient_by_sample"]["A0"] == result["patient_by_sample"]["A1"] == "P0"
 
 
 def test_split_by_patient_false_reproduces_the_old_sample_level_split():

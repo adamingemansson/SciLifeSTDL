@@ -56,6 +56,7 @@ def test_build_spatial_field_example_basic_shapes_and_disjointness():
     inputs, targets = build_spatial_field_example(
         adata, patches, context, query, _stub_image_feature_fn,
         sample_id="S0", patient_id="P0", patch_size_fullres=1.0,  # tiny -- this test isn't about overlap exclusion
+        require_full_sample_coords=False,
     )
     assert set(inputs.observed_barcodes.tolist()).isdisjoint(set(inputs.query_barcodes.tolist()))
     assert inputs.observed_full_gene_expression.shape[0] == inputs.observed_coords.shape[0]
@@ -89,6 +90,7 @@ def test_build_spatial_field_example_excludes_context_patches_overlapping_the_ho
     inputs, _ = build_spatial_field_example(
         adata, patches, context, [query_barcode], _stub_image_feature_fn,
         sample_id="S0", patient_id="P0", patch_size_fullres=30.0,  # large enough to guarantee overlap with the 10-unit-spaced neighbor
+        require_full_sample_coords=False,
     )
     assert neighbor_barcode not in inputs.observed_barcodes.tolist()
     assert inputs.provenance["n_context_excluded_for_physical_he_overlap"] >= 1
@@ -97,6 +99,7 @@ def test_build_spatial_field_example_excludes_context_patches_overlapping_the_ho
     inputs_small_patch, _ = build_spatial_field_example(
         adata, patches, context, [query_barcode], _stub_image_feature_fn,
         sample_id="S0", patient_id="P0", patch_size_fullres=0.01,
+        require_full_sample_coords=False,
     )
     assert neighbor_barcode in inputs_small_patch.observed_barcodes.tolist()
     assert inputs_small_patch.provenance["n_context_excluded_for_physical_he_overlap"] == 0
@@ -108,7 +111,7 @@ def test_build_spatial_field_example_rejects_missing_barcodes():
     with pytest.raises(ValueError, match="absent from the aligned sample data"):
         build_spatial_field_example(
             adata, patches, ["NOT-A-REAL-BARCODE"], [list(adata.obs_names)[0]], _stub_image_feature_fn,
-            sample_id="S0", patient_id="P0",
+            sample_id="S0", patient_id="P0", require_full_sample_coords=False,
         )
 
 
@@ -119,7 +122,104 @@ def test_build_spatial_field_example_rejects_context_query_overlap():
     with pytest.raises(ValueError, match="overlap"):
         build_spatial_field_example(
             adata, patches, shared, shared[:1], _stub_image_feature_fn,
-            sample_id="S0", patient_id="P0",
+            sample_id="S0", patient_id="P0", require_full_sample_coords=False,
+        )
+
+
+def test_build_spatial_field_example_requires_full_sample_coords_by_default():
+    """10th Codex re-audit of commit 9592d9e, finding #5 (confirmed):
+    the real trainer must always supply the complete aligned sample
+    lattice for coordinate-scaling normalization, not silently fall
+    back to a mask-dependent subset. Regression: omitting
+    full_sample_coords now raises by default; the escape hatch is only
+    available via an explicit require_full_sample_coords=False."""
+    adata = _square_grid_adata()
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query = barcodes[:1]
+    context = barcodes[1:]
+    with pytest.raises(ValueError, match="full_sample_coords is required"):
+        build_spatial_field_example(
+            adata, patches, context, query, _stub_image_feature_fn,
+            sample_id="S0", patient_id="P0", patch_size_fullres=1.0,
+        )
+    # Explicit opt-out still works (the test-only escape hatch).
+    build_spatial_field_example(
+        adata, patches, context, query, _stub_image_feature_fn,
+        sample_id="S0", patient_id="P0", patch_size_fullres=1.0, require_full_sample_coords=False,
+    )
+
+
+def test_build_spatial_field_example_rejects_non_2d_image_features():
+    adata = _square_grid_adata()
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query = barcodes[:1]
+    context = barcodes[1:]
+    with pytest.raises(ValueError, match="2D"):
+        build_spatial_field_example(
+            adata, patches, context, query, lambda p: np.zeros(len(p)),  # 1D, not [N, feature_dim]
+            sample_id="S0", patient_id="P0", patch_size_fullres=1.0, require_full_sample_coords=False,
+        )
+
+
+def test_build_spatial_field_example_rejects_non_finite_image_features():
+    adata = _square_grid_adata()
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query = barcodes[:1]
+    context = barcodes[1:]
+
+    def _nan_feature_fn(p: np.ndarray) -> np.ndarray:
+        out = _stub_image_feature_fn(p)
+        out[0, 0] = np.nan
+        return out
+
+    with pytest.raises(ValueError, match="non-finite"):
+        build_spatial_field_example(
+            adata, patches, context, query, _nan_feature_fn,
+            sample_id="S0", patient_id="P0", patch_size_fullres=1.0, require_full_sample_coords=False,
+        )
+
+
+def test_build_spatial_field_example_rejects_an_unexpected_feature_width():
+    adata = _square_grid_adata()
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query = barcodes[:1]
+    context = barcodes[1:]
+    with pytest.raises(ValueError, match="feature width"):
+        build_spatial_field_example(
+            adata, patches, context, query, _stub_image_feature_fn,
+            sample_id="S0", patient_id="P0", patch_size_fullres=1.0, require_full_sample_coords=False,
+            expected_feature_width=_N_FEATURES + 1,
+        )
+
+
+def test_build_spatial_field_example_rejects_a_patches_adata_row_count_mismatch():
+    adata = _square_grid_adata()
+    patches = _matching_patches(adata)[:-1]  # one row short
+    barcodes = list(adata.obs_names)
+    query = barcodes[:1]
+    context = barcodes[1:]
+    with pytest.raises(ValueError, match="patches has .* rows but adata has"):
+        build_spatial_field_example(
+            adata, patches, context, query, _stub_image_feature_fn,
+            sample_id="S0", patient_id="P0", patch_size_fullres=1.0, require_full_sample_coords=False,
+        )
+
+
+def test_build_spatial_field_example_rejects_duplicate_spot_coordinates():
+    adata = _square_grid_adata()
+    patches = _matching_patches(adata)
+    adata.obsm["spatial"][1] = adata.obsm["spatial"][0]  # corrupt: two spots at the identical location
+    barcodes = list(adata.obs_names)
+    query = barcodes[:1]
+    context = barcodes[1:]
+    with pytest.raises(ValueError, match="duplicate spot coordinates"):
+        build_spatial_field_example(
+            adata, patches, context, query, _stub_image_feature_fn,
+            sample_id="S0", patient_id="P0", patch_size_fullres=1.0, require_full_sample_coords=False,
         )
 
 
@@ -132,7 +232,7 @@ def test_build_spatial_field_example_rejects_a_mismatched_feature_function():
     with pytest.raises(ValueError, match="image_feature_fn returned"):
         build_spatial_field_example(
             adata, patches, context, query, lambda p: np.zeros((1, _N_FEATURES)),  # wrong row count
-            sample_id="S0", patient_id="P0", patch_size_fullres=1.0,
+            sample_id="S0", patient_id="P0", patch_size_fullres=1.0, require_full_sample_coords=False,
         )
 
 
@@ -148,7 +248,7 @@ def test_build_spatial_field_example_normalizes_coordinates_not_raw_pixels():
 
     inputs, _ = build_spatial_field_example(
         adata, patches, context, query, _stub_image_feature_fn,
-        sample_id="S0", patient_id="P0", patch_size_fullres=1.0,
+        sample_id="S0", patient_id="P0", patch_size_fullres=1.0, require_full_sample_coords=False,
     )
     combined = np.concatenate([inputs.observed_coords, inputs.query_coords], axis=0)
     assert np.allclose(combined.mean(axis=0), 0.0, atol=1e-4)  # centered
@@ -230,6 +330,7 @@ def test_end_to_end_manifest_to_example(tmp_path):
     inputs, targets = build_spatial_field_example(
         adata, patches, context, query, _stub_image_feature_fn,
         sample_id="L0", patient_id=manifest["samples"]["L0"]["patient_id"], patch_size_fullres=1.0,
+        full_sample_coords=adata.obsm["spatial"],  # the recommended real usage, not the test-only escape hatch
     )
     assert set(inputs.query_barcodes.tolist()) == set(query)
     assert set(inputs.observed_barcodes.tolist()).issubset(set(context))

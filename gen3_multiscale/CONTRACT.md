@@ -2619,7 +2619,231 @@ H&E. Context may contain surrounding H&E and observed GEX only."
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 33. Response to the tenth external Codex re-audit (of commit 9592d9e)
+
+Codex reviewed the real Step 1/2 code (§31-32) itself, not just the
+helper infrastructure. Verdict: "The foundation is substantially
+better, but Steps 1-2 are not fully closed yet" -- 2 experiment-critical
+findings and 3 smaller requirements, with an explicit instruction: fix
+points 1-3 before starting Step 3. All 5 verified against the real code
+before any fix; verdicts and fixes below.
+
+**Finding #1 (CRITICAL, CONFIRMED): held-out samples still influenced
+training-cohort selection.** `resolve_sample_selection`'s
+`check_gene_panel_compatibility` block called `resolve_compatible_sample_ids`
+on `sorted(set(train_ids) | set(validation_ids) | set(test_ids))` --
+POOLED train+validation+test together. A held-out sample's real gene
+panel could change which genes counted as "core" (the `min_gene_coverage`
+threshold denominator includes every candidate, held-out or not),
+which could change which TRAINING samples cleared `min_sample_coverage`
+and what the final frozen panel was -- held-out data indirectly
+influencing the training cohort/vocabulary, exactly what "derive the
+gene panel from training samples only" (5th Codex re-audit, carried
+into `dataset_manifest.build_dataset_manifest`) is meant to prevent.
+Confirmed by direct re-read of the pooling call site and reproduced in
+a new regression test before fixing.
+
+Fixed in both `gen3_multiscale/data/hest1k_catalog.py` and
+`gen2_architectures/data/hest1k_catalog.py` (kept in sync, same
+discipline as every other reused-infra fix in this document):
+`resolve_compatible_sample_ids` is now called on `train_ids` ONLY,
+producing a frozen `(train_ids, shared_genes)`. A new
+`_filter_held_out_ids_against_reference_panel(hest_data_dir, held_out_ids,
+reference_genes, min_sample_coverage)` independently checks each
+validation/test sample's real panel against that already-frozen
+reference and drops the ones that don't cover it -- it only ever READS
+held-out panels and can never feed back into `train_ids` or
+`shared_genes`. Verified by
+`test_resolve_sample_selection_derives_panel_from_train_only_not_pooled_with_held_out`
+(both copies): 11 samples share an identical, fully-compatible 30-gene
+panel; whichever 2 land in validation (determined by a dry run, not a
+hardcoded guess about the split RNG) are then degraded to a real
+25-gene panel (83% coverage of the training panel -- below the 90%
+threshold against the true training reference, but enough to have
+silently redefined "core" down to 25 genes and passed under the old
+pooled logic). After the fix: train_ids are completely unaffected and
+the frozen panel derived from train_ids alone is still all 30 genes;
+the degraded validation samples are correctly excluded from
+`validation_sample_ids`.
+
+This fix changes real threshold-boundary behavior in one pre-existing
+test, `test_resolve_sample_selection_end_to_end_drops_incompatible_organ_member`
+(both copies): with only 9 compatible samples total, whether the
+seeded split happens to place the incompatible `OUTLIER` sample inside
+`train_ids` itself now matters (counted as one of only 9 train
+candidates, genes it doesn't share fall to 8/9=0.889 coverage, just
+under the 0.9 threshold, which can legitimately exclude the whole
+cohort) -- a real, separate small-N boundary effect, not a bug. Fixed
+by having the test pick (via a cheap dry run over `split_seed`, never a
+hardcoded guess) a seed where `OUTLIER` lands outside `train_ids`,
+preserving the test's actual intent ("one held-out-quality outlier gets
+silently dropped, training untouched").
+
+**Finding #2 (CRITICAL, CONFIRMED): the "immutable" manifest didn't
+identify its own actual data content.** `_wsi_cache_provenance` recorded
+path/size/mtime only (a deliberate, documented choice for a *runtime
+cache key*, where detecting *most* changes cheaply is enough), and
+nothing at all identified the metadata CSV, h5ad files, or patch h5
+files. Confirmed: a manifest claiming immutability needs to actually
+identify the bytes it describes, not just a cheap proxy that can miss a
+same-size, same-mtime content change (rare but real -- e.g. a corrected
+re-download that preserves both).
+
+Fixed in `gen3_multiscale/data/dataset_manifest.py`: real SHA256
+content hashing (`_sha256_file`, streamed, not loaded fully into
+memory) for the metadata CSV (`metadata_csv_provenance`) and every kept
+sample's h5ad + patch h5 files (`samples[sid]["content_provenance"]`),
+plus the WSI cache (`wsi_cache["sha256"]`, added alongside the existing
+path/size/mtime fields, not replacing them). Hashing large files at
+every manifest build is real, non-trivial cost, so it is memoized in an
+on-disk digest database (`_cached_file_content_hash` /
+`load_digest_cache` / `save_digest_cache`, default
+`hest_cache_dir/content_digest_cache.json`) keyed by each file's own
+path+size+mtime -- exactly the mitigation the audit itself proposed
+("hashing can be cached via a separately-verified digest database for
+the one-time cost"). A cache hit still re-verifies size/mtime against
+the real file before ever trusting a memoized digest. `build_dataset_manifest`
+now has one deliberate side effect (reading/updating this digest cache)
+beyond the pure-function contract its own docstring previously claimed;
+the docstring is updated to say so explicitly. Verified by 4 new tests:
+every recorded sha256 matches an independent hash of the real file
+bytes; a real content mutation (with a real mtime bump) changes the
+recorded hash; the digest cache is actually CONSULTED on a repeat build
+(proven by tampering a cached digest for an unchanged file and
+observing the tampered value come back out, which could only happen if
+the cache were read rather than the real file re-hashed).
+
+**Finding #3 (important, CONFIRMED): patient identity wasn't
+study-namespaced.** Raw HEST-1k `patient` metadata values are not
+proven globally unique ACROSS different contributing studies -- two
+unrelated real patients from two different studies could share a
+literal patient label and get incorrectly merged into one "patient" for
+the train/val/test disjointness guarantee `_resolve_cross_organ_patient_conflicts`
+depends on.
+
+Fixed in both `hest1k_catalog.py` copies: when the real metadata has
+both `patient` and `study_link` columns (confirmed present in HEST-1k's
+real 28-column metadata CSV, `docs/dataset_notes.md`) and both are
+non-blank for a given row, the resolved patient identity is namespaced
+`f"{study_link}::{patient}"`. When `study_link` is absent as a column
+entirely, or blank for a specific row, behavior falls back to the
+pre-existing, already-tested bare-patient-value clustering -- namespacing
+is never fabricated from data that isn't there. Verified by 2 new
+tests (both copies):
+`test_patient_identity_is_namespaced_by_study_link` (two samples from
+study S1 both labeled patient "P0" cluster together; two OTHER samples
+from study S2 also labeled "P0" get a DIFFERENT resolved identity than
+S1's, and neither equals the bare "P0") and
+`test_patient_identity_falls_back_to_bare_value_without_a_study_link_column`
+(no `study_link` column at all -- behavior is unchanged from before this
+fix, so none of this file's other patient-column fixtures broke).
+
+**Finding #4 (important, RECORDED, deferred to Step 5 as instructed):
+per-modality GEX/H&E availability.** `example_builder.build_spatial_field_example`
+currently excludes a context spot's GEX *and* H&E entirely when its
+patch footprint overlaps the query hole, even though its real GEX
+reading is still valid and uncontaminated -- only the H&E contribution
+is actually compromised. The audit's own framing: "The deferred
+`image_available` mechanism must be completed during Step 5. It cannot
+remain optional for the real trainer." Recorded here as a firm
+requirement (not a soft "consider later" note, per the audit's explicit
+correction to §32's original wording): Step 5 (wiring real regional/
+global GigaPath WSI context into Architectures 3/4) MUST introduce a
+per-modality availability signal -- GEX+H&E observed / GEX observed
+with H&E unavailable / neither (query) -- so a physically-overlapping
+context spot can retain its valid GEX contribution while only its image
+contribution is masked, instead of losing both. This is a schema change
+(`SpatialFieldInputs` plus every architecture wrapper's attention/token
+logic) too large to fold into a Step 1/2 patch, but Step 5 cannot be
+considered complete without it.
+
+**Finding #5 (important, CONFIRMED): example-builder boundary checks
+were too loose.** `build_spatial_field_example` didn't verify
+`patches.shape[0] == adata.n_obs`, didn't check `image_feature_fn`'s
+output was 2D/finite/the expected width, didn't check
+`adata.obsm['spatial']` was `[N, 2]`/finite/non-duplicated, and silently
+fell back to a mask-dependent coordinate subset for spot-spacing
+normalization whenever `full_sample_coords` wasn't supplied -- a
+real, mask-to-mask-fluctuating spacing unit for no biological reason,
+acceptable only for small/synthetic tests, not the real trainer.
+
+Fixed in `gen3_multiscale/data/example_builder.py`:
+- `full_sample_coords` is now REQUIRED by default (raises if omitted);
+  the mask-dependent fallback is gated behind an explicit, clearly-named
+  `require_full_sample_coords=False` escape hatch reserved for
+  small/synthetic tests -- the real trainer must never set it.
+- `patches.shape[0] != adata.n_obs` now raises immediately.
+- `adata.obsm['spatial']` is checked for shape `[N, 2]`, all-finite, and
+  no exact-duplicate rows (a real Visium sample should never have two
+  spots at the identical physical coordinate; a duplicate indicates
+  corrupted or misaligned real data).
+- `image_feature_fn`'s output is checked for 2D-ness, row-count match
+  (pre-existing), all-finite values, and (via a new optional
+  `expected_feature_width` parameter) the caller's expected width, e.g.
+  GigaPath's real 1536.
+
+Verified by 7 new tests: the default-requires-full_sample_coords gate
+(and its explicit opt-out); non-2D features rejected; non-finite
+features rejected; a wrong feature width rejected; a patches/adata
+row-count mismatch rejected; duplicate spot coordinates rejected. The
+existing end-to-end test (`test_end_to_end_manifest_to_example`) was
+updated to pass the sample's real `adata.obsm["spatial"]` as
+`full_sample_coords` -- exercising the actual recommended production
+path instead of the test-only escape hatch.
+
+**What the audit confirmed as correct, no fix needed:** patient-disjoint
+splitting logic and global cross-organ reconciliation; the gene panel
+ultimately computed from training AnnData objects (the SOURCING was the
+bug, not the computation); query expression/patches never entering the
+feature path; physical patch-footprint overlap removal being
+geometrically conservative; coordinates translated/scaled, not raw;
+observed/query barcode separation and tensor alignment validated; the
+launcher's recorded-PGID fix (§30) "now satisfactory."
+
+Per the user's explicit instruction ("continue building, but do not
+start Step 3 from the current manifest without fixing points 1-3"):
+findings #1, #2, and #3 (the three hard blockers) are fixed above;
+finding #5 (good practice, not explicitly gating) is fixed too; finding
+#4 is recorded as a firm Step 5 requirement, not deferred silently.
+Step 3 ("implement Step 3 using realized composite query identities
+rather than seeds", per the same instruction) is unblocked as of this
+section.
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 374 passed (45 reused-infra + 12 example-schema +
+  11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 23 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 14 dataset-manifest + 14 example-builder)
+gen2_architectures + gen3_multiscale: 547 passed, 1 skipped
+```
+
+Note: `reused-infra` (13 checkpoint + 23 hest1k-catalog + 4
+query-overlap-report + 5 gene-panel-compatibility) grew by 3 tests this
+round: 2 study-namespacing tests plus 1 train-only-compatibility test,
+added identically to both `gen3_multiscale` and `gen2_architectures`
+copies of `test_hest1k_catalog.py`/`test_gene_panel_compatibility.py`.
+`dataset-manifest` grew by 3 (content-provenance regression tests) and
+`example-builder` grew by 6 (boundary-hardening regression tests),
+both `gen3_multiscale`-only (these two modules have no `gen2_architectures`
+copy).
+
+Note: a full monorepo run (`pytest -q` from the repo root, everything
+including the top-level `tests/` directory) still shows the same one
+pre-existing failure noted since §26,
+`tests/test_multi_sample.py::test_inject_multi_sample_n_genes`,
+unrelated to `gen2_architectures/` or `gen3_multiscale/`; unchanged and
+still out of scope for this pass.
+
+The block immediately below (pre-10th-audit-response test counts) is
+kept for historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 362 passed (42 reused-infra + 12 example-schema +

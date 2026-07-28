@@ -167,6 +167,43 @@ def resolve_compatible_sample_ids(
     return kept, shared_genes
 
 
+def _filter_held_out_ids_against_reference_panel(
+    hest_data_dir: str | Path, held_out_ids: list[str], reference_genes: list[str], min_sample_coverage: float,
+) -> tuple[list[str], list[str]]:
+    """Check each HELD-OUT sample's real gene panel against an ALREADY-
+    FROZEN, TRAINING-derived reference panel -- never the other
+    direction. Real, confirmed gap fixed here (9th Codex re-audit of
+    commit 9592d9e, gen3_multiscale copy): `resolve_sample_selection`
+    used to run `resolve_compatible_sample_ids` over train+validation+test
+    IDs pooled together, so a validation/test sample's real panel could
+    change which genes counted as "core" and therefore which TRAINING
+    samples were kept and what the final panel was -- held-out data
+    indirectly influencing the training cohort/vocabulary, exactly the
+    thing "derive the gene panel from training samples only" is meant
+    to prevent. This function only ever READS held-out panels and
+    compares them to an already-computed `reference_genes` list; it
+    never touches training data and can never change the reference
+    panel or which training samples were kept.
+
+    Returns (kept, dropped) -- `kept` is a SUBSET of `held_out_ids` in
+    the same relative order."""
+    reference = set(reference_genes)
+    kept, dropped = [], []
+    for sid in held_out_ids:
+        panel = _real_var_names(hest_data_dir, sid)
+        coverage = len(panel & reference) / len(reference) if reference else 0.0
+        (kept if coverage >= min_sample_coverage else dropped).append(sid)
+    if dropped:
+        preview = dropped[:20]
+        print(
+            f"resolve_sample_selection: excluded {len(dropped)}/{len(held_out_ids)} held-out "
+            f"sample(s) with insufficient coverage (<{min_sample_coverage:.0%}) of the "
+            f"training-derived reference panel: {preview}"
+            f"{', ...' if len(dropped) > len(preview) else ''}"
+        )
+    return kept, dropped
+
+
 def _resolve_cross_organ_patient_conflicts(
     train_ids: list[str], validation_ids: list[str], test_ids: list[str],
     patient_by_sample: dict[str, str],
@@ -333,17 +370,47 @@ def resolve_sample_selection(
     patient_by_sample: dict[str, str] = {}
     kept_organs = []
     has_patient_column = "patient" in visium.columns
+    has_study_link_column = "study_link" in visium.columns
     for organ, group in visium.groupby("organ"):
         ids = sorted(group["id"].tolist())
         if len(ids) < min_samples_per_organ:
             continue
 
         if split_by_patient and has_patient_column:
+            study_of = (
+                dict(zip(group["id"], group["study_link"])) if has_study_link_column else {}
+            )
             patient_of = {}
             for sid, patient in zip(group["id"], group["patient"]):
-                patient_of[str(sid)] = (
-                    str(sid) if pd.isna(patient) or str(patient).strip() == "" else str(patient)
-                )
+                sid = str(sid)
+                if pd.isna(patient) or str(patient).strip() == "":
+                    # No real patient identity for this sample -- fall
+                    # back to sample-level (identical to the old
+                    # behavior), never namespace a synthetic "patient".
+                    patient_of[sid] = sid
+                    continue
+                study = study_of.get(sid)
+                if has_study_link_column and not (pd.isna(study) or str(study).strip() == ""):
+                    # 10th Codex re-audit of commit 9592d9e, finding #3
+                    # (confirmed): raw HEST-1k `patient` values are not
+                    # proven globally unique ACROSS different
+                    # contributing studies -- two different studies could
+                    # coincidentally reuse the same patient label,
+                    # falsely merging two real, distinct people into one
+                    # "patient" for the train/val/test disjointness
+                    # guarantee. The real metadata CSV always has
+                    # study_link (docs/dataset_notes.md's confirmed
+                    # 28-column list), so namespace by it whenever it's
+                    # actually available.
+                    patient_of[sid] = f"{study}::{patient}"
+                else:
+                    # No study_link column at all (e.g. a metadata subset
+                    # that only has `patient`), or a blank study_link for
+                    # this specific row: fall back to the bare patient
+                    # value, matching this function's pre-existing,
+                    # already-tested behavior -- namespacing requires
+                    # real study information, and isn't fabricated here.
+                    patient_of[sid] = str(patient)
         else:
             patient_of = {sid: sid for sid in ids}
         samples_by_patient: dict[str, list[str]] = {}
@@ -418,15 +485,25 @@ def resolve_sample_selection(
         )
 
     if check_gene_panel_compatibility:
-        all_ids = sorted(set(train_ids) | set(validation_ids) | set(test_ids))
-        kept_ids, _shared_genes = resolve_compatible_sample_ids(
-            hest_data_dir, all_ids, min_gene_coverage=min_gene_coverage,
+        # Train-only: the "core genes" / final panel are derived from
+        # train_ids EXCLUSIVELY. validation_ids/test_ids are then
+        # independently checked against that already-frozen panel via
+        # _filter_held_out_ids_against_reference_panel, which only ever
+        # reads held-out data and can never feed back into train_ids or
+        # the panel itself (9th Codex re-audit of commit 9592d9e,
+        # finding #1).
+        kept_train_ids, shared_genes = resolve_compatible_sample_ids(
+            hest_data_dir, train_ids, min_gene_coverage=min_gene_coverage,
             min_sample_coverage=min_sample_coverage, min_panel_size=min_panel_size,
         )
-        kept_set = set(kept_ids)
-        train_ids = [sid for sid in train_ids if sid in kept_set]
-        validation_ids = [sid for sid in validation_ids if sid in kept_set]
-        test_ids = [sid for sid in test_ids if sid in kept_set]
+        train_ids = kept_train_ids
+        validation_ids, _dropped_val = _filter_held_out_ids_against_reference_panel(
+            hest_data_dir, validation_ids, shared_genes, min_sample_coverage,
+        )
+        test_ids, _dropped_test = _filter_held_out_ids_against_reference_panel(
+            hest_data_dir, test_ids, shared_genes, min_sample_coverage,
+        )
+        kept_set = set(train_ids) | set(validation_ids) | set(test_ids)
         organ_by_sample = {sid: organ for sid, organ in organ_by_sample.items() if sid in kept_set}
         tech_by_sample = {sid: tech for sid, tech in tech_by_sample.items() if sid in kept_set}
         patient_by_sample = {sid: patient for sid, patient in patient_by_sample.items() if sid in kept_set}

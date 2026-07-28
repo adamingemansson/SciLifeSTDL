@@ -137,11 +137,13 @@ def build_spatial_field_example(
     sample_id: str,
     patient_id: str,
     full_sample_coords: np.ndarray | None = None,
+    require_full_sample_coords: bool = True,
     patch_size_fullres: float = 224.0,
     k_neighbors: int = 6,
     local_k: int = 32,
     max_rings: int = 3,
     max_boundary_size: int | None = None,
+    expected_feature_width: int | None = None,
 ) -> tuple[SpatialFieldInputs, SpatialFieldTargets]:
     """Build one real SpatialFieldInputs/SpatialFieldTargets pair from
     one realized (context, query) barcode split.
@@ -159,10 +161,26 @@ def build_spatial_field_example(
     `full_sample_coords` (default: this example's own observed+query
     union) lets a caller pass the sample's COMPLETE coordinate lattice
     for a stable, mask-independent spot-spacing unit -- the recommended
-    real usage; falling back to the example's own subset is only for
-    small/synthetic tests where the whole-sample lattice isn't
-    conveniently available.
+    real usage. Falling back to the example's own subset is a
+    mask-dependent spacing unit that fluctuates example-to-example for
+    no biological reason (10th Codex re-audit of commit 9592d9e, finding
+    #5), so it is REQUIRED (raises if omitted) unless the caller
+    explicitly passes `require_full_sample_coords=False` -- a
+    deliberate, named escape hatch reserved for small/synthetic tests
+    where the whole-sample lattice isn't conveniently available; the
+    real trainer must never set it.
+
+    `expected_feature_width` (default: no check) lets a caller assert
+    `image_feature_fn`'s real output width (e.g. GigaPath's 1536) as an
+    extra fail-closed guard.
     """
+    if full_sample_coords is None and require_full_sample_coords:
+        raise ValueError(
+            f"{sample_id}: full_sample_coords is required (the complete aligned sample "
+            "lattice, for a stable mask-independent spot-spacing unit) -- pass it explicitly, "
+            "or require_full_sample_coords=False for small/synthetic tests only"
+        )
+
     obs_names = np.asarray(adata.obs_names, dtype=str)
     barcode_to_pos = {b: i for i, b in enumerate(obs_names)}
 
@@ -179,8 +197,23 @@ def build_spatial_field_example(
         raise ValueError(f"{sample_id}: context_barcodes is empty -- no context to condition on")
     if not query_barcodes:
         raise ValueError(f"{sample_id}: query_barcodes is empty -- nothing to predict")
+    if patches.shape[0] != adata.n_obs:
+        raise ValueError(
+            f"{sample_id}: patches has {patches.shape[0]} rows but adata has {adata.n_obs} spots -- "
+            "patches must already be aligned to adata (load_sample_for_examples's contract)"
+        )
 
     all_coords = np.asarray(adata.obsm["spatial"], dtype=np.float64)
+    if all_coords.ndim != 2 or all_coords.shape[1] != 2:
+        raise ValueError(f"{sample_id}: adata.obsm['spatial'] must be [N, 2], got shape {all_coords.shape}")
+    if not np.isfinite(all_coords).all():
+        raise ValueError(f"{sample_id}: adata.obsm['spatial'] contains non-finite coordinates")
+    if np.unique(all_coords, axis=0).shape[0] != all_coords.shape[0]:
+        raise ValueError(
+            f"{sample_id}: adata.obsm['spatial'] has duplicate spot coordinates -- corrupted or "
+            "misaligned real data"
+        )
+
     query_pos = np.asarray([barcode_to_pos[b] for b in query_barcodes], dtype=int)
     query_coords_raw = all_coords[query_pos]
 
@@ -216,10 +249,22 @@ def build_spatial_field_example(
 
     observed_patches = patches[context_pos]
     observed_gigapath_features = np.asarray(image_feature_fn(observed_patches), dtype=np.float32)
+    if observed_gigapath_features.ndim != 2:
+        raise ValueError(
+            f"{sample_id}: image_feature_fn must return a 2D [N, feature_dim] array, got shape "
+            f"{observed_gigapath_features.shape}"
+        )
     if observed_gigapath_features.shape[0] != context_pos.shape[0]:
         raise ValueError(
             f"{sample_id}: image_feature_fn returned {observed_gigapath_features.shape[0]} rows "
             f"for {context_pos.shape[0]} observed patches"
+        )
+    if not np.isfinite(observed_gigapath_features).all():
+        raise ValueError(f"{sample_id}: image_feature_fn returned non-finite feature values")
+    if expected_feature_width is not None and observed_gigapath_features.shape[1] != expected_feature_width:
+        raise ValueError(
+            f"{sample_id}: image_feature_fn returned feature width "
+            f"{observed_gigapath_features.shape[1]}, expected {expected_feature_width}"
         )
 
     boundary = extract_boundary_and_local_context(
