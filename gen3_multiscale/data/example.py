@@ -92,7 +92,18 @@ class SpatialFieldInputs:
     query_coords: np.ndarray  # [n_query, 2] float32, same normalization as observed_coords
 
     # Observed-spot content -- position-aligned with observed_coords/observed_barcodes.
-    observed_gex_conditioning: np.ndarray  # [n_observed, gex_dim] compact feature for scoring/gating
+    #
+    # 2nd Codex re-audit finding (of commit 547f51e), confirmed and fixed
+    # differently than initially proposed: _SharedFieldArchitecture no
+    # longer reads this field at all. The real, trainable "weighted_linear"
+    # gene conditioning encoder (models/gene_encoder.py) is now OWNED and
+    # CALLED by the model itself, from observed_full_gene_expression
+    # (below) -- the audit's own recommended fix, "be owned and called
+    # inside the model from raw observed GEX tensors." This field is kept
+    # in the schema (not removed) for backward compatibility and as a
+    # slot for a future PRECOMPUTED/frozen conditioning path, but no
+    # current architecture consumes it.
+    observed_gex_conditioning: np.ndarray  # [n_observed, gex_dim] NOT read by _SharedFieldArchitecture -- see note above
     observed_full_gene_expression: np.ndarray  # [n_observed, n_genes] untouched real values, transported not decoded
     observed_gigapath_features: np.ndarray  # [n_observed, 1536] frozen local H&E tile embeddings
 

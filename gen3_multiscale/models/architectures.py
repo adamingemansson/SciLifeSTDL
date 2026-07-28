@@ -41,6 +41,7 @@ import torch.nn as nn
 from gen3_multiscale.data.example import SpatialFieldInputs
 from gen3_multiscale.models.backbone import SpatialFieldBackbone
 from gen3_multiscale.models.flow import VelocityNetwork, flow_matching_loss, sample_residual_coefficients
+from gen3_multiscale.models.gene_encoder import WeightedGeneExpressionEncoder
 from gen3_multiscale.models.gene_basis import GeneResidualBasis, verify_gene_residual_basis
 from gen3_multiscale.models.geometry_utils import compute_hole_geometry, compute_relative_geometry, scatter_boundary_ring
 from gen3_multiscale.models.global_context import InducedGlobalGEXPool
@@ -93,6 +94,18 @@ class _SharedFieldArchitecture(nn.Module):
         self.use_global_slide = use_global_slide
         self.harmonic_k_neighbors = harmonic_k_neighbors
 
+        # The real, trainable "weighted_linear" gene conditioning encoder
+        # (CONTRACT.md section 10's frozen choice) -- fixes a real,
+        # confirmed gap (2nd Codex re-audit of commit 547f51e): the
+        # module existed (models/gene_encoder.py) but nothing called it,
+        # and SpatialFieldInputs.observed_gex_conditioning was a plain
+        # numpy array populated BEFORE forward() with no gradient path
+        # back into any encoder. Sourced from observed_full_gene_expression
+        # (already a required, always-populated field -- no schema
+        # change needed) rather than observed_gex_conditioning, which is
+        # no longer read by this class (see SpatialFieldInputs' own
+        # docstring for that field).
+        self.gene_encoder = WeightedGeneExpressionEncoder(n_genes, gex_feature_dim)
         self.spot_token = SpotTokenProjection(
             hidden_dim=hidden_dim, image_feature_dim=image_feature_dim, gex_feature_dim=gex_feature_dim,
         )
@@ -122,9 +135,15 @@ class _SharedFieldArchitecture(nn.Module):
         )
         # see module docstring: not yet real per-spot availability
         modality_flags = torch.ones(n_observed, 1, device=device)
+        # gex_features is computed HERE by the real trainable gene
+        # encoder from the untouched observed_full_gene_expression --
+        # observed_gex_conditioning is intentionally NOT read (see
+        # SpatialFieldInputs' own docstring for that field and the
+        # module-level note on self.gene_encoder above).
+        observed_expr = torch.as_tensor(inputs.observed_full_gene_expression, dtype=torch.float32, device=device)
         return self.spot_token(
             image_features=torch.as_tensor(inputs.observed_gigapath_features, dtype=torch.float32, device=device),
-            gex_features=torch.as_tensor(inputs.observed_gex_conditioning, dtype=torch.float32, device=device),
+            gex_features=self.gene_encoder(observed_expr),
             coords=torch.as_tensor(inputs.observed_coords, dtype=torch.float32, device=device),
             boundary_ring=full_ring,
             modality_flags=modality_flags,

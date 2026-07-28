@@ -1144,7 +1144,161 @@ training system is eventually built, it will be built on top of a
 transport head, device handling, and config/model bridge that are
 already correct, rather than inheriting these four bugs silently.
 
+## 23. Response to the second external Codex re-audit (of commit 547f51e)
+
+Adam forwarded a second, independent Codex re-audit, this time of
+`547f51e` (§22's fixes). Verdict: the four bug fixes from §22 are
+legitimate, but the system still isn't ready for the four 24-hour runs
+-- "the model components are safer; the real experiment pipeline still
+does not exist." Same discipline as every prior audit response: every
+claim checked against the actual code before any fix or non-fix.
+
+**Small factory bug -- CONFIRMED AND FIXED.** `build_architecture`
+indexed `_ARCHITECTURE_CLASSES[architecture_id]` BEFORE calling
+`resolve_model_kwargs` (which does the real validation), so an unknown
+architecture id raised a raw `KeyError` instead of the intended
+actionable `ValueError`. Fixed by reordering the two calls; verified by
+`test_build_architecture_raises_value_error_not_key_error_for_an_unknown_id`.
+
+**"Gene encoder not functionally integrated" -- CONFIRMED AND FIXED,
+properly this time.** Checked directly: `WeightedGeneExpressionEncoder`
+existed (§22) but nothing called it, `SpatialFieldInputs.observed_gex_conditioning`
+was a plain numpy array populated before `forward()` with no gradient
+path back into any encoder, and `gene_encoder_type` was silently stripped
+by the factory as pure metadata -- so the configs claimed an encoder the
+model never used, exactly as the audit said. Fixed by implementing the
+audit's own recommended fix ("owned and called inside the model from raw
+observed GEX tensors"): `_SharedFieldArchitecture` now constructs and
+owns a `WeightedGeneExpressionEncoder`, calling it on
+`observed_full_gene_expression` (an existing, always-populated field --
+no schema change needed) inside `_observed_tokens`, rather than reading
+the separate `observed_gex_conditioning` field at all. `model_factory.py`
+now VALIDATES `gene_encoder_type` (raises if it names anything other
+than `"weighted_linear"`, since that's the only encoder ever
+constructed) instead of silently discarding it. `observed_gex_conditioning`
+stays in the schema for backward compatibility/a future precomputed-
+conditioning path, with its docstring updated to say plainly that no
+current architecture reads it. Verified two ways:
+`test_gene_encoder_is_genuinely_wired_into_the_model` (gradients reach
+`gene_encoder.projection.weight`; changing `observed_full_gene_expression`
+changes the output) and `test_observed_gex_conditioning_field_no_longer_affects_the_model`
+(changing ONLY the now-unused field changes nothing). A real dropout-vs-
+`eval()` test bug (the same class of bug already caught twice before in
+this project -- Phase 6's `sample_residual_coefficients`, §18's global-
+slide diagnostic test) was caught building the second test and fixed by
+calling `model.eval()` before comparing two forward passes.
+
+**"Shared initialization only proven for Architectures 1 and 2" --
+CONFIRMED AND FIXED, not just re-documented.** The audit's own diagnosis
+was correct and matched what §15 already honestly admitted: Architecture
+3 constructs extra randomly-initialized global-GEX modules before some
+shared modules, so RNG-stream order legitimately diverges and "same
+seed" alone doesn't guarantee identical shared parameters once that
+happens. Rather than continuing to document this as a scoped limitation,
+`model_factory.py::synchronize_shared_initialization` now removes it: for
+every non-reference model, every parameter is copied FROM a reference
+model wherever a same-name (after stripping a per-model name prefix,
+e.g. Architecture 4 wraps a whole Architecture 3 as `self.conditioner`)
+same-shape parameter exists in the reference -- a guarantee that holds
+regardless of construction order, not merely "started from the same
+seed." `test_synchronize_shared_initialization_gives_all_four_real_architectures_identical_shared_parameters`
+builds all FOUR real architectures from the real config files,
+synchronizes them, and proves every genuinely shared parameter (correctly
+excluding parameters that are structurally different shapes across arms,
+like `branch_gate`'s output width, which legitimately differs between
+2-branch and 3-branch backbones) is byte-identical across every pair --
+including Architecture 3 and Architecture 4, the previously-unaddressed
+case the audit specifically called out.
+
+**"The configured mask schedule cannot be generated" -- CONFIRMED AND
+FIXED.** Checked directly and reproduced exactly as predicted: the
+reused `mask_bank.py::make_split` (verbatim copy) expects
+`masking_cfg.strategy`/`masking_cfg.params`; the real configs'
+`masking.strata` list had no consuming code anywhere, so building a real
+schedule from them would indeed raise `ValueError("unknown masking
+strategy None")`. New `data/mask_schedule.py::build_stratified_mask_bank`
+converts each stratum entry into a real `masking_cfg`
+(`strategy="random_dropout_patches"`, matching `gen2_architectures/data/masking.py`'s
+existing hole-size/shape stratification support per CONTRACT.md section
+4's original plan), calls `mask_bank.build_mask_bank` once per stratum
+with per-stratum seed offsets (so seeds never collide across strata),
+and merges the results into one stratum-tagged schedule. This is
+genuinely different in kind from the still-missing real per-sample
+HEST-1k data builder: mask scheduling operates purely on
+coordinate/slice-id arrays, so it's fully testable on synthetic data
+today (the same reasoning that let Phase 2's boundary extraction be
+built and tested before any real data pipeline existed). 12 tests,
+including one that loads the masking.strata block from all FOUR real
+config files and builds a real stratified bank from each, and one that
+calls the actual reused `mask_bank.make_split` directly with a converted
+stratum config to prove the exact failure mode the audit predicted no
+longer occurs.
+
+**Findings re-confirmed as ALREADY DISCLOSED, no new action:**
+- "There is no real training pipeline" -- unchanged; this is exactly
+  §21's own subject.
+- "Architectures 3 and 4 do not implement the intended slide
+  architecture" -- unchanged; §15/§17/§19/§20/§21 already say this.
+- "Leakage safety is structurally promising but not demonstrated
+  end-to-end" -- unchanged; blocked on the same missing real data
+  builder §21 already describes.
+- "The GigaPath slide cache key hashes coordinates and a namespace, but
+  not tile-feature contents, preprocessing fingerprint, or checkpoint."
+  Checked directly against `models/slide_encoder.py`'s
+  `_tensor_digest(coords, namespace)` -- confirmed accurate, and this is
+  EXACTLY what §6 already flagged before this audit arrived: "Cache
+  signature scheme... Not yet implemented as gen3-specific code... No new
+  cache-signature design needed; only wiring once there's a real cache to
+  protect." Re-confirmed, not new; still deferred to when the real WSI/
+  cache system is actually built.
+
+**Findings that are real but deferred, not fixed in this pass:**
+- **Harmonic anchor recomputed on CPU every forward() call, not cached.**
+  A genuine performance (not correctness) concern for a real 24-hour run
+  -- Architecture 2's `_harmonic_anchor` does run a full NumPy Jacobi
+  solve per call today. Caching it properly requires the same
+  sample+mask-fingerprint cache-signature system §6 already defers to
+  "when there's a real cache to protect" -- building it in isolation,
+  before the real data builder exists to define what a "mask fingerprint"
+  even is in production, would be premature. Tracked here explicitly
+  rather than silently dropped.
+- **A representative CUDA forward/backward + AMP + peak-memory gate is
+  mandatory before long runs.** Cannot be done in this environment at
+  all -- confirmed no CUDA device is available in this sandbox (checked
+  directly: `torch.cuda.is_available()` returns `False`). §22's device
+  fixes make the CODE PATH correct for whichever device the model
+  actually lives on; they cannot substitute for actually running that
+  code on a GPU. This remains an explicit, unclosable-here gate for
+  whoever has GPU access before any real run.
+
+**What this pass did NOT do**: the core §21 verdict is UNCHANGED --
+completing every fix in §22 and §23 is still not the same as having a
+real training system. What changed: two concrete, previously-real
+correctness gaps this audit specifically named (the gene encoder being
+present-but-unused, and the mask schedule being non-functional) are now
+genuinely fixed and tested, not just documented as gaps; the shared-
+initialization guarantee that was honestly scoped down to "Architecture
+1 vs 2 only" now covers all four architectures for real; and a small but
+real error-handling bug is fixed. Nothing here builds the missing
+training entrypoint, real data builder, real baselines, or GPU-dependent
+gates -- those remain exactly where §21 left them.
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 281 passed (41 reused-infra + 12 example-schema +
+  11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 18 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  17 launch-four-gpu-suite + 15 model-factory + 4 gene-encoder +
+  12 mask-schedule)
+full repo (gen2_architectures + gen3_multiscale): 450 passed, 1 skipped
+```
+
+The block immediately below (pre-2nd-audit-response test counts) is kept
+for historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 261 passed (41 reused-infra + 12 example-schema +
