@@ -1,11 +1,11 @@
 # gen3_multiscale — frozen contract and phase log
 
 Implements `CLAUDE_HANDOFF_MULTISCALE_SPATIAL_FIELD_ARCHITECTURES.md`'s
-staged phases. Status: **Phase 0-6 done** — all four architectures run
-real, tested, end-to-end forward passes on synthetic data. Losses/
-diagnostics (Phase 7) and configs/launcher (Phase 8) are **not yet
-implemented**. This document is extended, not replaced, as later phases
-land.
+staged phases. Status: **Phase 0-7 done** — all four architectures run
+real, tested, end-to-end forward passes on synthetic data, and now have a
+full loss/metrics/diagnostics layer (Phase 7). Configs/launcher (Phase 8)
+are **not yet implemented**. This document is extended, not replaced, as
+later phases land.
 
 ## 1. Base commit
 
@@ -664,13 +664,176 @@ tested, end-to-end forward passes.
   list in each phase's section above), but a systematic pass against
   that full checklist hasn't been done.
 
+## 18. Losses, metrics, and diagnostic interventions (Phase 7 — implemented)
+
+`models/losses.py` — the shared deterministic training objective, called
+identically by all four architectures (never a per-architecture
+reimplementation): `primary_reconstruction_loss` (plain MSE, matching the
+only loss actually exercised through Phase 6's gradient-flow tests) plus
+`spatial_gradient_loss`, the handoff's "one weak spatial-gradient
+objective on query graph edges that compares predicted differences with
+true differences ... This loss must match gradients rather than force
+neighbouring spots to be identical." Built on the SAME k-NN graph
+`boundary_graph.build_knn_adjacency` uses everywhere else (never a
+second, different notion of "query graph edges"). `combined_reconstruction_loss`
+assembles both with the handoff's stated default weight (0.05).
+
+**Verified against the exact design claim, not a smoke test**: a
+prediction offset from the truth by the same constant vector at every
+query has identical edge-to-edge differences to the truth, so it incurs
+near-zero gradient loss despite large primary-reconstruction loss —
+`test_spatial_gradient_loss_matches_gradients_not_absolute_levels`
+exercises this directly. 11 tests total.
+
+Documented simplification: `per_gene_scale` ("after scale normalization")
+falls back to the per-gene std of the target batch WITHIN the call when
+not supplied — the same structural limitation `harmonic.py` and
+`transport_head.py`'s `target_gene_scale` already have (a training-only
+fit must happen outside this function; there is no data builder yet to
+fit one from). Not silently assumed to already be a training-set scale.
+
+`evaluation/metrics.py` — `pearson_per_gene`/`rmse`/`nonzero_auc`/
+`frechet_distance`/`st_fid`/`st_mmd`/`embed_pca`/`pool_knn_neighborhood`
+are copied VERBATIM from `gen2_architectures/evaluation/metrics.py` (same
+§2 provenance discipline; these are pure numpy/scipy/sklearn functions
+with no gen2-specific dependency, so no adaptation was needed).
+`resolve_gene_panels` is adapted (same logic, public name) from
+`gen2_architectures/evaluation/audit_evaluation.py`'s private
+`_resolve_gene_panels`.
+
+Confirmed absent anywhere else in the repo before building (checked
+directly by an Explore agent, not assumed from the handoff's phrasing —
+see the research summary that motivated this phase): patient-level
+aggregation, hole-size/boundary-to-interior binning, a spatial-gradient
+loss, and any variogram/graph-Laplacian agreement metric. Built new:
+
+- `aggregate_patient_metrics` — "aggregate primary results first within
+  held-out patients and then macro-average across patients... report the
+  pooled descriptive value [too]... include confidence intervals at the
+  patient level when the number of held-out patients permits them;
+  otherwise state that uncertainty is not estimable from one patient."
+  Returns `patient_mean` (primary number), `pooled_mean` (explicitly
+  separate, flat descriptive value), and a 95% CI with `ci_estimable=0.0`
+  when `n_patients < 2` rather than a misleadingly-computed interval.
+  Verified with a deliberately imbalanced fixture (1 item from patient A,
+  3 items from patient B) proving the patient-mean (0.5) differs from the
+  pooled mean (0.75) — the exact failure mode patient-level aggregation
+  exists to prevent.
+- `boundary_interior_bins` / `hole_size_bins` — bin a per-query or
+  per-item metric by `query_depth_to_boundary` or hole size respectively;
+  shared `_bin_by_value` helper, `np.digitize`-based, fail-visible bin
+  labels (not silently dropped out-of-range values).
+- `edge_gradient_agreement` — query-edge gradient agreement decomposed
+  into components normal/tangential to the hole boundary, per Phase 7's
+  explicit request. "Normal" is defined as radial alignment with the
+  query set's own centroid — the SAME hole-geometry convention
+  `geometry_utils.compute_hole_geometry` already uses elsewhere in this
+  project (Phase 6), not a new one invented for this metric — classified
+  by whichever of radial/tangential the edge direction's absolute dot
+  product is larger against.
+- `spatial_variogram_agreement` / `graph_laplacian_agreement` — the
+  handoff asks for "spatial variogram OR graph-Laplacian agreement"; both
+  are provided since each is cheap given the k-NN graph already built
+  elsewhere. Verified with a real property test:
+  `test_spatial_variogram_agreement_detects_a_spatially_scrambled_field`
+  proves the variogram (unlike PCC/RMSE) is sensitive to a
+  same-values-wrong-locations corruption — the identical detectability
+  gap `pool_knn_neighborhood`'s own docstring already documents for
+  ST-FID/ST-MMD's plain per-point embeddings.
+
+21 tests total (`tests/test_metrics.py`), including smoke tests of the
+verbatim-copied functions (proving the copy itself is correct, not
+re-deriving gen2's own much larger test battery for functions that did
+not change).
+
+`evaluation/diagnostics.py` — evaluation-time modality-ablation
+interventions, matching the handoff's Phase 7 list exactly:
+`zero_observed_gex`, `shuffle_observed_gex`, `zero_he`,
+`shuffle_boundary_gex`, `permute_boundary_order`,
+`zero_global_slide_vector`/`swap_global_slide_vector`. Each of the first
+five returns a NEW `SpatialFieldInputs` via `dataclasses.replace` (never
+in-place mutation); the caller runs a real architecture's `forward()` on
+the original and perturbed inputs and compares outputs.
+
+**Real subtlety handled explicitly, not glossed over**:
+`shuffle_boundary_gex` cannot naively permute every `boundary_idx`
+position, because `_candidate_pool` (Phase 6) concatenates local and
+boundary candidates from the SAME `observed_full_gene_expression` array
+WITHOUT deduplication (§15's documented simplification) — a spot can be
+both a query's true-nearest local neighbor AND a Ring-1 boundary spot.
+Shuffling that spot's boundary role would silently corrupt its local role
+too, violating "local neighbours remain intact." `shuffle_boundary_gex`
+computes `boundary_idx - {all local_neighbor positions}` and only
+shuffles within that set; a hand-built minimal example with a
+deliberately overlapping local/boundary index (`test_shuffle_boundary_gex_leaves_locally_referenced_and_non_boundary_spots_untouched`)
+verifies the overlapping position is provably untouched while the
+boundary-only positions are exactly a permutation of their original rows.
+
+**Scope limitation, documented rather than silently worked around**: the
+global-slide-token zero/swap diagnostic requires a real LongNet global
+token wired into an architecture's `forward()`, which §15/§17 already
+record does not exist yet (`use_global_slide=True` raises
+`NotImplementedError` in every architecture wrapper). `zero_global_slide_vector`/
+`swap_global_slide_vector` are trivial tensor functions, exercised
+instead directly against `SpatialFieldBackbone`/`MultiscaleBlock`'s own
+`use_global_slide` path (which DOES already structurally accept a
+`global_slide_vector`, per `backbone.py`) — proving the mechanism itself
+is correct and ready, not proving any current architecture uses it yet.
+`test_global_slide_intervention_has_no_effect_at_initialization_but_measurable_effect_once_trained`
+is a genuine two-part learning-test analogue of the handoff's own gate
+("Architecture 3's prediction must measurably change under slide-token
+zero/swap on a smoke example; otherwise the slide branch is functionally
+ignored"): at fresh construction `GlobalConditioningFiLM`'s zero-init
+(Phase 5) means the intervention correctly has NO effect (confirms the
+test doesn't manufacture a false positive); after manually perturbing the
+FiLM weights away from zero to simulate a trained state, the same
+intervention MUST and does measurably change the output. A real bug was
+caught building this test: the backbone defaults to `dropout=0.1` and
+`nn.Module.training=True`, so per-call dropout masks alone changed the
+output between calls regardless of the global vector, confounding the
+comparison — fixed by calling `backbone.eval()` before the comparison
+(the same dropout-during-inference class of bug already caught once in
+Phase 6's `sample_residual_coefficients`, §16 — now caught a second time
+in a different module, reinforcing that this is a recurring hazard to
+check for, not a one-off).
+
+8 tests total (`tests/test_diagnostics.py`).
+
+## 19. What is still NOT covered
+
+- Everything §17 already listed (regional H&E/global-slide tokens not
+  wired into any architecture's `forward()`; non-deduplicated transport
+  candidate pool; hardcoded modality flags; no real per-sample data
+  builder; full leakage/geometry/learning/numerical gate-suite pass not
+  yet systematic) remains true — Phase 7 did not touch any of it.
+- The global-slide-token zero/swap diagnostic is verified at the
+  `MultiscaleBlock`/`SpatialFieldBackbone` level only, not against a full
+  architecture wrapper — blocked on the same `use_global_slide` wiring
+  gap as everything else involving the real LongNet token.
+- No training loop calls `combined_reconstruction_loss` or any Phase 7
+  metric/diagnostic yet — this phase built and tested the functions
+  themselves, not an integration into a training/eval harness (that's a
+  natural Phase 8 dependency, once configs/a launcher/a real data builder
+  exist to run them against).
+- No 90%-interval-coverage / predictive-diversity-vs-uncertainty-stratified-by-depth
+  reporting for Architecture 4 specifically — `sample_predictive_distribution`
+  (Phase 6) already returns `predictive_std`/`predictive_samples`, and
+  `boundary_interior_bins`/`hole_size_bins` (this phase) already support
+  binning any per-query/per-item scalar by depth or hole size, so the
+  building blocks exist, but nothing yet composes them into that specific
+  named report — flagged, not silently assumed done by proximity.
+- Diagnostic evaluations only build PERTURBED INPUTS; no orchestrator
+  runs "the full checkpoint through every intervention and tabulates the
+  deltas" end to end yet (a natural Phase 8 launcher/report concern, not
+  a Phase 7 one per the handoff's own phase split).
+
 ## Test status as of this document
 
 ```
-gen3_multiscale/tests/: 182 passed (41 reused-infra + 12 example-schema +
+gen3_multiscale/tests/: 222 passed (41 reused-infra + 12 example-schema +
   11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
   14 transport-head + 10 tokens + 16 attention + 10 global-context +
   7 harmonic + 7 geometry-utils + 9 backbone + 11 architectures +
-  9 gene-basis + 11 flow)
-full repo (gen2_architectures + gen3_multiscale): 351 passed, 1 skipped
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics)
+full repo (gen2_architectures + gen3_multiscale): 391 passed, 1 skipped
 ```
