@@ -10,6 +10,18 @@ the reference notebook only ever see log1p(RAW counts), never library-size-
 normalized log1p), with scFoundation layered in as a small ADDITIVE
 residual (not a replacement for STPath's own gene pathway).
 
+2026-07-27 (GPT-audit-flagged, then actually fixed): the bug described
+above was identified but the fix was never implemented -- every gen2
+config sets data.expression_transform: normalize_log1p, and nothing
+converted that back to raw-count log1p before it reached this model, so
+context["expression"] was silently fed to STPath in the wrong
+preprocessing space this whole time. Now fixed: train_local_neighborhood.
+py's _stpath_context_expression() computes log1p(adata.layers[
+"raw_counts"]) specifically for Architecture 4's context and passes it
+via build_masked_item's context_gene_features channel, leaving
+expression_transform (and the decoder target/loss, and every other
+architecture) untouched in the project's normal normalize_log1p space.
+
 GPT review's #6 concern (this is the riskiest of the 4 — STPath's frozen
 weights may be domain-mismatched outside the organs it was pretrained on)
 is handled at the CONFIG/training-budget level (half compute budget, see
@@ -56,9 +68,9 @@ class Architecture4(DeterministicSampleMixin, nn.Module):
             # STPath's real pretrained weights only ever see
             # log1p(raw_counts) -- context["expression"] must already be
             # RAW-COUNT log1p by the time it reaches this model (see
-            # gen2_architectures/training/data_prep.py's
-            # "stpath_native_log1p" preprocessing mode), so no further
-            # log1p is applied here.
+            # gen2_architectures/training/train_local_neighborhood.py's
+            # _stpath_context_expression(), which builds exactly that),
+            # so no further log1p is applied here.
             input_already_log1p=True,
         )
         # Exposed so the shared evaluation harness

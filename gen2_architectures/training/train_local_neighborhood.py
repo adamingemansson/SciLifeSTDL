@@ -60,6 +60,36 @@ def build_model(cfg, gene_names: list[str], scfoundation_dim: int | None):
     raise ValueError(f"train_local_neighborhood.py handles architectures '1'/'2'/'4', got {architecture!r}")
 
 
+def _stpath_context_expression(adata) -> np.ndarray:
+    """log1p(raw counts) for Architecture 4's context["expression"] input
+    only -- NOT the project's standard expression_transform (typically
+    normalize_log1p), which stays library-size-normalized for the
+    decoder target/loss and every other architecture.
+
+    2026-07-27 bugfix (GPT-audit-flagged, confirmed against the real
+    code): STPathContextEncoder is constructed with input_already_log1p=
+    True and applies no further log1p -- its frozen pretrained weights
+    expect log1p(RAW counts), never library-size-normalized log1p (see
+    arch4_stpath_hybrid.py's own module docstring and the
+    "stpath_native_log1p" comment that existed there without ever being
+    implemented). Every gen2 config sets data.expression_transform:
+    normalize_log1p, so without this, context["expression"] was silently
+    fed to STPath in the wrong preprocessing space. adata.layers[
+    "raw_counts"] is stashed unconditionally by loaders.py::
+    basic_qc_and_normalize regardless of the configured transform, so
+    this is always available."""
+    if "raw_counts" not in adata.layers:
+        raise ValueError(
+            "Architecture 4 requires adata.layers['raw_counts'] to build STPath's native "
+            "raw-count-log1p context input, but it is missing -- basic_qc_and_normalize "
+            "should always stash it regardless of expression_transform; check the data "
+            "loading path for this sample."
+        )
+    raw = adata.layers["raw_counts"]
+    raw = raw if isinstance(raw, np.ndarray) else raw.toarray()
+    return np.log1p(raw).astype(np.float32)
+
+
 def _sample_organ_tech(adata) -> tuple[str | None, str | None]:
     organ = str(adata.obs["organ"].iloc[0]) if "organ" in adata.obs else None
     tech = str(adata.obs["tech"].iloc[0]) if "tech" in adata.obs else None
@@ -179,6 +209,7 @@ def main(
         item = build_masked_item(
             coords3d, expr, adata.obs["slice_id"].to_numpy(), cfg.masking, images, seed=step,
             context_gene_feature_provider=provider if architecture == "2" else None,
+            context_gene_features=_stpath_context_expression(adata) if architecture == "4" else None,
             context_extra_feature_provider=provider if architecture == "4" else None,
             organ=organ, tech=tech, augment=augment,
             image_mode=image_mode, context_gex_mode=context_gex_mode,
@@ -228,6 +259,7 @@ def main(
                 adata, images, _ = held_out_adatas[str(sid)]
                 gene_inputs = {
                     "context_gene_feature_provider": scfoundation_providers.get(str(sid)) if architecture == "2" else None,
+                    "context_gene_features": _stpath_context_expression(adata) if architecture == "4" else None,
                     "context_extra_feature_provider": scfoundation_providers.get(str(sid)) if architecture == "4" else None,
                 }
                 metrics = evaluate.evaluate_sample(model, cfg, adata, images, gene_inputs, str(sid), "validation", checkpoint_dir)
