@@ -13,12 +13,12 @@ from gen3_multiscale.data.example import (
 
 def _valid_example(n_observed=6, n_query=3, n_genes=5, gex_dim=4, local_k=2):
     rng = np.random.default_rng(0)
-    observed_idx = np.arange(n_observed)
-    query_idx = np.arange(n_observed, n_observed + n_query)
     inputs = SpatialFieldInputs(
         sample_id="s1", patient_id="p1",
-        observed_idx=observed_idx, query_idx=query_idx,
-        coords=rng.normal(size=(n_observed + n_query, 2)).astype(np.float32),
+        observed_barcodes=np.array([f"o{i}" for i in range(n_observed)]),
+        query_barcodes=np.array([f"q{i}" for i in range(n_query)]),
+        observed_coords=rng.normal(size=(n_observed, 2)).astype(np.float32),
+        query_coords=rng.normal(size=(n_query, 2)).astype(np.float32),
         observed_gex_conditioning=rng.normal(size=(n_observed, gex_dim)).astype(np.float32),
         observed_full_gene_expression=rng.normal(size=(n_observed, n_genes)).astype(np.float32),
         observed_gigapath_features=rng.normal(size=(n_observed, 1536)).astype(np.float32),
@@ -36,33 +36,38 @@ def test_a_well_formed_example_passes_validation():
     validate_spatial_field_example(inputs, targets)  # must not raise
 
 
-def test_rejects_observed_and_query_index_overlap():
+def test_rejects_observed_and_query_barcode_overlap():
     inputs, targets = _valid_example()
-    bad_query_idx = inputs.query_idx.copy()
-    bad_query_idx[0] = inputs.observed_idx[0]  # leak: a query spot is also "observed"
-    bad_inputs = _replace(inputs, query_idx=bad_query_idx)
+    bad_query_barcodes = inputs.query_barcodes.copy()
+    bad_query_barcodes[0] = inputs.observed_barcodes[0]  # leak: a query spot is also "observed"
+    bad_inputs = _replace(inputs, query_barcodes=bad_query_barcodes)
     with pytest.raises(ValueError, match="overlap"):
         validate_spatial_field_example(bad_inputs, targets)
 
 
 def test_rejects_empty_observed_set():
     inputs, targets = _valid_example()
-    bad_inputs = _replace(inputs, observed_idx=np.array([], dtype=int))
-    with pytest.raises(ValueError, match="observed_idx is empty"):
+    bad_inputs = _replace(
+        inputs, observed_coords=np.zeros((0, 2), dtype=np.float32), observed_barcodes=np.array([]),
+        observed_gex_conditioning=np.zeros((0, inputs.observed_gex_conditioning.shape[1]), dtype=np.float32),
+        observed_full_gene_expression=np.zeros((0, inputs.observed_full_gene_expression.shape[1]), dtype=np.float32),
+        observed_gigapath_features=np.zeros((0, 1536), dtype=np.float32),
+    )
+    with pytest.raises(ValueError, match="observed_coords is empty"):
         validate_spatial_field_example(bad_inputs, targets)
 
 
 def test_rejects_empty_query_set():
     inputs, targets = _valid_example()
-    bad_inputs = _replace(inputs, query_idx=np.array([], dtype=int))
-    with pytest.raises(ValueError, match="query_idx is empty"):
+    bad_inputs = _replace(inputs, query_coords=np.zeros((0, 2), dtype=np.float32), query_barcodes=np.array([]))
+    with pytest.raises(ValueError, match="query_coords is empty"):
         validate_spatial_field_example(bad_inputs, targets)
 
 
 def test_rejects_local_neighbor_index_outside_observed_range():
     inputs, targets = _valid_example(n_observed=6)
     bad_neighbors = inputs.query_local_neighbor_idx.copy()
-    bad_neighbors[0, 0] = 999  # not a valid position in observed_idx
+    bad_neighbors[0, 0] = 999  # not a valid position in the observed_* arrays
     bad_inputs = _replace(inputs, query_local_neighbor_idx=bad_neighbors)
     with pytest.raises(ValueError, match="query_local_neighbor_idx"):
         validate_spatial_field_example(bad_inputs, targets)
@@ -100,7 +105,7 @@ def test_rejects_non_finite_observed_expression():
 
 def test_rejects_target_gene_panel_width_mismatch():
     inputs, targets = _valid_example(n_genes=5)
-    bad_targets = SpatialFieldTargets(query_expression=np.zeros((inputs.query_idx.shape[0], 3), dtype=np.float32))
+    bad_targets = SpatialFieldTargets(query_expression=np.zeros((inputs.query_coords.shape[0], 3), dtype=np.float32))
     with pytest.raises(ValueError, match="gene panel width"):
         validate_spatial_field_example(inputs, bad_targets)
 

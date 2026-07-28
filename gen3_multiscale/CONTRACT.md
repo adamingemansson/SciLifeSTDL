@@ -1,13 +1,12 @@
-# gen3_multiscale — Phase 0 frozen contract
+# gen3_multiscale — frozen contract and phase log
 
 Implements `CLAUDE_HANDOFF_MULTISCALE_SPATIAL_FIELD_ARCHITECTURES.md`'s
-"Phase 0: Freeze the experiment contract" and "Phase 1: Build one shared
-example object". Status: **Phase 0/1 only** — boundary-ring extraction
-(Phase 2), mask-aware WSI/LongNet adaptation (Phase 3), the shared GEX/
-transport gate (Phase 4), token modules (Phase 5), the four architecture
-wrappers (Phase 6), losses/diagnostics (Phase 7), and configs/launcher
-(Phase 8) are **not yet implemented**. This document will be extended,
-not replaced, as later phases land.
+staged phases. Status: **Phase 0/1/2 done**. Mask-aware WSI/LongNet
+adaptation (Phase 3), the shared GEX/transport gate (Phase 4), token
+modules (Phase 5), the four architecture wrappers (Phase 6), losses/
+diagnostics (Phase 7), and configs/launcher (Phase 8) are **not yet
+implemented**. This document is extended, not replaced, as later phases
+land.
 
 ## 1. Base commit
 
@@ -148,25 +147,83 @@ and matching gene-panel width between observed and target arrays.
 12 tests in `tests/test_example.py` cover valid construction and each
 violation.
 
-Not yet implemented: the real BUILDER that constructs a
-`SpatialFieldExample` from an actual HEST-1k sample + mask bank record —
-that's Phase 2 (boundary-ring BFS extraction) and Phase 3 (WSI tile
-attachment), the next staged deliverables.
+**Design fix caught during Phase 2** (recorded here, not silently
+smoothed over): the first version of `SpatialFieldInputs` sized `coords`
+to `n_observed + n_query` rows while describing `observed_idx`/
+`query_idx` as positions in a potentially much larger full-slide
+ordering — inconsistent, since a slide's real observed set is typically a
+large fraction of the whole slide. Fixed before any Phase 2 code was
+built on top of it: `observed_idx`/`query_idx` were replaced with
+`observed_barcodes`/`query_barcodes` (provenance-only, never used to
+index anything) plus separate `observed_coords`/`query_coords` arrays,
+position-aligned with every other `observed_*` content array — the same
+convention the other fields already used. This is exactly why phases are
+being staged and tested individually rather than built all at once.
 
-## 8. What Phase 0/1 does NOT cover yet
+Still not yet implemented: the real BUILDER that constructs a
+`SpatialFieldExample` from an actual HEST-1k sample + mask bank record,
+wiring `boundary_graph.py`'s output together with real loaded GEX/
+GigaPath features — that's Phase 3 (WSI tile attachment) territory, once
+LongNet/transport-head reuse is wired in.
 
-- No boundary-ring (Rings 1–3) BFS extraction — Phase 2.
+## 8. Boundary-ring extraction and local context (Phase 2 — implemented)
+
+`data/boundary_graph.py`:
+
+- `build_knn_adjacency(coords, k_neighbors=6)` — geometry-only k-NN graph
+  over a combined observed+query coordinate array (default `k=6` matches
+  Visium's hexagonal spot lattice). No expression/H&E content anywhere in
+  this function.
+- `extract_boundary_and_local_context(observed_coords, query_coords, ...)`
+  returns:
+  - `query_local_neighbor_idx` — TRUE `local_k` (default 32) nearest
+    observed spots per query, an independent k-NN search over the full
+    observed set (not graph hops) — "the high-resolution local context",
+    per the handoff, distinct from the boundary below.
+  - `boundary_idx`/`boundary_ring` — Rings 1–3, BFS over observed-observed
+    graph edges seeded by Ring 1 (observed spots directly graph-adjacent
+    to any query spot). Each observed spot appears in at most one ring
+    (its nearest). No random sampling, no hard cap — `max_boundary_size`
+    raises `ValueError` rather than truncating if set and exceeded, per
+    the handoff's explicit "fail closed... never silently truncate"
+    requirement.
+  - `query_depth_to_boundary` — BFS over query-query graph edges, seeded
+    by query spots that directly touch an observed spot (depth 0);
+    verified by test to increase toward a synthetic hole's interior.
+    Unreachable query spots (disconnected from any boundary-touching
+    query — a pathological case for a genuinely contiguous hole) get a
+    `max_rings + 1` sentinel, recorded in the diagnostic manifest, never
+    a crash or NaN.
+  - `diagnostic` — Phase 2 item 6's required manifest fields: observed/
+    query counts, per-ring boundary counts, local-k requested vs.
+    effective (padding is reported, not silent), boundary-touching query
+    count, unreachable-query count.
+
+11 tests in `tests/test_boundary_graph.py` directly exercise several of
+the handoff's own named gates: "Opposite sides of a synthetic hole are
+both visible", "Local neighbours differ across suitably separated
+queries", and "Fail closed if a configured safety maximum is exceeded;
+never silently truncate it" — plus an integration test proving
+`boundary_graph.py`'s output actually satisfies `example.py`'s
+`validate_spatial_field_example`.
+
+## 9. What is still NOT covered
+
 - No mask-aware GigaPath LongNet adaptation — Phase 3.
 - No gene-encoder ablation read/selection, no transport-head reuse — Phase 4.
 - No token modules, no model code at all — Phase 5/6.
 - No losses, no diagnostics, no configs, no launcher — Phase 7/8.
-- No leakage/geometry/learning/numerical gate suite yet — those tests
-  only become meaningful once there's a real model and a real data
-  builder to test; Phase 1's tests instead cover the schema/contract
-  layer those later tests will build on top of.
+- No real per-sample builder wiring `boundary_graph.py` + real loaded
+  HEST-1k data into a `SpatialFieldExample` yet.
+- No full leakage/geometry/learning/numerical gate suite — those tests
+  only become fully meaningful once there's a real model and a real data
+  builder; Phase 1/2's tests cover the schema/geometry contract layer
+  those later tests will build on top of (several geometry gates are
+  already directly covered, see §8).
 
 ## Test status as of this document
 
 ```
-gen3_multiscale/tests/: 53 passed (41 reused-infra + 12 new example-schema)
+gen3_multiscale/tests/: 64 passed (41 reused-infra + 12 example-schema + 11 boundary-graph)
+full repo (gen2_architectures + gen3_multiscale): 233 passed, 1 skipped
 ```

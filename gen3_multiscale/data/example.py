@@ -10,12 +10,28 @@ only for the loss/metrics call sites, and nothing in this module ever
 constructs one from the other.
 
 This module defines the SCHEMA and its invariants (Phase 1). It does not
-yet build these objects from real HEST-1k data -- boundary-ring
-extraction (Phase 2) and the mask-aware WSI path (Phase 3) are separate,
-not-yet-implemented stages. validate_spatial_field_example enforces the
-structural contract so Phase 2/3's real builder has something concrete to
-be checked against from the very first commit that touches them, and so
-this module is independently testable with synthetic examples now.
+yet build these objects from real HEST-1k data -- the mask-aware WSI path
+(Phase 3) is a separate, not-yet-implemented stage; boundary-ring
+extraction (Phase 2) is implemented in boundary_graph.py and produces the
+query_local_neighbor_idx/boundary_idx/boundary_ring/query_depth_to_boundary
+fields below. validate_spatial_field_example enforces the structural
+contract so Phase 2/3's real builder has something concrete to be checked
+against, and so this module is independently testable with synthetic
+examples now.
+
+2026-07-28 revision (caught while implementing Phase 2's boundary BFS):
+the first version of this schema described observed_idx/query_idx as
+"positions in a shared per-slide ordering" while sizing `coords` to only
+`n_observed + n_query` rows -- inconsistent, since a slide's real observed
+set can be a large fraction of the whole slide (thousands of spots) while
+`coords` can't be both "indexed by raw per-slide position" and "only
+n_observed+n_query rows long" at the same time. Fixed by dropping raw
+per-slide indexing entirely: observed_barcodes/query_barcodes are
+provenance-only identifiers (original spot names, never used to index
+any array here), and observed_coords/query_coords are separate arrays
+POSITION-aligned with the other observed_*/query_* content arrays, the
+same convention every other field already used. No caller ever needs a
+full per-slide array to interpret anything in this dataclass.
 """
 from __future__ import annotations
 
@@ -50,47 +66,47 @@ class SpatialFieldInputs:
     still populate the wrong array under the right name; the validator
     catches shape/index-level contamination the type system can't).
 
-    Indices (observed_idx, query_idx, boundary_idx, query_local_neighbor_idx)
-    are all indices into the SAME per-slide spot ordering -- the one
-    boundary_graph.py's future BFS will build coordinates/adjacency from
-    (Phase 2). observed_idx and query_idx partition that ordering; every
-    other index array indexes INTO observed_idx's members (never raw
-    per-slide row numbers), so a caller never needs the full per-slide
-    arrays to interpret them -- see the *_dense_idx cross-references
-    documented per field below.
+    Every observed_*/query_* array pair below is POSITION-aligned: row i
+    of observed_coords describes the same spot as row i of
+    observed_gex_conditioning, observed_full_gene_expression, and
+    observed_gigapath_features (and observed_barcodes[i] is that spot's
+    original identity, for provenance/debugging only -- never used to
+    index anything). query_local_neighbor_idx and boundary_idx are
+    positions WITHIN the observed_* arrays (i.e. in [0, n_observed)),
+    never raw per-slide positions -- there is no full-per-slide array
+    anywhere in this object to index into.
 
-    coords are slide-relative, already normalized (never raw physical
-    micrometers/pixels that could identify a specific sample's layout --
-    see the handoff's "Coordinate memorization" risk).
+    Coordinates are slide-relative, already normalized (never raw
+    physical micrometers/pixels that could identify a specific sample's
+    layout -- see the handoff's "Coordinate memorization" risk).
     """
     sample_id: str
     patient_id: str
 
-    # Per-slide spot ordering this example was built from -- every index
-    # field below is either a position in this ordering (observed_idx,
-    # query_idx) or a position WITHIN observed_idx (everything else,
-    # documented per-field).
-    observed_idx: np.ndarray  # [n_observed] int, positions in the per-slide ordering
-    query_idx: np.ndarray  # [n_query] int, positions in the per-slide ordering, disjoint from observed_idx
-    coords: np.ndarray  # [n_observed + n_query, 2] float32, normalized/relative, indexed like the per-slide ordering
+    # Provenance only -- original per-slide spot identity, never used to
+    # index any array in this dataclass.
+    observed_barcodes: np.ndarray  # [n_observed] str/int
+    query_barcodes: np.ndarray  # [n_query] str/int
 
-    # Observed-spot content -- length n_observed, aligned with observed_idx
-    # (row i here describes the spot at per-slide position observed_idx[i]).
+    observed_coords: np.ndarray  # [n_observed, 2] float32, normalized/relative
+    query_coords: np.ndarray  # [n_query, 2] float32, same normalization as observed_coords
+
+    # Observed-spot content -- position-aligned with observed_coords/observed_barcodes.
     observed_gex_conditioning: np.ndarray  # [n_observed, gex_dim] compact feature for scoring/gating
     observed_full_gene_expression: np.ndarray  # [n_observed, n_genes] untouched real values, transported not decoded
     observed_gigapath_features: np.ndarray  # [n_observed, 1536] frozen local H&E tile embeddings
 
-    # Boundary/local structure -- all values are positions WITHIN
-    # observed_idx (i.e. in [0, n_observed)), not per-slide positions.
-    query_local_neighbor_idx: np.ndarray  # [n_query, local_k] int, true nearest observed_idx positions per query
-    boundary_idx: np.ndarray  # [n_boundary] int, observed_idx positions in Rings 1-3, deduplicated
+    # Boundary/local structure -- all index values are positions WITHIN
+    # the observed_* arrays (i.e. in [0, n_observed)).
+    query_local_neighbor_idx: np.ndarray  # [n_query, local_k] int, true nearest observed positions per query
+    boundary_idx: np.ndarray  # [n_boundary] int, observed positions in Rings 1-3, deduplicated
     boundary_ring: np.ndarray  # [n_boundary] int in {1, 2, 3}, aligned with boundary_idx
-    query_depth_to_boundary: np.ndarray  # [n_query] int, BFS hops from the nearest boundary ring
+    query_depth_to_boundary: np.ndarray  # [n_query] int, BFS hops from the nearest observed spot
 
     # Optional dense WSI context (Phase 3) -- tiles whose footprint does
     # NOT overlap the hole. None until Phase 3 wires the mask-aware path.
     wsi_tile_features: np.ndarray | None = None  # [n_tiles, 1536]
-    wsi_tile_coords: np.ndarray | None = None  # [n_tiles, 2], same normalization as coords
+    wsi_tile_coords: np.ndarray | None = None  # [n_tiles, 2], same normalization as observed_coords
 
     # Free-form, not consumed by any forward() -- fingerprints/labels a
     # model must never read but a training/eval harness needs (mirrors
@@ -106,31 +122,29 @@ def validate_spatial_field_example(inputs: SpatialFieldInputs, targets: SpatialF
     project's established discipline (mask_bank.record_masks's identical
     context/query-overlap check, checkpoint.verify_gene_names's identical
     fail-closed stance)."""
-    observed_idx = np.asarray(inputs.observed_idx)
-    query_idx = np.asarray(inputs.query_idx)
-    n_observed = observed_idx.shape[0]
-    n_query = query_idx.shape[0]
+    n_observed = inputs.observed_coords.shape[0]
+    n_query = inputs.query_coords.shape[0]
 
     if n_observed == 0:
-        raise ValueError("SpatialFieldInputs.observed_idx is empty -- no context to condition on")
+        raise ValueError("SpatialFieldInputs.observed_coords is empty -- no context to condition on")
     if n_query == 0:
-        raise ValueError("SpatialFieldInputs.query_idx is empty -- nothing to predict")
-    if np.intersect1d(observed_idx, query_idx).size > 0:
-        raise ValueError(
-            "observed_idx and query_idx overlap -- a query spot cannot also be an observed "
-            "context spot (this would leak the hidden target through the context path)"
-        )
-    if len(np.unique(observed_idx)) != n_observed:
-        raise ValueError("observed_idx contains duplicate per-slide positions")
-    if len(np.unique(query_idx)) != n_query:
-        raise ValueError("query_idx contains duplicate per-slide positions")
+        raise ValueError("SpatialFieldInputs.query_coords is empty -- nothing to predict")
 
-    n_total = n_observed + n_query
-    if inputs.coords.shape[0] != n_total:
+    observed_barcodes = np.asarray(inputs.observed_barcodes)
+    query_barcodes = np.asarray(inputs.query_barcodes)
+    if observed_barcodes.shape[0] != n_observed:
+        raise ValueError("observed_barcodes must have one entry per observed spot")
+    if query_barcodes.shape[0] != n_query:
+        raise ValueError("query_barcodes must have one entry per query spot")
+    if np.intersect1d(observed_barcodes, query_barcodes).size > 0:
         raise ValueError(
-            f"coords has {inputs.coords.shape[0]} rows but observed_idx+query_idx cover "
-            f"{n_total} per-slide positions"
+            "observed_barcodes and query_barcodes overlap -- a query spot cannot also be an "
+            "observed context spot (this would leak the hidden target through the context path)"
         )
+    if len(np.unique(observed_barcodes)) != n_observed:
+        raise ValueError("observed_barcodes contains duplicate spot identities")
+    if len(np.unique(query_barcodes)) != n_query:
+        raise ValueError("query_barcodes contains duplicate spot identities")
 
     for name, arr in (
         ("observed_gex_conditioning", inputs.observed_gex_conditioning),
@@ -151,7 +165,7 @@ def validate_spatial_field_example(inputs: SpatialFieldInputs, targets: SpatialF
     if local_flat.size and (local_flat.min() < 0 or local_flat.max() >= n_observed):
         raise ValueError(
             "query_local_neighbor_idx contains a position outside [0, n_observed) -- must index "
-            "into observed_idx, not the per-slide ordering"
+            "into the observed_* arrays"
         )
 
     n_boundary = inputs.boundary_idx.shape[0]
@@ -159,8 +173,8 @@ def validate_spatial_field_example(inputs: SpatialFieldInputs, targets: SpatialF
         raise ValueError("boundary_idx and boundary_ring must have the same length")
     if n_boundary and (inputs.boundary_idx.min() < 0 or inputs.boundary_idx.max() >= n_observed):
         raise ValueError(
-            "boundary_idx contains a position outside [0, n_observed) -- must index into "
-            "observed_idx, not the per-slide ordering"
+            "boundary_idx contains a position outside [0, n_observed) -- must index into the "
+            "observed_* arrays"
         )
     if n_boundary and len(np.unique(inputs.boundary_idx)) != n_boundary:
         raise ValueError("boundary_idx contains duplicates -- each observed spot must appear once")
