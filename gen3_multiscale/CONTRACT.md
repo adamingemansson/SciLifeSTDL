@@ -1,10 +1,11 @@
 # gen3_multiscale — frozen contract and phase log
 
 Implements `CLAUDE_HANDOFF_MULTISCALE_SPATIAL_FIELD_ARCHITECTURES.md`'s
-staged phases. Status: **Phase 0/1/2/3/4/5 done**. The four architecture
-wrappers (Phase 6), losses/diagnostics (Phase 7), and configs/launcher
-(Phase 8) are **not yet implemented**. This document is extended, not
-replaced, as later phases land.
+staged phases. Status: **Phase 0-5 done; Phase 6 partial (Architectures
+1/2/3 implemented and integration-tested end-to-end; Architecture 4 is
+the next staged deliverable)**. Losses/diagnostics (Phase 7) and
+configs/launcher (Phase 8) are **not yet implemented**. This document is
+extended, not replaced, as later phases land.
 
 ## 1. Base commit
 
@@ -469,11 +470,134 @@ expression matrix must change the output; a uniform matrix must be
 reproduced exactly), the FiLM identity-at-init property, and structural
 query-exclusion.
 
+## 14. Real design bug caught while assembling Phase 6
+
+`ChunkedCrossAttention` (Phase 5) was built assuming ONE shared context
+set every query attends to (correct for the boundary, regional H&E, and
+global-GEX inducing tokens — all genuinely the same set for every query
+in an item). Wiring it up for the LOCAL candidates (Phase 6) exposed a
+real mismatch: each query has its OWN local_k=32 nearest neighbors, not
+a shared set. Fixed by adding `GatheredCrossAttention` (Phase 5's
+`attention.py`, same module the tests below cover): per-query gathered
+candidate-set attention, no chunking needed since per-query candidate
+counts are small by construction. `MultiscaleBlock`'s local branch now
+uses `GatheredCrossAttention`; boundary/regional/global-GEX branches
+correctly keep `ChunkedCrossAttention`. Documented rather than silently
+fixed — this is exactly the kind of integration bug staged, tested
+implementation is meant to surface before it reaches real training.
+
+## 15. Architecture 1/2/3 wrappers (Phase 6 items 1-4 — implemented)
+
+`models/harmonic.py::harmonic_interpolation` — Architecture 2's ONLY
+anchor input, and the exact-mask harmonic baseline every arm is compared
+against. Deliberately never imports torch (verified by test, reading its
+own source) — "The harmonic solver must be outside the trainable neural
+input path" is structurally true, not a convention to remember. Solved
+by vectorized Jacobi relaxation over the same k-NN graph
+`boundary_graph.py` builds. Verified against a REAL mathematical
+property, not a smoke test: on a regular grid, the discrete-Laplace
+solution for a linear boundary field is exactly linear (a linear
+function equals the mean of any symmetric neighbor set) — reconstructed
+to within 0.5 absolute error on a 21×21 grid. Also verified: the maximum
+principle (no interior overshoot beyond the observed value range) and
+determinism. 7 tests.
+
+`models/geometry_utils.py` — `compute_relative_geometry` (handles both
+per-query-gathered and shared-context candidate coordinates),
+`compute_hole_geometry` (log-compressed query count as an area proxy +
+per-query normalized distance to the hole centroid, the handoff's query-
+token "hole-level geometry" field), `scatter_boundary_ring` (expands
+`boundary_graph.py`'s sparse boundary-only ring labels into a full
+per-observed-spot ring array `SpotTokenProjection` needs). 7 tests.
+
+`models/backbone.py` — `MultiscaleBlock` assembles Phase 5's modules
+into Architecture 1's exact 5-step block (query-query self-attention,
+gated local+boundary cross-attention, feed-forward) with
+`use_regional_he`/`use_global_gex`/`use_global_slide` flags extending it
+to Architecture 3/4's richer version — the SAME class, never a
+subclassed or duplicated block. `SpatialFieldBackbone` stacks
+`n_blocks` (default 4, within the handoff's 4-6 range) of them. 9 tests,
+including a direct test of Phase 6 item 4 ("Confirm common state-dict
+modules initialize identically across arms for the same seed") at the
+backbone level: two backbones built with identical config and the same
+seed have byte-identical parameters.
+
+`models/architectures.py` — `_SharedFieldArchitecture` (the common
+assembly: token projections, `SpatialFieldBackbone`, `GeneValueTransportHead`,
+optional `InducedGlobalGEXPool`), with `Architecture1`/`Architecture2`/
+`Architecture3` as thin flag-setting subclasses — never four (well,
+three so far) copy-pasted models, per Phase 6's explicit instruction.
+`Architecture2`'s only difference from `Architecture1` is
+`use_anchor_blend=True`; `Architecture3`'s is `use_global_gex=True`
+(`use_regional_he`/`use_global_slide` raise `NotImplementedError` with a
+clear message when set — Phase 3's WSI regional/global-slide tokens
+exist but aren't wired into `forward()` yet, tracked below, not silently
+ignored).
+
+**Two things documented rather than silently glossed over** (both in
+`architectures.py`'s own module docstring too):
+- The transport candidate pool CONCATENATES local + boundary candidates
+  rather than the handoff's literal "deduplicated union" — a query's
+  true-nearest local neighbor is often also a Ring-1 boundary spot, so a
+  handful of candidates can appear twice, receiving correlated extra
+  weight in the transport gate's softmax. Not a leakage or correctness
+  bug (weights still sum to 1), but a real, flagged simplification;
+  proper deduplication needs per-query masked attention, a real follow-up.
+- Modality-availability flags are hardcoded to "available" — no real
+  per-spot H&E-missing signal is wired in from `SpatialFieldInputs` yet
+  (that data-builder plumbing doesn't exist).
+
+7 integration tests build a full synthetic `SpatialFieldInputs` via
+`boundary_graph.py` (the same square-grid-with-a-hole pattern Phase 2's
+own tests use) and run REAL forward passes through all three
+architectures for the first time — covering output shapes, Architecture
+1/3's structural anchor-freedom, Architecture 2's real (not synthetic)
+harmonic anchor and its near-anchor behavior at initialization,
+Architecture 3's global-GEX pool and its `NotImplementedError` guards,
+end-to-end gradient flow across dozens of parameters, and Phase 6 item 4
+at the FULL-MODEL level: Architecture 1 vs 2 (identical parameter
+structure apart from one deterministically-filled, non-RNG-consuming
+`blend_logit`) are proven byte-identical everywhere they share a
+parameter name for the same seed; Architecture 1 vs 3 (which
+legitimately diverges in RNG-stream order once its extra randomly-
+initialized modules are constructed) are proven identical specifically
+in the token-projection modules constructed before that divergence — a
+more modest, honestly-scoped claim than "the whole model," which isn't
+actually a meaningful property once architectures have different
+parameter counts.
+
+## 16. What is still NOT covered
+
+- **Architecture 4** (Phase 6 item 5, the stopped-gradient residual flow
+  field) — needs its own substantial flow-matching apparatus (velocity
+  network, low-rank gene-basis projection, ODE/flow-matching loss, ODE
+  sampler for multiple predictive draws) on top of Architecture 3's
+  conditioner. Scoped as the next staged deliverable, not folded into
+  this pass.
+- Regional H&E tokens and the real LongNet global-slide token are not
+  wired into any architecture's `forward()` yet (`use_regional_he=True`/
+  `use_global_slide=True` raise `NotImplementedError`) — Phase 3's
+  `slide_context.py`/`slide_encoder.py` exist but a data-builder that
+  produces regional-grid tokens and a real LongNet forward pass per
+  training item doesn't yet.
+- Transport candidate pool is concatenated, not deduplicated (§15).
+- Modality-availability flags are not yet real per-spot signals (§15).
+- No losses beyond a plain MSE used in the gradient-flow test — the
+  handoff's spatial-gradient loss, full metric suite, and diagnostic
+  interventions are Phase 7.
+- No configs, no launcher — Phase 8.
+- No full leakage/geometry/learning/numerical gate suite from the
+  handoff's own "Mandatory pre-run gates" section — many individual
+  gates are already directly covered across Phases 1-6 (see the running
+  list in each phase's section above), but a systematic pass against
+  that full checklist hasn't been done.
+
 ## Test status as of this document
 
 ```
-gen3_multiscale/tests/: 123 passed (41 reused-infra + 12 example-schema +
+gen3_multiscale/tests/: 158 passed (41 reused-infra + 12 example-schema +
   11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
-  14 transport-head + 10 tokens + 11 attention + 10 global-context)
-full repo (gen2_architectures + gen3_multiscale): 292 passed, 1 skipped
+  14 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 7 architectures)
+full repo (gen2_architectures + gen3_multiscale): 327 passed, 1 skipped
 ```

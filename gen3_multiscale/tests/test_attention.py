@@ -4,7 +4,9 @@ vs an unchunked reference, and fail-closed on an oversized context), and
 query-query dense/sparse switching at the handoff's own named threshold."""
 import torch
 
-from gen3_multiscale.models.attention import ChunkedCrossAttention, QueryQuerySelfAttention, RelativeGeometryBias
+from gen3_multiscale.models.attention import (
+    ChunkedCrossAttention, GatheredCrossAttention, QueryQuerySelfAttention, RelativeGeometryBias,
+)
 
 
 def _relative_geometry(query_coords, context_coords):
@@ -85,6 +87,62 @@ class TestChunkedCrossAttention:
         perm = torch.randperm(13)
         out_permuted = attn(query_hidden, context_hidden[perm], geometry[:, perm])
         assert torch.allclose(out_original, out_permuted, atol=1e-5)
+
+
+class TestGatheredCrossAttention:
+    def test_output_shape(self):
+        attn = GatheredCrossAttention(hidden_dim=32, n_heads=4)
+        query_hidden = torch.randn(5, 32)
+        candidate_hidden = torch.randn(5, 8, 32)  # each query has its OWN 8 candidates
+        candidate_geometry = torch.randn(5, 8, 3)
+        out = attn(query_hidden, candidate_hidden, candidate_geometry)
+        assert out.shape == (5, 32)
+        assert torch.isfinite(out).all()
+
+    def test_different_queries_get_independent_candidate_sets(self):
+        """Changing ONLY query 1's own candidates must not change query
+        0's output -- confirms candidates are genuinely per-query, not
+        accidentally shared/mixed across queries."""
+        torch.manual_seed(0)
+        attn = GatheredCrossAttention(hidden_dim=16, n_heads=2)
+        query_hidden = torch.randn(2, 16)
+        candidate_hidden = torch.randn(2, 4, 16)
+        candidate_geometry = torch.randn(2, 4, 3)
+        out_a = attn(query_hidden, candidate_hidden, candidate_geometry)
+
+        candidate_hidden_b = candidate_hidden.clone()
+        candidate_hidden_b[1] = torch.randn(4, 16)  # perturb only query 1's candidates
+        out_b = attn(query_hidden, candidate_hidden_b, candidate_geometry)
+
+        assert torch.allclose(out_a[0], out_b[0], atol=1e-6)
+        assert not torch.allclose(out_a[1], out_b[1])
+
+    def test_gradients_flow(self):
+        attn = GatheredCrossAttention(hidden_dim=16, n_heads=2)
+        query_hidden = torch.randn(3, 16, requires_grad=True)
+        candidate_hidden = torch.randn(3, 5, 16, requires_grad=True)
+        candidate_geometry = torch.randn(3, 5, 3, requires_grad=True)
+        out = attn(query_hidden, candidate_hidden, candidate_geometry)
+        out.sum().backward()
+        assert query_hidden.grad is not None and torch.isfinite(query_hidden.grad).all()
+        assert candidate_hidden.grad is not None and torch.isfinite(candidate_hidden.grad).all()
+        assert candidate_geometry.grad is not None and torch.isfinite(candidate_geometry.grad).all()
+
+    def test_rejects_mismatched_geometry_shape(self):
+        attn = GatheredCrossAttention(hidden_dim=16, n_heads=2)
+        try:
+            attn(torch.randn(3, 16), torch.randn(3, 5, 16), torch.randn(3, 4, 3))
+            assert False, "expected a ValueError"
+        except ValueError as exc:
+            assert "candidate_geometry" in str(exc)
+
+    def test_rejects_zero_candidates(self):
+        attn = GatheredCrossAttention(hidden_dim=16, n_heads=2)
+        try:
+            attn(torch.randn(3, 16), torch.randn(3, 0, 16), torch.randn(3, 0, 3))
+            assert False, "expected a ValueError"
+        except ValueError as exc:
+            assert "zero candidates" in str(exc)
 
 
 class TestQueryQuerySelfAttention:

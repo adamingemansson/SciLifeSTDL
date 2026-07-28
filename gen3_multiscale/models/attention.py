@@ -134,6 +134,58 @@ class ChunkedCrossAttention(nn.Module):
         return self.out_proj(attn_output.reshape(n_query, self.hidden_dim))
 
 
+class GatheredCrossAttention(nn.Module):
+    """Per-query candidate-set cross-attention: unlike ChunkedCrossAttention
+    (ONE shared context set every query attends to, e.g. the boundary --
+    the same Rings 1-3 spots for every query in the item), each query
+    here has its OWN candidate set, already gathered by the caller (e.g.
+    boundary_graph.py's per-query query_local_neighbor_idx, local_k=32
+    candidates per query). No chunking here -- per-query candidate counts
+    are small by construction (local_k, or a handful of regional/global
+    tokens), so a single dense per-query softmax is both correct and
+    cheap; chunking exists specifically for the boundary's potentially
+    large SHARED context, not this case."""
+
+    def __init__(self, hidden_dim: int = 512, n_heads: int = 8):
+        super().__init__()
+        if hidden_dim % n_heads != 0:
+            raise ValueError(f"hidden_dim ({hidden_dim}) must be divisible by n_heads ({n_heads})")
+        self.hidden_dim = hidden_dim
+        self.n_heads = n_heads
+        self.head_dim = hidden_dim // n_heads
+
+        self.query_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.key_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.value_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.geometry_bias = RelativeGeometryBias(n_heads)
+
+    def forward(
+        self, query_hidden: torch.Tensor, candidate_hidden: torch.Tensor, candidate_geometry: torch.Tensor,
+    ) -> torch.Tensor:
+        n_query, n_candidates, _ = candidate_hidden.shape
+        if query_hidden.shape[0] != n_query:
+            raise ValueError(f"query_hidden has {query_hidden.shape[0]} rows, expected {n_query}")
+        if candidate_geometry.shape != (n_query, n_candidates, 3):
+            raise ValueError(
+                f"candidate_geometry must be [{n_query}, {n_candidates}, 3], got "
+                f"{tuple(candidate_geometry.shape)}"
+            )
+        if n_candidates == 0:
+            raise ValueError("candidate_hidden has zero candidates -- nothing to attend to")
+
+        q = self.query_proj(query_hidden).view(n_query, self.n_heads, self.head_dim)
+        k = self.key_proj(candidate_hidden).view(n_query, n_candidates, self.n_heads, self.head_dim)
+        v = self.value_proj(candidate_hidden).view(n_query, n_candidates, self.n_heads, self.head_dim)
+        scale = 1.0 / math.sqrt(self.head_dim)
+
+        bias = self.geometry_bias(candidate_geometry).permute(0, 2, 1)  # [Nq, heads, C]
+        logits = torch.einsum("qhd,qchd->qhc", q, k) * scale + bias
+        weights = torch.softmax(logits, dim=-1)
+        output = torch.einsum("qhc,qchd->qhd", weights, v)
+        return self.out_proj(output.reshape(n_query, self.hidden_dim))
+
+
 class QueryQuerySelfAttention(nn.Module):
     """Full O(n^2) self-attention among query tokens when the hole has at
     most dense_threshold spots (default 256, matching the handoff's own
