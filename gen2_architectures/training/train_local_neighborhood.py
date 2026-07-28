@@ -177,6 +177,21 @@ def main(
         )
         print(f"scFoundation feature width: {scfoundation_dim}")
 
+    # 2026-07-27 (GPT-audit-flagged, second-pass re-audit): a given
+    # training sample's adata never changes across steps -- only WHICH
+    # context/query spots get drawn from it does -- but
+    # _stpath_context_expression(adata) (log1p of the full raw-count
+    # matrix, every spot x every gene) was recomputed from scratch on
+    # EVERY single training step for Architecture 4, purely wasted CPU/RAM
+    # work repeated potentially millions of times over a run. Precompute
+    # it once per training sample here instead (only when architecture 4
+    # actually needs it) and look it up by sample id inside the loop.
+    train_stpath_context: dict[str, np.ndarray] = {}
+    if architecture == "4":
+        train_stpath_context = {
+            str(sid): _stpath_context_expression(adata) for sid, adata in zip(train_ids, train_adatas)
+        }
+
     model = build_model(cfg, gene_names, scfoundation_dim).to(device)
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
@@ -273,7 +288,7 @@ def main(
         item = build_masked_item(
             coords3d, expr, adata.obs["slice_id"].to_numpy(), cfg.masking, images, seed=step,
             context_gene_feature_provider=provider if architecture == "2" else None,
-            context_gene_features=_stpath_context_expression(adata) if architecture == "4" else None,
+            context_gene_features=train_stpath_context.get(sid) if architecture == "4" else None,
             context_extra_feature_provider=provider if architecture == "4" else None,
             organ=organ, tech=tech, augment=augment,
             image_mode=image_mode, context_gex_mode=context_gex_mode,
