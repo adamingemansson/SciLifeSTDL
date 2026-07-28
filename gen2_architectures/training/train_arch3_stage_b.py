@@ -49,22 +49,39 @@ def _load_stage_a(stage_a_checkpoint_dir: str, gene_names: list[str]) -> Denoisi
     # autoencoder's input/output columns are positional, not name-keyed.
     # Compare the exact ordered gene list against Stage A's own saved
     # gene_names.json, not just its width.
+    #
+    # 2026-07-27 (GPT-audit-flagged, second-pass re-audit): this check used
+    # to silently SKIP (fall back to the width-only check above) whenever
+    # gene_names.json was missing, instead of raising -- "fails open" on
+    # exactly the incomplete-checkpoint case it exists to catch.
+    # checkpoint.save_checkpoint ALWAYS writes gene_names.json (even for a
+    # zero-trainable-parameter model), so a missing file means a genuinely
+    # incomplete/corrupted Stage A checkpoint dir, not a legitimate older
+    # format to tolerate -- raise loudly rather than silently trusting an
+    # unverifiable gene panel.
     stage_a_gene_names_path = stage_a_dir / "gene_names.json"
-    if stage_a_gene_names_path.is_file():
-        stage_a_gene_names = json.loads(stage_a_gene_names_path.read_text())
-        if list(stage_a_gene_names) != list(gene_names):
-            first_diff = next(
-                (i for i, (a, b) in enumerate(zip(stage_a_gene_names, gene_names)) if a != b),
-                min(len(stage_a_gene_names), len(gene_names)),
-            )
-            raise ValueError(
-                f"Stage A's gene panel ({stage_a_gene_names_path}) has the same width "
-                f"({n_genes}) as this run's, but the ORDERED gene identities differ "
-                f"(first mismatch at index {first_diff}: "
-                f"{stage_a_gene_names[first_diff] if first_diff < len(stage_a_gene_names) else '<end>'!r} vs "
-                f"{gene_names[first_diff] if first_diff < len(gene_names) else '<end>'!r}). "
-                "Stage A and Stage B must share the exact same ordered gene panel."
-            )
+    if not stage_a_gene_names_path.is_file():
+        raise ValueError(
+            f"Stage A checkpoint at {stage_a_dir} has no gene_names.json -- cannot verify its "
+            "gene panel matches this run's ordered gene identities (only the width was "
+            "checked above, which is not sufficient). This looks like an incomplete Stage A "
+            "checkpoint; regenerate it with the current checkpoint.save_checkpoint, which "
+            "always writes gene_names.json."
+        )
+    stage_a_gene_names = json.loads(stage_a_gene_names_path.read_text())
+    if list(stage_a_gene_names) != list(gene_names):
+        first_diff = next(
+            (i for i, (a, b) in enumerate(zip(stage_a_gene_names, gene_names)) if a != b),
+            min(len(stage_a_gene_names), len(gene_names)),
+        )
+        raise ValueError(
+            f"Stage A's gene panel ({stage_a_gene_names_path}) has the same width "
+            f"({n_genes}) as this run's, but the ORDERED gene identities differ "
+            f"(first mismatch at index {first_diff}: "
+            f"{stage_a_gene_names[first_diff] if first_diff < len(stage_a_gene_names) else '<end>'!r} vs "
+            f"{gene_names[first_diff] if first_diff < len(gene_names) else '<end>'!r}). "
+            "Stage A and Stage B must share the exact same ordered gene panel."
+        )
     autoencoder = DenoisingTranscriptomeAutoencoder(n_genes=n_genes, **stage_a_config["params"])
     checkpoint.load_trainable_state(autoencoder, stage_a_checkpoint_dir)
     return autoencoder

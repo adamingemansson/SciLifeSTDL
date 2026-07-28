@@ -57,19 +57,31 @@ def _load_stage_b_model(saved_model_config: dict, gene_names: list[str], device)
     # 2026-07-27 bugfix: see train_arch3_stage_b.py::_load_stage_a's own
     # comment -- same width isn't the same panel. Compare exact ordered
     # gene identities too.
+    #
+    # 2026-07-27 (GPT-audit-flagged, second-pass re-audit): used to fail
+    # OPEN (silently skip the identity check) when gene_names.json was
+    # missing -- see train_arch3_stage_b.py::_load_stage_a's identical
+    # fix for why that's wrong (checkpoint.save_checkpoint always writes
+    # this file; a missing one means a genuinely incomplete checkpoint).
     stage_a_gene_names_path = stage_a_checkpoint_dir / "gene_names.json"
-    if stage_a_gene_names_path.is_file():
-        stage_a_gene_names = json.loads(stage_a_gene_names_path.read_text())
-        if list(stage_a_gene_names) != list(gene_names):
-            first_diff = next(
-                (i for i, (a, b) in enumerate(zip(stage_a_gene_names, gene_names)) if a != b),
-                min(len(stage_a_gene_names), len(gene_names)),
-            )
-            raise ValueError(
-                f"Stage A's gene panel ({stage_a_gene_names_path}) has the same width "
-                f"({n_genes}) as this Stage B checkpoint's, but the ORDERED gene identities "
-                f"differ (first mismatch at index {first_diff})"
-            )
+    if not stage_a_gene_names_path.is_file():
+        raise ValueError(
+            f"Stage A checkpoint at {stage_a_checkpoint_dir} has no gene_names.json -- cannot "
+            "verify its gene panel matches this Stage B checkpoint's ordered gene identities "
+            "(only the width was checked above, which is not sufficient). This looks like an "
+            "incomplete Stage A checkpoint."
+        )
+    stage_a_gene_names = json.loads(stage_a_gene_names_path.read_text())
+    if list(stage_a_gene_names) != list(gene_names):
+        first_diff = next(
+            (i for i, (a, b) in enumerate(zip(stage_a_gene_names, gene_names)) if a != b),
+            min(len(stage_a_gene_names), len(gene_names)),
+        )
+        raise ValueError(
+            f"Stage A's gene panel ({stage_a_gene_names_path}) has the same width "
+            f"({n_genes}) as this Stage B checkpoint's, but the ORDERED gene identities "
+            f"differ (first mismatch at index {first_diff})"
+        )
     autoencoder = DenoisingTranscriptomeAutoencoder(n_genes=n_genes, **stage_a_config["params"])
     checkpoint.load_trainable_state(autoencoder, stage_a_checkpoint_dir)
     autoencoder = autoencoder.to(device)
