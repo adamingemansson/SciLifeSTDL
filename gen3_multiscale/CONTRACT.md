@@ -1,11 +1,11 @@
 # gen3_multiscale — frozen contract and phase log
 
 Implements `CLAUDE_HANDOFF_MULTISCALE_SPATIAL_FIELD_ARCHITECTURES.md`'s
-staged phases. Status: **Phase 0-5 done; Phase 6 partial (Architectures
-1/2/3 implemented and integration-tested end-to-end; Architecture 4 is
-the next staged deliverable)**. Losses/diagnostics (Phase 7) and
-configs/launcher (Phase 8) are **not yet implemented**. This document is
-extended, not replaced, as later phases land.
+staged phases. Status: **Phase 0-6 done** — all four architectures run
+real, tested, end-to-end forward passes on synthetic data. Losses/
+diagnostics (Phase 7) and configs/launcher (Phase 8) are **not yet
+implemented**. This document is extended, not replaced, as later phases
+land.
 
 ## 1. Base commit
 
@@ -566,14 +566,82 @@ more modest, honestly-scoped claim than "the whole model," which isn't
 actually a meaningful property once architectures have different
 parameter counts.
 
-## 16. What is still NOT covered
+## 16. Architecture 4 (Phase 6 item 5 — implemented)
 
-- **Architecture 4** (Phase 6 item 5, the stopped-gradient residual flow
-  field) — needs its own substantial flow-matching apparatus (velocity
-  network, low-rank gene-basis projection, ODE/flow-matching loss, ODE
-  sampler for multiple predictive draws) on top of Architecture 3's
-  conditioner. Scoped as the next staged deliverable, not folded into
-  this pass.
+`models/gene_basis.py::GeneResidualBasis`/`fit_gene_residual_basis` — the
+fixed (never an `nn.Parameter`, never gradient-trained) low-rank basis
+mapping full-gene residuals to/from a compact coefficient field, fit via
+truncated SVD on a caller-supplied TRAINING-only residuals matrix (this
+module has no way to enforce the training-only part from inside, the
+same structural limitation `harmonic.py` and `target_gene_scale` already
+have — documented, not silently assumed safe). Its gene ordering is
+hashed and `verify_gene_residual_basis` fails closed (mirrors
+`checkpoint.verify_gene_names`) if a caller's current panel doesn't
+match. Verified against real linear-algebra properties: basis rows are
+provably orthonormal, reconstruction error strictly decreases as rank
+increases, and a full-rank basis reconstructs its own fitting data almost
+exactly. 9 tests.
+
+`models/flow.py` — `VelocityNetwork` built from the SAME
+`QueryQuerySelfAttention`/`ChunkedCrossAttention` modules every other
+architecture uses (never a from-memory reimplementation, per the
+handoff's explicit warning), conditioned on a single shared
+`sinusoidal_time_embedding` broadcast identically to every query token
+("one shared continuous-time value for the whole hole").
+`flow_matching_loss` implements linear/rectified conditional flow
+matching (`x_t = (1-t)x0 + t x1`, target velocity `x1 - x0`, one shared
+`t` and noise draw per hole). `sample_residual_coefficients`
+Euler-integrates the learned ODE for multiple independent draws.
+
+**Real bug caught by testing, not by inspection**: sampling initially
+left the velocity network in whatever training-mode it was already in,
+so an active dropout mask (drawing from the GLOBAL torch RNG on every
+forward call) silently broke reproducibility even under a fixed
+`generator` — caught by `test_sampling_is_reproducible_with_a_fixed_generator`
+failing with small, not-obviously-wrong-looking deltas. Fixed: sampling
+now forces `eval()` for its duration and restores the caller's original
+training mode afterward (`try`/`finally`), verified by a dedicated
+regression test. 11 tests total, including a direct test of the
+handoff's own gate ("Architecture 4's velocity output must depend on
+both time and conditioning, and multiple samples must not be identical").
+
+`models/architectures.py::Architecture4` — wraps a full, unmodified
+`Architecture3` instance as `self.conditioner` (satisfies "Use exactly
+the Architecture 3 conditioner and deterministic transport mean... do not
+change its width, number of blocks, boundary selection, slide inputs,
+gene encoder, or transport head" by literally reusing the same class, not
+re-deriving an equivalent one). Three methods, not a single overloaded
+`forward()`:
+- `forward(inputs)` — runs ONLY the deterministic conditioner, identical
+  contract to `Architecture3.forward()` (a caller computing the shared
+  deterministic losses never needs to know which architecture it holds).
+- `compute_flow_matching_loss(inputs, target_expression)` — computes the
+  target residual against the DETACHED deterministic mean, projects it
+  through the gene basis, and calls `flow_matching_loss`. Both
+  `query_hidden` and `deterministic_mean` are unconditionally `.detach()`'d
+  before use — "Initially stop gradients from the flow loss into the
+  deterministic conditioner" with no flag to disable it in this first
+  implementation, matching the handoff's "initially" framing.
+- `sample_predictive_distribution(inputs, n_samples, n_steps)` — draws
+  multiple residual-field samples, adds them to the deterministic mean,
+  and returns `predictive_mean`/`predictive_std`/`predictive_samples`
+  (plus `expression` aliased to `predictive_mean`, per "Primary PCC/RMSE
+  comparison should use the predictive mean across samples").
+
+4 integration tests build on the same synthetic `SpatialFieldInputs`
+fixture as Architectures 1-3: `forward()` matches the conditioner
+contract and stays anchor-free; backpropagating the flow loss ALONE
+leaves every conditioner parameter's `.grad` as `None` while the velocity
+network's parameters receive finite gradients (the stop-gradient contract
+verified directly, not just documented); the predictive distribution has
+correct shapes and its samples are provably not identical; and a gene
+basis fit on a different gene panel is rejected at construction.
+
+**This completes Phase 6** — all four architectures now run real,
+tested, end-to-end forward passes.
+
+## 17. What is still NOT covered
+
 - Regional H&E tokens and the real LongNet global-slide token are not
   wired into any architecture's `forward()` yet (`use_regional_he=True`/
   `use_global_slide=True` raise `NotImplementedError`) — Phase 3's
@@ -586,6 +654,10 @@ parameter counts.
   handoff's spatial-gradient loss, full metric suite, and diagnostic
   interventions are Phase 7.
 - No configs, no launcher — Phase 8.
+- No real per-sample DATA BUILDER wiring actual HEST-1k samples (not
+  synthetic square grids) into `SpatialFieldExample`/forward passes —
+  everything through Phase 6 has been verified on synthetic geometry;
+  real-data wiring is a Phase 7/8 concern.
 - No full leakage/geometry/learning/numerical gate suite from the
   handoff's own "Mandatory pre-run gates" section — many individual
   gates are already directly covered across Phases 1-6 (see the running
@@ -595,9 +667,10 @@ parameter counts.
 ## Test status as of this document
 
 ```
-gen3_multiscale/tests/: 158 passed (41 reused-infra + 12 example-schema +
+gen3_multiscale/tests/: 182 passed (41 reused-infra + 12 example-schema +
   11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
   14 transport-head + 10 tokens + 16 attention + 10 global-context +
-  7 harmonic + 7 geometry-utils + 9 backbone + 7 architectures)
-full repo (gen2_architectures + gen3_multiscale): 327 passed, 1 skipped
+  7 harmonic + 7 geometry-utils + 9 backbone + 11 architectures +
+  9 gene-basis + 11 flow)
+full repo (gen2_architectures + gen3_multiscale): 351 passed, 1 skipped
 ```

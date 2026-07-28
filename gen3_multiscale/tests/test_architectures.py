@@ -8,7 +8,8 @@ import torch
 
 from gen3_multiscale.data.boundary_graph import extract_boundary_and_local_context
 from gen3_multiscale.data.example import SpatialFieldInputs, SpatialFieldTargets, validate_spatial_field_example
-from gen3_multiscale.models.architectures import Architecture1, Architecture2, Architecture3
+from gen3_multiscale.models.architectures import Architecture1, Architecture2, Architecture3, Architecture4
+from gen3_multiscale.models.gene_basis import fit_gene_residual_basis
 
 
 def _synthetic_inputs(n_genes=6, gex_dim=4, image_dim=8, seed=0):
@@ -159,3 +160,82 @@ def test_architecture_1_and_3_share_identical_token_projection_initialization():
     for name, param1 in model1.query_token.named_parameters():
         param3 = dict(model3.query_token.named_parameters())[name]
         assert torch.equal(param1, param3), f"query_token.{name} differs between Arch1 and Arch3"
+
+
+def _gene_basis_for(n_genes, rank=4, seed=99):
+    rng = np.random.default_rng(seed)
+    residuals = rng.normal(size=(30, n_genes))
+    gene_names = [f"g{i}" for i in range(n_genes)]
+    return fit_gene_residual_basis(residuals, gene_names, rank=rank), gene_names
+
+
+def test_architecture_4_forward_matches_the_conditioner_contract():
+    """Architecture4's plain forward() runs ONLY the deterministic
+    conditioner -- the same contract Architecture3 has, per the handoff's
+    "Report Architecture 4's deterministic mean using the same path as
+    Architecture 3."""
+    inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    gene_basis, gene_names = _gene_basis_for(n_genes)
+    torch.manual_seed(0)
+    model = Architecture4(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        gene_basis=gene_basis, gene_names=gene_names, **_MODEL_KWARGS,
+    )
+    out = model(inputs)
+    assert out["expression"].shape == targets.query_expression.shape
+    assert out["anchor_expression"] is None  # Architecture 4 remains anchor-free
+
+
+def test_architecture_4_flow_loss_gradients_reach_only_the_velocity_network():
+    """"Initially stop gradients from the flow loss into the deterministic
+    conditioner" -- verified directly: backpropagating ONLY the flow loss
+    must leave every conditioner parameter's .grad as None."""
+    inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    gene_basis, gene_names = _gene_basis_for(n_genes)
+    torch.manual_seed(0)
+    model = Architecture4(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        gene_basis=gene_basis, gene_names=gene_names, **_MODEL_KWARGS,
+    )
+    loss = model.compute_flow_matching_loss(inputs, torch.as_tensor(targets.query_expression))
+    assert torch.isfinite(loss)
+    loss.backward()
+
+    for name, param in model.conditioner.named_parameters():
+        assert param.grad is None, f"conditioner.{name} received a gradient from the flow loss"
+    velocity_grads = [p.grad for p in model.velocity_network.parameters() if p.grad is not None]
+    assert len(velocity_grads) > 0
+    assert all(torch.isfinite(g).all() for g in velocity_grads)
+
+
+def test_architecture_4_predictive_distribution_shapes_and_diversity():
+    inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    gene_basis, gene_names = _gene_basis_for(n_genes)
+    torch.manual_seed(0)
+    model = Architecture4(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        gene_basis=gene_basis, gene_names=gene_names, n_flow_samples=5, n_ode_steps=4, **_MODEL_KWARGS,
+    )
+    n_query = targets.query_expression.shape[0]
+    out = model.sample_predictive_distribution(inputs)
+    assert out["predictive_samples"].shape == (5, n_query, n_genes)
+    assert out["predictive_mean"].shape == (n_query, n_genes)
+    assert out["predictive_std"].shape == (n_query, n_genes)
+    assert out["expression"] is out["predictive_mean"]
+    assert torch.isfinite(out["predictive_mean"]).all()
+    assert (out["predictive_std"] > 0).any()  # samples must actually differ somewhere
+    assert not torch.allclose(out["predictive_samples"][0], out["predictive_samples"][1])
+
+
+def test_architecture_4_rejects_a_gene_basis_fit_on_a_different_panel():
+    inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    wrong_basis, _ = _gene_basis_for(n_genes)
+    wrong_gene_names = [f"different_gene_{i}" for i in range(n_genes)]
+    try:
+        Architecture4(
+            n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+            gene_basis=wrong_basis, gene_names=wrong_gene_names, **_MODEL_KWARGS,
+        )
+        assert False, "expected a ValueError"
+    except ValueError as exc:
+        assert "gene panel" in str(exc)

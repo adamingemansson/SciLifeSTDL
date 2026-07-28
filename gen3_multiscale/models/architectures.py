@@ -1,15 +1,14 @@
-"""Architecture 1/2/3 wrappers -- Phase 6 items 1-4 of the multiscale
-spatial-field handoff. All three share ONE base class
+"""Architecture 1/2/3/4 wrappers -- Phase 6 of the multiscale spatial-
+field handoff. Architectures 1/2/3 share ONE base class
 (_SharedFieldArchitecture) with explicit feature flags, per Phase 6's
 own instruction: "Avoid four copy-pasted models. Use shared modules with
 explicit feature flags so accidental differences are visible in resolved
 configs, while preserving clear architecture names and checkpoints."
-
-Architecture 4 (Phase 6 item 5, the stopped-gradient residual flow field)
-is deliberately NOT in this module -- it needs its own substantial flow-
-matching apparatus (velocity network, gene-basis projection, ODE
-sampling) on top of Architecture 3's conditioner, scoped as its own
-follow-up rather than folded in here.
+Architecture 4 wraps a full Architecture3 instance as its frozen-at-the-
+flow-loss conditioner (see Architecture4's own docstring below) rather
+than being a fourth _SharedFieldArchitecture flag combination, since its
+extra apparatus (velocity network, gene-basis projection, ODE sampling)
+is qualitatively different from a token/attention feature flag.
 
 KNOWN SIMPLIFICATION (documented here and in CONTRACT.md, not silently
 assumed away): the handoff specifies the transport candidate pool as
@@ -41,6 +40,8 @@ import torch.nn as nn
 
 from gen3_multiscale.data.example import SpatialFieldInputs
 from gen3_multiscale.models.backbone import SpatialFieldBackbone
+from gen3_multiscale.models.flow import VelocityNetwork, flow_matching_loss, sample_residual_coefficients
+from gen3_multiscale.models.gene_basis import GeneResidualBasis, verify_gene_residual_basis
 from gen3_multiscale.models.geometry_utils import compute_hole_geometry, compute_relative_geometry, scatter_boundary_ring
 from gen3_multiscale.models.global_context import InducedGlobalGEXPool
 from gen3_multiscale.models.harmonic import harmonic_interpolation
@@ -249,3 +250,130 @@ class Architecture3(_SharedFieldArchitecture):
         kwargs.setdefault("use_global_gex", True)
         kwargs.setdefault("use_global_slide", False)  # NotImplementedError until wired -- see CONTRACT.md
         super().__init__(**kwargs)
+
+
+class Architecture4(nn.Module):
+    """Hierarchical Residual Flow Field.
+
+    "Use exactly the Architecture 3 conditioner and deterministic
+    transport mean. Do not change its width, number of blocks, boundary
+    selection, slide inputs, gene encoder, or transport head. Architecture
+    4 remains anchor-free. Its deterministic mean is Architecture 3's
+    learned transport prediction, not harmonic or IDW." -- satisfied by
+    literally constructing a full Architecture3 instance as self.conditioner
+    and calling it unmodified, rather than re-deriving an equivalent
+    conditioner from scratch.
+
+    "Initially stop gradients from the flow loss into the deterministic
+    conditioner" -- self.conditioner's forward pass is always run WITHOUT
+    torch.no_grad() (so its own deterministic-loss gradients, computed
+    separately by a caller, are unaffected), but the query_hidden and
+    deterministic mean handed to the flow apparatus are .detach()'d
+    before use, every time, unconditionally -- there is no flag to turn
+    this off in this first implementation, matching the handoff's
+    "initially" framing (a later experiment could relax it, not this one).
+
+    gene_basis must be a GeneResidualBasis already fit on TRAINING-split
+    residuals (gene_basis.py, fit offline, outside this class -- this
+    class only ever calls verify_gene_residual_basis, never fits one
+    itself, so it can never accidentally fit on validation/test data).
+    """
+
+    def __init__(
+        self,
+        n_genes: int,
+        gex_feature_dim: int,
+        gene_basis: GeneResidualBasis,
+        gene_names: list[str],
+        image_feature_dim: int = 1536,
+        hidden_dim: int = 512,
+        n_heads: int = 8,
+        n_blocks: int = 4,
+        n_flow_blocks: int = 2,
+        dense_threshold: int = 256,
+        sparse_k: int = 10,
+        chunk_size: int = 1024,
+        max_boundary_size: int | None = None,
+        transport_heads: int = 8,
+        transport_temperature: float = 1.0,
+        gene_gate_mode: str = "per_gene",
+        use_query_gate: bool = True,
+        use_residual: bool = False,
+        residual_rank: int = 32,
+        target_gene_scale: torch.Tensor | None = None,
+        n_gex_inducing: int = 16,
+        harmonic_k_neighbors: int = 6,
+        n_flow_samples: int = 8,
+        n_ode_steps: int = 20,
+    ):
+        super().__init__()
+        verify_gene_residual_basis(gene_basis, gene_names)
+        self.gene_basis = gene_basis
+        self.n_flow_samples = n_flow_samples
+        self.n_ode_steps = n_ode_steps
+
+        self.conditioner = Architecture3(
+            n_genes=n_genes, gex_feature_dim=gex_feature_dim, image_feature_dim=image_feature_dim,
+            hidden_dim=hidden_dim, n_heads=n_heads, n_blocks=n_blocks,
+            dense_threshold=dense_threshold, sparse_k=sparse_k, chunk_size=chunk_size,
+            max_boundary_size=max_boundary_size, transport_heads=transport_heads,
+            transport_temperature=transport_temperature, gene_gate_mode=gene_gate_mode,
+            use_query_gate=use_query_gate, use_residual=use_residual, residual_rank=residual_rank,
+            target_gene_scale=target_gene_scale, n_gex_inducing=n_gex_inducing,
+            harmonic_k_neighbors=harmonic_k_neighbors,
+        )
+        self.velocity_network = VelocityNetwork(
+            residual_rank=gene_basis.rank, hidden_dim=hidden_dim, n_heads=n_heads, n_blocks=n_flow_blocks,
+            dense_threshold=dense_threshold, sparse_k=sparse_k, chunk_size=chunk_size,
+        )
+
+    def forward(self, inputs: SpatialFieldInputs) -> dict:
+        """Runs ONLY the deterministic conditioner -- the same contract
+        Architecture 3 itself has, so a caller computing the shared
+        deterministic reconstruction/gradient losses (Phase 7) never
+        needs to know it's holding an Architecture4 instance rather than
+        an Architecture3 one."""
+        return self.conditioner(inputs)
+
+    def compute_flow_matching_loss(self, inputs: SpatialFieldInputs, target_expression: torch.Tensor) -> torch.Tensor:
+        conditioner_out = self.conditioner(inputs)
+        query_hidden = conditioner_out["query_hidden"].detach()
+        deterministic_mean = conditioner_out["expression"].detach()
+        target_residual = target_expression - deterministic_mean
+        target_coefficients = self.gene_basis.to_coefficients(target_residual)
+        query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32)
+        return flow_matching_loss(self.velocity_network, target_coefficients, query_coords, query_hidden)
+
+    @torch.no_grad()
+    def sample_predictive_distribution(
+        self, inputs: SpatialFieldInputs, n_samples: int | None = None, n_steps: int | None = None,
+    ) -> dict:
+        """Draws multiple low-rank residual-field samples and adds the
+        corresponding full-gene residuals to the deterministic transport
+        mean. "Primary PCC/RMSE comparison should use the predictive mean
+        across samples" -- returned as predictive_mean (and also as
+        "expression", so this dict is drop-in compatible with the
+        conditioner-only forward()'s output for anything that only reads
+        "expression"). Also reports predictive_std (uncertainty) and the
+        raw per-sample field for diversity diagnostics (Phase 7)."""
+        conditioner_out = self.conditioner(inputs)
+        query_hidden = conditioner_out["query_hidden"]
+        deterministic_mean = conditioner_out["expression"]
+        query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32)
+        n_query = query_coords.shape[0]
+
+        coefficient_samples = sample_residual_coefficients(
+            self.velocity_network, n_query, query_coords, query_hidden,
+            n_samples=n_samples or self.n_flow_samples, n_steps=n_steps or self.n_ode_steps,
+        )
+        residual_samples = self.gene_basis.from_coefficients(coefficient_samples)  # [S, Nq, G]
+        predictive_samples = deterministic_mean[None] + residual_samples
+        predictive_mean = predictive_samples.mean(dim=0)
+        predictive_std = predictive_samples.std(dim=0)
+        return {
+            "expression": predictive_mean,
+            "predictive_mean": predictive_mean,
+            "predictive_std": predictive_std,
+            "predictive_samples": predictive_samples,
+            "deterministic_mean": deterministic_mean,
+        }
