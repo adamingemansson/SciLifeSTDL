@@ -309,10 +309,18 @@ def resolve_sample_selection(
     patient identity isn't available.
 
     Returns a dict: train_sample_ids, validation_sample_ids, test_sample_ids
-    (all list[str]), organ_by_sample, tech_by_sample (both dict[str, str]),
-    organ_vocab, tech_vocab (both list[str], sorted-unique -- ready to pass
-    straight into OrganTechEmbedding via build_organ_tech_vocab-equivalent
-    ordering).
+    (all list[str]), organ_by_sample, tech_by_sample, patient_by_sample
+    (all dict[str, str]), organ_vocab, tech_vocab (both list[str],
+    sorted-unique -- ready to pass straight into OrganTechEmbedding via
+    build_organ_tech_vocab-equivalent ordering).
+
+    patient_by_sample (added for the real Gen3 dataset manifest, which
+    needs each kept sample's real patient identity, not just the
+    disjointness guarantee this function already enforced internally
+    without exposing the mapping itself): every sample id this function
+    actually kept -> its resolved patient value (see split_by_patient's
+    own docstring above for exactly what that value is when a sample has
+    no real `patient` metadata).
     """
     import random
 
@@ -412,6 +420,7 @@ def resolve_sample_selection(
     kept_ids_after_conflicts = set(train_ids) | set(validation_ids) | set(test_ids)
     organ_by_sample = {sid: organ for sid, organ in organ_by_sample.items() if sid in kept_ids_after_conflicts}
     tech_by_sample = {sid: tech for sid, tech in tech_by_sample.items() if sid in kept_ids_after_conflicts}
+    patient_by_sample = {sid: patient for sid, patient in patient_by_sample.items() if sid in kept_ids_after_conflicts}
     kept_organs = sorted({organ_by_sample[sid] for sid in train_ids})
     if not train_ids:
         raise ValueError(
@@ -432,6 +441,7 @@ def resolve_sample_selection(
         test_ids = [sid for sid in test_ids if sid in kept_set]
         organ_by_sample = {sid: organ for sid, organ in organ_by_sample.items() if sid in kept_set}
         tech_by_sample = {sid: tech for sid, tech in tech_by_sample.items() if sid in kept_set}
+        patient_by_sample = {sid: patient for sid, patient in patient_by_sample.items() if sid in kept_set}
         # An organ only stays in the vocabulary if it still has real
         # TRAINING samples -- losing just its validation/test sample(s)
         # to the compatibility check is a real but minor degradation
@@ -451,6 +461,7 @@ def resolve_sample_selection(
         "test_sample_ids": sorted(test_ids),
         "organ_by_sample": organ_by_sample,
         "tech_by_sample": tech_by_sample,
+        "patient_by_sample": patient_by_sample,
         "organ_vocab": sorted(kept_organs),
         "tech_vocab": ["Visium"],
     }

@@ -2413,18 +2413,129 @@ entry.
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 31. Real Gen3 data builder -- Step 1: immutable dataset manifest
+
+First stage of the real Gen3 data builder/trainer (§30's 9-step order,
+item 1: "Build an immutable dataset manifest with sample IDs, composite
+(sample_id, spot_id) identities, gene order/hash, coordinates, WSI/cache
+provenance and patient-level splits").
+
+**`data/dataset_manifest.py`** (new module):
+
+- `composite_spot_id(sample_id, barcode) -> str` -- `f"{sample_id}::{barcode}"`,
+  the TRUE globally-unique spot identity every later leakage/novelty
+  check (Step 3) is built on. Plain Visium barcodes are NOT globally
+  unique and are reused across different samples/slides -- a gap this
+  document has flagged repeatedly (§26 finding #6, §27, §28) but never
+  closed until now. Rejects sample_ids/barcodes containing the "::"
+  delimiter itself (both are real, plausible strings that must never be
+  ambiguous once combined). Verified by a regression test that gives
+  TWO different synthetic samples the exact same literal barcode
+  strings (the real scenario) and confirms their composite identities
+  are still disjoint.
+- `gene_panel_hash(gene_names) -> str` -- ordered-panel hash, same
+  discipline as `gene_basis.fit_gene_residual_basis`'s
+  `gene_names_hash` and `checkpoint.verify_gene_names`: hashes the
+  exact ORDER, not just set membership.
+- `build_dataset_manifest(...)` -- calls `hest1k_catalog.resolve_sample_selection`
+  (unchanged, reused as-is) for the patient-disjoint splits, then
+  derives the gene panel by calling `loaders.load_multi_sample` on
+  TRAINING samples ONLY (discarding the loaded expression matrices
+  immediately afterward -- only the resulting panel is kept), reads
+  every kept sample's (train AND held-out) real barcodes/coordinates
+  via a cheap `backed="r"` anndata read (mirroring
+  `hest1k_catalog._real_var_names`'s identical pattern -- never loads a
+  held-out sample's expression matrix), and records lightweight WSI
+  cache provenance (path/size/mtime -- the same cheap "identity"
+  convention `slide_context.py`'s own runtime cache key already uses,
+  deliberately NOT a full-file SHA256 hash, which would be
+  prohibitively slow for many large per-sample GigaPath tile caches at
+  manifest-build time). Returns `None` for a sample's `wsi_cache` field
+  when the cache file doesn't exist yet -- not an error here; Step 8's
+  preflight gates are where "required but missing" becomes fail-closed,
+  not this bookkeeping step.
+- `save_dataset_manifest`/`load_dataset_manifest`/`ensure_dataset_manifest` --
+  the same atomic-write (process-specific temp file + `os.replace`) and
+  fail-closed-reuse pattern every other persisted artifact in this
+  package already follows (`mask_bank.save_mask_bank`,
+  `mask_schedule.save_stratified_mask_bank`). `ensure_dataset_manifest`
+  compares a fresh in-memory rebuild against the on-disk file
+  byte-for-byte (not just a few fingerprint fields) and raises if they
+  differ -- real HEST-1k data or build arguments can change between
+  runs, and a manifest that silently kept describing stale data would
+  defeat the entire point of building one.
+- `all_composite_spot_ids(manifest, sample_ids=None)` -- the base set
+  Step 3's leakage/novelty checks will be built on.
+
+**`data/loaders.py`** (new module, copied VERBATIM from
+`gen2_architectures/data/loaders.py` at commit 621c610, same
+copy-provenance discipline as every other reused module in this
+package): `load_hest_sample`, `load_multi_sample` (with its
+`reference_genes` strict-held-out-vocabulary path, already exactly what
+"derive the gene panel from training samples only" needs),
+`basic_qc_and_normalize`, `load_hest_patches`/`align_patches_to_adata`
+for H&E patches, `get_coords_3d`. This is the first module in
+`gen3_multiscale/` that actually loads real per-sample expression data
+-- Phases 0-8 built the schema/model/architecture/mask-scheduling
+layers around real data without ever loading any.
+
+**`hest1k_catalog.resolve_sample_selection`** (both `gen3_multiscale`
+and `gen2_architectures` copies, kept in sync): now also returns
+`patient_by_sample` in its result dict. The function already computed
+this internally (used by `_resolve_cross_organ_patient_conflicts`) but
+never exposed it; the dataset manifest needs each kept sample's real
+patient identity, and re-deriving it independently from the metadata
+CSV a second time would risk silently disagreeing with the split
+function's own internal computation. A small, additive, backward-
+compatible change (new dict key, existing callers unaffected); applied
+identically to both copies, with an identical new regression test in
+both test files.
+
+**Verified with real (not `.touch()`-placeholder) synthetic AnnData**:
+unlike `test_hest1k_catalog.py`'s existing fixtures (which only need
+files to exist, never reads their content unless
+`check_gene_panel_compatibility=True`), this module reads real
+barcodes, coordinates, and gene panels, so `test_dataset_manifest.py`
+writes genuine small `.h5ad` files (`anndata.AnnData` with
+`obsm['spatial']`, real `var_names`/`obs_names`) via `anndata`/`scanpy`,
+both already available in this environment. 10 new tests, including the
+barcode-collision regression above and a test that gives held-out
+samples EXTRA genes train samples don't have, confirming `gene_panel`
+reflects only what training samples actually have (the split's actual
+reported `validation_sample_ids` is determined via a dry run first,
+rather than guessing `resolve_sample_selection`'s internal shuffle, so
+the assertion is deterministic and legible rather than a hardcoded
+guess).
+
+**Deliberately NOT built in this step** (later steps in the 9-step
+order): loading/aligning H&E patches or WSI tiles, mask realization,
+composite-identity leakage ENFORCEMENT (this step only provides the
+identity vocabulary; Step 3 builds the actual reject-on-collision
+checks), Novae graphs, or anything touching the trainer/evaluator. This
+module's job is exactly what its name says -- one authoritative,
+persisted description of what data exists and how it's split -- nothing
+that consumes it yet exists.
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
 
 ```
-gen3_multiscale/tests/: 342 passed (41 reused-infra + 12 example-schema +
+gen3_multiscale/tests/: 353 passed (42 reused-infra + 12 example-schema +
   11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
   18 transport-head + 10 tokens + 16 attention + 10 global-context +
   7 harmonic + 7 geometry-utils + 9 backbone + 23 architectures +
   9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
   27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
-  37 mask-schedule)
-gen2_architectures + gen3_multiscale: 511 passed, 1 skipped
+  37 mask-schedule + 10 dataset-manifest)
+gen2_architectures + gen3_multiscale: 523 passed, 1 skipped
 ```
+
+Note: `reused-infra` (13 checkpoint + 21 hest1k-catalog + 4
+query-overlap-report + 4 gene-panel-compatibility) grew by one test this
+round -- `test_resolve_sample_selection_returns_patient_by_sample`,
+added identically to both `gen3_multiscale` and `gen2_architectures`'
+copies of `test_hest1k_catalog.py`.
 
 Note: a full monorepo run (`pytest -q` from the repo root, everything
 including the top-level `tests/` directory) still shows the same one

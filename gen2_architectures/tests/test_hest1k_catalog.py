@@ -244,6 +244,29 @@ def test_split_by_patient_keeps_every_sample_from_a_held_out_patient_together():
         assert not ({patient_of(sid) for sid in test} & {patient_of(sid) for sid in train})
 
 
+def test_resolve_sample_selection_returns_patient_by_sample():
+    """Regression test: resolve_sample_selection computes patient_by_sample
+    internally (used by _resolve_cross_organ_patient_conflicts) but never
+    exposed it -- needed by gen3_multiscale's real dataset manifest,
+    applied here too to keep the two copies in sync. Every kept sample id
+    must appear with its real resolved patient value, filtered the same
+    way organ_by_sample/tech_by_sample already are."""
+    with tempfile.TemporaryDirectory() as tmp:
+        patient_by_id = {f"L{i}": f"P{i // 3}" for i in range(9)}
+        hest_dir, meta_path = _make_fake_hest1k(
+            Path(tmp), {"Lung": [f"L{i}" for i in range(9)]}, patient_by_id=patient_by_id,
+        )
+        result = resolve_sample_selection(
+            hest_dir, str(meta_path), organs="all", min_samples_per_organ=3,
+            n_validation_per_organ=1, n_test_per_organ=1, split_seed=0,
+            check_gene_panel_compatibility=False, split_by_patient=True,
+        )
+        all_kept = set(result["train_sample_ids"]) | set(result["validation_sample_ids"]) | set(result["test_sample_ids"])
+        assert set(result["patient_by_sample"].keys()) == all_kept
+        for sid in all_kept:
+            assert result["patient_by_sample"][sid] == patient_by_id[sid]
+
+
 def test_split_by_patient_false_reproduces_the_old_sample_level_split():
     with tempfile.TemporaryDirectory() as tmp:
         patient_by_id = {f"L{i}": f"P{i // 3}" for i in range(9)}

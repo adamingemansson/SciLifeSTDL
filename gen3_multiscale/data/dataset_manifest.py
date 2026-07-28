@@ -1,0 +1,291 @@
+"""Immutable Gen3 dataset manifest -- Step 1 of the real Gen3 data
+builder/trainer (Adam's explicit instruction and 9-step implementation
+order, gen3_multiscale/CONTRACT.md section 30: "Build an immutable
+dataset manifest with sample IDs, composite (sample_id, spot_id)
+identities, gene order/hash, coordinates, WSI/cache provenance and
+patient-level splits.").
+
+Builds and persists ONE authoritative, atomically-written artifact
+describing exactly what data a Gen3 training run will use:
+  - patient-disjoint train/validation/test sample splits (reusing
+    hest1k_catalog.resolve_sample_selection's already-audited logic,
+    never re-derived independently here)
+  - the ordered gene panel, derived from TRAINING samples only via
+    loaders.load_multi_sample's real QC/normalization pipeline (never
+    letting held-out samples shrink or choose the vocabulary -- the
+    exact discipline the 5th Codex re-audit's implementation order
+    item 5 specified)
+  - every kept sample's real per-spot barcodes and coordinates, and the
+    composite (sample_id, spot_id) identities every later leakage check
+    (Step 3) is built on -- plain Visium barcodes are NOT globally
+    unique and are reused across different samples/slides, a gap
+    repeatedly confirmed across this project's audit rounds (most
+    recently CONTRACT.md section 26 finding #6)
+  - lightweight WSI/cache provenance (path, size, mtime -- the same
+    cheap "identity" convention slide_context.py already uses for its
+    own runtime cache key, NOT a full-file content hash, which would be
+    prohibitively slow to compute for many large per-sample GigaPath
+    tile caches at manifest-build time)
+
+Every later step in the real data builder (example construction, mask-
+realization fingerprinting, Novae graphs, WSI wiring, the trainer and
+evaluator) reads THIS manifest rather than re-deriving splits/panels/
+identities independently -- one authoritative source of truth, not
+several independently-computed ones that could silently disagree.
+
+Deliberately NOT built here: loading full expression matrices for
+validation/test samples (only train samples are loaded, to derive the
+gene panel; validation/test samples are only read cheaply for
+barcodes/coordinates, via anndata's backed='r' mode -- mirroring
+hest1k_catalog._real_var_names's own established cheap-read pattern),
+mask realization (Step 2/3), or WSI feature loading (Step 5). This
+module's job is provenance and identity bookkeeping, not data loading
+for training itself.
+"""
+from __future__ import annotations
+
+import json
+import os
+from hashlib import sha256
+from pathlib import Path
+from typing import Iterable
+
+import numpy as np
+
+from gen3_multiscale.data import loaders
+from gen3_multiscale.data.hest1k_catalog import resolve_sample_selection
+
+_MANIFEST_VERSION = 1
+
+
+def composite_spot_id(sample_id: str, barcode: str) -> str:
+    """The TRUE globally-unique spot identity used throughout this
+    module and every later leakage check -- plain Visium barcodes are
+    NOT globally unique and are reused across different samples/slides
+    (repeatedly confirmed across this project's audit rounds, most
+    recently CONTRACT.md section 26 finding #6: "Plain Visium barcodes
+    are not globally unique and are reused between slides"). Uses a
+    delimiter ("::") that cannot appear in a real HEST-1k sample_id (a
+    filesystem-safe identifier) or a real 10x/Visium barcode (e.g.
+    "AAACAAGTATCTCCCA-1")."""
+    sample_id = str(sample_id)
+    barcode = str(barcode)
+    if "::" in sample_id or "::" in barcode:
+        raise ValueError(
+            f"sample_id {sample_id!r} or barcode {barcode!r} contains the '::' composite-id "
+            "delimiter -- this would make composite_spot_id ambiguous"
+        )
+    return f"{sample_id}::{barcode}"
+
+
+def _read_sample_barcodes_and_coords(hest_data_dir: str | Path, sample_id: str) -> tuple[list[str], np.ndarray]:
+    """Real per-spot barcodes and spatial coordinates for one sample,
+    read WITHOUT loading the full expression matrix (anndata's
+    backed='r' mode still loads obs/obsm eagerly, only X stays lazy --
+    mirrors hest1k_catalog._real_var_names's identical cheap-read
+    pattern). Used for every kept sample (train AND held-out), since
+    identity/coordinate bookkeeping is needed for all of them, not just
+    the train samples whose expression actually gets loaded to derive
+    the gene panel."""
+    import anndata as ad
+    path = loaders._resolve_hest_sample_file(hest_data_dir, sample_id, ".h5ad")
+    adata = ad.read_h5ad(path, backed="r")
+    barcodes = [str(x) for x in adata.obs_names]
+    coords = np.asarray(adata.obsm["spatial"], dtype=np.float64)
+    if coords.shape[0] != len(barcodes):
+        raise ValueError(
+            f"{sample_id}: obsm['spatial'] has {coords.shape[0]} rows but obs_names has "
+            f"{len(barcodes)} entries -- misaligned real data"
+        )
+    return barcodes, coords
+
+
+def gene_panel_hash(gene_names: list[str]) -> str:
+    """Ordered-panel hash -- same discipline as
+    gene_basis.fit_gene_residual_basis's gene_names_hash and
+    checkpoint.verify_gene_names: the exact ORDER is hashed, not just
+    set membership, since every architecture's dense gene-indexed
+    tensors depend on a fixed, agreed-upon ordering."""
+    return sha256("\n".join(str(g) for g in gene_names).encode("utf-8")).hexdigest()
+
+
+def _wsi_cache_provenance(hest_cache_dir: str | Path, sample_id: str) -> dict | None:
+    """Lightweight provenance for one sample's dense GigaPath WSI tile
+    cache (path/size/mtime -- the same cheap "identity" convention
+    slide_context.py's own load_slide_context already uses for its
+    runtime cache key, NOT a full-file SHA256 content hash, which would
+    be prohibitively slow to compute for many large per-sample tile
+    caches at manifest-build time). Returns None (not an error) when the
+    cache file doesn't exist yet -- WSI conditioning may not be enabled
+    for every organ/run, and Step 8's preflight gates (not this module)
+    are where "required but missing" becomes fail-closed."""
+    path = Path(hest_cache_dir) / "gigapath_slide_cache" / f"{sample_id}.npz"
+    if not path.is_file():
+        return None
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "size_bytes": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def build_dataset_manifest(
+    hest_data_dir: str | Path,
+    metadata_csv: str,
+    *,
+    organs: list[str] | str = "all",
+    species: str | list[str] | None = "Homo sapiens",
+    min_nb_genes: int | None = 5000,
+    min_samples_per_organ: int = 3,
+    max_samples_per_organ: int | None = None,
+    n_validation_per_organ: int = 1,
+    n_test_per_organ: int = 1,
+    split_seed: int = 0,
+    check_gene_panel_compatibility: bool = True,
+    min_gene_coverage: float = 0.9,
+    min_sample_coverage: float = 0.9,
+    min_panel_size: int = 5000,
+    split_by_patient: bool = True,
+    gene_min_genes_per_spot: int = 200,
+    gene_min_cells: int = 3,
+    expression_transform: str = "normalize_log1p",
+    expression_target_sum: float = 1e4,
+    hest_cache_dir: str | Path | None = None,
+) -> dict:
+    """Build the complete, in-memory dataset manifest. Pure function of
+    its inputs (and the real files on disk) -- no persistence here (see
+    save_dataset_manifest/ensure_dataset_manifest below for the atomic-
+    write/fail-closed-reuse pair every other artifact in this package
+    already follows)."""
+    hest_data_dir = Path(hest_data_dir)
+    hest_cache_dir = Path(hest_cache_dir) if hest_cache_dir is not None else hest_data_dir
+
+    split = resolve_sample_selection(
+        hest_data_dir, metadata_csv, organs=organs, species=species, min_nb_genes=min_nb_genes,
+        min_samples_per_organ=min_samples_per_organ, max_samples_per_organ=max_samples_per_organ,
+        n_validation_per_organ=n_validation_per_organ, n_test_per_organ=n_test_per_organ,
+        split_seed=split_seed, check_gene_panel_compatibility=check_gene_panel_compatibility,
+        min_gene_coverage=min_gene_coverage, min_sample_coverage=min_sample_coverage,
+        min_panel_size=min_panel_size, split_by_patient=split_by_patient,
+    )
+    train_ids = split["train_sample_ids"]
+    validation_ids = split["validation_sample_ids"]
+    test_ids = split["test_sample_ids"]
+    all_ids = sorted(set(train_ids) | set(validation_ids) | set(test_ids))
+
+    # The gene panel is derived from TRAINING samples ONLY, via the real
+    # QC/normalization pipeline every sample actually goes through
+    # (loaders.load_multi_sample) -- "Derive the ordered gene panel from
+    # training samples only... never let held-out samples shrink or
+    # choose the vocabulary" (5th Codex re-audit implementation order,
+    # item 5). The loaded AnnData objects themselves are discarded
+    # immediately after extracting the panel; this function only ever
+    # needs to know WHAT the panel is, not hold every training sample's
+    # full expression matrix in memory afterward.
+    train_organs = [split["organ_by_sample"][sid] for sid in train_ids]
+    train_techs = [split["tech_by_sample"][sid] for sid in train_ids]
+    train_adatas = loaders.load_multi_sample(
+        hest_data_dir, train_ids, min_genes=gene_min_genes_per_spot, min_cells=gene_min_cells,
+        organs=train_organs, techs=train_techs, expression_transform=expression_transform,
+        expression_target_sum=expression_target_sum,
+    )
+    gene_panel = list(train_adatas[0].var_names) if train_adatas else []
+    del train_adatas  # discard the loaded expression matrices -- only the panel is kept
+
+    samples: dict[str, dict] = {}
+    for sample_id in all_ids:
+        barcodes, coords = _read_sample_barcodes_and_coords(hest_data_dir, sample_id)
+        samples[sample_id] = {
+            "organ": split["organ_by_sample"][sample_id],
+            "tech": split["tech_by_sample"][sample_id],
+            "patient_id": split["patient_by_sample"][sample_id],
+            "split": (
+                "train" if sample_id in train_ids
+                else "validation" if sample_id in validation_ids
+                else "test"
+            ),
+            "n_spots": len(barcodes),
+            "barcodes": barcodes,
+            "composite_spot_ids": [composite_spot_id(sample_id, b) for b in barcodes],
+            "coords": coords.tolist(),
+            "wsi_cache": _wsi_cache_provenance(hest_cache_dir, sample_id),
+        }
+
+    return {
+        "version": _MANIFEST_VERSION,
+        "hest_data_dir": str(hest_data_dir.resolve()),
+        "metadata_csv": str(metadata_csv),
+        "build_args": {
+            "organs": organs, "species": species, "min_nb_genes": min_nb_genes,
+            "min_samples_per_organ": min_samples_per_organ, "max_samples_per_organ": max_samples_per_organ,
+            "n_validation_per_organ": n_validation_per_organ, "n_test_per_organ": n_test_per_organ,
+            "split_seed": split_seed, "check_gene_panel_compatibility": check_gene_panel_compatibility,
+            "min_gene_coverage": min_gene_coverage, "min_sample_coverage": min_sample_coverage,
+            "min_panel_size": min_panel_size, "split_by_patient": split_by_patient,
+            "gene_min_genes_per_spot": gene_min_genes_per_spot, "gene_min_cells": gene_min_cells,
+            "expression_transform": expression_transform, "expression_target_sum": expression_target_sum,
+        },
+        "train_sample_ids": train_ids,
+        "validation_sample_ids": validation_ids,
+        "test_sample_ids": test_ids,
+        "organ_vocab": split["organ_vocab"],
+        "tech_vocab": split["tech_vocab"],
+        "gene_panel": gene_panel,
+        "n_genes": len(gene_panel),
+        "gene_panel_hash": gene_panel_hash(gene_panel),
+        "samples": samples,
+    }
+
+
+def save_dataset_manifest(manifest: dict, path: str | Path) -> Path:
+    """Atomic write, mirroring mask_bank.save_mask_bank/
+    mask_schedule.save_stratified_mask_bank exactly (process-specific
+    temp file then os.replace) -- multiple concurrent jobs may all
+    request the same immutable manifest at once."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    os.replace(tmp, path)
+    return path
+
+
+def load_dataset_manifest(path: str | Path) -> dict:
+    return json.loads(Path(path).read_text())
+
+
+def ensure_dataset_manifest(path: str | Path, **build_kwargs) -> tuple[dict, Path]:
+    """Load-or-atomically-create, mirroring every other ensure_* function
+    in this package: reuse an existing on-disk manifest if it is BYTE-
+    FOR-BYTE identical to a fresh rebuild from the same inputs, otherwise
+    build and persist a fresh one. Fails closed (raises) if an existing
+    file differs from what these exact build_kwargs would produce --
+    real HEST-1k data on disk can change (a new download, a corrected
+    sample) between runs, and an immutable manifest that silently kept
+    describing stale data would defeat the entire point of building one."""
+    path = Path(path)
+    expected = build_dataset_manifest(**build_kwargs)
+    if path.exists():
+        existing = load_dataset_manifest(path)
+        if existing != expected:
+            raise ValueError(
+                f"dataset manifest {path} does not match a fresh rebuild from the current "
+                "hest_data_dir/metadata_csv/build_args -- the underlying data or build "
+                "arguments changed since this manifest was built; use a new path or remove "
+                "the stale manifest"
+            )
+        return existing, path
+    save_dataset_manifest(expected, path)
+    return expected, path
+
+
+def all_composite_spot_ids(manifest: dict, sample_ids: Iterable[str] | None = None) -> set[str]:
+    """Every composite (sample_id, spot_id) identity across the given
+    samples (default: every sample in the manifest) -- the base set
+    Step 3's leakage/novelty checks are built on."""
+    ids = sample_ids if sample_ids is not None else manifest["samples"].keys()
+    out: set[str] = set()
+    for sample_id in ids:
+        out.update(manifest["samples"][sample_id]["composite_spot_ids"])
+    return out
