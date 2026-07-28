@@ -2518,17 +2518,118 @@ that consumes it yet exists.
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 32. Real Gen3 data builder -- Step 1 fix + Step 2: real example builder
+
+**Step 1 fix, found while designing Step 2, before any Step-2 code
+shipped:** `_read_sample_barcodes_and_coords` used a cheap `backed='r'`
+read with NO per-spot QC filtering, so the manifest's declared spot set
+for a sample could silently disagree with what `loaders.load_multi_sample`
+(used for gene-panel derivation, and now reused by the example builder)
+actually keeps after `min_genes` filtering. Fixed: applies the
+IDENTICAL filter, for every sample (train and held-out), via a real
+(non-backed) read -- a one-time manifest-build cost, not a
+per-training-step one. Verified by a new regression test with one
+deliberately all-zero-expression spot.
+
+**Step 2: `data/example_builder.py`** (new module), Step 2 of the
+9-step order: "Build training examples from realized masks. Query
+spots must be physically absent from both input GEX and target-region
+H&E. Context may contain surrounding H&E and observed GEX only."
+
+- `load_sample_for_examples(manifest, sample_id, hest_data_dir=None)` --
+  real, QC'd, gene-panel-aligned expression AND H&E patches for one
+  manifest sample. Reads every QC/normalization parameter FROM the
+  manifest's own `build_args`, never re-specified independently, so the
+  spot/gene universe this returns is guaranteed identical to what the
+  manifest already declared -- one authoritative source, not two that
+  could drift apart. Documented, deliberate scope boundary: HEST-1k's
+  own H&E patch extraction can drop a further, normal ~4.5% of spots
+  that have no matching patch (`loaders.align_patches_to_adata`'s
+  existing, audited behavior); this function's returned barcode set can
+  therefore be a SUBSET of the manifest's declared one, checked (never
+  silently GROWS beyond the manifest) but not itself an error.
+- `build_spatial_field_example(adata, patches, context_barcodes,
+  query_barcodes, image_feature_fn, ...)` -- the real per-example
+  builder. Query spots are already structurally absent from every
+  `observed_*` array by construction (this function never reads a query
+  spot's expression or patch for anything beyond the geometry check and
+  `SpatialFieldTargets` itself); the NEW, real safety logic is
+  PHYSICAL, not just barcode-level: a context spot whose H&E patch
+  FOOTPRINT overlaps the query hole (a real square of pixels around its
+  coordinate, not a point) is excluded from the observed set entirely,
+  via `slide_context.nonoverlapping_context_patch_mask` (already-
+  audited overlap geometry from Phase 3, reused here for the first
+  time, not reimplemented). Verified directly: a context spot placed
+  immediately adjacent to a query spot (same barcode-level disjointness,
+  genuinely different barcode) is excluded when the patch size is large
+  enough to physically overlap, and correctly retained when it isn't --
+  both directions of the same test.
+- Coordinates are normalized before being stored, not raw physical
+  pixels/microns -- `SpatialFieldInputs`' own documented contract
+  ("Coordinate memorization" risk) and a repeated audit recommendation
+  (6th Codex re-audit of commit 06f5cce: "Use coordinates relative to
+  the hole or slide centre in units of median spot spacing. Do not feed
+  raw pixel coordinates."). Centered on this example's own
+  observed+query centroid; scaled by `_median_nearest_neighbor_spacing`,
+  computed from the sample's WHOLE real spot lattice (a caller-supplied
+  `full_sample_coords`) so the unit doesn't fluctuate mask-to-mask.
+  Verified by a regression test using a real, non-trivial physical
+  spacing (37.5) and confirming the stored coordinates end up centered
+  near zero and scaled to roughly spot-spacing units (~1.0), not the
+  raw value.
+- `image_feature_fn` (H&E tile -> feature vector) is INJECTED, not
+  called directly -- this module has no hard dependency on a real
+  GigaPath checkpoint, matching every other pluggable-feature-function
+  pattern already established in this codebase
+  (`models/slide_encoder.py`, `gen2_architectures/data/context_features.py`'s
+  `ContextOnlyNovaeProvider`/`PrecomputedSpotFeatureProvider`). Fully
+  testable with a cheap deterministic stub.
+
+**Deliberately NOT built in this step, and why:**
+
+- **Real GigaPath tile-encoding + disk caching wired in as the default
+  `image_feature_fn`.** `gen2_architectures/training/data_prep.py`'s
+  `get_gigapath_features` (cfg-coupled, patch-content + preprocessing-
+  version fingerprinted, disk-cached) is the audited real implementation
+  to eventually plug in here -- not reimplemented in this pass because
+  it needs a real GigaPath tile-encoder checkpoint to run or meaningfully
+  test, and this module's `image_feature_fn` injection point already
+  makes wiring it in later a small, additive change, not a redesign.
+- **A per-spot `image_available` schema flag + model-layer masking.**
+  Several audit rounds (most explicitly the 5th, commit c02a5d1 finding
+  #5) asked for observed spots to be KEPT with a zeroed feature and an
+  explicit `image_available=false` flag, rather than excluded outright.
+  This pass instead EXCLUDES overlapping-footprint context spots from
+  the observed set entirely -- satisfying the literal 9-step Step 2
+  instruction ("physically absent... H&E") without a schema change.
+  Adding a soft "kept but flagged unavailable" field would require
+  extending `SpatialFieldInputs` (a schema every architecture already
+  consumes) AND wiring every architecture wrapper's attention/token
+  logic to actually respect the flag -- a substantial, separate change
+  to already-heavily-audited model code, not a data-builder concern.
+  Left as an explicit design note for Step 5 (wiring real WSI context
+  into Architectures 3/4), which already touches that model-layer
+  surface for a related reason.
+- **Dense WSI tile loading/filtering** (`slide_context.load_slide_context`/
+  `visible_slide_context`, the regional/global GigaPath path) -- Step
+  5's job, not Step 2's; this module only builds the local
+  observed/query/boundary example, matching Architecture 1/2's scope,
+  not yet the full regional-H&E/global-slide context Architectures 3/4
+  are meant to eventually use.
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
 
 ```
-gen3_multiscale/tests/: 353 passed (42 reused-infra + 12 example-schema +
+gen3_multiscale/tests/: 362 passed (42 reused-infra + 12 example-schema +
   11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
   18 transport-head + 10 tokens + 16 attention + 10 global-context +
   7 harmonic + 7 geometry-utils + 9 backbone + 23 architectures +
   9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
   27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
-  37 mask-schedule + 10 dataset-manifest)
-gen2_architectures + gen3_multiscale: 523 passed, 1 skipped
+  37 mask-schedule + 11 dataset-manifest + 8 example-builder)
+gen2_architectures + gen3_multiscale: 532 passed, 1 skipped
 ```
 
 Note: `reused-infra` (13 checkpoint + 21 hest1k-catalog + 4
