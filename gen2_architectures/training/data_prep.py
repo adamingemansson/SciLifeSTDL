@@ -13,6 +13,7 @@ avoid reintroducing the same class of bug in a "fresh" reimplementation.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import time
 from pathlib import Path
@@ -103,6 +104,53 @@ def apply_sample_selection(cfg) -> None:
             cfg.model.params.organ_vocab = result["organ_vocab"]
         if "tech_vocab" not in cfg.model.params or cfg.model.params.tech_vocab is None:
             cfg.model.params.tech_vocab = result["tech_vocab"]
+
+
+def save_or_verify_split_manifest(checkpoint_dir: str | Path, cfg) -> None:
+    """GPT-audit-flagged bug (2026-07-27, confirmed and fixed): unlike
+    src/'s training pipeline, gen2 never pinned its resolved train/
+    validation/test sample-ID split anywhere -- it was recomputed by
+    apply_sample_selection() fresh on every single process launch, so a
+    resumed run (or a later standalone evaluation run against the same
+    checkpoint_dir) had no way to detect if the "held-out" test samples had
+    silently changed, e.g. because the HEST-1k catalog metadata was
+    updated, cfg.data.sample_selection's knobs were edited, or
+    split_seed's own default changed.
+
+    Call this once, right after apply_sample_selection(cfg), from every
+    entrypoint that reads cfg.data.{train,validation,test}_sample_ids
+    (all 3 training scripts' main(), plus run_held_out_evaluation.py's
+    main()). The FIRST caller for a given checkpoint_dir pins the
+    currently-resolved split to checkpoint_dir/sample_split.json; every
+    later caller instead verifies the currently-resolved split against
+    that pinned manifest and raises loudly on any mismatch, refusing to
+    silently train on or evaluate against a different held-out set than
+    the run originally committed to.
+    """
+    manifest_path = Path(checkpoint_dir) / "sample_split.json"
+    current = {
+        "train_sample_ids": [str(s) for s in cfg.data.get("train_sample_ids", [])],
+        "validation_sample_ids": [str(s) for s in cfg.data.get("validation_sample_ids", [])],
+        "test_sample_ids": [str(s) for s in cfg.data.get("test_sample_ids", [])],
+    }
+    if not manifest_path.is_file():
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = manifest_path.parent / f"{manifest_path.name}.tmp{os.getpid()}"
+        with open(tmp_path, "w") as f:
+            json.dump(current, f, indent=2)
+        os.replace(tmp_path, manifest_path)
+        print(f"sample_split.json pinned to {manifest_path}")
+        return
+    pinned = json.loads(manifest_path.read_text())
+    mismatches = [key for key in current if current[key] != pinned.get(key)]
+    if mismatches:
+        raise ValueError(
+            f"split manifest mismatch at {manifest_path}: {mismatches} differ from the "
+            "currently-resolved train/validation/test sample selection -- refusing to "
+            "continue, since this would silently change which samples are held-out test "
+            "data partway through an experiment. If this is a deliberate re-split, delete "
+            "the manifest file first."
+        )
 
 
 def apply_smoke_override(cfg, smoke_steps: int | None) -> None:

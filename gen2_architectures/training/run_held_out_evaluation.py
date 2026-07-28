@@ -79,6 +79,7 @@ def _load_stage_b_model(saved_model_config: dict, gene_names: list[str], device)
 def main(config_path: str) -> None:
     cfg = OmegaConf.load(config_path)
     data_prep.apply_sample_selection(cfg)
+    data_prep.save_or_verify_split_manifest(cfg.training.checkpoint_dir, cfg)
     device = torch.device(cfg.training.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
 
     checkpoint_dir = Path(cfg.training.checkpoint_dir)

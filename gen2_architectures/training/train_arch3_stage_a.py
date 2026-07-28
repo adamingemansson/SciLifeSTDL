@@ -31,6 +31,7 @@ def main(config_path: str, smoke_steps: int | None = None, max_wall_clock_hours_
     cfg = OmegaConf.load(config_path)
     data_prep.seed_everything(int(cfg.training.get("seed", 0)))
     data_prep.apply_sample_selection(cfg)
+    data_prep.save_or_verify_split_manifest(cfg.training.checkpoint_dir, cfg)
     data_prep.apply_smoke_override(cfg, smoke_steps)
     if max_wall_clock_hours_override is not None:
         cfg.training.max_wall_clock_hours = max_wall_clock_hours_override
