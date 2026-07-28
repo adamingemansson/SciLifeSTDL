@@ -468,6 +468,37 @@ def test_load_synchronized_initialization_rejects_a_manifest_claiming_the_wrong_
         load_synchronized_initialization(fresh, tmp_path / "architecture1", manifest=manifest, architecture_name="architecture1")
 
 
+def test_load_synchronized_initialization_rejects_a_permuted_gene_order_for_architecture_4(tmp_path):
+    """Regression test for a real, confirmed gap (7th Codex re-audit of
+    commit 2782ff0): the manifest records gene_basis_gene_names_hash, but
+    load_synchronized_initialization never compared it against the
+    freshly-constructed model's own gene_basis. `_gene_basis_matrix`
+    (the numeric buffer) gets OVERWRITTEN by load_trainable_state
+    regardless of what the fresh model was built with -- that check
+    alone can never catch a gene-identity mismatch, since after loading
+    the buffer always matches the checkpoint's numbers. The plain
+    dataclass `gene_basis` attribute, however, is NOT part of the
+    tensor state_dict and is never touched by loading -- it silently
+    keeps reflecting whatever gene_names the fresh model was
+    CONSTRUCTED with. A model built against a permuted gene order (same
+    rank, same n_genes, so construction itself succeeds) must now be
+    rejected explicitly, not silently accepted just because its
+    (overwritten) basis matrix bytes end up correct."""
+    models = _build_all_four()
+    manifest = persist_four_architecture_initializations(models, tmp_path)
+
+    n_genes = 6
+    permuted_gene_names = [f"g{i}" for i in reversed(range(n_genes))]
+    rng = np.random.default_rng(0)
+    permuted_basis = fit_gene_residual_basis(rng.normal(size=(20, n_genes)), permuted_gene_names, rank=4)
+    fresh = build_architecture(
+        _load("architecture4"), n_genes=n_genes, gex_feature_dim=4,
+        gene_basis=permuted_basis, gene_names=permuted_gene_names,
+    )
+    with pytest.raises(ValueError, match="gene panel/order mismatch"):
+        load_synchronized_initialization(fresh, tmp_path / "architecture4", manifest=manifest, architecture_name="architecture4")
+
+
 def test_persist_synchronized_initializations_on_all_four_real_architectures(tmp_path):
     """End-to-end: synchronize, persist (passing the synchronizer's own
     provenance), and verify the manifest's shared_parameter_mapping

@@ -6,6 +6,7 @@ real GPU. See launch_four_gpu_suite.py's module docstring for why
 `default_command_builder` itself (pointing at a training entrypoint that
 does not exist yet) is deliberately NOT exercised end-to-end here."""
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -188,20 +189,33 @@ def test_launch_suite_cleans_up_already_spawned_jobs_when_a_later_spawn_fails(tm
     named_configs, config_paths = _minimal_named_configs(n=3)
 
     class _FakeProc:
+        # A fake, out-of-range pid (no real process ever has this id) so
+        # _terminate_process_group's os.getpgid(pid) call reliably raises
+        # ProcessLookupError and falls back to the plain terminate()
+        # path -- exercising the SAME fallback branch a real environment
+        # without process-group support would take, without needing an
+        # actual OS process.
+        _next_pid = 999_999_001
+
         def __init__(self):
+            self.pid = _FakeProc._next_pid
+            _FakeProc._next_pid += 1
             self.terminated = False
             self.waited = False
+
+        def poll(self):
+            return 0 if self.terminated else None
 
         def terminate(self):
             self.terminated = True
 
-        def wait(self):
+        def wait(self, timeout=None):
             self.waited = True
             return 0
 
     created = []
 
-    def fake_popen(command, env=None, stdout=None, stderr=None):
+    def fake_popen(command, env=None, stdout=None, stderr=None, start_new_session=None):
         if len(created) == 2:
             raise FileNotFoundError("simulated: no such file or directory")
         proc = _FakeProc()
@@ -220,6 +234,82 @@ def test_launch_suite_cleans_up_already_spawned_jobs_when_a_later_spawn_fails(tm
     assert all(proc.terminated and proc.waited for proc in created)
     # All three log files were opened (cfg0, cfg1, cfg2) before the failure.
     assert {p.name for p in tmp_path.iterdir()} == {"cfg0.log", "cfg1.log", "cfg2.log"}
+
+
+def test_launch_suite_cleans_up_every_job_on_keyboard_interrupt_during_the_wait_phase(tmp_path, monkeypatch):
+    """Regression test for a real, confirmed gap (7th Codex re-audit of
+    commit 2782ff0): cleanup previously only wrapped the SPAWN loop, not
+    the WAIT loop -- exactly the phase a real, hours-long training run
+    spends nearly all of its time in. `except Exception` also never
+    caught KeyboardInterrupt/SystemExit at all (they inherit from
+    BaseException directly), so a real Ctrl+C during either phase
+    previously left every started job running unmonitored. Here, one
+    job's own wait() call raises KeyboardInterrupt (standing in for a
+    real Ctrl+C arriving mid-run) -- every already-spawned job, not just
+    the ones before the interruption, must still be terminated."""
+    named_configs, config_paths = _minimal_named_configs(n=3)
+
+    class _FakeProc:
+        _next_pid = 999_999_101
+
+        def __init__(self, raise_on_wait: bool):
+            self.pid = _FakeProc._next_pid
+            _FakeProc._next_pid += 1
+            self.terminated = False
+            self.waited = False
+            self._raise_on_wait = raise_on_wait
+            self._first_wait = True
+
+        def poll(self):
+            return 0 if self.terminated else None
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            # Simulate the interrupt arriving during the MAIN wait loop's
+            # plain proc.wait() call (timeout=None) -- not during
+            # _terminate_process_group's own cleanup wait(timeout=...).
+            if self._raise_on_wait and self._first_wait and timeout is None:
+                self._first_wait = False
+                raise KeyboardInterrupt()
+            self.waited = True
+            return 0
+
+    created = []
+
+    def fake_popen(command, env=None, stdout=None, stderr=None, start_new_session=None):
+        proc = _FakeProc(raise_on_wait=(len(created) == 1))  # the SECOND job's wait() raises
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(launch_four_gpu_suite_module.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(KeyboardInterrupt):
+        launch_suite(
+            named_configs, config_paths, gpu_list=["0", "1", "2"], log_root=tmp_path,
+            command_builder=_stub_command_builder(),
+        )
+
+    assert len(created) == 3  # all three jobs were spawned before the interrupt
+    assert all(proc.terminated for proc in created)
+
+
+def test_terminate_process_group_escalates_to_sigkill_when_sigterm_is_ignored():
+    """Real (not monkeypatched) subprocess test: a child that installs a
+    SIGTERM-ignoring handler must still be reaped -- real, confirmed gap
+    (7th Codex re-audit of commit 2782ff0: "children that ignore
+    SIGTERM"). _terminate_process_group escalates to SIGKILL after a
+    short timeout for exactly this case."""
+    code = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+    proc = subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
+    try:
+        launch_four_gpu_suite_module._terminate_process_group(proc, timeout=1.0)
+        assert proc.poll() is not None  # reaped via SIGKILL, not left running
+    finally:
+        if proc.poll() is None:  # pragma: no cover -- safety net only
+            proc.kill()
+            proc.wait()
 
 
 def test_launch_suite_refuses_to_start_any_job_when_the_audit_fails(tmp_path):

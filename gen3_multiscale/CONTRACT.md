@@ -2078,7 +2078,200 @@ this round.
 **No 24-hour run has been started or will be auto-started. This
 document only records fixes to already-written code and tests.**
 
+## 28. Response to the seventh external Codex re-audit (of commit 2782ff0)
+
+Adam forwarded a seventh re-audit, of `2782ff0` (§27's fixes), again
+verified directly against the real commit (diffed against `06f5cce` in a
+local checkout). Verdict: "the four contained fixes are real
+improvements," with 4 additional contained issues found before the real
+trainer should be built. Same discipline as every prior round: every
+claim checked against the actual code before any fix.
+
+**"Verified fixes" list -- all six items independently re-confirmed
+true.** No corrections needed.
+
+**Issue #1, "seed-pool enforcement is not yet experiment-safe" --
+MULTIPLE SUB-CLAIMS, SPLIT VERDICT.**
+
+1. *"It verifies unique random seeds, not unique realized query masks.
+   Different seeds can still generate the same masked spots."*
+   CONFIRMED, DEFERRED (structurally out of scope for this module).
+   `build_stratified_training_seed_bank`'s own docstring is explicit
+   about this design: it produces a "lossless, deterministic (stratum,
+   seed) schedule" specifically so it never has to materialize actual
+   per-item masks -- its docstring cites `build_training_seed_bank`'s
+   own reasoning for why NOT doing so avoids "the exact multi-gigabyte-
+   JSON problem." Checking that two different seeds produce genuinely
+   DIFFERENT realized query-spot sets requires actually running the
+   masking algorithm against real coordinates for every seed, which
+   this module deliberately does not do (and, per that avoided-JSON-
+   size reasoning, should not do). This can only be checked once the
+   real per-sample data builder (§21) exists to run the masking
+   algorithm and inspect its output; verifying it here would mean either
+   materializing every mask (defeating the module's whole design) or
+   adding a check with no real masking function to check against yet.
+2. *"The mask-bank schema changed, but `_MASK_GENERATION_VERSION`
+   remains '2'... an older bank without
+   `realized_unique_seeds_per_stratum` can therefore be silently
+   reused."* CONFIRMED, FIXED, but NOT via a version bump.
+   `_MASK_GENERATION_VERSION` is reserved for changes to the actual
+   (stratum, seed) GENERATION ALGORITHM (per its own docstring) -- this
+   round's change added a new DERIVED REPORTING field without changing
+   what seeds get generated for the same inputs, so bumping it would
+   conflate two genuinely different kinds of change and cause an
+   on-disk bank to be needlessly regenerated for a schema-only reason.
+   The actual practical problem the audit describes is real, though:
+   `ensure_stratified_training_seed_bank` returned the raw on-disk JSON
+   on a validated reuse, which could predate this round's field
+   addition. Fixed at the correct layer: once every identifying field
+   and the exact `items` sequence are confirmed identical between the
+   on-disk bank and a fresh recomputation, the two are semantically
+   equivalent by definition, so the function now returns the freshly-
+   recomputed (always schema-current) dict instead of the possibly-
+   stale on-disk one. Verified by a regression test that writes a bank,
+   deletes `realized_unique_seeds_per_stratum` from the on-disk file to
+   simulate an older artifact, and confirms a subsequent
+   `ensure_stratified_training_seed_bank` call backfills the field while
+   returning the exact same `items` schedule.
+3. *"Strict mode combined with the default `unique_masks_per_stratum=
+   n_items` is mathematically impossible when there is more than one
+   stratum."* CONFIRMED AND FIXED. Verified directly: with the previous
+   default, `require_full_seed_pool=True` would raise UNCONDITIONALLY
+   for any `n_strata > 1` if a caller left `unique_masks_per_stratum`
+   unset -- a guaranteed-to-fail footgun, not a real precondition, since
+   a stratum can only ever be visited `n_items // n_strata` times, which
+   is always less than `n_items` once there's more than one stratum.
+   Fixed: in strict mode, an unset `unique_masks_per_stratum` now
+   defaults to the naturally achievable ceiling (`n_items // n_strata`)
+   instead of `n_items`, so the strict default trivially satisfies its
+   own guarantee by construction. The permissive (non-strict) default of
+   `n_items` is unchanged. Verified by a new regression test.
+4. *"Before training, the builder must: require an explicit feasible
+   mask count per stratum; enable strict seed-pool checking; fingerprint
+   the actual realized query-spot sets; reject duplicate masks and
+   train/validation/test query overlap; increment the mask-bank version
+   and reject stale banks."* CONFIRMED, ALREADY DISCLOSED/DEFERRED. This
+   is a checklist for the real data builder/trainer (§21), not a gap in
+   this module -- items 1-3 above already give that future builder the
+   TOOLS it would need (`realized_unique_seeds_per_stratum`,
+   `require_full_seed_pool`, a version field that means what it says);
+   items about duplicate-mask/split-overlap rejection are the same
+   still-missing composite-identity enforcement §26 finding #6 and §27
+   already cover.
+
+**Issue #2, "Architecture 4 gene identity is persisted but not
+verified" -- CONFIRMED AND FIXED.** Checked directly:
+`load_synchronized_initialization` recorded and could read
+`gene_basis_gene_names_hash` from the manifest but never compared it
+against anything. The reason this specific check matters, verified by
+reading `checkpoint.load_trainable_state`: `_gene_basis_matrix` (the
+basis MATRIX's numeric content) is a registered buffer, so
+`load_state_dict` OVERWRITES it with the checkpoint's own values
+regardless of what the freshly-constructed model computed -- the tensor-
+hash check the loader already does will therefore always pass for the
+matrix itself. The separate, plain-dataclass `gene_basis` ATTRIBUTE
+(holding `gene_names_hash`, i.e. which genes/order the matrix's numbers
+apply to) is not part of any tensor state_dict and is never touched by
+loading -- it silently keeps reflecting whatever gene_names the fresh
+model happened to be CONSTRUCTED with. A model built against a permuted
+gene order (same rank, same n_genes, so construction itself succeeds)
+would previously pass every existing check despite its basis matrix now
+meaning something different than its own metadata claims. Fixed: added
+an explicit comparison between the freshly-constructed model's
+`gene_basis.gene_names_hash` and the manifest's
+`gene_basis_gene_names_hash` whenever both are present. Verified by the
+audit's own suggested regression test: persist Architecture 4 normally,
+then attempt to load onto a fresh Architecture 4 built with a genuinely
+PERMUTED gene order (same rank/n_genes) -- now rejected with an explicit
+"gene panel/order mismatch" error instead of silently loading.
+
+**Issue #3, "Architecture 4's target API is inconsistent" -- CONFIRMED
+AND FIXED.** Checked directly: `_prepare_target_expression` (added in
+§27 for a different, real gap) called `target_expression.to(...)`, which
+assumes a `torch.Tensor`. `SpatialFieldTargets.query_expression` --
+documented and typed as `np.ndarray` throughout `data/example.py`, the
+NATURAL source of this argument for any real caller -- has no `.to()`
+method; a trainer passing `targets.query_expression` directly, exactly
+as the schema describes, would have hit an `AttributeError` instead of
+the validation this method exists to provide. Fixed: switched to
+`torch.as_tensor(target_expression, device=device,
+dtype=deterministic_mean.dtype)`, which accepts both a raw numpy array
+and an existing tensor uniformly; both call sites' type hints updated to
+`torch.Tensor | np.ndarray`. Verified by a new regression test that
+passes `targets.query_expression` (confirmed via `isinstance` to
+genuinely be a raw `np.ndarray`, not a tensor) directly into
+`compute_flow_matching_loss` and confirms it now succeeds.
+
+**Issue #4, "launcher cleanup is not interruption-safe" -- CONFIRMED AND
+FIXED, all four sub-points.** Checked directly against `launch_suite`'s
+§27 cleanup code:
+
+1. *"Not `KeyboardInterrupt` or `SystemExit`."* CONFIRMED -- the
+   handler was `except Exception`, and both inherit from `BaseException`
+   directly, not `Exception`. Changed to `except BaseException`.
+2. *"Not interruption during the waiting phase."* CONFIRMED -- the
+   `try/except` only wrapped the SPAWN loop; the WAIT loop (where a
+   real, hours-long run spends nearly all its time) had no cleanup
+   coverage of any kind. Both loops are now inside the same
+   `try/except BaseException/finally` block.
+3. *"Children that ignore `SIGTERM`."* CONFIRMED -- cleanup only ever
+   called `proc.terminate()` once with no escalation. A new
+   `_terminate_process_group` helper now does SIGTERM -> wait(timeout)
+   -> SIGKILL, verified by a REAL (not monkeypatched) subprocess test:
+   a child that installs `signal.signal(signal.SIGTERM, signal.SIG_IGN)`
+   is still reaped within the timeout.
+4. *"Subprocess-owned dataloader workers."* CONFIRMED -- `proc.terminate()`
+   only ever signals the immediate child PID, not any processes IT
+   spawns (e.g. PyTorch `DataLoader` worker processes, which a real
+   training job would have). Every job is now started with
+   `subprocess.Popen(..., start_new_session=True)`, putting it (and
+   anything it spawns) in its own process group; `_terminate_process_group`
+   signals that whole group via `os.killpg`, with a fallback to
+   `proc.terminate()`/`proc.kill()` if group-based signaling is
+   unavailable (e.g. a `ProcessLookupError`/`PermissionError` platform
+   difference).
+
+Verified additionally by a monkeypatched-`Popen` regression test proving
+a `KeyboardInterrupt` raised from one job's `wait()` call during the
+main wait loop still triggers `_terminate_process_group` for every
+already-spawned job, not just the ones spawned before the interrupt.
+
+**"Still unresolved... actual launch blockers" list -- re-confirmed
+accurate, no new action; unchanged from §21/§26/§27.** Every item (no
+real data builder/trainer, no physical H&E masking enforcement, no
+composite split-disjointness gate, no held-out-mask novelty gate, no
+regional/global WSI conditioning in Architectures 3/4, no cache-content
+provenance, no pooled-prediction patient-level evaluator, no CUDA/AMP/
+memory smoke test, no functional Novae path) restates gaps already
+tracked in prior sections. Nothing in this list is new; nothing
+regressed.
+
+**No 24-hour run has been started or will be auto-started. This
+document only records fixes to already-written code and tests.**
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 338 passed (41 reused-infra + 12 example-schema +
+  11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 23 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  25 launch-four-gpu-suite + 34 model-factory + 4 gene-encoder +
+  37 mask-schedule)
+gen2_architectures + gen3_multiscale: 507 passed, 1 skipped
+```
+
+Note: a full monorepo run (`pytest -q` from the repo root, everything
+including the top-level `tests/` directory) still shows one additional
+pre-existing failure, `tests/test_multi_sample.py::test_inject_multi_sample_n_genes`,
+first noted in §26 as confirmed pre-existing on `c02a5d1` (reproduces
+under `git stash`) and unrelated to `gen2_architectures/` or
+`gen3_multiscale/`; unchanged and still out of scope for this pass.
+
+The block immediately below (pre-7th-audit-response test counts) is
+kept for historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 332 passed (41 reused-infra + 12 example-schema +
@@ -2096,13 +2289,6 @@ remaining contained bug #2) in `gen2_architectures/training/checkpoint.py`,
 so `gen2_architectures/tests/` is included in the 501 figure with its
 own `test_load_trainable_state_raises_on_genuine_mismatch` updated in
 lockstep.
-
-Note: a full monorepo run (`pytest -q` from the repo root, everything
-including the top-level `tests/` directory) still shows one additional
-pre-existing failure, `tests/test_multi_sample.py::test_inject_multi_sample_n_genes`,
-first noted in §26 as confirmed pre-existing on `c02a5d1` (reproduces
-under `git stash`) and unrelated to `gen2_architectures/` or
-`gen3_multiscale/`; unchanged and still out of scope for this pass.
 
 The block immediately below (pre-6th-audit-response test counts) is
 kept for historical continuity rather than deleted, per this document's

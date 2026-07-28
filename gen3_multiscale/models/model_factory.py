@@ -535,6 +535,31 @@ def load_synchronized_initialization(
                 "loading -- the loaded checkpoint does not reproduce the persisted initialization"
             )
 
+    # Real, confirmed gap (7th Codex re-audit of commit 2782ff0): the
+    # manifest records gene_basis_gene_names_hash for Architecture 4, but
+    # it was never actually compared against the freshly-constructed
+    # model's own gene_basis. The basis MATRIX's numeric content is
+    # already verified above (_gene_basis_matrix is a registered buffer,
+    # covered by the tensor_hashes loop) -- but the matrix's raw numbers
+    # carry no information about which genes, or which order, those
+    # numbers apply to. A checkpoint whose basis matrix happens to match
+    # byte-for-byte while the freshly-constructed model was built against
+    # a DIFFERENT gene panel/order (a real, plausible config-drift
+    # mistake -- e.g. an updated gene vocabulary file, same rank, same
+    # incidentally-identical values) would previously pass every check
+    # here despite predicting into the wrong genes entirely.
+    model_gene_basis = getattr(model, "gene_basis", None)
+    expected_gene_basis_hash = entry.get("gene_basis_gene_names_hash")
+    if model_gene_basis is not None and expected_gene_basis_hash is not None:
+        actual_gene_basis_hash = model_gene_basis.gene_names_hash
+        if actual_gene_basis_hash != expected_gene_basis_hash:
+            raise ValueError(
+                f"{architecture_name}'s freshly-constructed gene_basis has gene_names_hash "
+                f"{actual_gene_basis_hash!r}, but the manifest expects "
+                f"{expected_gene_basis_hash!r} -- gene panel/order mismatch between the "
+                "checkpoint's basis and the model being loaded onto"
+            )
+
 
 def load_ad_hoc_checkpoint_unverified(model: torch.nn.Module, architecture_dir: str | Path) -> None:
     """Load a checkpoint with NO manifest verification at all -- a thin

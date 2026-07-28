@@ -8,6 +8,7 @@ synthetic coordinates (pure geometry, like Phase 2's boundary-extraction
 tests -- no dependency on real loaded HEST-1k data) and against the
 REAL masking.strata blocks in the four actual config files.
 """
+import json
 from pathlib import Path
 
 import numpy as np
@@ -327,6 +328,53 @@ def test_build_stratified_training_seed_bank_require_full_seed_pool_accepts_a_su
         unique_masks_per_stratum=64, require_full_seed_pool=True,
     )
     assert all(count == 64 for count in bank["realized_unique_seeds_per_stratum"].values())
+
+
+def test_build_stratified_training_seed_bank_require_full_seed_pool_with_default_unique_masks_per_stratum_does_not_always_raise():
+    """Regression test for a real, confirmed gap (7th Codex re-audit of
+    commit 2782ff0): "Strict mode combined with the default
+    unique_masks_per_stratum=n_items is mathematically impossible when
+    there is more than one stratum." Confirmed -- the permissive
+    default (n_items) can never be exhausted once n_strata > 1, so
+    require_full_seed_pool=True previously raised UNCONDITIONALLY
+    whenever a caller left unique_masks_per_stratum unset, which is a
+    guaranteed-to-fail footgun, not a real precondition. Strict mode now
+    defaults unique_masks_per_stratum to the naturally achievable
+    ceiling (n_items // n_strata) instead, so the default trivially
+    satisfies its own guarantee."""
+    coords3d, slice_ids, obs_names = _training_seed_slide()  # 2 strata
+    bank = build_stratified_training_seed_bank(
+        coords3d, slice_ids, obs_names, n_items=10, base_seed=0, strata=_STRATA, require_full_seed_pool=True,
+    )
+    assert bank["unique_masks_per_stratum"] == 5  # 10 items // 2 strata
+    assert all(count == 5 for count in bank["realized_unique_seeds_per_stratum"].values())
+
+
+def test_ensure_stratified_training_seed_bank_backfills_a_schema_field_missing_from_an_older_on_disk_bank(tmp_path):
+    """Regression test for a real, confirmed gap (7th Codex re-audit of
+    commit 2782ff0): this module's output schema gained a new derived
+    field (realized_unique_seeds_per_stratum) without a
+    _MASK_GENERATION_VERSION bump, since the actual (stratum, seed)
+    GENERATION algorithm didn't change -- correctly, per that field's own
+    documented purpose. But that meant a validated reuse of an on-disk
+    bank written before this field existed would return the raw,
+    field-missing dict as-is. ensure_stratified_training_seed_bank now
+    returns the freshly-recomputed (schema-current) dict whenever a
+    reuse is validated, not the raw on-disk JSON, so this can never
+    surface as a missing key after a legitimate reuse."""
+    coords3d, slice_ids, obs_names = _training_seed_slide()
+    path = tmp_path / "training_seeds.json"
+    first, _ = ensure_stratified_training_seed_bank(path, coords3d, slice_ids, obs_names, n_items=6, base_seed=0, strata=_STRATA)
+    assert "realized_unique_seeds_per_stratum" in first
+
+    # Simulate an older on-disk artifact written before this field existed.
+    stale = json.loads(path.read_text())
+    del stale["realized_unique_seeds_per_stratum"]
+    path.write_text(json.dumps(stale, indent=2, sort_keys=True))
+
+    reused, _ = ensure_stratified_training_seed_bank(path, coords3d, slice_ids, obs_names, n_items=6, base_seed=0, strata=_STRATA)
+    assert "realized_unique_seeds_per_stratum" in reused
+    assert reused["items"] == first["items"]  # still the exact same schedule, just schema-complete
 
 
 def test_build_stratified_training_seed_bank_with_one_unique_mask_per_stratum_still_produces_distinct_combinations():

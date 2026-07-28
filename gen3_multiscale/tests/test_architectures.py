@@ -336,6 +336,27 @@ def test_architecture_4_compute_flow_matching_loss_rejects_a_non_finite_target()
         model.compute_flow_matching_loss(inputs, bad_target)
 
 
+def test_architecture_4_compute_flow_matching_loss_accepts_a_raw_numpy_target():
+    """Regression test for a real, confirmed gap (7th Codex re-audit of
+    commit 2782ff0): SpatialFieldTargets.query_expression -- the
+    natural, real source of this argument -- is typed and documented as
+    a plain np.ndarray throughout data/example.py. The previous
+    `target_expression.to(...)` call would raise AttributeError on a
+    genuine numpy array (numpy arrays have no `.to()` method); a real
+    trainer passing targets.query_expression directly, exactly as the
+    schema documents, would have crashed here."""
+    inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    gene_basis, gene_names = _gene_basis_for(n_genes)
+    torch.manual_seed(0)
+    model = Architecture4(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        gene_basis=gene_basis, gene_names=gene_names, **_MODEL_KWARGS,
+    )
+    assert isinstance(targets.query_expression, np.ndarray)
+    loss = model.compute_flow_matching_loss(inputs, targets.query_expression)
+    assert torch.isfinite(loss)
+
+
 def test_architecture_4_compute_flow_matching_loss_accepts_a_target_on_a_different_dtype():
     """A target passed as float64 (a common default from raw numpy/anndata
     conversion) must be moved onto the model's own dtype, not rejected or

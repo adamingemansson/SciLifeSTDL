@@ -318,7 +318,22 @@ def build_stratified_training_seed_bank(
             "than there are items"
         )
 
-    unique_masks_per_stratum = n_items if unique_masks_per_stratum is None else int(unique_masks_per_stratum)
+    if unique_masks_per_stratum is None:
+        # Real, confirmed gap (7th Codex re-audit of commit 2782ff0):
+        # defaulting to n_items unconditionally means
+        # require_full_seed_pool=True combined with the default is
+        # MATHEMATICALLY IMPOSSIBLE to satisfy whenever n_strata > 1
+        # (a stratum is only ever visited n_items // n_strata times, always
+        # less than n_items for n_strata > 1) -- a guaranteed-to-raise
+        # footgun, not a real precondition. In strict mode, default to the
+        # naturally achievable ceiling (n_items // n_strata) instead, so
+        # the default trivially satisfies its own guarantee by
+        # construction; the permissive (non-strict) default of n_items is
+        # unchanged, preserving the 5th round's "oversized pools are
+        # legitimate" decision for the common, non-strict case.
+        unique_masks_per_stratum = (n_items // n_strata) if require_full_seed_pool else n_items
+    else:
+        unique_masks_per_stratum = int(unique_masks_per_stratum)
     if unique_masks_per_stratum < 1:
         raise ValueError(f"unique_masks_per_stratum must be positive, got {unique_masks_per_stratum}")
     if unique_masks_per_stratum >= _STRATUM_SEED_STRIDE:
@@ -404,7 +419,25 @@ def ensure_stratified_training_seed_bank(
     persist a fresh one. Fails closed (raises) on any mismatch -- now
     including a changed `spatial_fingerprint` (see
     `build_stratified_training_seed_bank`'s docstring) -- rather than
-    silently reusing a stale or altered schedule."""
+    silently reusing a stale or altered schedule.
+
+    Returns the freshly-recomputed `expected` dict on a validated reuse,
+    NOT the raw on-disk JSON (real, confirmed gap -- 7th Codex re-audit
+    of commit 2782ff0): this module's own output schema has grown new
+    derived fields over time (e.g. `realized_unique_seeds_per_stratum`,
+    added this round); an on-disk bank written by an OLDER version of
+    this module would simply lack that key. Bumping
+    `_MASK_GENERATION_VERSION` would be the wrong tool here -- that field
+    is reserved for changes to the actual (stratum, seed) GENERATION
+    algorithm (see its own docstring), and adding a derived reporting
+    field changes neither the algorithm nor the resulting seeds. Once
+    every identifying field AND the exact `items` sequence are confirmed
+    identical between the on-disk bank and a fresh recomputation, the two
+    are semantically equivalent by definition -- returning the fresh
+    `expected` (which is always complete under the CURRENT schema)
+    instead of the possibly-schema-stale on-disk dict closes the gap
+    without conflating "the seeds changed" with "the reporting schema
+    grew a field"."""
     path = Path(path)
     expected = build_stratified_training_seed_bank(
         coords3d, slice_ids, obs_names, n_items, base_seed, strata,
@@ -424,7 +457,7 @@ def ensure_stratified_training_seed_bank(
                 )
         if bank.get("items") != expected["items"]:
             raise ValueError(f"stratified training seed bank {path} contains an altered schedule")
-        return bank, path
+        return expected, path
     save_stratified_mask_bank(expected, path)  # a generic atomic-JSON writer, not mask-bank-specific -- mask_bank.py itself reuses save_mask_bank the same way for its own training seed banks
     return expected, path
 

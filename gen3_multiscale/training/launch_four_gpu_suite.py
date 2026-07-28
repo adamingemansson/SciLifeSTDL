@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
@@ -171,6 +172,37 @@ def default_command_builder(config: dict, config_path: Path, smoke: bool) -> lis
     return command
 
 
+def _terminate_process_group(proc: subprocess.Popen, timeout: float = 10.0) -> None:
+    """Terminate `proc` and every process in its process group (real,
+    confirmed gap -- 7th Codex re-audit of commit 2782ff0: "children that
+    ignore SIGTERM... subprocess-owned dataloader workers"). `proc` must
+    have been started with `start_new_session=True` so it (and anything
+    IT spawns, e.g. PyTorch DataLoader worker processes) shares one
+    process group distinct from this launcher's own -- signaling that
+    whole group, not just `proc`'s own PID, is what actually reaches
+    those worker children. Escalates SIGTERM -> wait(timeout) -> SIGKILL,
+    so a process that ignores SIGTERM (or is itself stuck) still gets
+    reaped rather than left running indefinitely."""
+    if proc.poll() is not None:
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, AttributeError):
+        proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, AttributeError):
+        proc.kill()
+    proc.wait()
+
+
 @dataclass(frozen=True)
 class JobResult:
     name: str
@@ -242,16 +274,24 @@ def launch_suite(
     log_root = Path(log_root)
     log_root.mkdir(parents=True, exist_ok=True)
 
-    # If a Popen call partway through this loop raises (e.g. a
-    # command_builder produced a command naming a nonexistent
-    # executable), the jobs started in EARLIER iterations must not be
-    # left as orphaned, unmonitored subprocesses with leaked open log
-    # file handles -- real, confirmed gap (6th Codex re-audit of commit
-    # 06f5cce: "add cleanup if Popen succeeds for some arms and then
-    # fails while spawning another: terminate and wait for
-    # already-started children and close all log handles").
+    # Both spawning AND waiting are wrapped together so a failure or
+    # interruption at EITHER stage cleans up every already-started job,
+    # not just the ones from a failed spawn loop (real, confirmed gap --
+    # 7th Codex re-audit of commit 2782ff0: cleanup previously only
+    # covered "interruption during spawning", never "interruption during
+    # the waiting phase" -- exactly the phase a real, hours-long training
+    # run spends nearly all its time in). `except BaseException`, not
+    # `except Exception` (same audit: KeyboardInterrupt/SystemExit
+    # inherit from BaseException directly, so a Ctrl+C during either
+    # phase previously bypassed cleanup entirely, leaving every started
+    # job running unmonitored). Each job is started with
+    # `start_new_session=True` so `_terminate_process_group` can signal
+    # its entire process group -- reaching DataLoader worker children,
+    # not just the immediate training process -- with a SIGTERM-then-
+    # SIGKILL escalation for anything that ignores SIGTERM.
     pending = []
     log_handles = []
+    jobs = []
     try:
         for (name, cfg), gpu in zip(named_configs.items(), gpu_list):
             command = command_builder(cfg, config_paths[name], smoke_only)
@@ -263,26 +303,24 @@ def launch_suite(
             log_path = log_root / f"{name}.log"
             log_file = log_path.open("w")
             log_handles.append(log_file)
-            proc = subprocess.Popen(command, env=env, stdout=log_file, stderr=subprocess.STDOUT)
+            proc = subprocess.Popen(
+                command, env=env, stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True,
+            )
             pending.append((name, str(gpu), command, log_path, proc))
-    except Exception:
+
+        for name, gpu, command, log_path, proc in pending:
+            returncode = proc.wait()
+            jobs.append(JobResult(
+                name=name, gpu=gpu, command=command, log_path=str(log_path),
+                returncode=returncode, succeeded=returncode == 0,
+            ))
+    except BaseException:
         for _, _, _, _, proc in pending:
-            proc.terminate()
-        for _, _, _, _, proc in pending:
-            proc.wait()
+            _terminate_process_group(proc)
+        raise
+    finally:
         for handle in log_handles:
             handle.close()
-        raise
-
-    jobs = []
-    for name, gpu, command, log_path, proc in pending:
-        returncode = proc.wait()
-        jobs.append(JobResult(
-            name=name, gpu=gpu, command=command, log_path=str(log_path),
-            returncode=returncode, succeeded=returncode == 0,
-        ))
-    for handle in log_handles:
-        handle.close()
 
     ok = all(job.succeeded for job in jobs)  # "preserve nonzero exit status and stop promotion if any arm fails"
     summary = {"ok": ok, "smoke_only": smoke_only, "jobs": [asdict(job) for job in jobs]}

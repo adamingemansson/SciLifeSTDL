@@ -411,7 +411,7 @@ class Architecture4(nn.Module):
         an Architecture3 one."""
         return self.conditioner(inputs)
 
-    def _prepare_target_expression(self, target_expression: torch.Tensor, deterministic_mean: torch.Tensor, device: torch.device) -> torch.Tensor:
+    def _prepare_target_expression(self, target_expression: torch.Tensor | np.ndarray, deterministic_mean: torch.Tensor, device: torch.device) -> torch.Tensor:
         """Move `target_expression` onto the model's own device/dtype and
         validate its shape/finiteness against `deterministic_mean` --
         real, confirmed gap (6th Codex re-audit of commit 06f5cce): "Both
@@ -424,8 +424,19 @@ class Architecture4(nn.Module):
         failing at the actual point of the mistake, and a non-finite
         target (a real, plausible upstream data bug) would silently
         poison the flow loss with NaN/Inf rather than failing loudly at
-        the boundary where it enters this model."""
-        target_expression = target_expression.to(device=device, dtype=deterministic_mean.dtype)
+        the boundary where it enters this model.
+
+        Uses `torch.as_tensor(...)`, not a bare `.to(...)` call (real,
+        confirmed gap -- 7th Codex re-audit of commit 2782ff0):
+        `SpatialFieldTargets.query_expression` -- the natural, real
+        source of this argument -- is typed and documented as a plain
+        `np.ndarray` throughout `data/example.py`, and a numpy array has
+        no `.to()` method at all; a caller passing that natural target
+        object directly (exactly what a real trainer would do) would
+        have hit an `AttributeError` here instead of the validation this
+        method exists to provide. `torch.as_tensor` accepts both a numpy
+        array and an existing tensor uniformly."""
+        target_expression = torch.as_tensor(target_expression, device=device, dtype=deterministic_mean.dtype)
         if target_expression.shape != deterministic_mean.shape:
             raise ValueError(
                 f"target_expression {tuple(target_expression.shape)} must match the conditioner's "
@@ -435,7 +446,7 @@ class Architecture4(nn.Module):
             raise ValueError("target_expression contains non-finite (NaN/Inf) values")
         return target_expression
 
-    def compute_flow_matching_loss(self, inputs: SpatialFieldInputs, target_expression: torch.Tensor) -> torch.Tensor:
+    def compute_flow_matching_loss(self, inputs: SpatialFieldInputs, target_expression: torch.Tensor | np.ndarray) -> torch.Tensor:
         device = next(self.parameters()).device
         conditioner_out = self.conditioner(inputs)
         query_hidden = conditioner_out["query_hidden"].detach()
@@ -446,7 +457,7 @@ class Architecture4(nn.Module):
         query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32, device=device)
         return flow_matching_loss(self.velocity_network, target_coefficients, query_coords, query_hidden)
 
-    def compute_losses(self, inputs: SpatialFieldInputs, target_expression: torch.Tensor) -> dict:
+    def compute_losses(self, inputs: SpatialFieldInputs, target_expression: torch.Tensor | np.ndarray) -> dict:
         """Runs self.conditioner exactly ONCE and derives both the
         deterministic conditioner output and the flow-matching loss from
         that single pass. Calling forward() and compute_flow_matching_loss()
