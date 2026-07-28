@@ -235,9 +235,40 @@ def build_spatial_field_example(
     observed_barcodes = obs_names[context_pos]
     observed_coords_raw = all_coords[context_pos]
 
-    spacing_source = full_sample_coords if full_sample_coords is not None else np.concatenate(
-        [context_coords_all_raw, query_coords_raw], axis=0,
-    )
+    if full_sample_coords is not None:
+        # 11th Codex re-audit of commit 9dab8fe, finding #3 ("validate
+        # full_sample_coords itself -- shape, finiteness, uniqueness,
+        # row count and agreement with the aligned sample. Currently
+        # only adata.obsm['spatial'] receives those checks."): a caller
+        # can pass ANY array here -- it must be held to the same
+        # fail-closed standard as adata.obsm['spatial'] itself, plus an
+        # explicit check that it actually IS the aligned sample's own
+        # complete lattice (a superset containing every one of
+        # all_coords' rows), not some unrelated or mismatched array.
+        full_coords_arr = np.asarray(full_sample_coords, dtype=np.float64)
+        if full_coords_arr.ndim != 2 or full_coords_arr.shape[1] != 2:
+            raise ValueError(
+                f"{sample_id}: full_sample_coords must be [M, 2], got shape {full_coords_arr.shape}"
+            )
+        if not np.isfinite(full_coords_arr).all():
+            raise ValueError(f"{sample_id}: full_sample_coords contains non-finite coordinates")
+        if np.unique(full_coords_arr, axis=0).shape[0] != full_coords_arr.shape[0]:
+            raise ValueError(f"{sample_id}: full_sample_coords has duplicate rows")
+        if full_coords_arr.shape[0] < all_coords.shape[0]:
+            raise ValueError(
+                f"{sample_id}: full_sample_coords has {full_coords_arr.shape[0]} rows, fewer than "
+                f"the aligned sample's {all_coords.shape[0]} spots -- it must be the COMPLETE lattice"
+            )
+        full_coords_set = {tuple(row) for row in full_coords_arr}
+        n_missing = sum(1 for row in all_coords if tuple(row) not in full_coords_set)
+        if n_missing:
+            raise ValueError(
+                f"{sample_id}: full_sample_coords does not agree with the aligned sample -- "
+                f"{n_missing} of the sample's own coordinates are absent from it"
+            )
+        spacing_source = full_coords_arr
+    else:
+        spacing_source = np.concatenate([context_coords_all_raw, query_coords_raw], axis=0)
     scale = max(_median_nearest_neighbor_spacing(spacing_source), 1e-6)
     reference = np.concatenate([observed_coords_raw, query_coords_raw], axis=0).mean(axis=0)
     observed_coords = ((observed_coords_raw - reference) / scale).astype(np.float32)

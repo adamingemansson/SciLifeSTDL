@@ -150,6 +150,82 @@ def test_build_spatial_field_example_requires_full_sample_coords_by_default():
     )
 
 
+def test_build_spatial_field_example_rejects_a_malformed_full_sample_coords():
+    """11th Codex re-audit of commit 9dab8fe, finding #3 ("validate
+    full_sample_coords itself -- shape, finiteness, uniqueness, row
+    count and agreement with the aligned sample"): a caller-supplied
+    full_sample_coords must be held to the same fail-closed standard as
+    adata.obsm['spatial'] itself."""
+    adata = _square_grid_adata()
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query = barcodes[:1]
+    context = barcodes[1:]
+    real_coords = adata.obsm["spatial"]
+
+    with pytest.raises(ValueError, match=r"full_sample_coords must be \[M, 2\]"):
+        build_spatial_field_example(
+            adata, patches, context, query, _stub_image_feature_fn,
+            sample_id="S0", patient_id="P0", patch_size_fullres=1.0,
+            full_sample_coords=real_coords[:, :1],  # wrong shape, [N, 1]
+        )
+
+    non_finite = real_coords.copy()
+    non_finite[0, 0] = np.nan
+    with pytest.raises(ValueError, match="non-finite"):
+        build_spatial_field_example(
+            adata, patches, context, query, _stub_image_feature_fn,
+            sample_id="S0", patient_id="P0", patch_size_fullres=1.0,
+            full_sample_coords=non_finite,
+        )
+
+    duplicated = real_coords.copy()
+    duplicated[1] = duplicated[0]
+    with pytest.raises(ValueError, match="duplicate rows"):
+        build_spatial_field_example(
+            adata, patches, context, query, _stub_image_feature_fn,
+            sample_id="S0", patient_id="P0", patch_size_fullres=1.0,
+            full_sample_coords=duplicated,
+        )
+
+    too_few_rows = real_coords[:-5]
+    with pytest.raises(ValueError, match="fewer than"):
+        build_spatial_field_example(
+            adata, patches, context, query, _stub_image_feature_fn,
+            sample_id="S0", patient_id="P0", patch_size_fullres=1.0,
+            full_sample_coords=too_few_rows,
+        )
+
+    mismatched = real_coords.copy()
+    mismatched[0] = [-999.0, -999.0]  # replaces a real row with an unrelated value -- no longer agrees
+    with pytest.raises(ValueError, match="does not agree with the aligned sample"):
+        build_spatial_field_example(
+            adata, patches, context, query, _stub_image_feature_fn,
+            sample_id="S0", patient_id="P0", patch_size_fullres=1.0,
+            full_sample_coords=mismatched,
+        )
+
+
+def test_build_spatial_field_example_accepts_a_genuinely_larger_full_sample_coords_superset():
+    """The recommended real usage: full_sample_coords is the sample's
+    COMPLETE lattice, which can legitimately have MORE rows than the
+    aligned adata (e.g. spots dropped for missing H&E patches) as long
+    as every one of the aligned sample's own coordinates is present."""
+    adata = _square_grid_adata()
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query = barcodes[:1]
+    context = barcodes[1:]
+    real_coords = adata.obsm["spatial"]
+    superset = np.concatenate([real_coords, np.array([[1000.0, 1000.0]])], axis=0)
+
+    inputs, _ = build_spatial_field_example(
+        adata, patches, context, query, _stub_image_feature_fn,
+        sample_id="S0", patient_id="P0", patch_size_fullres=1.0, full_sample_coords=superset,
+    )
+    assert inputs.observed_coords.shape[0] == len(context)
+
+
 def test_build_spatial_field_example_rejects_non_2d_image_features():
     adata = _square_grid_adata()
     patches = _matching_patches(adata)

@@ -196,6 +196,70 @@ def test_gene_panel_is_derived_from_training_samples_only(tmp_path):
     assert "HELDOUT_ONLY_GENE0" not in manifest["gene_panel"]
 
 
+def test_held_out_samples_missing_genes_from_the_final_panel_are_excluded(tmp_path):
+    """11th Codex re-audit of commit 9dab8fe, finding #2 (CONFIRMED):
+    hest1k_catalog's own held-out compatibility pre-filter only requires
+    min_sample_coverage (typically 90%) of `shared_genes` -- a RAW
+    var_names intersection computed independently of, and not
+    necessarily identical to, this function's actual frozen gene_panel
+    (which additionally applies gene_min_cells's pooled QC filter and is
+    typically a strict subset of shared_genes). A held-out sample can
+    pass that 90% pre-filter yet still be missing gene(s) that end up in
+    the real frozen panel, which example_builder.load_sample_for_examples
+    requires 100% of -- crashing at evaluation time instead of at
+    manifest-build time. Regression: 5 train samples share an identical
+    20-gene panel; the held-out (validation) sample is missing exactly 1
+    of those 20 genes (95% coverage -- passes the coarse 90% pre-filter)
+    but must still be excluded here, since it fails the exact 100%
+    check against the ACTUAL frozen (gene_min_cells=0, so
+    gene_panel == shared_genes here) panel."""
+    full_genes = [f"GENE{i}" for i in range(20)]
+    degraded_genes = full_genes[:19]  # missing GENE19
+    sample_ids = [f"L{i}" for i in range(6)]
+
+    dry_run_dir, dry_run_meta, _ = _make_synthetic_hest1k(
+        tmp_path / "dry_run", {"Lung": sample_ids}, gene_names=full_genes, n_spots_per_sample=1,
+    )
+    dry_run = build_dataset_manifest(
+        dry_run_dir, str(dry_run_meta), organs="all", min_samples_per_organ=6,
+        n_validation_per_organ=1, n_test_per_organ=0, split_seed=0,
+        check_gene_panel_compatibility=False, min_nb_genes=None, gene_min_genes_per_spot=1, gene_min_cells=0,
+    )
+    held_out_id = dry_run["validation_sample_ids"][0]
+
+    hest_dir = tmp_path / "hest1k"
+    (hest_dir / "st").mkdir(parents=True)
+    (hest_dir / "patches").mkdir(parents=True)
+    rng = np.random.default_rng(0)
+    rows = []
+    sample_genes = {sid: (degraded_genes if sid == held_out_id else full_genes) for sid in sample_ids}
+    for sid, genes in sample_genes.items():
+        n = 5
+        barcodes = [f"{sid}-SPOT{i}-1" for i in range(n)]
+        counts = rng.poisson(5, size=(n, len(genes))).astype(np.float32)
+        coords = rng.uniform(0, 1000, size=(n, 2))
+        adata = ad.AnnData(
+            X=counts, obs=pd.DataFrame(index=pd.Index(barcodes)), var=pd.DataFrame(index=pd.Index(genes)),
+        )
+        adata.obsm["spatial"] = coords
+        adata.write_h5ad(hest_dir / "st" / f"{sid}.h5ad")
+        (hest_dir / "patches" / f"{sid}.h5").touch()
+        rows.append({"id": sid, "organ": "Lung", "st_technology": "Visium", "species": "Homo sapiens", "nb_genes": len(genes)})
+    meta_path = tmp_path / "meta.csv"
+    pd.DataFrame(rows).to_csv(meta_path, index=False)
+
+    manifest = build_dataset_manifest(
+        hest_dir, str(meta_path), organs="all", min_samples_per_organ=6,
+        n_validation_per_organ=1, n_test_per_organ=0, split_seed=0,
+        check_gene_panel_compatibility=True,  # the coarse pre-filter this test proves is insufficient alone
+        min_gene_coverage=0.5, min_sample_coverage=0.9, min_panel_size=5,
+        min_nb_genes=None, gene_min_genes_per_spot=1, gene_min_cells=0,
+    )
+    assert set(manifest["gene_panel"]) == set(full_genes)  # unaffected -- train samples are all fully compatible
+    assert held_out_id not in manifest["validation_sample_ids"]
+    assert held_out_id not in manifest["samples"]
+
+
 def test_manifest_excludes_spots_that_fail_the_per_spot_min_genes_filter(tmp_path):
     """Regression test for a real, confirmed gap (found while designing
     Step 2, before any Step-2 code shipped): an earlier version of this
@@ -291,14 +355,18 @@ def test_content_hash_changes_when_real_file_content_changes(tmp_path):
     assert before != after
 
 
-def test_content_digest_cache_is_consulted_on_repeat_builds(tmp_path):
-    """The digest cache (the 10th audit's own proposed mitigation for
-    hashing cost: "cached via a separately-verified digest database")
-    must actually be READ on a repeat build, not just written. Proven by
-    tampering the cached digest for an UNCHANGED file (same size/mtime)
-    and observing the tampered value come back out of the next build --
-    if the cache weren't consulted, the real (untampered) hash would
-    have been recomputed instead."""
+def test_content_hash_is_always_freshly_computed_never_trusted_from_the_digest_cache(tmp_path):
+    """11th Codex re-audit of commit 9dab8fe, finding #1 (CONFIRMED):
+    an earlier version of this module trusted a cached digest whenever
+    a file's path+size+mtime matched a digest_cache entry -- stat
+    metadata is not a cryptographic guarantee, so a manifest that
+    claims to identify real file content by hash must never use an
+    unverified shortcut for that hash. Regression (the OPPOSITE
+    assertion of this test's now-removed predecessor): tampering the
+    on-disk digest cache for an UNCHANGED file (same size/mtime) must
+    NOT affect the next build's recorded hash -- the manifest must
+    always reflect the REAL file content, regardless of what the cache
+    file says."""
     hest_dir, meta_path, _ = _make_synthetic_hest1k(tmp_path, {"Lung": ["L0", "L1", "L2"]})
     digest_cache_path = tmp_path / "digest_cache.json"
     build_kwargs = dict(
@@ -309,7 +377,7 @@ def test_content_digest_cache_is_consulted_on_repeat_builds(tmp_path):
     )
     manifest = build_dataset_manifest(**build_kwargs)
     real_hash = manifest["samples"]["L0"]["content_provenance"]["h5ad"]["sha256"]
-    assert digest_cache_path.is_file()
+    assert digest_cache_path.is_file()  # still recorded, as a write-only ledger
 
     digest_cache = load_digest_cache(digest_cache_path)
     h5ad_path = str((hest_dir / "st" / "L0.h5ad").resolve())
@@ -318,7 +386,8 @@ def test_content_digest_cache_is_consulted_on_repeat_builds(tmp_path):
     save_digest_cache(digest_cache, digest_cache_path)
 
     rebuilt = build_dataset_manifest(**build_kwargs)
-    assert rebuilt["samples"]["L0"]["content_provenance"]["h5ad"]["sha256"] == "0" * 64
+    assert rebuilt["samples"]["L0"]["content_provenance"]["h5ad"]["sha256"] == real_hash
+    assert rebuilt["samples"]["L0"]["content_provenance"]["h5ad"]["sha256"] != "0" * 64
 
 
 def test_save_and_load_dataset_manifest_round_trips(tmp_path):

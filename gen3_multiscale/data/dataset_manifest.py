@@ -28,15 +28,18 @@ describing exactly what data a Gen3 training run will use:
     9592d9e (finding #2, confirmed) correctly flagged as insufficient
     for the MANIFEST's own immutability claim (a runtime cache key only
     needs to detect *most* changes cheaply; an immutability record needs
-    to actually identify the bytes it describes). Hashing full file
-    content at manifest-build time is a real, non-trivial cost for large
-    per-sample files, so it is memoized in an on-disk "digest database"
-    (see _cached_file_content_hash/load_digest_cache/save_digest_cache
-    below) keyed by each file's own path+size+mtime -- exactly the
-    mitigation the audit itself proposed ("hashing can be cached via a
-    separately-verified digest database for the one-time cost"): a cache
-    hit still re-verifies size/mtime against the real file before ever
-    trusting a memoized digest.
+    to actually identify the bytes it describes). Every recorded hash is
+    ALWAYS freshly computed from the file's real bytes -- an earlier
+    version of this module tried to memoize digests keyed by
+    path+size+mtime and trust a cache hit, but the 11th Codex re-audit
+    of commit 9dab8fe (finding #1, confirmed) correctly flagged that
+    stat metadata is not a cryptographic guarantee and must never gate
+    whether the real content gets verified (its own regression test
+    proved a tampered cached digest would silently come back out of a
+    rebuild). `digest_cache`/load_digest_cache/save_digest_cache still
+    exist as a write-only, on-disk historical ledger of path -> {size,
+    mtime, sha256} for auditing/debugging -- never read to skip a real
+    hash computation.
 
 Every later step in the real data builder (example construction, mask-
 realization fingerprinting, Novae graphs, WSI wiring, the trainer and
@@ -64,7 +67,7 @@ from typing import Iterable
 import numpy as np
 
 from gen3_multiscale.data import loaders
-from gen3_multiscale.data.hest1k_catalog import resolve_sample_selection
+from gen3_multiscale.data.hest1k_catalog import _real_var_names, resolve_sample_selection
 
 _MANIFEST_VERSION = 1
 
@@ -150,21 +153,25 @@ def _sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
 
 
 def _cached_file_content_hash(path: Path, digest_cache: dict) -> str:
-    """SHA256 content hash of `path`, memoized in `digest_cache` (an
-    in-memory dict backed by load_digest_cache/save_digest_cache below)
-    keyed by the file's own path+size+mtime identity. A cache hit still
-    re-verifies size/mtime against the real file on disk before ever
-    trusting a memoized digest -- never trusts a stale key alone."""
+    """Real SHA256 content hash of `path`, ALWAYS freshly computed by
+    reading the file's actual bytes -- never returned from a cached
+    value. 11th Codex re-audit of commit 9dab8fe, finding #1 (CONFIRMED):
+    an earlier version of this function trusted a memoized digest
+    whenever the file's path+size+mtime matched a digest_cache entry,
+    and its own regression test demonstrated this by tampering the
+    cached SHA256 and observing the fake value come back out of a
+    rebuild -- stat metadata (size/mtime) is not a cryptographic
+    guarantee and must never gate whether the real content actually gets
+    verified; a manifest that claims to identify real file content by
+    hash cannot use an unverified shortcut for that hash. `digest_cache`
+    is still updated here and persisted to disk (see
+    load_digest_cache/save_digest_cache below) as a plain historical
+    ledger of path -> {size, mtime, sha256} for auditing/debugging --
+    but it is WRITE-ONLY from this function's perspective: it is never
+    read to decide whether to skip a real hash computation."""
+    digest = _sha256_file(path)
     stat = path.stat()
     key = str(path.resolve())
-    cached = digest_cache.get(key)
-    if (
-        cached is not None
-        and cached.get("size_bytes") == stat.st_size
-        and cached.get("mtime_ns") == stat.st_mtime_ns
-    ):
-        return cached["sha256"]
-    digest = _sha256_file(path)
     digest_cache[key] = {
         "size_bytes": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns), "sha256": digest,
     }
@@ -235,6 +242,22 @@ def _sample_content_provenance(hest_data_dir: str | Path, sample_id: str, digest
     }
 
 
+def _filter_ids_missing_final_panel_genes(
+    hest_data_dir: str | Path, ids: list[str], gene_panel_set: set[str],
+) -> tuple[list[str], list[str]]:
+    """The DEFINITIVE, exact held-out gene-panel check -- every id must
+    cover 100% of the ACTUAL frozen gene_panel (the real panel
+    example_builder.load_sample_for_examples will require in full, not
+    a heuristic coverage fraction). See build_dataset_manifest's call
+    site for why this is a separate, stricter check than
+    hest1k_catalog's own coarse pre-filter. Returns (kept, dropped)."""
+    kept, dropped = [], []
+    for sid in ids:
+        real_panel = _real_var_names(hest_data_dir, sid)
+        (kept if gene_panel_set <= real_panel else dropped).append(sid)
+    return kept, dropped
+
+
 def build_dataset_manifest(
     hest_data_dir: str | Path,
     metadata_csv: str,
@@ -283,7 +306,6 @@ def build_dataset_manifest(
     train_ids = split["train_sample_ids"]
     validation_ids = split["validation_sample_ids"]
     test_ids = split["test_sample_ids"]
-    all_ids = sorted(set(train_ids) | set(validation_ids) | set(test_ids))
 
     # The gene panel is derived from TRAINING samples ONLY, via the real
     # QC/normalization pipeline every sample actually goes through
@@ -303,6 +325,41 @@ def build_dataset_manifest(
     )
     gene_panel = list(train_adatas[0].var_names) if train_adatas else []
     del train_adatas  # discard the loaded expression matrices -- only the panel is kept
+
+    # 11th Codex re-audit of commit 9dab8fe, finding #2 (CONFIRMED): the
+    # held-out compatibility check inside resolve_sample_selection only
+    # requires min_sample_coverage (typically 90%) of `shared_genes` --
+    # hest1k_catalog.resolve_compatible_sample_ids's own RAW-var_names
+    # panel intersection, computed independently of, and NOT necessarily
+    # identical to, this function's actual frozen `gene_panel` (which
+    # additionally applies gene_min_cells's pooled QC filter and is
+    # therefore typically a STRICT SUBSET of shared_genes). A held-out
+    # sample can pass that coarse 90% pre-filter yet still be missing
+    # one or more genes that end up in the real frozen `gene_panel`,
+    # which example_builder.load_sample_for_examples requires 100% of --
+    # crashing at evaluation time instead of at manifest-build time.
+    # This is the definitive, exact check: every held-out sample must
+    # cover 100% of the ACTUAL frozen panel, checked here (after the
+    # panel is frozen), not the coarser pre-filter's job. Non-conforming
+    # samples are DROPPED (with a printed notice), matching this
+    # codebase's established pattern of excluding individual
+    # incompatible members rather than crashing the whole run.
+    gene_panel_set = set(gene_panel)
+    validation_ids, dropped_validation = _filter_ids_missing_final_panel_genes(
+        hest_data_dir, validation_ids, gene_panel_set,
+    )
+    test_ids, dropped_test = _filter_ids_missing_final_panel_genes(
+        hest_data_dir, test_ids, gene_panel_set,
+    )
+    dropped_for_final_panel = dropped_validation + dropped_test
+    if dropped_for_final_panel:
+        print(
+            f"build_dataset_manifest: excluded {len(dropped_for_final_panel)} held-out sample(s) "
+            f"missing gene(s) from the final frozen {len(gene_panel)}-gene panel (examples: "
+            f"{dropped_for_final_panel[:20]})"
+        )
+
+    all_ids = sorted(set(train_ids) | set(validation_ids) | set(test_ids))
 
     samples: dict[str, dict] = {}
     for sample_id in all_ids:

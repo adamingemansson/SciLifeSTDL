@@ -2887,7 +2887,154 @@ preflight gates"), not Step 3's.
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 35. Response to the eleventh external Codex re-audit (of commits 9dab8fe/d1fa094)
+
+Codex verified the 10th-round fixes as real (train-only compatibility,
+patient namespacing, example validation, partial-overlap leakage
+detection all confirmed), then found 3 further issues before Step 4:
+digest-cache trust, a held-out gene-panel coverage inconsistency, and
+Step 3 not yet being a complete enforcement gate. All 3 verified against
+the real code before fixing.
+
+**Finding #1 (CONFIRMED): the digest cache was TRUSTED, not verified.**
+`_cached_file_content_hash` returned a memoized digest whenever a
+file's path+size+mtime matched a `digest_cache` entry -- the 10th
+round's own regression test (`test_content_digest_cache_is_consulted_on_repeat_builds`)
+proved this by tampering the cached SHA256 and asserting the FAKE value
+came back out of a rebuild. Correct per the audit: "For an immutable
+manifest/preflight, rehash the files. A stat-based cache can be used
+for convenience, but it cannot be the authority for cryptographic
+verification." Fixed: `_cached_file_content_hash` now ALWAYS computes a
+fresh hash by reading the real file bytes; `digest_cache` is still
+updated and persisted to disk, but purely as a write-only historical
+ledger (path -> {size, mtime, sha256}) for auditing/debugging, never
+read to skip a real hash computation. The old test was replaced with
+its logical opposite,
+`test_content_hash_is_always_freshly_computed_never_trusted_from_the_digest_cache`:
+tampering the on-disk digest cache for an UNCHANGED file must NOT
+affect the next build's recorded hash.
+
+**Finding #2 (CONFIRMED): held-out gene-panel compatibility was
+inconsistent with the actual frozen panel.** `hest1k_catalog`'s
+held-out pre-filter (`_filter_held_out_ids_against_reference_panel`,
+added in §33) only requires `min_sample_coverage` (typically 90%) of
+`shared_genes` -- a RAW var_names intersection computed independently
+of, and not necessarily identical to, `build_dataset_manifest`'s actual
+frozen `gene_panel` (which additionally applies `gene_min_cells`'s
+pooled QC filter and is typically a STRICT SUBSET of `shared_genes`).
+Verified by tracing both code paths: `resolve_compatible_sample_ids`
+computes `shared_genes` from RAW, unfiltered `_real_var_names`;
+`load_multi_sample` computes the real `gene_panel` from the SAME raw
+intersection further reduced by a pooled `min_cells` filter -- two
+genuinely different computations that can disagree. A held-out sample
+passing the coarse 90% pre-filter can still be missing gene(s) that end
+up in the real frozen panel, which `example_builder.load_sample_for_examples`
+requires 100% of -- crashing at evaluation time instead of at
+manifest-build time. Fixed per the audit's own "ideally" recommendation:
+a new, definitive check in `dataset_manifest.build_dataset_manifest`
+(`_filter_ids_missing_final_panel_genes`), run AFTER `gene_panel` is
+frozen, requiring exact 100% coverage of the ACTUAL final panel; the
+coarse pre-filter is kept as a cheap, non-authoritative early filter,
+not removed. Non-conforming held-out samples are dropped with a printed
+notice, matching the codebase's established pattern, rather than
+crashing the whole run. Verified by
+`test_held_out_samples_missing_genes_from_the_final_panel_are_excluded`:
+5 train samples share an identical 20-gene panel; the held-out sample
+is missing exactly 1 of those genes (95% coverage -- passes the coarse
+pre-filter) but is correctly excluded by the new exact check.
+
+**Finding #3 (CONFIRMED): Step 3 was a useful utility but not yet a
+complete enforcement gate.** Five concrete gaps, all closed in
+`data/mask_fingerprint.py`:
+- **Duplicate identities inside a query list.** `sorted_composite_query_fingerprint`
+  now raises if `query_obs_names` contains the same barcode more than
+  once (a real query set must be a set of distinct spots); `realized_query_composite_ids`
+  inherits the same check per record.
+- **Validate every realized identity against the manifest and expected
+  sample.** New `validate_realized_barcodes_against_manifest(manifest,
+  sample_id, obs_names)`; `realize_seed_and_fingerprint` gained an
+  optional `manifest` parameter that validates both context and query
+  barcodes before fingerprinting.
+- **Detect identical masks across different strata/configurations, not
+  only seeds passed to one masking configuration.** New
+  `verify_realized_pool_uniqueness(coords3d, slice_ids, obs_names,
+  sample_id, items, manifest=None)` checks uniqueness across a POOL of
+  `{"label", "masking_cfg", "seed"}` entries spanning ANY number of
+  different configs, not just one config's seed range;
+  `verify_realized_seed_uniqueness` is now a thin single-config wrapper
+  over it. Verified with an engineered, deterministic cross-config
+  collision: `mask_bank.make_split`'s `hold_out_slice` branch never
+  reads `masking_cfg['params']` at all, so two configs differing only
+  in an ignored params field realize byte-identical masks for the same
+  seed.
+- **Process the complete production schedule and persist a leakage
+  report.** New `build_mask_fingerprint_report(manifest, sample_id,
+  coords3d, slice_ids, obs_names, strata, stratified_training_seed_bank,
+  stratified_mask_bank)`: deduplicates the FULL training schedule's
+  (stratum, seed) pairs (a schedule's `n_items` can legitimately repeat
+  pairs via round-robin cycling), realizes each exactly once, pool-
+  checks uniqueness across strata, validates every identity against the
+  manifest, and runs the cross-split leakage check against the real
+  validation/test records -- plus `save_mask_fingerprint_report`/
+  `load_mask_fingerprint_report` (atomic write, mirroring every other
+  artifact in this package) so Step 8's preflight gate has a concrete
+  artifact to require before training starts.
+- **Validate `full_sample_coords` itself.** `example_builder.build_spatial_field_example`
+  now checks a caller-supplied `full_sample_coords` for shape `[M, 2]`,
+  finiteness, no duplicate rows, at least as many rows as the aligned
+  sample, and that every one of the aligned sample's own coordinates is
+  actually present in it (real agreement, not just a same-shaped
+  unrelated array) -- previously only `adata.obsm['spatial']` itself
+  received these checks.
+
+**A real, separate finding surfaced while testing the production-
+schedule report, not something to silently work around:** on a small-
+to-moderate synthetic grid, `random_dropout_patches` scattering
+independently-seeded train/validation/test query patches across ONE
+shared per-sample coordinate space produces cross-split query overlap
+by chance alone with real regularity -- confirmed at both a 144-spot
+and a 1600-spot grid with this project's existing stratum radii. This
+is not a bug in `mask_fingerprint.py` (its job is to DETECT this, which
+it correctly does) -- it is a real characteristic of the existing
+per-sample mask-drawing scheme (`mask_bank.py`/`mask_schedule.py`,
+unmodified here) that has never guaranteed cross-split disjointness
+within one sample. Recorded here as a real, open question for whoever
+wires per-sample validation/test masks into the real trainer (Step 6)
+or preflight gates (Step 8): either the mask-drawing scheme needs an
+explicit disjointness mechanism (e.g. excluding already-claimed
+validation/test query spots from the training draw pool), or per-sample
+in-sample validation/test masking needs to be reconsidered in favor of
+relying solely on the sample-level train/validation/test split. Not
+fixed in this pass -- out of scope for a fingerprinting/detection module
+whose job is to surface exactly this kind of problem, not to redesign
+the mask-generation scheme itself.
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 395 passed (45 reused-infra + 12 example-schema +
+  11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 23 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 15 dataset-manifest + 16 example-builder +
+  18 mask-fingerprint)
+gen2_architectures + gen3_multiscale: 568 passed, 1 skipped
+```
+
+Note: a full monorepo run (`pytest -q` from the repo root, everything
+including the top-level `tests/` directory) still shows the same one
+pre-existing failure noted since §26,
+`tests/test_multi_sample.py::test_inject_multi_sample_n_genes`,
+unrelated to `gen2_architectures/` or `gen3_multiscale/`; unchanged and
+still out of scope for this pass.
+
+The block immediately below (pre-11th-audit-response test counts) is
+kept for historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 381 passed (45 reused-infra + 12 example-schema +
