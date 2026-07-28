@@ -1,12 +1,11 @@
 # gen3_multiscale — frozen contract and phase log
 
 Implements `CLAUDE_HANDOFF_MULTISCALE_SPATIAL_FIELD_ARCHITECTURES.md`'s
-staged phases. Status: **Phase 0/1/2 done**. Mask-aware WSI/LongNet
-adaptation (Phase 3), the shared GEX/transport gate (Phase 4), token
-modules (Phase 5), the four architecture wrappers (Phase 6), losses/
-diagnostics (Phase 7), and configs/launcher (Phase 8) are **not yet
-implemented**. This document is extended, not replaced, as later phases
-land.
+staged phases. Status: **Phase 0/1/2/3 done**. The shared GEX/transport
+gate (Phase 4), token modules (Phase 5), the four architecture wrappers
+(Phase 6), losses/diagnostics (Phase 7), and configs/launcher (Phase 8)
+are **not yet implemented**. This document is extended, not replaced, as
+later phases land.
 
 ## 1. Base commit
 
@@ -207,23 +206,88 @@ never silently truncate it" — plus an integration test proving
 `boundary_graph.py`'s output actually satisfies `example.py`'s
 `validate_spatial_field_example`.
 
-## 9. What is still NOT covered
+## 9. Mask-aware WSI path (Phase 3 — implemented)
 
-- No mask-aware GigaPath LongNet adaptation — Phase 3.
+`data/slide_context.py` — copied VERBATIM from `src/data/slide_context.py`
+(§2's copy-provenance discipline): dense-WSI-tile-cache loading,
+conservative axis-aligned tile/hole footprint overlap removal
+(`_overlaps_query_hole`, `visible_slide_context`), and the local-patch
+equivalent (`nonoverlapping_context_patch_mask`) already used by
+`src/training/train.py`. This is the exact audited mechanism the handoff
+asks Phase 3 to reuse, not reimplement. 5 tests (adapted from
+`tests/test_hierarchical_missing_tissue.py`'s existing coverage of the
+same logic, kept self-contained rather than imported so gen3's copy is
+independently verified) cover tile-overlap removal, `all_zero`/`full`
+image modes, and the fail-loud "every tile removed" case.
+
+`models/slide_encoder.py`:
+
+- `FrozenGigaPathSlideEncoder` — copied VERBATIM (narrow extraction, not
+  the whole file) from `src/models/hierarchical_slide.py`'s identically-
+  named class: the official Prov-GigaPath LongNet wrapper, fail-closed on
+  a missing checkpoint (never silently falls back to randomly-initialized
+  LongNet weights), FlashAttention capability checks, FP16 CUDA inference
+  with a bounded output cache. The REST of `hierarchical_slide.py` (the
+  older `HierarchicalMissingTissueEncoder` fusion design) is deliberately
+  NOT copied — the handoff is explicit: "Do not copy the older fusion
+  design blindly." 1 test covers the fail-closed missing-checkpoint path
+  (the only part testable without a real ~350MB Prov-GigaPath checkpoint
+  and a CUDA+FlashAttention environment); full LongNet forward-pass
+  testing is deferred to when real GPU/checkpoint access is available.
+- `pool_regional_tokens` — NEW. Prov-GigaPath's stable public interface
+  returns only one global CLS vector per slide-encoder call (confirmed by
+  reading the class above, not assumed) — it does not expose per-tile
+  contextualized states, so regional H&E tokens come from mean-pooling
+  the VISIBLE pre-LongNet tile embeddings into a fixed `grid_size x
+  grid_size` grid instead, exactly the handoff's specified fallback
+  ("Do not depend on private unstable internals merely to obtain
+  regional tokens"). Grid cell boundaries are computed from the
+  slide's COMPLETE tile extent (`full_slide_coord_bounds`), not the
+  hole-shrunk visible subset — verified by test that the same physical
+  tile lands in the identical grid cell regardless of which other tiles
+  a particular hole happens to remove, so a model could learn to
+  interpret "region (i, j)" consistently across different training items
+  on the same slide. Empty cells (e.g. fully hole-covered) get an
+  explicit `available=False` flag alongside their zero vector, never a
+  silently fabricated value indistinguishable from real all-zero content.
+  6 tests cover cell assignment, multi-tile averaging, empty-cell
+  marking, zero-tile input, bounds-stability across different visible
+  subsets, and invalid-bounds rejection.
+
+`evaluation/debug_plot.py` — Phase 3 item 5's visual/debug artifact:
+`plot_mask_wsi_boundary_debug` renders one PNG showing observed/query ST
+spots, boundary rings 1–3 (colored by ring), and retained/rejected WSI
+tile footprints in one coordinate frame — a human-auditable sanity check
+that mask-aware WSI filtering and boundary-ring extraction agree with
+each other, before any of it is trusted inside a model. matplotlib is
+imported lazily (only inside the function) so nothing that transitively
+imports this module needs it in a headless environment that never calls
+it. 2 tests prove it runs end-to-end against real `boundary_graph.py`
+output (not a pixel/visual-regression test — proof of a clean execution
+path against the real data shapes it will be fed).
+
+## 10. What is still NOT covered
+
 - No gene-encoder ablation read/selection, no transport-head reuse — Phase 4.
-- No token modules, no model code at all — Phase 5/6.
+- No token modules, no model code for the spatial-field backbone itself — Phase 5/6.
 - No losses, no diagnostics, no configs, no launcher — Phase 7/8.
-- No real per-sample builder wiring `boundary_graph.py` + real loaded
-  HEST-1k data into a `SpatialFieldExample` yet.
+- No real per-sample builder wiring `boundary_graph.py` + `slide_context.py`
+  + real loaded HEST-1k data into a `SpatialFieldExample` yet — that
+  glue code is a natural Phase 4/5 dependency once the transport head and
+  token modules exist to consume it.
+- `FrozenGigaPathSlideEncoder`'s actual LongNet forward pass is untested
+  here (requires a real checkpoint + CUDA + FlashAttention) — only its
+  fail-closed missing-checkpoint behavior is verified.
 - No full leakage/geometry/learning/numerical gate suite — those tests
   only become fully meaningful once there's a real model and a real data
-  builder; Phase 1/2's tests cover the schema/geometry contract layer
-  those later tests will build on top of (several geometry gates are
-  already directly covered, see §8).
+  builder; Phase 1/2/3's tests cover the schema/geometry/WSI-overlap
+  contract layers those later tests will build on top of (several
+  individual gates are already directly covered, see §8/§9).
 
 ## Test status as of this document
 
 ```
-gen3_multiscale/tests/: 64 passed (41 reused-infra + 12 example-schema + 11 boundary-graph)
-full repo (gen2_architectures + gen3_multiscale): 233 passed, 1 skipped
+gen3_multiscale/tests/: 78 passed (41 reused-infra + 12 example-schema +
+  11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot)
+full repo (gen2_architectures + gen3_multiscale): 247 passed, 1 skipped
 ```
