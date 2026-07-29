@@ -3693,7 +3693,212 @@ standing "cannot execute on the remote GPU server directly" constraint.
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 41. Real Gen3 data builder -- Step 5, part 2: real regional/global GigaPath wiring, plus a response to the sixteenth external Codex re-audit (of Step 5 part 1)
+
+Adam forwarded 3 further findings against part 1's data-layer
+foundation, then authorized continuing directly into Part 2's real
+architecture wiring. All 3 findings re-confirmed against the actual code
+before any fix; Part 2 is now genuinely wired end to end, not a
+foundation-only checkpoint.
+
+**Finding #1 (CONFIRMED): `slide_cache_namespace` was absent from the
+WSI all-or-none validation.** `example.py`'s `wsi_fields_set` tuple only
+checked `wsi_tile_features`/`wsi_tile_coords`/`full_slide_coord_bounds`
+-- a caller could set every field except `slide_cache_namespace` (left
+`None`) and `validate_spatial_field_example` would accept it, silently
+losing the real cache-key material a downstream `use_global_slide=True`
+forward pass needs. Fixed: `slide_cache_namespace` is now the fourth (of
+what became five, see finding #2) required WSI field, plus an explicit
+non-empty-string check.
+
+**Finding #2 (CONFIRMED): one `wsi_tile_coords` field conflated two
+genuinely different coordinate systems.** Real GigaPath/LongNet needs
+its own UNNORMALIZED, native level-0 tile-pixel coordinates for its
+pretrained positional encoding; regional spatial attention needs the
+SAME centered/spot-spacing-normalized frame as `observed_coords`/
+`query_coords`. A single field could never correctly serve both
+consumers. Fixed: split into `wsi_tile_native_coords` (raw level-0
+pixels, fed to `FrozenGigaPathSlideEncoder`) and
+`wsi_tile_regional_coords` (the same `(raw - reference) / scale`
+transform as every other coordinate in the example, fed to
+`compute_relative_geometry` for regional cross-attention) -- both
+derived from the identical transform in `example_builder.py`, never two
+independently-computed values that could drift apart.
+
+**Finding #3 (CONFIRMED): the dense-cache content digest covered only
+half the fields that actually affect masking.** `load_slide_context`'s
+`context_id` hashed `features`/`coords`/`tile_size` only --
+`visible_slide_context`'s hole-overlap test runs entirely in the
+`mask_coords`/`mask_tile_size`/`coords_are_centers` frame, which for a
+`dense_wsi_cache` with a separate `level0_coords`/`level0_tile_size` is
+a genuinely DIFFERENT coordinate system than `coords`/`tile_size`. A
+cache file changed ONLY in those masking-relevant fields would silently
+keep its old `context_id` despite producing different visible tiles for
+every hole. Fixed: all six real fields are now hashed together. Also
+fixed in the same pass (no duplicate-tile check existed at all): a
+`dense_wsi_cache` with two tiles at the identical coordinate now raises
+explicitly rather than silently double-counting that region's
+contribution to both regional pooling and the LongNet global vector.
+
+Verified by 2 new tests in `test_slide_context.py` (level0-mask-field
+digest sensitivity, duplicate-coordinate rejection), 3 new tests in
+`test_example.py` (missing/blank `slide_cache_namespace`,
+native-vs-regional independent scaling), and every existing WSI test
+call site updated to the new five-field schema.
+
+**Part 2: the real regional/global architecture wiring (Adam's Part 2
+design, all six bullets satisfied).**
+
+`_SharedFieldArchitecture` (`models/architectures.py`) gained
+`_regional_he_tokens`/`_global_slide_vector`, and `forward()`'s two
+`NotImplementedError` blocks are now real code:
+
+- *Regional tokens use normalized model coordinates and stable pre-mask
+  bounds.* `_regional_he_tokens` pools `wsi_tile_features` via the
+  already-audited `pool_regional_tokens` (mean-pooling into a
+  `regional_grid_size x regional_grid_size` grid, using
+  `full_slide_coord_bounds` -- computed from the COMPLETE tile set
+  before hole-filtering, so grid cell (i, j) is slide-stable across
+  different holes) against `wsi_tile_regional_coords`. Grid cells with
+  zero visible tiles are INDEX-SELECTED out of the returned tensors
+  entirely (`available.nonzero(...)`), never zero-valued-but-still-
+  attended -- the same discipline `boundary_idx`/`local_idx` already use
+  for excluded content elsewhere in this codebase. A new
+  `regional_grid_cell_centers` helper (`models/slide_encoder.py`)
+  computes each surviving cell's real center in the same frame, fed to
+  `compute_relative_geometry` for real regional cross-attention geometry
+  (`SpatialFieldBackbone` already had the cross-attention consumer side
+  built and unchanged).
+- *LongNet uses native GigaPath coordinates.* `_global_slide_vector`
+  calls the injected `FrozenGigaPathSlideEncoder` with
+  `wsi_tile_native_coords` -- never the regional frame, which would
+  silently corrupt LongNet's real pretrained positional encoding.
+  Verified directly by a dedicated test that captures the actual
+  coordinates the stub encoder receives and confirms they are the
+  large-magnitude native values, never the small-magnitude regional
+  ones.
+- *Regional/global H&E enters hidden conditioning only.* Both branches
+  write ONLY into `block_kwargs` (consumed by
+  `SpatialFieldBackbone`'s cross-attention/FiLM path), never into
+  `shared_hidden_parts`/`shared_expression_parts` (the real GEX
+  value-candidate pool `GeneValueTransportHead` predicts from) -- true
+  by construction, not a runtime check, mirroring how
+  `gex_inducing_expression` IS deliberately added to that pool as a
+  contrasting example already in this file. Verified by a dedicated
+  structural test: `shared_candidate_expression`/`shared_candidate_hidden`
+  have the EXACT same shape whether or not `use_regional_he`/
+  `use_global_slide` are enabled (holding `use_global_gex` fixed),
+  proving neither branch ever appends a row to the real prediction
+  candidate pool.
+- *Architecture 3 enables both branches.* `configs/architecture3.yaml`
+  now sets `use_regional_he: true`/`use_global_slide: true` (previously
+  `false` with "NOT YET WIRED" comments) plus a new `regional_grid_size:
+  4` and `data.slide_context_source: dense_wsi_cache` (the real,
+  tissue-wide tile grid -- `spot_aligned` stays an explicit diagnostic
+  fallback, never used by a production config, per Adam's explicit
+  requirement). The Python class-level kwarg defaults on
+  `Architecture3.__init__` deliberately stay `False` (an interpretation
+  choice, not literally what was asked at the class-default level) --
+  flipping the class default would have broken roughly 20 unrelated
+  existing tests across this codebase that construct `Architecture3`/
+  `Architecture4` without synthetic WSI data; the config is what a real
+  training entrypoint actually reads, so "Architecture 3 enables both
+  branches" is satisfied at the level that matters operationally.
+- *Architecture 4 reuses that exact Architecture 3 conditioner.* A real,
+  confirmed gap found while implementing this (not a numbered finding,
+  but directly required by this bullet): `Architecture4.__init__`
+  previously silently OMITTED `use_regional_he`/`use_global_slide`/
+  `global_slide_dim`/`regional_grid_size`/`slide_encoder`/
+  `gigapath_checkpoint_sha256` entirely when constructing its internal
+  `self.conditioner = Architecture3(...)` -- so `Architecture3`'s own
+  `kwargs.setdefault(False)` (and its `global_slide_dim` default) always
+  won regardless of what a caller asked Architecture4 for, meaning this
+  bullet was never actually true for these fields. Fixed: all six are
+  now explicit `Architecture4.__init__` parameters, forwarded verbatim.
+  `configs/architecture4.yaml` mirrors architecture3.yaml's flags/
+  `regional_grid_size`/`slide_context_source` for the same reason.
+- *Architectures 1/2 remain unaffected.* Unchanged at the Python level;
+  `configs/architecture1.yaml`/`architecture2.yaml` keep
+  `use_regional_he`/`use_global_slide: false` by design (their stale
+  "NotImplementedError if set true" comments, now factually wrong since
+  the wiring is real, were corrected to say "kept false by design").
+
+**`use_global_slide=True` fails closed at construction, not at forward
+time.** `_SharedFieldArchitecture.__init__` now requires (mirroring Step
+4's `checkpoint_provenance` required-dict pattern) both a real
+`slide_encoder` (`FrozenGigaPathSlideEncoder`) and a non-empty
+`gigapath_checkpoint_sha256` whenever `use_global_slide=True`, raising
+`ValueError` immediately otherwise -- never a silent default. The
+complete LongNet cache namespace the handoff specifies (tile-cache
+content hash + visible-tile identity + GigaPath checkpoint SHA256 +
+model architecture/version) is assembled at `forward()` time by
+combining the data layer's `inputs.slide_cache_namespace` (already real,
+see Finding #2 above) with the model-construction-time checkpoint SHA256
+and a new `model_architecture_version` string -- properties of WHICH
+MODEL is running, correctly supplied by the model layer, never assumed
+by the data layer.
+
+**`data/example_builder.py` now actually populates the WSI fields from
+real data** -- the missing link connecting the Part 1 schema and Part 2
+wiring to a real HEST-1k dense WSI tile cache. `build_spatial_field_example`
+gained `slide_context`/`image_mode` parameters; when `slide_context` is
+given, it calls the already-audited `slide_context.visible_slide_context`
+(removing every tile whose footprint physically overlaps the query
+hole, matching the same physical-damage model context H&E patches
+already use) and derives `wsi_tile_native_coords`/
+`wsi_tile_regional_coords`/`wsi_tile_features`/`slide_cache_namespace`
+from the result, plus `full_slide_coord_bounds` from the COMPLETE
+(pre-hole) tile set in the same normalized frame. Verified by 3 new
+tests in `test_example_builder.py`: real native-vs-regional frame
+wiring end to end, and Adam's explicit acceptance criterion --
+corrupting a WSI tile that overlaps the hole changes NOTHING in the
+built example, while corrupting a visible tile changes
+`wsi_tile_features` directly.
+
+**`models/model_factory.py` gained `slide_encoder`/
+`gigapath_checkpoint_sha256` passthrough parameters** on
+`resolve_model_kwargs`/`build_architecture` -- neither is representable
+in static YAML (a live frozen encoder instance and a real checkpoint
+hash), so they can never come from `model.params`; a caller (the real
+trainer, Step 6, or a test) supplies them directly and they are
+forwarded into the constructor unmodified, exactly like `gene_basis`/
+`gene_names` already are for Architecture 4. Without this, flipping
+`configs/architecture3.yaml`/`architecture4.yaml`'s flags to `true`
+would have made `test_model_factory.py`'s real from-YAML construction
+tests unable to build a model at all (a real regression this session
+caught and fixed by adding this passthrough, not by reverting the
+config flags) -- `test_model_factory.py` now builds Architecture 3/4
+with a duck-typed stub `slide_encoder` (no real checkpoint needed,
+matching every other pluggable-component test stub in this codebase)
+whenever it constructs from the real config files.
+
+**Not done in this pass (unchanged from Part 1's honest scope
+boundary):** the real trainer (Step 6) that would construct a genuine
+`FrozenGigaPathSlideEncoder` from a real checkpoint path and compute its
+SHA256; the real A100 smoke-test script (frozen/eval-mode LongNet,
+FP16/FlashAttention, bounded memory) -- still undeliverable as anything
+other than a script for Adam to run himself, per this session's standing
+"cannot execute on the remote GPU server directly" constraint.
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 472 passed (45 reused-infra + 23 example-schema +
+  11 boundary-graph + 10 slide-context + 7 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 28 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 17 dataset-manifest + 20 example-builder +
+  46 mask-fingerprint + 22 novae-graph)
+gen2_architectures + gen3_multiscale: 645 passed, 1 skipped
+```
+
+The block immediately below (pre-Step-5-part-2 test counts) is kept for
+historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 459 passed (45 reused-infra + 20 example-schema +

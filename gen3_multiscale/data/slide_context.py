@@ -100,15 +100,39 @@ def load_slide_context(
         # a proxy for content, not content itself (a file replaced
         # in-place with different bytes but the same size, at a moment
         # that rounds to the same mtime granularity, would silently
-        # collide). Hash the REAL tile-cache content -- features, coords,
-        # and tile_size together -- so any content change invalidates
-        # every downstream cache keyed off context_id, regardless of
-        # what the filesystem metadata says.
+        # collide). Hash the REAL tile-cache content.
+        #
+        # 16th Codex re-audit (Step 5 Part 2), CONFIRMED: the first
+        # content-hash version only covered features/coords/tile_size --
+        # NOT mask_coords/mask_tile_size/coords_are_centers, every one of
+        # which independently affects WHICH tiles visible_slide_context
+        # actually keeps (its hole-overlap test runs entirely in the
+        # mask_coords/mask_tile_size/coords_are_centers frame, a
+        # DIFFERENT coordinate system than coords/tile_size for a
+        # dense_wsi_cache with a separate level0_coords/level0_tile_size).
+        # A cache file changed ONLY in those masking-relevant fields
+        # (same features/coords/tile_size) would have silently kept the
+        # old context_id despite producing different visible tiles for
+        # every hole. All six real fields are now hashed together.
         content_digest = hashlib.sha256()
         content_digest.update(np.ascontiguousarray(features).tobytes())
         content_digest.update(np.ascontiguousarray(coords).tobytes())
+        content_digest.update(np.ascontiguousarray(mask_coords).tobytes())
         content_digest.update(str(tile_size).encode())
+        content_digest.update(str(mask_tile_size).encode())
+        content_digest.update(str(coords_are_centers).encode())
         identity = f"{sample_id}:dense:{content_digest.hexdigest()}"
+        # 16th Codex re-audit (Step 5 Part 2), CONFIRMED: no check existed
+        # for duplicate tile coordinates -- a corrupted or badly-generated
+        # cache with two tiles at the identical position would silently
+        # double-count that region's contribution to both regional
+        # pooling and the LongNet global vector, and pool_regional_tokens
+        # would attribute it to one grid cell twice.
+        if np.unique(coords, axis=0).shape[0] != coords.shape[0]:
+            raise ValueError(
+                f"dense WSI cache {path} contains duplicate tile coordinates -- refusing a "
+                "corrupted/malformed tile cache"
+            )
     else:
         raise ValueError(
             "data.slide_context_source must be disabled, spot_aligned, or dense_wsi_cache"

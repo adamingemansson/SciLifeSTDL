@@ -36,6 +36,33 @@ def _gene_basis(n_genes=6, rank=4, seed=0):
     return fit_gene_residual_basis(rng.normal(size=(20, n_genes)), gene_names, rank=rank), gene_names
 
 
+class _StubSlideEncoder(torch.nn.Module):
+    """Duck-typed stand-in for FrozenGigaPathSlideEncoder -- no real
+    checkpoint needed, same forward(tile_features, tile_coords,
+    cache_namespace) -> [output_dim] contract."""
+
+    def __init__(self, tile_feature_dim: int = 1536, output_dim: int = 768):
+        super().__init__()
+        self.proj = torch.nn.Linear(tile_feature_dim, output_dim)
+
+    def forward(self, tile_features, tile_coords, cache_namespace):
+        return self.proj(tile_features.mean(dim=0))
+
+
+def _wsi_kwargs_for(name: str) -> dict:
+    """architecture3.yaml/architecture4.yaml now set use_global_slide:
+    true (Step 5 Part 2's "Architecture 3 enables both branches" /
+    "Architecture 4 reuses that exact conditioner") -- their
+    constructors fail closed without a real slide_encoder and
+    gigapath_checkpoint_sha256, neither representable in static YAML
+    (see model_factory.resolve_model_kwargs's own docstring). This stub
+    plays the role the real trainer (Step 6, not yet built) will
+    eventually play when constructing these architectures for real."""
+    if name in ("architecture3", "architecture4"):
+        return {"slide_encoder": _StubSlideEncoder(), "gigapath_checkpoint_sha256": "deadbeef" * 8}
+    return {}
+
+
 def test_resolve_model_kwargs_strips_known_metadata_fields():
     config = _load("architecture1")
     kwargs = resolve_model_kwargs(config, n_genes=6, gex_feature_dim=4)
@@ -93,10 +120,10 @@ def test_build_architecture_constructs_a_real_model_from_each_real_config(name):
     """The core regression test for finding #4: every real config file
     must actually construct its architecture without a TypeError."""
     config = _load(name)
-    kwargs = {}
+    kwargs = dict(_wsi_kwargs_for(name))
     if name == "architecture4":
         basis, gene_names = _gene_basis()
-        kwargs = {"gene_basis": basis, "gene_names": gene_names}
+        kwargs.update(gene_basis=basis, gene_names=gene_names)
     model = build_architecture(config, n_genes=6, gex_feature_dim=4, **kwargs)
     assert isinstance(model, torch.nn.Module)
     assert sum(p.numel() for p in model.parameters()) > 0
@@ -188,10 +215,12 @@ def _build_all_four(n_genes=6, gex_feature_dim=4):
     return {
         "architecture1": build_architecture(_load("architecture1"), n_genes=n_genes, gex_feature_dim=gex_feature_dim),
         "architecture2": build_architecture(_load("architecture2"), n_genes=n_genes, gex_feature_dim=gex_feature_dim),
-        "architecture3": build_architecture(_load("architecture3"), n_genes=n_genes, gex_feature_dim=gex_feature_dim),
+        "architecture3": build_architecture(
+            _load("architecture3"), n_genes=n_genes, gex_feature_dim=gex_feature_dim, **_wsi_kwargs_for("architecture3"),
+        ),
         "architecture4": build_architecture(
             _load("architecture4"), n_genes=n_genes, gex_feature_dim=gex_feature_dim,
-            gene_basis=basis, gene_names=gene_names,
+            gene_basis=basis, gene_names=gene_names, **_wsi_kwargs_for("architecture4"),
         ),
     }
 
@@ -364,7 +393,10 @@ def test_persist_synchronized_initializations_records_gene_basis_gene_names_hash
     c02a5d1: "is actually only gene_names_hash... does not describe how
     the basis was fitted") -- the name now says precisely what it is."""
     basis, gene_names = _gene_basis(n_genes=6)
-    model4 = build_architecture(_load("architecture4"), n_genes=6, gex_feature_dim=4, gene_basis=basis, gene_names=gene_names)
+    model4 = build_architecture(
+        _load("architecture4"), n_genes=6, gex_feature_dim=4, gene_basis=basis, gene_names=gene_names,
+        **_wsi_kwargs_for("architecture4"),
+    )
     manifest = persist_synchronized_initializations({"architecture4": model4}, tmp_path)
     assert manifest["architectures"]["architecture4"]["gene_basis_gene_names_hash"] == basis.gene_names_hash
 
@@ -493,7 +525,7 @@ def test_load_synchronized_initialization_rejects_a_permuted_gene_order_for_arch
     permuted_basis = fit_gene_residual_basis(rng.normal(size=(20, n_genes)), permuted_gene_names, rank=4)
     fresh = build_architecture(
         _load("architecture4"), n_genes=n_genes, gex_feature_dim=4,
-        gene_basis=permuted_basis, gene_names=permuted_gene_names,
+        gene_basis=permuted_basis, gene_names=permuted_gene_names, **_wsi_kwargs_for("architecture4"),
     )
     with pytest.raises(ValueError, match="gene panel/order mismatch"):
         load_synchronized_initialization(fresh, tmp_path / "architecture4", manifest=manifest, architecture_name="architecture4")
@@ -515,7 +547,7 @@ def test_load_synchronized_initialization_rejects_a_manifest_missing_gene_basis_
 
     fresh = build_architecture(
         _load("architecture4"), n_genes=6, gex_feature_dim=4,
-        gene_basis=_gene_basis(n_genes=6)[0], gene_names=_gene_basis(n_genes=6)[1],
+        gene_basis=_gene_basis(n_genes=6)[0], gene_names=_gene_basis(n_genes=6)[1], **_wsi_kwargs_for("architecture4"),
     )
     with pytest.raises(ValueError, match="no gene_basis_gene_names_hash recorded"):
         load_synchronized_initialization(fresh, tmp_path / "architecture4", manifest=manifest, architecture_name="architecture4")
@@ -531,7 +563,7 @@ def test_load_synchronized_initialization_rejects_a_model_missing_gene_basis_whe
 
     fresh = build_architecture(
         _load("architecture4"), n_genes=6, gex_feature_dim=4,
-        gene_basis=_gene_basis(n_genes=6)[0], gene_names=_gene_basis(n_genes=6)[1],
+        gene_basis=_gene_basis(n_genes=6)[0], gene_names=_gene_basis(n_genes=6)[1], **_wsi_kwargs_for("architecture4"),
     )
     del fresh.gene_basis
     with pytest.raises(ValueError, match="has no gene_basis attribute at all"):
@@ -561,7 +593,7 @@ def test_persist_synchronized_initializations_on_all_four_real_architectures(tmp
     )
 
     for name in models:
-        fresh_kwargs = dict(n_genes=6, gex_feature_dim=4)
+        fresh_kwargs = dict(n_genes=6, gex_feature_dim=4, **_wsi_kwargs_for(name))
         if name == "architecture4":
             basis, gene_names = _gene_basis(n_genes=6)
             fresh_kwargs.update(gene_basis=basis, gene_names=gene_names)
@@ -595,7 +627,7 @@ def test_persist_four_architecture_initializations_synchronizes_persists_and_rou
     )
 
     for name in models:
-        fresh_kwargs = dict(n_genes=6, gex_feature_dim=4)
+        fresh_kwargs = dict(n_genes=6, gex_feature_dim=4, **_wsi_kwargs_for(name))
         if name == "architecture4":
             basis, gene_names = _gene_basis(n_genes=6)
             fresh_kwargs.update(gene_basis=basis, gene_names=gene_names)

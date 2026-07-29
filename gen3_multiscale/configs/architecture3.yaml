@@ -1,16 +1,28 @@
 # Architecture 3: Hierarchical Slide-Boundary Field.
 #
 # Exactly Architecture 1's conditioner plus all-observed-GEX inducing
-# tokens (use_global_gex: true), still anchor-free. The fairness matrix
-# also calls for regional WSI tokens and the mask-aware GigaPath LongNet
-# global token for this architecture -- use_regional_he/use_global_slide
-# are left false here because CONTRACT.md sections 15/17/19 record that
-# wiring as NOT YET IMPLEMENTED (architectures.py raises
-# NotImplementedError if either is set true): Phase 3 built the WSI
-# path (slide_context.py, slide_encoder.py) but no architecture wrapper
-# consumes its output in forward() yet. This is a real, tracked gap, not
-# a silent downgrade of the fairness matrix -- see architecture1.yaml's
-# header for the shared-field/static-config-audit contract.
+# tokens (use_global_gex: true), still anchor-free, PLUS regional WSI
+# tokens and the mask-aware frozen GigaPath LongNet global token -- the
+# fairness matrix's full spec for this architecture (Step 5 Part 2:
+# "Architecture 3 enables both branches"). use_regional_he/use_global_slide
+# are real and wired end to end (models/architectures.py's
+# _regional_he_tokens/_global_slide_vector, consuming
+# SpatialFieldInputs.wsi_tile_*/full_slide_coord_bounds/
+# slide_cache_namespace -- populated by example_builder.py from a real
+# slide_context.load_slide_context() cache).
+#
+# `slide_encoder`/`gigapath_checkpoint_sha256` are NOT set anywhere in
+# this file: they are a live FrozenGigaPathSlideEncoder instance plus its
+# checkpoint's real SHA256, neither of which is representable in static
+# YAML. The real trainer (Step 6, not yet built) is responsible for
+# constructing FrozenGigaPathSlideEncoder from the checkpoint path
+# recorded in `required_fingerprints.gigapath_checkpoint` below, hashing
+# it, and passing both into resolve_model_kwargs's output before
+# construction -- resolve_model_kwargs/Architecture3.__init__ both fail
+# CLOSED (raise ValueError) if use_global_slide=true and either is
+# missing, so this config can never silently train with global slide
+# conditioning disabled by omission. See architecture1.yaml's header for
+# the shared-field/static-config-audit contract.
 
 experiment_name: gen3_architecture3_hierarchical_slide_boundary_v1
 
@@ -42,10 +54,11 @@ model:
     use_residual: false
     residual_rank: 32
     use_anchor_blend: false
-    use_regional_he: false      # NOT YET WIRED -- see header note; fairness matrix calls for true
-    use_global_gex: true        # the one difference from Architecture 1 that IS wired -- CONTRACT.md section 15
-    use_global_slide: false     # NOT YET WIRED -- see header note; fairness matrix calls for true
+    use_regional_he: true       # real, wired -- Step 5 Part 2; see header note for slide_encoder/checksum caveat
+    use_global_gex: true        # CONTRACT.md section 15
+    use_global_slide: true      # real, wired -- Step 5 Part 2; see header note for slide_encoder/checksum caveat
     global_slide_dim: 768
+    regional_grid_size: 4
     n_gex_inducing: 16
     harmonic_k_neighbors: 6
     gene_encoder_type: weighted_linear
@@ -77,6 +90,14 @@ masking:
 data:
   hest_data_dir: data/raw/hest1k
   hest_cache_dir: data/cache/hest1k
+  # use_regional_he/use_global_slide=true above need real WSI-tile
+  # context (slide_context.load_slide_context) -- dense_wsi_cache is the
+  # real, tissue-wide, non-overlapping tile grid (precompute_gigapath_wsi_tiles.py);
+  # spot_aligned is an explicit DIAGNOSTIC fallback over the much sparser
+  # ST-covered patch lattice and is never presented as complete WSI
+  # coverage (slide_context.py's own docstring) -- production training
+  # must use dense_wsi_cache, never spot_aligned (16th Codex re-audit).
+  slide_context_source: dense_wsi_cache
   sample_selection:
     organs: all
     metadata_csv: hf://datasets/MahmoodLab/hest/HEST_v1_3_0.csv
@@ -93,7 +114,7 @@ evaluation:
   patient_level_aggregation: true
 
 required_fingerprints:
-  gigapath_checkpoint: null   # would become required once use_global_slide/use_regional_he are wired in
+  gigapath_checkpoint: null   # real checkpoint path REQUIRED before training -- use_global_slide=true now means Architecture3.__init__ raises ValueError without a real slide_encoder built from this checkpoint (see header note); still null because no real trainer/checkpoint deployment exists yet (Step 6)
   gene_vocabulary: null
   train_mask_bank: null
   validation_mask_bank: null

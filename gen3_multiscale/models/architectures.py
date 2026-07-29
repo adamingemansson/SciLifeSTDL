@@ -26,11 +26,32 @@ doc's literal "deduplicated" wording. Proper deduplication would need
 per-query masked attention (a real, larger change); flagged as a
 follow-up, not implemented in this pass.
 
-Also documented: modality-availability flags are hardcoded to
-"available" (no real per-spot H&E-missing signal is wired in yet -- the
-data-builder that would produce that flag from SpatialFieldInputs is not
-built, see CONTRACT.md's Phase 3/6 notes), so SpotTokenProjection's
-modality-flag branch is currently a fixed input, not yet doing real work.
+Modality-availability flags (16th Codex re-audit, Step 5 Part 2): now
+read from SpatialFieldInputs.observed_image_available, the real
+per-spot H&E-availability signal example_builder.py produces --
+SpotTokenProjection's modality-flag branch does real work.
+
+Regional H&E / global LongNet wiring (Step 5 Part 2): use_regional_he
+pools the item's visible WSI tiles into a fixed grid_size x grid_size
+of regional tokens (models.slide_encoder.pool_regional_tokens, stable
+across every hole on a slide since it pools from full_slide_coord_bounds),
+projects them into hidden_dim, and cross-attends the query field to
+only the grid cells that actually had a visible tile (unavailable cells
+are excluded from the attended set entirely, not zero-valued-but-still-
+attended, matching this codebase's established index-selection pattern
+for excluded content elsewhere -- boundary_idx/local_idx are index sets,
+never masks). use_global_slide runs the injected, frozen
+FrozenGigaPathSlideEncoder once per item over the item's visible tiles
+in their REAL, unnormalized GigaPath-native coordinates (never the
+normalized regional-attention coordinates -- see SpatialFieldInputs'
+own docstring for why two separate coordinate fields exist) and FiLM-
+modulates the query field with the resulting global vector. Both
+branches read ONLY from SpatialFieldInputs' WSI fields and ONLY feed
+the backbone's HIDDEN-state attention/FiLM path -- neither ever touches
+`shared_expression_parts`/`local_expression` (the real, untouched GEX
+value-candidate pool the transport head draws predictions from), so
+regional/global H&E can influence what the model attends to but can
+never become a literal predicted gene value itself.
 """
 from __future__ import annotations
 
@@ -46,6 +67,7 @@ from gen3_multiscale.models.gene_basis import GeneResidualBasis, verify_gene_res
 from gen3_multiscale.models.geometry_utils import compute_hole_geometry, compute_relative_geometry, scatter_boundary_ring
 from gen3_multiscale.models.global_context import InducedGlobalGEXPool
 from gen3_multiscale.models.harmonic import harmonic_interpolation
+from gen3_multiscale.models.slide_encoder import FrozenGigaPathSlideEncoder, pool_regional_tokens, regional_grid_cell_centers
 from gen3_multiscale.models.tokens import QueryTokenProjection, SpotTokenProjection
 from gen3_multiscale.models.transport_head import GeneValueTransportHead
 
@@ -86,6 +108,10 @@ class _SharedFieldArchitecture(nn.Module):
         global_slide_dim: int = 768,
         n_gex_inducing: int = 16,
         harmonic_k_neighbors: int = 6,
+        regional_grid_size: int = 4,
+        slide_encoder: FrozenGigaPathSlideEncoder | None = None,
+        gigapath_checkpoint_sha256: str | None = None,
+        model_architecture_version: str = "gen3-multiscale-shared-field-v1",
     ):
         super().__init__()
         self.use_anchor_blend = use_anchor_blend
@@ -93,6 +119,33 @@ class _SharedFieldArchitecture(nn.Module):
         self.use_global_gex = use_global_gex
         self.use_global_slide = use_global_slide
         self.harmonic_k_neighbors = harmonic_k_neighbors
+        self.regional_grid_size = regional_grid_size
+        self.model_architecture_version = model_architecture_version
+
+        # 16th Codex re-audit (Step 5 Part 2): the complete LongNet cache
+        # namespace must bind tile-cache content + visible-tile identity
+        # (SpatialFieldInputs.slide_cache_namespace, already real) PLUS
+        # the checkpoint's own SHA256 PLUS this model's architecture/
+        # version -- properties of WHICH MODEL is running, not of the
+        # data, so they are supplied here at construction time, never by
+        # the data layer. Required (fail-closed, not a silent default)
+        # whenever use_global_slide=True, mirroring gen3_multiscale's
+        # established "make provenance required, not optional" discipline
+        # (Step 4's checkpoint_provenance is the same pattern).
+        if use_global_slide:
+            if slide_encoder is None:
+                raise ValueError("use_global_slide=True requires a real slide_encoder (FrozenGigaPathSlideEncoder)")
+            if not gigapath_checkpoint_sha256 or not str(gigapath_checkpoint_sha256).strip():
+                raise ValueError("use_global_slide=True requires a non-empty gigapath_checkpoint_sha256")
+        self.slide_encoder = slide_encoder
+        self.gigapath_checkpoint_sha256 = gigapath_checkpoint_sha256
+
+        if use_regional_he:
+            self.regional_token_proj = nn.Sequential(
+                nn.LayerNorm(image_feature_dim), nn.Linear(image_feature_dim, hidden_dim),
+            )
+        else:
+            self.regional_token_proj = None
 
         # The real, trainable "weighted_linear" gene conditioning encoder
         # (CONTRACT.md section 10's frozen choice) -- fixes a real,
@@ -132,8 +185,13 @@ class _SharedFieldArchitecture(nn.Module):
             torch.as_tensor(inputs.boundary_idx, device=device),
             torch.as_tensor(inputs.boundary_ring, device=device),
         )
-        # see module docstring: not yet real per-spot availability
-        modality_flags = torch.ones(n_observed, 1, device=device)
+        # 16th Codex re-audit (Step 5 Part 2), CONFIRMED real: this used
+        # to be hardcoded to "always available" -- example_builder.py now
+        # produces a genuine per-spot flag (observed_image_available),
+        # threaded through here for real.
+        modality_flags = torch.as_tensor(
+            inputs.observed_image_available, dtype=torch.float32, device=device,
+        ).unsqueeze(-1)
         # gex_features is computed HERE by the real trainable gene
         # encoder from the untouched observed_full_gene_expression (see
         # the module-level note on self.gene_encoder above).
@@ -201,6 +259,72 @@ class _SharedFieldArchitecture(nn.Module):
         )
         return torch.from_numpy(anchor).to(dtype=query_coords.dtype, device=device)
 
+    def _require_wsi_context(self, inputs: SpatialFieldInputs, requiring_flag: str) -> None:
+        if inputs.wsi_tile_features is None:
+            raise ValueError(
+                f"{requiring_flag}=True requires wsi_tile_features/wsi_tile_native_coords/"
+                "wsi_tile_regional_coords/full_slide_coord_bounds/slide_cache_namespace on "
+                "SpatialFieldInputs -- build the example with a real slide_context "
+                "(gen3_multiscale.data.slide_context.load_slide_context) passed to "
+                "example_builder.build_spatial_field_example"
+            )
+
+    def _regional_he_tokens(
+        self, inputs: SpatialFieldInputs, query_coords: torch.Tensor, device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pools this item's visible WSI tiles into a stable
+        regional_grid_size x regional_grid_size grid (models.slide_encoder.
+        pool_regional_tokens, using full_slide_coord_bounds so grid cell
+        (i, j) refers to the SAME physical region regardless of which
+        hole this item's mask cut), projects the pooled tile FEATURES
+        into hidden_dim, and computes each remaining query's relative
+        geometry to the grid cells' real centers. Cells with zero
+        visible tiles are EXCLUDED from the returned tensors entirely
+        (index-selected out, never zero-valued-but-still-attended) --
+        the same "excluded means absent from the tensor, not masked"
+        discipline this module already uses for boundary_idx/local_idx."""
+        self._require_wsi_context(inputs, "use_regional_he")
+        tile_features = torch.as_tensor(inputs.wsi_tile_features, dtype=torch.float32, device=device)
+        tile_coords = torch.as_tensor(inputs.wsi_tile_regional_coords, dtype=torch.float32, device=device)
+        tokens, available = pool_regional_tokens(
+            tile_features.cpu().numpy(), tile_coords.cpu().numpy(), inputs.full_slide_coord_bounds,
+            grid_size=self.regional_grid_size,
+        )
+        available_idx = available.nonzero(as_tuple=True)[0]
+        if available_idx.numel() == 0:
+            raise ValueError(
+                f"{inputs.sample_id}: no regional grid cell has any visible WSI tile -- "
+                "use_regional_he=True cannot proceed with zero regional tokens"
+            )
+        centers = regional_grid_cell_centers(inputs.full_slide_coord_bounds, self.regional_grid_size)
+        regional_features = tokens[available_idx].to(device=device, dtype=torch.float32)
+        regional_centers = centers[available_idx].to(device=device, dtype=query_coords.dtype)
+        regional_hidden = self.regional_token_proj(regional_features)
+        regional_geometry = compute_relative_geometry(query_coords, regional_centers)
+        return regional_hidden, regional_geometry
+
+    def _global_slide_vector(self, inputs: SpatialFieldInputs, device: torch.device) -> torch.Tensor:
+        """Runs the injected, frozen FrozenGigaPathSlideEncoder ONCE over
+        this item's visible WSI tiles in their REAL, unnormalized
+        GigaPath-native coordinates (wsi_tile_native_coords -- NEVER
+        wsi_tile_regional_coords, which would silently corrupt LongNet's
+        real positional encoding, see SpatialFieldInputs' own docstring).
+        The cache namespace combines the data layer's own real cache
+        material (content hash + visible-tile-set identity, already
+        bound into inputs.slide_cache_namespace) with THIS model's
+        checkpoint SHA256 and architecture/version -- properties of
+        which model is running, supplied at construction, never assumed
+        by the data layer (16th Codex re-audit's complete cache-key
+        requirement)."""
+        self._require_wsi_context(inputs, "use_global_slide")
+        cache_namespace = (
+            f"{inputs.slide_cache_namespace}:checkpoint={self.gigapath_checkpoint_sha256}:"
+            f"model={self.model_architecture_version}"
+        )
+        tile_features = torch.as_tensor(inputs.wsi_tile_features, dtype=torch.float32, device=device)
+        native_coords = torch.as_tensor(inputs.wsi_tile_native_coords, dtype=torch.float32, device=device)
+        return self.slide_encoder(tile_features, native_coords, cache_namespace)
+
     def forward(self, inputs: SpatialFieldInputs) -> dict:
         device = next(self.parameters()).device
         query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32, device=device)
@@ -254,15 +378,24 @@ class _SharedFieldArchitecture(nn.Module):
             shared_geometry_parts.append(sentinel)
             shared_expression_parts.append(gex_out["expression"])
         if self.use_regional_he:
-            raise NotImplementedError(
-                "use_regional_he=True requires regional H&E tokens from Phase 3's WSI path, "
-                "not yet wired into this forward() -- see CONTRACT.md"
-            )
+            regional_hidden, regional_geometry = self._regional_he_tokens(inputs, query_coords, device)
+            block_kwargs["regional_hidden"] = regional_hidden
+            block_kwargs["regional_geometry"] = regional_geometry
+            # Regional H&E feeds ONLY the backbone's hidden-state
+            # cross-attention branch above -- structurally never appended
+            # to shared_hidden_parts/shared_expression_parts, so it can
+            # never become a literal GEX value candidate the transport
+            # head could select as a prediction (16th Codex re-audit's
+            # "regional/global H&E enters hidden conditioning only"
+            # requirement -- true by construction, not by a runtime
+            # check, exactly like gex_inducing_expression's structural
+            # separation from the backbone-only regional/boundary path
+            # above).
         if self.use_global_slide:
-            raise NotImplementedError(
-                "use_global_slide=True requires a real LongNet global token from Phase 3's "
-                "FrozenGigaPathSlideEncoder, not yet wired into this forward() -- see CONTRACT.md"
-            )
+            block_kwargs["global_slide_vector"] = self._global_slide_vector(inputs, device)
+
+        # end-of-branch invariant, verifiable by any caller/test: neither
+        # branch above ever touched shared_hidden_parts/shared_expression_parts.
 
         final_query_hidden = self.backbone(query_hidden, query_coords, **block_kwargs)
 
@@ -369,6 +502,13 @@ class Architecture4(nn.Module):
         harmonic_k_neighbors: int = 6,
         n_flow_samples: int = 8,
         n_ode_steps: int = 20,
+        use_regional_he: bool = False,
+        use_global_slide: bool = False,
+        global_slide_dim: int = 768,
+        regional_grid_size: int = 4,
+        slide_encoder: FrozenGigaPathSlideEncoder | None = None,
+        gigapath_checkpoint_sha256: str | None = None,
+        model_architecture_version: str = "gen3-multiscale-shared-field-v1",
     ):
         super().__init__()
         verify_gene_residual_basis(gene_basis, gene_names)
@@ -388,6 +528,16 @@ class Architecture4(nn.Module):
         self.n_flow_samples = n_flow_samples
         self.n_ode_steps = n_ode_steps
 
+        # 16th Codex re-audit (Step 5 Part 2), CONFIRMED real: this used
+        # to hardcode-omit use_regional_he/use_global_slide/global_slide_dim
+        # and every slide-encoder param entirely -- Architecture3's OWN
+        # kwargs.setdefault(False) (or its global_slide_dim default) would
+        # then silently apply even if a caller asked THIS Architecture4
+        # for regional/global H&E, meaning "Architecture 4 reuses
+        # Architecture 3's exact conditioner" was never actually true for
+        # those flags. Now forwarded explicitly, so self.conditioner
+        # really is what a standalone Architecture3(**these same kwargs)
+        # would be.
         self.conditioner = Architecture3(
             n_genes=n_genes, gex_feature_dim=gex_feature_dim, image_feature_dim=image_feature_dim,
             hidden_dim=hidden_dim, n_heads=n_heads, n_blocks=n_blocks,
@@ -397,6 +547,11 @@ class Architecture4(nn.Module):
             use_query_gate=use_query_gate, use_residual=use_residual, residual_rank=residual_rank,
             target_gene_scale=target_gene_scale, n_gex_inducing=n_gex_inducing,
             harmonic_k_neighbors=harmonic_k_neighbors,
+            use_regional_he=use_regional_he, use_global_slide=use_global_slide,
+            global_slide_dim=global_slide_dim,
+            regional_grid_size=regional_grid_size, slide_encoder=slide_encoder,
+            gigapath_checkpoint_sha256=gigapath_checkpoint_sha256,
+            model_architecture_version=model_architecture_version,
         )
         self.velocity_network = VelocityNetwork(
             residual_rank=gene_basis.rank, hidden_dim=hidden_dim, n_heads=n_heads, n_blocks=n_flow_blocks,

@@ -80,6 +80,8 @@ def resolve_model_kwargs(
     gex_feature_dim: int,
     gene_basis: GeneResidualBasis | None = None,
     gene_names: list[str] | None = None,
+    slide_encoder=None,
+    gigapath_checkpoint_sha256: str | None = None,
 ) -> dict:
     """Turn a resolved config dict into the exact kwargs its
     architecture's constructor accepts. Fails closed (raises ValueError)
@@ -87,6 +89,18 @@ def resolve_model_kwargs(
     parameter nor a known non-constructor field -- silently dropping an
     unrecognized field would hide a typo or a genuinely missing wiring
     decision, not just cosmetic config noise.
+
+    `slide_encoder`/`gigapath_checkpoint_sha256` (Step 5 Part 2) are
+    never read from `model.params` -- a live FrozenGigaPathSlideEncoder
+    instance and a real checkpoint SHA256 are not representable in
+    static YAML. A caller (the real trainer, once built, or a test)
+    supplies them here directly; they are forwarded unmodified into the
+    constructor kwargs whenever given, exactly like gene_basis/gene_names
+    for Architecture 4 below. Omitting them while a config sets
+    use_global_slide: true is intentional and fails closed: the
+    architecture constructor itself raises (see
+    _SharedFieldArchitecture.__init__) rather than silently training
+    with global slide conditioning disabled.
     """
     model_cfg = config.get("model") or {}
     architecture_id = str(model_cfg.get("architecture", ""))
@@ -133,6 +147,10 @@ def resolve_model_kwargs(
 
     kwargs["n_genes"] = n_genes
     kwargs["gex_feature_dim"] = gex_feature_dim
+    if slide_encoder is not None:
+        kwargs["slide_encoder"] = slide_encoder
+    if gigapath_checkpoint_sha256 is not None:
+        kwargs["gigapath_checkpoint_sha256"] = gigapath_checkpoint_sha256
     if architecture_id == "4":
         if gene_basis is None or gene_names is None:
             raise ValueError("Architecture 4 requires gene_basis and gene_names (fit offline, outside this factory)")
@@ -606,6 +624,8 @@ def build_architecture(
     gex_feature_dim: int,
     gene_basis: GeneResidualBasis | None = None,
     gene_names: list[str] | None = None,
+    slide_encoder=None,
+    gigapath_checkpoint_sha256: str | None = None,
     seed: int | None = None,
 ) -> torch.nn.Module:
     """Construct a real Architecture1-4 instance from a resolved config.
@@ -613,11 +633,16 @@ def build_architecture(
     config field (if present) is used -- either way, `torch.manual_seed`
     is called immediately before construction so "identical shared
     initialization... not merely identical seeds" (Codex audit finding
-    #9) is actually exercised here, not left to a caller to remember."""
+    #9) is actually exercised here, not left to a caller to remember.
+
+    `slide_encoder`/`gigapath_checkpoint_sha256` (Step 5 Part 2) pass
+    straight through to resolve_model_kwargs -- see its own docstring
+    for why they can never come from the config dict itself."""
     model_cfg = config.get("model") or {}
     architecture_id = str(model_cfg.get("architecture", ""))
     kwargs = resolve_model_kwargs(
         config, n_genes=n_genes, gex_feature_dim=gex_feature_dim, gene_basis=gene_basis, gene_names=gene_names,
+        slide_encoder=slide_encoder, gigapath_checkpoint_sha256=gigapath_checkpoint_sha256,
     )  # validates architecture_id (raises ValueError, not a raw KeyError) before any dict lookup below
     architecture_cls = _ARCHITECTURE_CLASSES[architecture_id]
     effective_seed = seed if seed is not None else (model_cfg.get("params") or {}).get("init_seed")

@@ -158,6 +158,15 @@ def test_accepts_a_zeroed_image_feature_for_an_unavailable_spot():
     validate_spatial_field_example(good_inputs, targets)  # must not raise
 
 
+_VALID_WSI_KWARGS = dict(
+    wsi_tile_features=np.zeros((2, 1536), dtype=np.float32),
+    wsi_tile_native_coords=np.asarray([[9000.0, 9000.0], [9100.0, 9100.0]], dtype=np.float32),
+    wsi_tile_regional_coords=np.asarray([[-1.0, -1.0], [1.0, 1.0]], dtype=np.float32),
+    full_slide_coord_bounds=(-5.0, 5.0, -5.0, 5.0),
+    slide_cache_namespace="content-hash:visible-set:checkpoint-sha256",
+)
+
+
 def test_rejects_wsi_fields_set_partially():
     inputs, targets = _valid_example()
     bad_inputs = _replace(inputs, wsi_tile_features=np.zeros((2, 1536), dtype=np.float32))
@@ -165,14 +174,34 @@ def test_rejects_wsi_fields_set_partially():
         validate_spatial_field_example(bad_inputs, targets)
 
 
+def test_rejects_wsi_context_with_no_slide_cache_namespace():
+    """16th Codex re-audit (Step 5 Part 2 acceptance criteria),
+    CONFIRMED: a prior version's all-or-none check did not include
+    slide_cache_namespace at all -- WSI context could pass validation
+    with slide_cache_namespace=None, defeating the whole point of a
+    real, required LongNet cache-key binding."""
+    inputs, targets = _valid_example()
+    kwargs = dict(_VALID_WSI_KWARGS)
+    kwargs["slide_cache_namespace"] = None
+    bad_inputs = _replace(inputs, **kwargs)
+    with pytest.raises(ValueError, match="must be set together"):
+        validate_spatial_field_example(bad_inputs, targets)
+
+
+def test_rejects_a_blank_slide_cache_namespace():
+    inputs, targets = _valid_example()
+    kwargs = dict(_VALID_WSI_KWARGS)
+    kwargs["slide_cache_namespace"] = "   "
+    bad_inputs = _replace(inputs, **kwargs)
+    with pytest.raises(ValueError, match="non-empty string"):
+        validate_spatial_field_example(bad_inputs, targets)
+
+
 def test_rejects_degenerate_full_slide_coord_bounds():
     inputs, targets = _valid_example()
-    bad_inputs = _replace(
-        inputs,
-        wsi_tile_features=np.zeros((2, 1536), dtype=np.float32),
-        wsi_tile_coords=np.asarray([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32),
-        full_slide_coord_bounds=(0.0, 0.0, -5.0, 5.0),  # xmax == xmin
-    )
+    kwargs = dict(_VALID_WSI_KWARGS)
+    kwargs["full_slide_coord_bounds"] = (0.0, 0.0, -5.0, 5.0)  # xmax == xmin
+    bad_inputs = _replace(inputs, **kwargs)
     with pytest.raises(ValueError, match="degenerate"):
         validate_spatial_field_example(bad_inputs, targets)
 
@@ -182,25 +211,37 @@ def test_rejects_a_visible_tile_outside_the_full_slide_bounds():
     bounds must come from the COMPLETE slide -- a visible tile falling
     outside those bounds indicates a mismatched/stale bounds computation,
     which would make regional grid cell (i, j) refer to inconsistent
-    physical regions across examples."""
+    physical regions across examples. Checked against the REGIONAL
+    (normalized) coordinates, not the native GigaPath coordinates, which
+    live in an entirely different, unnormalized scale."""
     inputs, targets = _valid_example()
-    bad_inputs = _replace(
-        inputs,
-        wsi_tile_features=np.zeros((1, 1536), dtype=np.float32),
-        wsi_tile_coords=np.asarray([[100.0, 100.0]], dtype=np.float32),
-        full_slide_coord_bounds=(-5.0, 5.0, -5.0, 5.0),  # tile at (100,100) is well outside
-    )
+    kwargs = dict(_VALID_WSI_KWARGS)
+    kwargs["wsi_tile_features"] = np.zeros((1, 1536), dtype=np.float32)
+    kwargs["wsi_tile_native_coords"] = np.asarray([[9000.0, 9000.0]], dtype=np.float32)
+    kwargs["wsi_tile_regional_coords"] = np.asarray([[100.0, 100.0]], dtype=np.float32)  # well outside bounds
+    bad_inputs = _replace(inputs, **kwargs)
     with pytest.raises(ValueError, match="outside full_slide_coord_bounds"):
         validate_spatial_field_example(bad_inputs, targets)
 
 
 def test_accepts_valid_wsi_context_fields():
     inputs, targets = _valid_example()
-    good_inputs = _replace(
-        inputs,
-        wsi_tile_features=np.zeros((2, 1536), dtype=np.float32),
-        wsi_tile_coords=np.asarray([[-1.0, -1.0], [1.0, 1.0]], dtype=np.float32),
-        full_slide_coord_bounds=(-5.0, 5.0, -5.0, 5.0),
+    good_inputs = _replace(inputs, **_VALID_WSI_KWARGS)
+    validate_spatial_field_example(good_inputs, targets)  # must not raise
+
+
+def test_native_and_regional_wsi_coords_are_independently_scaled():
+    """The core reason two separate fields exist: native GigaPath
+    coordinates and normalized regional coordinates live on completely
+    different scales for the same real tile -- one is not simply a
+    scaled copy discoverable from the other without the same
+    reference/scale example_builder.py used, so validation must accept
+    them independently rather than assuming any fixed relationship
+    between the two arrays' raw values."""
+    inputs, targets = _valid_example()
+    good_inputs = _replace(inputs, **_VALID_WSI_KWARGS)
+    assert not np.allclose(
+        good_inputs.wsi_tile_native_coords[:, 0], good_inputs.wsi_tile_regional_coords[:, 0],
     )
     validate_spatial_field_example(good_inputs, targets)  # must not raise
 

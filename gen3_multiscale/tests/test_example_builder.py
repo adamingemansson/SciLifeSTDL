@@ -374,6 +374,120 @@ def test_build_spatial_field_example_normalizes_coordinates_not_raw_pixels():
     assert 0.5 < np.median(dist[:, 1]) < 2.0
 
 
+def _wsi_slide_context(tile_xys: list[tuple[float, float]], tile_size: float = 20.0) -> dict:
+    """A minimal, hand-built slide_context.load_slide_context()-shaped
+    dict -- real level-0 WSI tile coordinates/features, independent of
+    the GEX spot coordinate frame (as real dense_wsi_cache tiles are)."""
+    coords = np.asarray(tile_xys, dtype=np.float32)
+    features = np.stack([np.full(8, float(i + 1), dtype=np.float32) for i in range(len(tile_xys))])
+    return {
+        "features": features, "coords": coords, "mask_coords": coords,
+        "tile_size": tile_size, "mask_tile_size": tile_size, "coords_are_centers": True,
+        "context_id": "wsi-unit-test", "source": "dense_wsi_cache",
+    }
+
+
+def test_build_spatial_field_example_wires_wsi_context_with_separate_coordinate_frames():
+    """16th Codex re-audit (Step 5 Part 2), CONFIRMED: wsi_tile_native_coords
+    must stay the raw level-0 pixel frame real GigaPath/LongNet expects,
+    while wsi_tile_regional_coords is the same centered/spot-spacing-
+    normalized frame as observed_coords/query_coords -- both derived from
+    the identical (raw - reference) / scale transform. full_slide_coord_bounds
+    comes from the COMPLETE (pre-hole) tile set, and slide_cache_namespace
+    is real (non-empty, bound to the visible tile set)."""
+    adata = _square_grid_adata(n_side=6, spacing=10.0)
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query_barcode = barcodes[14]  # coords (20, 20) -- see _square_grid_adata's x*spacing,y*spacing layout
+    context = [b for b in barcodes if b != query_barcode]
+
+    # Tiles at x=0,20,40 (y=20, tile_size=20): the x=20 tile's footprint
+    # overlaps the query hole; x=0/x=40 do not (see test_slide_context.py's
+    # identical overlap-threshold arithmetic).
+    slide_context = _wsi_slide_context([(0.0, 10.0), (20.0, 20.0), (40.0, 30.0)])
+
+    inputs, _ = build_spatial_field_example(
+        adata, patches, context, [query_barcode], _stub_image_feature_fn,
+        sample_id="S0", patient_id="P0", patch_size_fullres=15.0,
+        require_full_sample_coords=False, slide_context=slide_context,
+    )
+
+    assert inputs.slide_cache_namespace and inputs.slide_cache_namespace.strip()
+    assert inputs.wsi_tile_native_coords.shape == (2, 2)
+    assert inputs.wsi_tile_regional_coords.shape == (2, 2)
+    assert inputs.wsi_tile_features.shape == (2, 8)
+    # Native coords are the RAW level-0 pixels -- untouched by centering/scaling.
+    assert set(inputs.wsi_tile_native_coords[:, 0].tolist()) == {0.0, 40.0}
+    # Regional coords are NOT the raw pixels -- they went through the same
+    # (raw - reference) / scale transform as observed_coords/query_coords.
+    assert not np.array_equal(inputs.wsi_tile_regional_coords, inputs.wsi_tile_native_coords)
+    # The regional frame must be the SAME transform as observed_coords'
+    # own centering/scaling: reconstruct it directly from provenance's
+    # recorded scale and the sample-wide centroid the builder itself used
+    # (observed_coords+query_coords union mean), and compare exactly.
+    scale = inputs.provenance["spot_spacing_scale"]
+    centroid = np.concatenate(
+        [adata.obsm["spatial"][[barcodes.index(b) for b in context]], adata.obsm["spatial"][[14]]], axis=0,
+    ).mean(axis=0)
+    expected_regional = (inputs.wsi_tile_native_coords - centroid) / scale
+    assert np.allclose(inputs.wsi_tile_regional_coords, expected_regional, atol=1e-4)
+    # full_slide_coord_bounds spans the COMPLETE (3-tile) slide, not just
+    # the 2 tiles that survived hole-filtering: the removed tile (x=20)
+    # lies strictly inside the bounds even though it's absent from
+    # wsi_tile_regional_coords itself.
+    xmin, xmax, ymin, ymax = inputs.full_slide_coord_bounds
+    removed_tile_regional_x = (20.0 - centroid[0]) / scale
+    assert xmin <= removed_tile_regional_x <= xmax
+    assert removed_tile_regional_x not in inputs.wsi_tile_regional_coords[:, 0].tolist()
+    assert inputs.provenance["wsi_context_available"] is True
+
+
+def test_build_spatial_field_example_excludes_hole_overlapping_wsi_tiles_but_keeps_visible_ones():
+    """Direct acceptance-criteria test: changing the content of a WSI
+    tile whose footprint overlaps the query hole must NOT change any
+    field of the built example; changing a visible tile's content MUST."""
+    adata = _square_grid_adata(n_side=6, spacing=10.0)
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query_barcode = barcodes[14]
+    context = [b for b in barcodes if b != query_barcode]
+
+    def _build(hole_tile_value: float, visible_tile_value: float):
+        slide_context = _wsi_slide_context([(0.0, 10.0), (20.0, 20.0), (40.0, 30.0)])
+        slide_context["features"][1, :] = hole_tile_value  # x=20 -- overlaps the hole
+        slide_context["features"][0, :] = visible_tile_value  # x=0 -- visible
+        inputs, _ = build_spatial_field_example(
+            adata, patches, context, [query_barcode], _stub_image_feature_fn,
+            sample_id="S0", patient_id="P0", patch_size_fullres=15.0,
+            require_full_sample_coords=False, slide_context=slide_context,
+        )
+        return inputs
+
+    baseline = _build(hole_tile_value=1.0, visible_tile_value=5.0)
+    changed_hole_only = _build(hole_tile_value=999.0, visible_tile_value=5.0)  # hole tile corrupted
+    changed_visible = _build(hole_tile_value=1.0, visible_tile_value=999.0)  # visible tile corrupted
+
+    assert np.array_equal(baseline.wsi_tile_features, changed_hole_only.wsi_tile_features)
+    assert not np.array_equal(baseline.wsi_tile_features, changed_visible.wsi_tile_features)
+
+
+def test_build_spatial_field_example_no_slide_context_leaves_wsi_fields_unset():
+    adata = _square_grid_adata()
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query = barcodes[14:16]
+    context = [b for b in barcodes if b not in query]
+
+    inputs, _ = build_spatial_field_example(
+        adata, patches, context, query, _stub_image_feature_fn,
+        sample_id="S0", patient_id="P0", patch_size_fullres=1.0,
+        require_full_sample_coords=False,
+    )
+    assert inputs.wsi_tile_features is None
+    assert inputs.slide_cache_namespace is None
+    assert inputs.provenance["wsi_context_available"] is False
+
+
 def _make_synthetic_hest1k_with_patches(
     tmp_path: Path, organ_sample_ids: dict[str, list[str]], n_spots_per_sample: int = 6,
     gene_names: list[str] | None = None, seed: int = 0,

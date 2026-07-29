@@ -51,9 +51,9 @@ model:
     use_residual: false
     residual_rank: 32
     use_anchor_blend: false
-    use_regional_he: false     # NotImplementedError if set true -- Phase 3 WSI path not wired into forward() yet
+    use_regional_he: false     # kept false by design -- Architecture 1 has no regional/global H&E branch (Step 5 Part 2 wired this in for Architecture 3 only)
     use_global_gex: false
-    use_global_slide: false    # NotImplementedError if set true -- see above
+    use_global_slide: false    # kept false by design -- see above
     global_slide_dim: 768
     n_gex_inducing: 16
     harmonic_k_neighbors: 6
@@ -105,7 +105,7 @@ evaluation:
   patient_level_aggregation: true
 
 required_fingerprints:
-  gigapath_checkpoint: null   # unused by this architecture (use_global_slide/use_regional_he are false) -- left null deliberately
+  gigapath_checkpoint: null   # unused by this architecture (use_global_slide/use_regional_he are false, by design) -- left null deliberately
   gene_vocabulary: null       # pinned ordered gene-name JSON, once Phase 0's real data builder exists
   train_mask_bank: null
   validation_mask_bank: null

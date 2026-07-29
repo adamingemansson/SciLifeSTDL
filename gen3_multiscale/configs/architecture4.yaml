@@ -3,16 +3,23 @@
 # Exactly Architecture 3's anchor-free conditioner and deterministic
 # transport mean plus a stopped-gradient low-rank residual flow.
 # Architecture4's constructor (models/architectures.py) wraps a full,
-# unmodified Architecture3 instance internally -- it does NOT accept
-# use_anchor_blend/use_regional_he/use_global_slide kwargs directly (they
-# are fixed by construction to Architecture3's own defaults), so this
-# file's `model.params` intentionally has a different shape from
-# architecture{1,2,3}.yaml rather than a synthetic "matching" set of
-# keys that the real class would reject. static_config_audit only
-# compares keys present in ALL FOUR configs, so Architecture 4's extra/
-# missing keys are not a violation -- see architecture1.yaml's header for
-# the shared-field/static-config-audit contract and the KNOWN GAP note
-# (no real training entrypoint or data builder exists yet).
+# unmodified Architecture3 instance internally as self.conditioner --
+# it does NOT accept use_anchor_blend (fixed by construction to
+# Architecture3's own default, false), but it DOES accept
+# use_regional_he/use_global_slide/global_slide_dim/regional_grid_size/
+# slide_encoder/gigapath_checkpoint_sha256 directly and forwards them
+# unmodified into self.conditioner's construction (Step 5 Part 2 fixed a
+# real, confirmed gap here: an earlier version silently omitted these,
+# so self.conditioner always got Architecture3's OWN false defaults
+# regardless of what Architecture4's caller asked for). This file's
+# `model.params` still intentionally has a different overall shape from
+# architecture{1,2,3}.yaml (n_flow_blocks/n_flow_samples/n_ode_steps/
+# gene_basis_rank have no equivalent there) rather than a synthetic
+# "matching" set of keys -- see architecture1.yaml's header for the
+# shared-field/static-config-audit contract. Like architecture3.yaml,
+# `slide_encoder`/`gigapath_checkpoint_sha256` are not representable in
+# static YAML and must be supplied by the real trainer (Step 6, not yet
+# built) from `required_fingerprints.gigapath_checkpoint` below.
 
 experiment_name: gen3_architecture4_hierarchical_residual_flow_v1
 
@@ -44,6 +51,10 @@ model:
     use_query_gate: true
     use_residual: false
     residual_rank: 32
+    use_regional_he: true     # forwarded into self.conditioner (Architecture3) -- Step 5 Part 2; see header note for slide_encoder/checksum caveat
+    use_global_slide: true    # forwarded into self.conditioner (Architecture3) -- Step 5 Part 2; see header note for slide_encoder/checksum caveat
+    global_slide_dim: 768
+    regional_grid_size: 4
     n_gex_inducing: 16
     harmonic_k_neighbors: 6
     gene_encoder_type: weighted_linear
@@ -78,6 +89,10 @@ masking:
 data:
   hest_data_dir: data/raw/hest1k
   hest_cache_dir: data/cache/hest1k
+  # See architecture3.yaml's identical note -- forwarded into
+  # self.conditioner, so Architecture 4 needs the same real dense WSI
+  # tile cache Architecture 3 does, never the spot_aligned diagnostic.
+  slide_context_source: dense_wsi_cache
   sample_selection:
     organs: all
     metadata_csv: hf://datasets/MahmoodLab/hest/HEST_v1_3_0.csv
@@ -100,7 +115,7 @@ evaluation:
   # already support binning any per-query/per-item scalar).
 
 required_fingerprints:
-  gigapath_checkpoint: null
+  gigapath_checkpoint: null   # real checkpoint path REQUIRED before training -- use_global_slide=true (forwarded into self.conditioner) now means construction raises ValueError without a real slide_encoder built from this checkpoint; still null because no real trainer/checkpoint deployment exists yet (Step 6)
   gene_vocabulary: null
   gene_residual_basis: null   # fit_gene_residual_basis output, TRAINING-split only (models/gene_basis.py)
   train_mask_bank: null

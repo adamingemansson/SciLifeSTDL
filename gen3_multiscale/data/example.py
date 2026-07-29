@@ -136,17 +136,41 @@ class SpatialFieldInputs:
     # Dense WSI context (Phase 3 / Step 5) -- tiles whose footprint does
     # NOT overlap the hole (real deployment-visible tiles only; already
     # filtered by slide_context.visible_slide_context before reaching
-    # here). None together (all three or none) until a caller wires in a
-    # real slide_context.load_slide_context result.
+    # here). All FIVE of the fields below are set together (all or none)
+    # until a caller wires in a real slide_context.load_slide_context
+    # result.
+    #
+    # 16th Codex re-audit (Step 5 Part 2 acceptance criteria), CONFIRMED
+    # real: a prior version had exactly ONE wsi_tile_coords field, used
+    # for BOTH real GigaPath LongNet inference (which needs its own
+    # native level-0 tile coordinates for positional encoding -- see
+    # models.slide_encoder.FrozenGigaPathSlideEncoder.forward) AND
+    # regional-token spatial pooling / relative-geometry-to-query
+    # (which needs the SAME centered, spot-spacing-normalized frame as
+    # observed_coords/query_coords, or a query-relative attention bias
+    # would be computing distances in the wrong units entirely).
+    # Feeding LongNet a normalized, per-example-centered coordinate would
+    # silently corrupt its real positional encoding (LongNet was
+    # pretrained on true physical tile positions, not a value that
+    # rescales and re-centers per example); feeding the regional pooler
+    # raw native pixel coordinates would make relative geometry to
+    # query_coords meaningless. Two separate fields now exist, BOTH
+    # derived from the exact same documented transformation
+    # (`(raw_native - reference) / scale`, the SAME reference/scale
+    # example_builder.py already computes for observed_coords/
+    # query_coords) so a caller can never accidentally mix them up by
+    # only having one array to reach for.
+    wsi_tile_native_coords: np.ndarray | None = None  # [n_visible_tiles, 2], real level-0 GigaPath/LongNet coords, UNNORMALIZED
+    wsi_tile_regional_coords: np.ndarray | None = None  # [n_visible_tiles, 2], same centered/normalized frame as observed_coords
     wsi_tile_features: np.ndarray | None = None  # [n_visible_tiles, 1536]
-    wsi_tile_coords: np.ndarray | None = None  # [n_visible_tiles, 2], same normalization as observed_coords
     # (xmin, xmax, ymin, ymax) computed from the COMPLETE tile set BEFORE
-    # hole filtering, in the SAME normalized frame as wsi_tile_coords --
-    # models.slide_encoder.pool_regional_tokens's own required input, so
-    # regional grid cell (i, j) refers to the SAME physical region across
-    # every example on this slide regardless of which hole was cut for
-    # this particular item (15th Codex re-audit's "regional-grid bounds
-    # must come from the complete slide before masking" requirement).
+    # hole filtering, in the SAME normalized frame as
+    # wsi_tile_regional_coords -- models.slide_encoder.pool_regional_tokens's
+    # own required input, so regional grid cell (i, j) refers to the
+    # SAME physical region across every example on this slide regardless
+    # of which hole was cut for this particular item (15th Codex
+    # re-audit's "regional-grid bounds must come from the complete slide
+    # before masking" requirement).
     full_slide_coord_bounds: tuple[float, float, float, float] | None = None
     # Real cache-key material for the frozen LongNet global vector (15th
     # Codex re-audit's "the existing coordinate-only in-memory LongNet
@@ -158,6 +182,10 @@ class SpatialFieldInputs:
     # with the loaded GigaPath checkpoint's own SHA256 (a property of
     # WHICH model is running, not of this example) to form the complete
     # cache namespace; this dataclass never assumes a specific checkpoint.
+    # REQUIRED whenever the other WSI fields are set (16th Codex
+    # re-audit, CONFIRMED: a prior version's all-or-none check did not
+    # include this field at all, so WSI context could pass validation
+    # with slide_cache_namespace=None).
     slide_cache_namespace: str | None = None
 
     # Free-form, not consumed by any forward() -- fingerprints/labels a
@@ -254,33 +282,46 @@ def validate_spatial_field_example(inputs: SpatialFieldInputs, targets: SpatialF
         raise ValueError("query_depth_to_boundary must be non-negative (BFS hop count)")
 
     wsi_fields_set = (
-        inputs.wsi_tile_features is not None, inputs.wsi_tile_coords is not None,
-        inputs.full_slide_coord_bounds is not None,
+        inputs.wsi_tile_native_coords is not None, inputs.wsi_tile_regional_coords is not None,
+        inputs.wsi_tile_features is not None, inputs.full_slide_coord_bounds is not None,
+        inputs.slide_cache_namespace is not None,
     )
     if any(wsi_fields_set) and not all(wsi_fields_set):
         raise ValueError(
-            "wsi_tile_features, wsi_tile_coords, and full_slide_coord_bounds must be set together "
-            "(all three or none) -- regional/global GigaPath context requires all of them"
+            "wsi_tile_native_coords, wsi_tile_regional_coords, wsi_tile_features, "
+            "full_slide_coord_bounds, and slide_cache_namespace must be set together (all five or "
+            "none) -- regional/global GigaPath context requires all of them"
         )
     if inputs.wsi_tile_features is not None:
-        if inputs.wsi_tile_features.shape[0] != inputs.wsi_tile_coords.shape[0]:
-            raise ValueError("wsi_tile_features and wsi_tile_coords must have the same row count")
+        if inputs.wsi_tile_features.shape[0] != inputs.wsi_tile_native_coords.shape[0]:
+            raise ValueError("wsi_tile_features and wsi_tile_native_coords must have the same row count")
+        if inputs.wsi_tile_features.shape[0] != inputs.wsi_tile_regional_coords.shape[0]:
+            raise ValueError("wsi_tile_features and wsi_tile_regional_coords must have the same row count")
         if inputs.wsi_tile_features.shape[0] == 0:
             raise ValueError("wsi_tile_features is set but has zero rows -- pass None instead of an empty array")
-        if not np.all(np.isfinite(inputs.wsi_tile_features)) or not np.all(np.isfinite(inputs.wsi_tile_coords)):
-            raise ValueError("wsi_tile_features/wsi_tile_coords contain non-finite values")
+        if not np.all(np.isfinite(inputs.wsi_tile_features)):
+            raise ValueError("wsi_tile_features contains non-finite values")
+        if not np.all(np.isfinite(inputs.wsi_tile_native_coords)) or not np.all(np.isfinite(inputs.wsi_tile_regional_coords)):
+            raise ValueError("wsi_tile_native_coords/wsi_tile_regional_coords contain non-finite values")
+        if not str(inputs.slide_cache_namespace).strip():
+            raise ValueError("slide_cache_namespace must be a non-empty string when WSI context is set")
         xmin, xmax, ymin, ymax = inputs.full_slide_coord_bounds
         if not (xmax > xmin and ymax > ymin):
             raise ValueError(f"full_slide_coord_bounds {inputs.full_slide_coord_bounds} is degenerate/invalid")
-        tile_xy = np.asarray(inputs.wsi_tile_coords, dtype=np.float64)
+        # full_slide_coord_bounds is documented as the SAME normalized
+        # frame as wsi_tile_regional_coords (models.slide_encoder.
+        # pool_regional_tokens's own required input) -- checked against
+        # the regional, not native, coordinates.
+        regional_xy = np.asarray(inputs.wsi_tile_regional_coords, dtype=np.float64)
         outside = (
-            (tile_xy[:, 0] < xmin) | (tile_xy[:, 0] > xmax) | (tile_xy[:, 1] < ymin) | (tile_xy[:, 1] > ymax)
+            (regional_xy[:, 0] < xmin) | (regional_xy[:, 0] > xmax)
+            | (regional_xy[:, 1] < ymin) | (regional_xy[:, 1] > ymax)
         )
         if outside.any():
             raise ValueError(
-                f"{int(outside.sum())} wsi_tile_coords row(s) fall outside full_slide_coord_bounds "
-                f"{inputs.full_slide_coord_bounds} -- the visible tile set must be a subset of the "
-                "complete slide the bounds were computed from"
+                f"{int(outside.sum())} wsi_tile_regional_coords row(s) fall outside "
+                f"full_slide_coord_bounds {inputs.full_slide_coord_bounds} -- the visible tile set "
+                "must be a subset of the complete slide the bounds were computed from"
             )
 
     if targets.query_expression.shape[0] != n_query:

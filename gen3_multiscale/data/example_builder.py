@@ -57,7 +57,7 @@ from scipy.spatial import cKDTree
 from gen3_multiscale.data import loaders
 from gen3_multiscale.data.boundary_graph import extract_boundary_and_local_context
 from gen3_multiscale.data.example import SpatialFieldInputs, SpatialFieldTargets, validate_spatial_field_example
-from gen3_multiscale.data.slide_context import nonoverlapping_context_patch_mask
+from gen3_multiscale.data.slide_context import nonoverlapping_context_patch_mask, visible_slide_context
 
 
 def load_sample_for_examples(
@@ -154,6 +154,8 @@ def build_spatial_field_example(
     max_rings: int = 3,
     max_boundary_size: int | None = None,
     expected_feature_width: int | None = None,
+    slide_context: dict | None = None,
+    image_mode: str = "target_zero",
 ) -> tuple[SpatialFieldInputs, SpatialFieldTargets]:
     """Build one real SpatialFieldInputs/SpatialFieldTargets pair from
     one realized (context, query) barcode split.
@@ -183,6 +185,30 @@ def build_spatial_field_example(
     `expected_feature_width` (default: no check) lets a caller assert
     `image_feature_fn`'s real output width (e.g. GigaPath's 1536) as an
     extra fail-closed guard.
+
+    `slide_context` (default: None -- no regional/global WSI context) is
+    a real `slide_context.load_slide_context(...)` result -- the whole,
+    UNMASKED tissue-wide GigaPath tile cache for this sample.
+    `slide_context.visible_slide_context` removes every tile whose
+    footprint physically overlaps this example's query hole (16th Codex
+    re-audit, Step 5 Part 2: "Every WSI tile physically overlapping the
+    hole is excluded"), so architectures.py's regional-token pooling and
+    LongNet global-vector computation only ever see tiles that could
+    still exist after the same physical damage query spots model. Two
+    coordinate frames are derived from the surviving tiles, from the
+    SAME `(raw - reference) / scale` transform already used for
+    observed_coords/query_coords: `wsi_tile_native_coords` keeps the raw
+    level-0 pixel coordinates real GigaPath/LongNet positional encoding
+    expects; `wsi_tile_regional_coords` is the centered/spot-spacing-
+    normalized frame regional spatial attention shares with every other
+    coordinate in this example. `full_slide_coord_bounds` is computed
+    from the COMPLETE (pre-hole-filtering) tile set in that same
+    normalized frame, so a regional grid cell's spatial meaning stays
+    stable across different holes on the same slide (16th Codex
+    re-audit: "Regional-grid bounds come from the complete slide before
+    masking"). `slide_cache_namespace` is `visible_slide_context`'s own
+    `context_id` -- already bound to real tile-cache content, the visible
+    tile set, and this example's hole (15th/16th Codex re-audits).
     """
     if full_sample_coords is None and require_full_sample_coords:
         raise ValueError(
@@ -289,6 +315,29 @@ def build_spatial_field_example(
     observed_coords = ((observed_coords_raw - reference) / scale).astype(np.float32)
     query_coords = ((query_coords_raw - reference) / scale).astype(np.float32)
 
+    wsi_tile_native_coords = None
+    wsi_tile_regional_coords = None
+    wsi_tile_features = None
+    full_slide_coord_bounds = None
+    slide_cache_namespace = None
+    if slide_context is not None:
+        visible = visible_slide_context(slide_context, query_coords_raw, image_mode, patch_size_fullres)
+        if visible["available"]:
+            wsi_tile_native_coords = np.asarray(visible["coords"], dtype=np.float32)
+            wsi_tile_regional_coords = ((wsi_tile_native_coords - reference) / scale).astype(np.float32)
+            wsi_tile_features = np.asarray(visible["features"], dtype=np.float32)
+            # Bounds come from the COMPLETE (unmasked) tile set, in the
+            # same normalized frame, so a regional grid cell keeps the
+            # same spatial meaning regardless of which hole this
+            # particular example carries (16th Codex re-audit).
+            full_slide_native = np.asarray(slide_context["coords"], dtype=np.float32)
+            full_slide_regional = (full_slide_native - reference) / scale
+            full_slide_coord_bounds = (
+                float(full_slide_regional[:, 0].min()), float(full_slide_regional[:, 0].max()),
+                float(full_slide_regional[:, 1].min()), float(full_slide_regional[:, 1].max()),
+            )
+            slide_cache_namespace = str(visible["context_id"])
+
     X = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()
     observed_full_gene_expression = np.asarray(X[context_pos], dtype=np.float32)
     query_expression = np.asarray(X[query_pos], dtype=np.float32)
@@ -350,10 +399,16 @@ def build_spatial_field_example(
         boundary_idx=boundary.boundary_idx,
         boundary_ring=boundary.boundary_ring,
         query_depth_to_boundary=boundary.query_depth_to_boundary,
+        wsi_tile_native_coords=wsi_tile_native_coords,
+        wsi_tile_regional_coords=wsi_tile_regional_coords,
+        wsi_tile_features=wsi_tile_features,
+        full_slide_coord_bounds=full_slide_coord_bounds,
+        slide_cache_namespace=slide_cache_namespace,
         provenance={
             "n_context_requested": len(context_barcodes),
             "n_context_image_unavailable_for_physical_he_overlap": n_image_unavailable,
             "spot_spacing_scale": scale,
+            "wsi_context_available": wsi_tile_features is not None,
             **boundary.diagnostic,
         },
     )

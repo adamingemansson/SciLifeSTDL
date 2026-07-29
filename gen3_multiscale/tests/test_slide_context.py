@@ -5,6 +5,7 @@ slide_context.py logic -- kept self-contained here rather than imported,
 since gen3_multiscale's copy must be independently verified, not just
 assumed identical."""
 import numpy as np
+import pytest
 from omegaconf import OmegaConf
 
 from gen3_multiscale.data.slide_context import (
@@ -130,3 +131,54 @@ def test_load_slide_context_id_is_bound_to_real_content_not_just_file_stat(tmp_p
     ctx_b = load_slide_context(cfg, "S0", None, spot_coords)
 
     assert ctx_a["context_id"] != ctx_b["context_id"]
+
+
+def test_load_slide_context_id_changes_when_only_the_level0_mask_fields_change(tmp_path):
+    """16th Codex re-audit (Step 5 Part 2 acceptance criteria), CONFIRMED:
+    a prior content-hash version only covered features/coords/tile_size
+    -- NOT mask_coords/mask_tile_size/coords_are_centers, which
+    independently drive WHICH tiles visible_slide_context keeps for a
+    given hole (a dense_wsi_cache's level0_coords/level0_tile_size can
+    differ entirely from its coords/tile_size). A cache changed ONLY in
+    those masking-relevant level0 fields must still get a new context_id."""
+    cache_dir = tmp_path / "hest1k" / "gigapath_slide_cache"
+    cache_dir.mkdir(parents=True)
+    coords = np.asarray([[0, 0], [256, 0]], dtype=np.float32)
+    features = np.ones((2, 1536), dtype=np.float32)
+    cfg = OmegaConf.create({"data": {"slide_context_source": "dense_wsi_cache", "hest_data_dir": str(tmp_path / "hest1k")}})
+    spot_coords = np.asarray([[10, 10]], dtype=np.float32)
+
+    np.savez(
+        cache_dir / "S0.npz", features=features, coords=coords, tile_size=np.asarray(256.0),
+        coords_are_centers=np.asarray(False),
+        level0_coords=np.asarray([[0, 0], [512, 0]], dtype=np.float32),  # different level0 mask coords
+        level0_tile_size=np.asarray(256.0),
+    )
+    ctx_a = load_slide_context(cfg, "S0", None, spot_coords)
+
+    np.savez(
+        cache_dir / "S0.npz", features=features, coords=coords, tile_size=np.asarray(256.0),
+        coords_are_centers=np.asarray(False),
+        level0_coords=np.asarray([[0, 0], [1024, 0]], dtype=np.float32),  # changed ONLY this
+        level0_tile_size=np.asarray(256.0),
+    )
+    ctx_b = load_slide_context(cfg, "S0", None, spot_coords)
+
+    assert ctx_a["context_id"] != ctx_b["context_id"]
+
+
+def test_load_slide_context_rejects_duplicate_tile_coordinates(tmp_path):
+    """16th Codex re-audit (Step 5 Part 2 acceptance criteria), CONFIRMED:
+    no check existed for duplicate tile coordinates -- a corrupted or
+    badly-generated cache with two tiles at the identical position would
+    silently double-count that region's real contribution."""
+    cache_dir = tmp_path / "hest1k" / "gigapath_slide_cache"
+    cache_dir.mkdir(parents=True)
+    duplicate_coords = np.asarray([[0, 0], [0, 0], [256, 0]], dtype=np.float32)
+    features = np.ones((3, 1536), dtype=np.float32)
+    _write_dense_wsi_cache(cache_dir / "S0.npz", features, duplicate_coords)
+    cfg = OmegaConf.create({"data": {"slide_context_source": "dense_wsi_cache", "hest_data_dir": str(tmp_path / "hest1k")}})
+    spot_coords = np.asarray([[10, 10]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="duplicate tile coordinates"):
+        load_slide_context(cfg, "S0", None, spot_coords)

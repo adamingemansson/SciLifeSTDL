@@ -258,3 +258,29 @@ def pool_regional_tokens(
 
     available = counts > 0
     return torch.from_numpy(tokens), torch.from_numpy(available)
+
+
+def regional_grid_cell_centers(
+    full_slide_coord_bounds: tuple[float, float, float, float], grid_size: int = 4,
+) -> torch.Tensor:
+    """Real (x, y) center coordinates for each of pool_regional_tokens's
+    grid_size x grid_size cells, in the SAME row-major `cell = row *
+    grid_size + col` ordering that function uses internally -- so a
+    caller can zip cell index i from pool_regional_tokens's output with
+    row i here and get the correct physical center for that exact cell,
+    needed to compute a real relative geometry from each query to each
+    regional token (models.geometry_utils.compute_relative_geometry)."""
+    if grid_size < 1:
+        raise ValueError(f"grid_size must be positive, got {grid_size}")
+    xmin, xmax, ymin, ymax = full_slide_coord_bounds
+    if not (xmax > xmin and ymax > ymin):
+        raise ValueError(f"invalid full_slide_coord_bounds {full_slide_coord_bounds}")
+    cell_w = (xmax - xmin) / grid_size
+    cell_h = (ymax - ymin) / grid_size
+    centers = np.zeros((grid_size * grid_size, 2), dtype=np.float32)
+    for row in range(grid_size):
+        for col in range(grid_size):
+            cell = row * grid_size + col
+            centers[cell, 0] = xmin + (col + 0.5) * cell_w
+            centers[cell, 1] = ymin + (row + 0.5) * cell_h
+    return torch.from_numpy(centers)
