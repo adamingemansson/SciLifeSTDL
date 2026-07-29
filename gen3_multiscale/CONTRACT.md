@@ -4588,6 +4588,79 @@ training loop. No previous fixes need undoing.
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 47. Response to the twenty-second external Codex re-audit -- verdict confirmed, 1 minor CLI fix, 2 requirements deferred into Step 6 itself
+
+Adam verified commit `036172b` directly and confirmed all 3 of the 21st
+round's fixes are present and correct: "There is no code blocker
+preventing the two hardware gates now." He identified one minor,
+immediately-actionable efficiency fix, plus two integration
+requirements he explicitly scoped to be implemented AS PART OF Step 6
+itself, not as another standalone infrastructure-only audit round --
+verbatim: "Two requirements should be implemented inside Step 6, not as
+another standalone audit round... No more infrastructure-only audit
+round is needed first."
+
+**Fixed this round:** `scripts/precompute_gen3_spot_features.py` did
+not validate `--batch-size` before calling `load_gigapath_tile_encoder_
+for_gen3` -- `encode_gen3_spot_feature_cache` already rejects
+`batch_size <= 0` (20th/21st re-audit), but only after this script had
+already paid the cost of loading the real ~1.1B-parameter tile encoder
+from HuggingFace. Now checked immediately after argument parsing, before
+any config/manifest loading or encoder load.
+
+**Explicitly recorded for Step 6 itself, NOT implemented this round
+(per Adam's own explicit scoping):**
+1. **Do not pass a bare feature matrix into the builder.** The real
+   trainer must pass the complete loaded cache record -- or features
+   plus the cache's own `barcodes`/`image_source_available` -- into
+   whatever wires `precomputed_spot_features` into
+   `build_spatial_field_example`, and verify the cache's `barcodes`
+   exactly equal `adata.obs_names` at that call site. A bare `features`
+   array alone (as `precomputed_spot_features` currently accepts, by
+   design, from the 21st round) cannot detect a trainer bug that
+   silently passes a DIFFERENT sample's same-shaped feature matrix --
+   `load_gen3_spot_features` itself already verifies barcode identity/
+   order when it loads a cache from disk, but that guarantee is lost
+   the moment only the bare `features` array is threaded onward without
+   also carrying (and re-checking) its barcodes at the point of use.
+2. **Preflight must verify COVERAGE, not merely consistency.** Build
+   the `provenance_by_source` map `tile_encoder_preflight.require_
+   consistent_tile_encoder_provenance` consumes FROM THE IMMUTABLE
+   MANIFEST, and require EXACTLY two entries for every sample the
+   manifest selects: `f"{sample}:dense_wsi"` and
+   `f"{sample}:spot_features"`. The 21st round's fix makes every entry
+   actually present internally consistent and provenance-valid, but
+   never checked that a full, complete SET of entries was actually
+   handed to it in the first place -- a caller that silently only
+   built the map for 3 of an experiment's 8 samples (or omitted the
+   dense-WSI entry for one of them) would still pass the gate today.
+   This coverage check, plus the actual `require_consistent_tile_
+   encoder_provenance(...)` call, must run BEFORE constructing the
+   model, optimizer, or DataLoader -- a consistent SUBSET of caches
+   must never be enough to pass.
+
+**Adam's verdict, recorded verbatim:** "proceed with the real
+pinned-cache test and A100 LongNet/Architecture 3/4 smoke. Once those
+pass, Claude should begin the actual Step 6 data pipeline/trainer and
+implement the two integration requirements above there."
+
+**Explicitly still open:** the two independent hardware gates (build
+and validate one real dense cache with a pinned revision; run the A100
+LongNet/Architecture 3/4 smoke) still require real GPU/HuggingFace/
+checkpoint access this sandbox does not have -- unchanged from the 21st
+round. Step 6 itself has NOT been started; when it is, it must
+incorporate both integration requirements above as part of its own
+implementation, not bolted on afterward.
+
+**Test status: unchanged this round** (551 `gen3_multiscale/tests`, 724
+`gen2_architectures + gen3_multiscale`, 13 repo-root
+`tests/test_conditioning.py`, all re-run and confirmed passing) -- the
+one CLI fix has no dedicated test file of its own (a one-line argument-
+parsing guard, mirroring the already-tested check one call deeper in
+`encode_gen3_spot_feature_cache`) and no other file changed.
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
 
 ```

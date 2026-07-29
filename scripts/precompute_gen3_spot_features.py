@@ -58,6 +58,14 @@ def main() -> None:
     args = parser.parse_args()
     from src.models.conditioning import _validate_immutable_hf_revision
     _validate_immutable_hf_revision(args.tile_encoder_revision)
+    # 22nd Codex re-audit ("reject invalid CLI batch_size before loading
+    # the large encoder"): encode_gen3_spot_feature_cache already
+    # rejects batch_size <= 0, but only after this script has already
+    # paid the cost of loading the ~1.1B-parameter tile encoder from
+    # HuggingFace -- check here too, before that load, so a typo'd
+    # --batch-size fails immediately.
+    if args.batch_size <= 0:
+        raise ValueError(f"--batch-size must be positive, got {args.batch_size}")
 
     cfg = OmegaConf.load(args.config)
     manifest = load_dataset_manifest(args.manifest)
