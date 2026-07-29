@@ -35,6 +35,57 @@ _HF_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
+def validate_tile_encoder_provenance(source: str, tile_encoder_provenance: dict) -> None:
+    """Fail-closed validation of a real GigaPath tile-encoder provenance
+    dict (the same 6-field shape `gigapath_tile_encoder_provenance` --
+    src.models.conditioning -- produces): expected repository, an
+    immutable 40-hex-char commit SHA, a nonblank library version, the
+    exact current preprocessing spec, a well-formed 64-hex-char weights
+    digest, and a supported schema version.
+
+    Factored out of load_slide_context's dense_wsi_cache branch (19th
+    Codex re-audit, remaining launch blocker #3) so
+    gen3_multiscale/data/spot_feature_cache.py's Gen3 spot-feature cache
+    -- a genuinely different cache format -- can apply the IDENTICAL
+    validation to its own tile-encoder provenance rather than
+    reimplementing (and risking silently drifting from) these same six
+    checks. `source` is a human-readable identifier (e.g. a file path)
+    used only in error messages."""
+    if tile_encoder_provenance["hf_repo_id"] != _EXPECTED_GIGAPATH_HF_REPO_ID:
+        raise ValueError(
+            f"{source} tile_encoder_hf_repo_id="
+            f"{tile_encoder_provenance['hf_repo_id']!r}, expected "
+            f"{_EXPECTED_GIGAPATH_HF_REPO_ID!r}"
+        )
+    if not _HF_COMMIT_SHA_RE.match(tile_encoder_provenance["hf_revision"]):
+        raise ValueError(
+            f"{source} tile_encoder_hf_revision="
+            f"{tile_encoder_provenance['hf_revision']!r} is not a full 40-character "
+            "lowercase hex Hugging Face commit SHA -- rebuild with a pinned, "
+            "immutable --tile-encoder-revision"
+        )
+    if not tile_encoder_provenance["timm_version"].strip() or tile_encoder_provenance["timm_version"] == "None":
+        raise ValueError(f"{source} has a blank/missing tile_encoder_timm_version")
+    if tile_encoder_provenance["preprocessing_spec"] != _EXPECTED_GIGAPATH_PREPROCESSING_SPEC:
+        raise ValueError(
+            f"{source} tile_encoder_preprocessing_spec="
+            f"{tile_encoder_provenance['preprocessing_spec']!r}, expected "
+            f"{_EXPECTED_GIGAPATH_PREPROCESSING_SPEC!r} -- rebuild it with the current "
+            "scripts/precompute_gigapath_wsi_tiles.py"
+        )
+    if not _SHA256_HEX_RE.match(tile_encoder_provenance["state_dict_sha256"]):
+        raise ValueError(
+            f"{source} tile_encoder_state_dict_sha256 is not a well-formed "
+            "64-character lowercase hex SHA256 digest"
+        )
+    if tile_encoder_provenance["schema_version"] not in _SUPPORTED_TILE_ENCODER_SCHEMA_VERSIONS:
+        raise ValueError(
+            f"{source} tile_encoder_schema_version="
+            f"{tile_encoder_provenance['schema_version']} is not supported "
+            f"(supported: {sorted(_SUPPORTED_TILE_ENCODER_SCHEMA_VERSIONS)})"
+        )
+
+
 def _cache_path(cfg, sample_id: str) -> Path:
     configured = cfg.data.get("slide_context_cache_dir")
     if configured:
@@ -130,40 +181,11 @@ def load_slide_context(
         # so a cache built against the wrong repo, an unpinned/malformed
         # revision, a blank library version, stale preprocessing, or an
         # unrecognized schema could all silently pass. Every field is now
-        # validated explicitly, fail-closed.
-        if tile_encoder_provenance["hf_repo_id"] != _EXPECTED_GIGAPATH_HF_REPO_ID:
-            raise ValueError(
-                f"slide cache {path} tile_encoder_hf_repo_id="
-                f"{tile_encoder_provenance['hf_repo_id']!r}, expected "
-                f"{_EXPECTED_GIGAPATH_HF_REPO_ID!r}"
-            )
-        if not _HF_COMMIT_SHA_RE.match(tile_encoder_provenance["hf_revision"]):
-            raise ValueError(
-                f"slide cache {path} tile_encoder_hf_revision="
-                f"{tile_encoder_provenance['hf_revision']!r} is not a full 40-character "
-                "lowercase hex Hugging Face commit SHA -- rebuild with a pinned, "
-                "immutable --tile-encoder-revision"
-            )
-        if not tile_encoder_provenance["timm_version"].strip() or tile_encoder_provenance["timm_version"] == "None":
-            raise ValueError(f"slide cache {path} has a blank/missing tile_encoder_timm_version")
-        if tile_encoder_provenance["preprocessing_spec"] != _EXPECTED_GIGAPATH_PREPROCESSING_SPEC:
-            raise ValueError(
-                f"slide cache {path} tile_encoder_preprocessing_spec="
-                f"{tile_encoder_provenance['preprocessing_spec']!r}, expected "
-                f"{_EXPECTED_GIGAPATH_PREPROCESSING_SPEC!r} -- rebuild it with the current "
-                "scripts/precompute_gigapath_wsi_tiles.py"
-            )
-        if not _SHA256_HEX_RE.match(tile_encoder_provenance["state_dict_sha256"]):
-            raise ValueError(
-                f"slide cache {path} tile_encoder_state_dict_sha256 is not a well-formed "
-                "64-character lowercase hex SHA256 digest"
-            )
-        if tile_encoder_provenance["schema_version"] not in _SUPPORTED_TILE_ENCODER_SCHEMA_VERSIONS:
-            raise ValueError(
-                f"slide cache {path} tile_encoder_schema_version="
-                f"{tile_encoder_provenance['schema_version']} is not supported "
-                f"(supported: {sorted(_SUPPORTED_TILE_ENCODER_SCHEMA_VERSIONS)})"
-            )
+        # validated explicitly, fail-closed, via the shared validator
+        # (factored out in the 20th re-audit so
+        # spot_feature_cache.py's Gen3 spot-feature cache applies the
+        # identical checks rather than risking a second, drifting copy).
+        validate_tile_encoder_provenance(f"slide cache {path}", tile_encoder_provenance)
         features = np.asarray(cached["features"], dtype=np.float32)
         coords = np.asarray(cached["coords"], dtype=np.float32)
         tile_size = float(np.asarray(cached["tile_size"]).item())

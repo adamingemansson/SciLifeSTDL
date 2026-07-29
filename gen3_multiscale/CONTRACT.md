@@ -4335,7 +4335,162 @@ here for the record.
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 45. Response to the twentieth external Codex re-audit -- 3 Step 6 boundaries, and the Gen3 spot-feature cache/provider they require before the trainer begins
+
+Adam verified commit `1187586` (the 19th round's fix) directly and
+confirmed the exact dense-WSI launch blocker is fully closed: mandatory
+revision forwarding, full provenance validation/hash binding, and
+barcode checks are all implemented correctly. He then identified three
+remaining Step 6 boundaries -- none of them invalidate the dense-WSI
+fix, but all three must be respected before the real trainer begins.
+
+**Boundary #1 (informational, no code change needed): `_load_gigapath_
+tile_encoder()` still defaults to `revision=None`, and older STPath/Gen2
+callers legitimately use that unpinned path.** Confirmed real and
+confirmed out of scope to change -- `GigapathPatchEncoder`,
+`STPathContextEncoder`, and `precompute_gigapath_features` all call it
+with no revision, and changing their default behavior was never asked
+for and would affect Gen1/Gen2 architectures this document does not
+own. The boundary is: Gen3 must never route through any of those
+callers. Satisfied by construction below -- the new Gen3 spot-feature
+cache never calls `_load_gigapath_tile_encoder()` without a mandatory,
+pre-validated revision.
+
+**Boundary #2 (CONFIRMED real gap, now closed): cache provenance was
+validated syntactically but never against an experiment-declared
+expected revision/state hash, and never checked for cross-sample/
+cross-cache agreement.** A syntactically valid dense-WSI or spot-feature
+cache built from a DIFFERENT, still validly-pinned revision would pass
+each cache's own internal validation and silently load -- nothing
+previously checked that every cache used in one experiment agreed with
+each other, or with what the experiment's config/manifest declared.
+Fixed: new `gen3_multiscale/data/tile_encoder_preflight.py`,
+`require_consistent_tile_encoder_provenance(provenance_by_source,
+expected_provenance=None)` -- a pure function (no I/O, no torch/timm
+import) that requires every provenance dict passed to it to be
+pairwise-identical across all six fields, and (when
+`expected_provenance` is given) to also exactly match it field-by-field
+for every field the caller chose to pin. Ready to be wired into Step
+8's mandatory preflight gates once the real trainer exists; has no
+caller yet since Step 8 is not built.
+
+**Boundary #3 (CONFIRMED real gap, now closed): `scripts/precompute_
+hierarchical_slide_4gpu.sh`'s spot-feature stage still calls the legacy,
+unpinned `precompute_gigapath_samples.py`.** Confirmed by reading that
+script and its target (`src.training.train.get_gigapath_features`):
+it calls `_load_gigapath_tile_encoder()` with no revision and its
+on-disk cache (`gigapath_cache/<sample_id>.npz`) stores only `features`/
+`barcodes`/`patch_fingerprint` -- no tile-encoder provenance at all, so
+it can never satisfy `load_slide_context`'s or the new
+`load_gen3_spot_features`'s mandatory-provenance contract. Those spot
+caches are NOT valid Gen3 inputs, and this script's legacy stage is left
+untouched (it still serves whatever non-Gen3 purpose it originally had)
+-- Gen3 gets its own, independent spot-feature pipeline instead:
+
+- New `gen3_multiscale/data/spot_feature_cache.py`:
+  `build_gen3_spot_feature_cache(cfg, sample_id, barcodes, patches,
+  image_source_available, tile_encoder_revision, device, batch_size)`
+  encodes every AVAILABLE H&E patch for one manifest sample exactly
+  once, with a MANDATORY immutable `tile_encoder_revision` (validated
+  via the same `_validate_immutable_hf_revision` the dense-WSI script
+  now requires) -- never `_load_gigapath_tile_encoder()`'s unpinned
+  default. `barcodes`/`patches`/`image_source_available` are the exact
+  aligned triple `loaders.align_patches_to_adata` (via
+  `example_builder.load_sample_for_examples`) already produces; a spot
+  with `image_source_available=False` gets an explicit zero feature
+  row and is NEVER fed to the tile encoder -- the same "never pass
+  unavailable patches to GigaPath" discipline Step 5 Part 2 launch
+  blocker #1 established. Every cache records the full 6-field
+  provenance object PLUS a `patch_content_sha256` binding the cache to
+  the exact barcode order, availability mask, and real pixel bytes of
+  every patch actually encoded. Cached to a deliberately distinct
+  directory (`gigapath_gen3_spot_cache/`) from both the legacy
+  (`gigapath_cache/`) and dense-WSI (`gigapath_slide_cache/`) caches, so
+  this module can never accidentally load either.
+  `load_gen3_spot_features(cfg, sample_id, barcodes, patches,
+  image_source_available)` validates ALL of: every required field
+  present (fails closed on an old-format or legacy cache); the full
+  provenance (via `slide_context.validate_tile_encoder_provenance`,
+  factored out of `load_slide_context`'s dense_wsi_cache branch so both
+  cache formats share one validator instead of risking two drifting
+  copies); barcode identity AND order; `image_source_available`
+  identity; `features` shape/finiteness; and real patch content (by
+  recomputing `patch_content_sha256` from the caller's already-loaded
+  real barcodes/availability/patches -- no second disk read, so this is
+  effectively free).
+- New `scripts/precompute_gen3_spot_features.py`: the Gen3-specific,
+  manifest-driven CLI -- driven by a real, already-built dataset
+  manifest (never an independently-specified sample list that could
+  drift from what masks were built against), `--tile-encoder-revision`
+  MANDATORY (same discipline as `precompute_gigapath_wsi_tiles.py`),
+  validated before any work begins.
+
+**Not a code change this round -- reaffirming the same Step 6
+requirement recorded in section 44:** `image_feature_fn` must never
+invoke the tile encoder per training example. This round's cache/
+provider module makes that concretely possible: the real trainer's
+`image_feature_fn` should become a slice into
+`load_gen3_spot_features(...)["features"]` by context row index, never
+a live GigaPath forward pass.
+
+**Tests added:** `gen3_multiscale/tests/test_tile_encoder_preflight.py`
+(7 tests, pure-function -- accepts identical provenance, rejects a
+mismatched revision, rejects a mismatched weights hash even with a
+matching revision string, rejects disagreement with an experiment-
+declared expected provenance, accepts a partial expected-provenance
+pin, rejects empty input) and
+`gen3_multiscale/tests/test_spot_feature_cache.py` (11 tests -- rejects
+an unpinned/malformed revision and a barcodes/patches length mismatch
+and duplicate barcodes before touching the encoder; a real build-then-
+load round trip confirming unavailable rows are an explicit zero and
+available rows are real/nonzero; a clear error when no cache exists;
+rejects a barcode order mismatch, a changed `image_source_available`,
+patches that changed since the cache was built, a cache missing
+provenance fields entirely (the legacy-cache shape), and a hand-
+corrupted malformed revision; confirms two samples built with different
+pinned revisions genuinely record different provenance). GigaPath
+itself is monkeypatched with cheap deterministic stubs (the same
+established pattern as the A100 smoke test's LongNet call-counting
+wrapper) so these tests exercise the real orchestration/validation logic
+without needing network/GPU/gated-repo access this sandbox does not
+have; `timm` is injected into `sys.modules` only because it is not
+installed here and `gigapath_tile_encoder_provenance`'s real,
+correct mandatory-timm_version behavior would otherwise reject every
+cache built in this sandbox.
+
+**Explicitly still open, per Adam's own stated order:** the two
+independent hardware gates (build and validate one real dense cache
+with a pinned revision; run the A100 LongNet/Architecture 3/4 smoke)
+still require real GPU/HuggingFace/checkpoint access this sandbox does
+not have. After both pass, Step 6 should begin with THIS round's Gen3
+cache/provider and a Step 8 preflight wiring `require_consistent_tile_
+encoder_provenance` across every selected sample's dense-WSI and
+spot-feature caches -- not directly with the training loop. No previous
+fixes need undoing.
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 535 passed (45 reused-infra + 27 example-schema +
+  11 boundary-graph + 36 slide-context + 9 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 31 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 17 dataset-manifest + 26 example-builder +
+  46 mask-fingerprint + 22 novae-graph + 4 loaders + 11 spot-feature-cache
+  [new file] + 7 tile-encoder-preflight [new file])
+gen2_architectures + gen3_multiscale: 708 passed, 1 skipped
+(repo-root tests/test_conditioning.py: 13 passed, unchanged this round --
+the fix this round lives entirely in gen3_multiscale/, plus one shared
+validator refactor inside gen3_multiscale/data/slide_context.py)
+```
+
+The block immediately below (pre-20th-re-audit test counts) is kept for
+historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 517 passed (45 reused-infra + 27 example-schema +
