@@ -26,6 +26,11 @@ def _load_split_samples(cfg, manifest, split):
 
 def test_load_gen3_sample_data_returns_a_verified_sample(tmp_path, monkeypatch):
     cfg, manifest = build_synthetic_gen3_experiment(tmp_path, monkeypatch)
+    # Adam's Step 6 audit #6 of commit a32051b: the dense-WSI cache is now
+    # only loaded for an architecture that actually consumes it
+    # (use_regional_he/use_global_slide) -- this test's OWN point is to
+    # exercise that loaded path, so it must ask for one explicitly.
+    cfg.model = {"params": {"use_regional_he": True}}
     sample_id = manifest["train_sample_ids"][0]
     sample = load_gen3_sample_data(cfg, manifest, sample_id)
     assert isinstance(sample, Gen3SampleData)
@@ -38,6 +43,25 @@ def test_load_gen3_sample_data_returns_a_verified_sample(tmp_path, monkeypatch):
     assert sample.tile_encoder_provenance["dense_wsi"] is not None
     assert sample.tile_encoder_provenance["spot_features"] is not None
     assert sample.tile_encoder_provenance["dense_wsi"]["hf_revision"] == sample.tile_encoder_provenance["spot_features"]["hf_revision"]
+
+
+def test_load_gen3_sample_data_skips_dense_wsi_cache_when_architecture_does_not_consume_it(tmp_path, monkeypatch):
+    """Adam's Step 6 audit #6 of commit a32051b: "do not load dense WSI
+    caches for architectures that do not consume them." A config with
+    neither use_regional_he nor use_global_slide set (or no model.params
+    section at all, e.g. Architecture 1/2) must never pay for the dense-
+    WSI cache load, even when data.slide_context_source is configured to
+    dense_wsi_cache."""
+    cfg, manifest = build_synthetic_gen3_experiment(tmp_path, monkeypatch)
+    sample_id = manifest["train_sample_ids"][0]
+    sample = load_gen3_sample_data(cfg, manifest, sample_id)
+    assert sample.slide_context_record is None
+    assert sample.tile_encoder_provenance["dense_wsi"] is None
+    assert sample.tile_encoder_provenance["spot_features"] is not None
+
+    cfg.model = {"params": {"use_regional_he": False, "use_global_slide": False}}
+    sample_explicit_false = load_gen3_sample_data(cfg, manifest, sample_id)
+    assert sample_explicit_false.tile_encoder_provenance["dense_wsi"] is None
 
 
 def test_load_gen3_sample_data_rejects_an_unknown_sample_id(tmp_path, monkeypatch):

@@ -147,7 +147,7 @@ def static_config_audit(named_configs: dict[str, dict]) -> dict:
     }
 
 
-def check_required_fingerprints(config: dict) -> list[str]:
+def check_required_fingerprints(config: dict, *, smoke_only: bool = False) -> list[str]:
     """"Refuse to start if any required checkpoint, vocabulary, cache,
     split, or mask-bank fingerprint is absent." A config declares its
     candidate paths under `required_fingerprints: {name: path}`; this
@@ -171,10 +171,27 @@ def check_required_fingerprints(config: dict) -> list[str]:
     `gigapath_checkpoint` is only consumed when `model.params.
     use_global_slide` is true (`train.py::maybe_build_slide_encoder`);
     `gene_residual_basis` only for Architecture 4 (`train.py::
-    maybe_load_gene_basis`). Every OTHER declared `required_fingerprints`
-    entry this config doesn't actually need is intentionally never
-    checked here -- a config listing extra, unused paths (e.g. for a
-    future Step 7/8 consumer) must not block launch on their account."""
+    maybe_load_gene_basis`) -- required even for a smoke launch, since
+    Architecture4's constructor needs a real gene basis just to build the
+    model at all. Every OTHER declared `required_fingerprints` entry this
+    config doesn't actually need is intentionally never checked here -- a
+    config listing extra, unused paths (e.g. for a future Step 7/8
+    consumer) must not block launch on their account.
+
+    Real, confirmed gap (Adam's Step 6 audit #8 of commit a32051b):
+    "Require Architecture 4's conditioner checkpoint in launcher
+    preflight." `architecture3_conditioner_checkpoint` was previously
+    never checked here at all -- `train.py::
+    maybe_load_pretrained_conditioner_for_architecture4` DOES require it
+    for any non-smoke Architecture 4 run (and raises if missing), meaning
+    the launcher's own preflight gate was weaker than the trainer's own
+    runtime check it is supposed to front-run: a real, non-smoke
+    Architecture 4 launch could pass this gate and still fail deep inside
+    the trainer. `smoke_only`, mirroring `train.py`'s own `--smoke` vs
+    `--smoke --staged-smoke` distinction (a plain smoke is CONSTRUCTION-
+    ONLY and exempt; `default_command_builder`'s `--smoke` produces a
+    construction-only smoke, so this launcher's own smoke phase is
+    correctly not blocked on a checkpoint that phase never touches)."""
     required_fingerprints = config.get("required_fingerprints") or {}
     model_params = (config.get("model") or {}).get("params") or {}
     architecture_id = str((config.get("model") or {}).get("architecture", ""))
@@ -184,6 +201,8 @@ def check_required_fingerprints(config: dict) -> list[str]:
         needed.add("gigapath_checkpoint")
     if architecture_id == "4":
         needed.add("gene_residual_basis")
+        if not smoke_only:
+            needed.add("architecture3_conditioner_checkpoint")
 
     missing = []
     for name in sorted(needed):
@@ -374,7 +393,7 @@ def launch_suite(
 
     if not skip_fingerprint_check:
         for name, cfg in named_configs.items():
-            missing = check_required_fingerprints(cfg)
+            missing = check_required_fingerprints(cfg, smoke_only=smoke_only)
             if missing:
                 raise ValueError(f"{name}: refusing to start -- missing required fingerprints: {missing}")
 

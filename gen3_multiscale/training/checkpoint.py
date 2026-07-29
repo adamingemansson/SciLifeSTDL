@@ -51,6 +51,7 @@ restart with different optimization dynamics, not a real continuation.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -119,25 +120,12 @@ def _history_dir(checkpoint_dir: str | Path) -> Path:
     return Path(checkpoint_dir) / "history"
 
 
-def _snapshot_into_history(checkpoint_dir: str | Path, step: int) -> Path:
-    """Hard-link (falling back to a real copy across filesystems) the just-
-    written root checkpoint files into a step-numbered history snapshot.
-    Root files must already exist by the time this is called."""
-    out_dir = Path(checkpoint_dir)
-    snapshot_dir = _history_dir(checkpoint_dir) / f"step_{int(step):08d}"
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-    for name in _CHECKPOINT_FILENAMES:
-        src = out_dir / name
-        if not src.is_file():
-            continue
-        dst = snapshot_dir / name
-        if dst.exists():
-            dst.unlink()
-        try:
-            os.link(src, dst)
-        except OSError:
-            shutil.copy2(src, dst)
-    return snapshot_dir
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _prune_history(checkpoint_dir: str | Path, keep_last: int) -> None:
@@ -194,6 +182,14 @@ def rollback_checkpoint(checkpoint_dir: str | Path, step: int) -> None:
         tmp_path = out_dir / f"{name}.tmp{os.getpid()}"
         shutil.copy2(src, tmp_path)
         os.replace(tmp_path, out_dir / name)
+    # Audit #5 of commit a32051b (atomic "latest" pointer): every real
+    # loader below resolves through latest_step.json, not the root files
+    # directly -- rolling back must move that pointer too, or the next
+    # resume would silently ignore the rollback and keep resolving to the
+    # newer (rolled-back-FROM) step's still-present history bundle.
+    pointer_tmp = out_dir / f"latest_step.json.tmp{os.getpid()}"
+    pointer_tmp.write_text(json.dumps({"step": int(step)}, indent=2))
+    os.replace(pointer_tmp, out_dir / "latest_step.json")
     print(f"rolled back {out_dir} to step {step} (from history snapshot {snapshot_dir})")
 
 
@@ -237,18 +233,51 @@ def save_checkpoint(
     step: int, extra_metadata: dict | None = None, keep_last: int = 2,
     optimizer: torch.optim.Optimizer | None = None, rng: random.Random | None = None,
 ) -> None:
-    weights_path = save_trainable_state(model, checkpoint_dir)
-    out_dir = Path(checkpoint_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    """Transactional checkpoint save -- Adam's Step 6 audit #5 of commit
+    a32051b: "Make checkpoints transactional: immutable step bundles,
+    per-file hashes and step identity, manifest written last, fail-closed
+    loading, atomic latest pointer." Before this, `checkpoint_dir`'s root
+    files were each individually atomic (temp-then-replace) but NOT
+    atomic as a GROUP -- a crash between two of those individual writes
+    could leave a root checkpoint with e.g. `trainable_weights.pt` from
+    step N but `training_state.json` still from step N-1, with nothing
+    that would ever detect or refuse that mismatch on the next load.
+
+    The complete step bundle (weights + config + gene names + training
+    state + optimizer/RNG state, plus a `manifest.json` of per-file
+    sha256 hashes written LAST) is now built in a staging directory and
+    renamed into `history/step_XXXXXXXX/` with a single atomic
+    `os.replace` -- that directory is therefore always either absent or
+    fully complete, never partially written. `checkpoint_dir`'s root
+    files are refreshed afterward purely as a convenience mirror (so
+    existing tooling that reads root files directly keeps working); every
+    REAL loader below resolves through `latest_step.json` (the atomic
+    pointer, written last of all) to the immutable bundle and verifies
+    its manifest hashes before trusting anything, so a crash during the
+    root-mirror refresh can no longer corrupt what gets loaded.
+
+    A step bundle is now always created (regardless of `keep_last`,
+    unlike the pre-audit-#5 behavior where `keep_last<=0` meant no
+    history/transactionality at all) -- `keep_last<=0` still means
+    "prune nothing," matching `_prune_history`'s existing contract, but
+    can no longer mean "skip the one mechanism that makes a checkpoint
+    verifiable.\""""
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    history_dir = _history_dir(checkpoint_dir)
+    history_dir.mkdir(parents=True, exist_ok=True)
+    step_dir = history_dir / f"step_{int(step):08d}"
+    staging_dir = history_dir / f".step_{int(step):08d}.staging{os.getpid()}"
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    weights_path = save_trainable_state(model, staging_dir)
     for name, payload in [
         ("model_config.json", model_config), ("gene_names.json", list(gene_names)),
         ("training_state.json", {"step": int(step), **(extra_metadata or {})}),
     ]:
-        final_path = out_dir / name
-        tmp_path = out_dir / f"{name}.tmp{os.getpid()}"
-        with open(tmp_path, "w") as f:
-            json.dump(payload, f, indent=2)
-        os.replace(tmp_path, final_path)
+        (staging_dir / name).write_text(json.dumps(payload, indent=2))
 
     # 2026-07-27 (GPT-audit-flagged, fix #6): checkpoints used to save
     # ONLY model weights -- no AdamW optimizer state (momentum/variance
@@ -259,25 +288,107 @@ def save_checkpoint(
     # a caller that truly doesn't care (e.g. a one-off inference/eval
     # rebuild) can simply not pass optimizer, and no file is written.
     if optimizer is not None:
-        opt_path = out_dir / "optimizer_rng_state.pt"
-        opt_tmp_path = out_dir / f"optimizer_rng_state.pt.tmp{os.getpid()}"
-        torch.save({"optimizer": optimizer.state_dict(), **_rng_state_blob(rng)}, opt_tmp_path)
-        os.replace(opt_tmp_path, opt_path)
+        torch.save(
+            {"optimizer": optimizer.state_dict(), **_rng_state_blob(rng)},
+            staging_dir / "optimizer_rng_state.pt",
+        )
 
     weights_size = weights_path.stat().st_size if weights_path is not None else 0
+
+    file_hashes = {
+        name: _file_sha256(staging_dir / name) for name in _CHECKPOINT_FILENAMES if (staging_dir / name).is_file()
+    }
+    step_manifest = {"version": 1, "kind": "gen3_checkpoint_step_manifest", "step": int(step), "files": file_hashes}
+    # Written LAST inside the staging directory -- a loader can treat its
+    # presence (and its own hashes matching) as proof this bundle
+    # finished writing completely.
+    (staging_dir / "manifest.json").write_text(json.dumps(step_manifest, indent=2, sort_keys=True))
+
+    if step_dir.exists():
+        shutil.rmtree(step_dir)
+    os.replace(staging_dir, step_dir)  # atomic: step_dir is now either absent or fully complete
+
+    # Refresh checkpoint_dir's ROOT files as a convenience mirror, always
+    # sourced from the just-completed IMMUTABLE bundle -- real loaders
+    # below never trust these root files directly; they resolve through
+    # latest_step.json instead, so a crash between these per-file
+    # root-mirror writes can no longer corrupt what gets loaded.
+    for name in _CHECKPOINT_FILENAMES:
+        src = step_dir / name
+        if not src.is_file():
+            continue
+        tmp_root = checkpoint_dir / f"{name}.tmp{os.getpid()}"
+        try:
+            os.link(src, tmp_root)
+        except OSError:
+            shutil.copy2(src, tmp_root)
+        os.replace(tmp_root, checkpoint_dir / name)
+
     if keep_last > 0:
-        _snapshot_into_history(checkpoint_dir, step)
         _prune_history(checkpoint_dir, keep_last)
+
+    # Atomic "latest" pointer, written LAST of everything in this
+    # function -- a crash at any point before this line leaves
+    # latest_step.json unchanged (still pointing at the previous,
+    # still-fully-valid step), never at a step whose bundle isn't
+    # actually complete yet.
+    pointer_tmp = checkpoint_dir / f"latest_step.json.tmp{os.getpid()}"
+    pointer_tmp.write_text(json.dumps({"step": int(step)}, indent=2))
+    os.replace(pointer_tmp, checkpoint_dir / "latest_step.json")
+
     history_steps = list_checkpoint_history(checkpoint_dir)
     history_size = sum(
         f.stat().st_size for f in _history_dir(checkpoint_dir).rglob("*") if f.is_file()
     ) if history_steps else 0
     print(
-        f"checkpoint saved to {out_dir} (step {step}"
+        f"checkpoint saved to {checkpoint_dir} (step {step}"
         f"{', weights + config + gene names' if weights_path is not None else ', config + gene names only (no trainable weights)'}"
         f", weights={_human_size(weights_size)}"
         f", history kept={history_steps} total_history_size={_human_size(history_size)})"
     )
+
+
+def _resolve_checkpoint_source(checkpoint_dir: str | Path) -> Path:
+    """Fail-closed transactional load resolution -- Adam's Step 6 audit #5
+    of commit a32051b: "fail-closed loading." If `checkpoint_dir/
+    latest_step.json` exists, resolves to that step's IMMUTABLE history
+    bundle and verifies every file the bundle's own `manifest.json`
+    recorded still matches its sha256 on disk right now -- a crash
+    between individual file writes (or the checkpoint being altered
+    after being written) can therefore no longer silently produce a load
+    built from files belonging to different steps; the whole bundle is
+    rejected instead. Falls back to `checkpoint_dir` itself when there is
+    no pointer -- a `best/` bundle (verified separately, by `train.py::
+    verify_checkpoint_bundle_identity`) or a legacy checkpoint saved
+    before this pointer existed."""
+    checkpoint_dir = Path(checkpoint_dir)
+    pointer_path = checkpoint_dir / "latest_step.json"
+    if not pointer_path.is_file():
+        return checkpoint_dir
+    pointer = json.loads(pointer_path.read_text())
+    step = int(pointer["step"])
+    step_dir = _history_dir(checkpoint_dir) / f"step_{step:08d}"
+    manifest_path = step_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            f"checkpoint at {checkpoint_dir} points (via latest_step.json) at step {step} but its "
+            f"bundle manifest is missing at {manifest_path} -- refusing to load a possibly-partial "
+            "or corrupted checkpoint"
+        )
+    step_manifest = json.loads(manifest_path.read_text())
+    for name, expected_hash in (step_manifest.get("files") or {}).items():
+        file_path = step_dir / name
+        if not file_path.is_file():
+            raise RuntimeError(
+                f"checkpoint step {step} bundle manifest references {name} but it is missing from "
+                f"{step_dir} -- refusing to load a corrupted checkpoint"
+            )
+        if _file_sha256(file_path) != expected_hash:
+            raise RuntimeError(
+                f"checkpoint step {step} file {name} does not match the sha256 recorded in its own "
+                "bundle manifest -- corrupted or partially-written checkpoint, refusing to load"
+            )
+    return step_dir
 
 
 def load_trainable_state(model: nn.Module, checkpoint_dir: str | Path) -> None:
@@ -295,8 +406,11 @@ def load_trainable_state(model: nn.Module, checkpoint_dir: str | Path) -> None:
     whole job is to fail loudly rather than load a wrong or partial
     state. Same fix applied identically to gen2_architectures/training/
     checkpoint.py's copy of this function, per this file's own
-    copy-provenance discipline."""
-    in_dir = Path(checkpoint_dir)
+    copy-provenance discipline. Resolves through `_resolve_checkpoint_source`
+    first (audit #5) -- for a transactional checkpoint_dir this loads
+    from the verified, immutable history bundle, never directly from the
+    (merely a convenience mirror) root files."""
+    in_dir = _resolve_checkpoint_source(checkpoint_dir)
     weights_path = in_dir / "trainable_weights.pt"
     trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
     if weights_path.is_file():
@@ -317,7 +431,7 @@ def load_trainable_state(model: nn.Module, checkpoint_dir: str | Path) -> None:
 
 
 def load_training_state(checkpoint_dir: str | Path) -> dict:
-    path = Path(checkpoint_dir) / "training_state.json"
+    path = _resolve_checkpoint_source(checkpoint_dir) / "training_state.json"
     if not path.is_file():
         return {"step": 0}
     return json.loads(path.read_text())
@@ -336,8 +450,12 @@ def verify_gene_names(checkpoint_dir: str | Path, gene_names: list[str]) -> None
     until metrics look wrong. Call this once at resume time, right after
     confirming a checkpoint exists, before load_trainable_state -- mirrors
     the exact same ordered-identity check already used for Stage A/Stage B
-    (train_arch3_stage_b.py::_load_stage_a)."""
-    path = Path(checkpoint_dir) / "gene_names.json"
+    (train_arch3_stage_b.py::_load_stage_a). Resolves through
+    `_resolve_checkpoint_source` first (audit #5) -- the verified,
+    immutable history bundle, not the (merely a convenience mirror) root
+    files."""
+    resolved_dir = _resolve_checkpoint_source(checkpoint_dir)
+    path = resolved_dir / "gene_names.json"
     if not path.is_file():
         raise ValueError(
             f"checkpoint at {checkpoint_dir} has no gene_names.json -- cannot verify its gene "
@@ -369,8 +487,9 @@ def load_optimizer_and_rng_state(
     checkpoint saved without an optimizer (e.g. a fully-frozen model) —
     callers should treat that as "fresh optimizer state, resume anyway"
     rather than an error, since older/lighter checkpoints are still
-    otherwise valid to resume from."""
-    path = Path(checkpoint_dir) / "optimizer_rng_state.pt"
+    otherwise valid to resume from. Resolves through
+    `_resolve_checkpoint_source` first (audit #5)."""
+    path = _resolve_checkpoint_source(checkpoint_dir) / "optimizer_rng_state.pt"
     if not path.is_file():
         return False
     # weights_only=False: this file isn't a bare state_dict, it also

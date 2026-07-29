@@ -84,6 +84,13 @@ def test_run_training_smoke_runs_one_step_for_architecture1_and_2(tmp_path, monk
     assert (checkpoint_dir / "run_manifest.json").is_file()
     assert not (checkpoint_dir / "trainable_weights.pt").is_file()
 
+    # Adam's Step 6 audit #9 of commit a32051b: "Record environment
+    # versions." Never a claim of bit-exact CUDA determinism -- see
+    # verify_resume_consistency's own scope-caveat docstring.
+    run_manifest = json.loads((checkpoint_dir / "run_manifest.json").read_text())
+    assert run_manifest["environment_versions"]["torch"]
+    assert "code_commit_hash" in run_manifest
+
 
 def test_run_training_smoke_runs_architecture3_with_regional_he(tmp_path, monkeypatch):
     """use_regional_he=True, use_global_gex=True, use_global_slide=False --
@@ -276,9 +283,21 @@ def test_run_training_refuses_to_resume_under_a_changed_architecture(tmp_path, m
 
 
 def test_run_training_requires_optimizer_state_to_resume_a_real_checkpoint(tmp_path, monkeypatch):
-    """Regression test: a checkpoint_dir with training_state.json (step >
-    0) but no optimizer_rng_state.pt must refuse to resume rather than
-    silently restarting optimizer momentum/RNG state from scratch."""
+    """Regression test: a checkpoint whose IMMUTABLE history bundle is
+    missing optimizer_rng_state.pt must refuse to resume rather than
+    silently restarting optimizer momentum/RNG state from scratch.
+
+    Adam's Step 6 audit #5 of commit a32051b made checkpoints
+    transactional: every real loader now resolves through
+    `latest_step.json` to the immutable `history/step_XXXXXXXX/` bundle,
+    never trusting `checkpoint_dir`'s root files directly (those are only
+    a convenience mirror). So corrupting/deleting a file from the ROOT
+    no longer simulates an incomplete checkpoint -- this test now deletes
+    the file from the actual immutable bundle the loader resolves to,
+    which correctly raises a fail-closed RuntimeError at
+    `_resolve_checkpoint_source` (the bundle's own manifest.json still
+    references the now-missing file) before `run_training` even gets to
+    its own optimizer-state check."""
     cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
     sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
     config_path = tmp_path / "config.yaml"
@@ -292,11 +311,13 @@ def test_run_training_requires_optimizer_state_to_resume_a_real_checkpoint(tmp_p
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
     train_module.run_training(str(config_path), smoke=False)
     assert (checkpoint_dir / "optimizer_rng_state.pt").is_file()
-    (checkpoint_dir / "optimizer_rng_state.pt").unlink()
+    step_bundle_dir = checkpoint_dir / "history" / "step_00000001"
+    assert (step_bundle_dir / "optimizer_rng_state.pt").is_file()
+    (step_bundle_dir / "optimizer_rng_state.pt").unlink()
 
     config["training"]["total_steps"] = 2
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
-    with pytest.raises(ValueError, match="optimizer_rng_state"):
+    with pytest.raises(RuntimeError, match="optimizer_rng_state"):
         train_module.run_training(str(config_path), smoke=False)
 
 
@@ -378,6 +399,35 @@ def test_compute_training_gene_scale_is_a_positive_pure_function_of_training_dat
     assert scale_a.shape == (len(manifest["gene_panel"]),)
     assert (scale_a > 0).all()
     assert np.array_equal(scale_a, scale_b)
+
+
+def test_compute_training_gene_scale_streaming_matches_naive_dense_pooled_std(tmp_path, monkeypatch):
+    """Adam's Step 6 audit #6 of commit a32051b: compute_training_gene_scale
+    now streams per-gene sum/sum-of-squares in row chunks (sparse-sliced
+    before densifying) instead of densifying and concatenating every
+    training sample's full expression matrix at once. Numerically proves
+    the streamed result matches the old naive full-densify-then-.std()
+    computation (within float64 accumulation-order tolerance), and that
+    the result is INDEPENDENT of chunk_size."""
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    from gen3_multiscale.training.gen3_dataset import load_gen3_sample_data
+
+    train_samples = {sid: load_gen3_sample_data(cfg, manifest, sid) for sid in manifest["train_sample_ids"]}
+
+    pooled = []
+    for sample in train_samples.values():
+        X = sample.adata.X
+        X = X.toarray() if hasattr(X, "toarray") else np.asarray(X)
+        pooled.append(np.asarray(X, dtype=np.float64))
+    naive_scale = np.clip(np.concatenate(pooled, axis=0).std(axis=0), 1e-6, None).astype(np.float32)
+
+    streamed_default = train_module.compute_training_gene_scale(train_samples)
+    streamed_tiny_chunks = train_module.compute_training_gene_scale(train_samples, chunk_size=1)
+    streamed_huge_chunks = train_module.compute_training_gene_scale(train_samples, chunk_size=10_000)
+
+    np.testing.assert_allclose(streamed_default, naive_scale, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(streamed_tiny_chunks, naive_scale, rtol=1e-5, atol=1e-6)
+    np.testing.assert_array_equal(streamed_default, streamed_huge_chunks)
 
 
 def test_deterministic_train_index_for_step_is_reproducible_and_covers_the_dataset():

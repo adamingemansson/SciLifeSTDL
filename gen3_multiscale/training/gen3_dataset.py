@@ -152,7 +152,24 @@ def load_gen3_sample_data(cfg, manifest: dict, sample_id: str) -> Gen3SampleData
     dense_wsi_provenance = None
     slide_context_record = None
     source = str(cfg.data.get("slide_context_source", "disabled"))
-    if source != "disabled":
+    # Adam's Step 6 audit #6 of commit a32051b: "do not load dense WSI
+    # caches for architectures that do not consume them." The dense-WSI
+    # fields (wsi_tile_longnet_coords/wsi_tile_regional_coords/
+    # wsi_tile_features/full_slide_coord_bounds -- see data/example.py's
+    # own docstring) feed BOTH the real GigaPath LongNet global vector
+    # (use_global_slide) AND regional-token spatial pooling
+    # (use_regional_he) -- gating on use_global_slide alone would
+    # silently break a use_regional_he-only architecture (Architecture 3
+    # without use_global_slide), so both flags are checked. Architecture
+    # 1/2 configs use neither, and previously still paid the full dense
+    # WSI cache load (real per-slide-tile-set I/O + memory) every time
+    # `data.slide_context_source` was left non-"disabled" in a shared
+    # config, even though nothing downstream ever reads the result.
+    model_params = cfg.get("model", {}).get("params", {}) or {}
+    architecture_needs_dense_wsi_cache = bool(model_params.get("use_regional_he", False)) or bool(
+        model_params.get("use_global_slide", False)
+    )
+    if source != "disabled" and architecture_needs_dense_wsi_cache:
         spot_features_for_slide = None  # dense_wsi_cache path never needs precomputed spot features
         slide_context_record = slide_context.load_slide_context(
             cfg, sample_id, spot_features_for_slide, full_sample_coords.astype(np.float32),
@@ -199,6 +216,7 @@ class _HeldOutMaskItem:
     sample_id: str
     context_obs_names: list
     query_obs_names: list
+    stratum: str | None = None
 
 
 @dataclass
@@ -296,7 +314,7 @@ def build_gen3_mask_schedule(
             for record in bank["records"]:
                 schedule.held_out_items.append(_HeldOutMaskItem(
                     sample_id=sample_id, context_obs_names=record["context_obs_names"],
-                    query_obs_names=record["query_obs_names"],
+                    query_obs_names=record["query_obs_names"], stratum=record.get("stratum"),
                 ))
     return schedule
 
@@ -341,6 +359,20 @@ class Gen3SpatialFieldDataset(torch.utils.data.Dataset):
 
     def __len__(self) -> int:
         return len(self._items)
+
+    def item_identity(self, idx: int) -> dict:
+        """`sample_id`/`stratum` for item `idx` in this FIXED, deterministic
+        schedule -- Adam's Step 6 audit #7 of commit a32051b: the
+        evaluator needs "sample/patient/mask/stratum identity" per
+        retained record, which the raw `(inputs, targets)` pair returned
+        by `__getitem__` doesn't carry (`patient_id` is on `inputs`
+        itself; `stratum` is schedule-level and train items already
+        carry it, so this exposes the same field for held-out items).
+        `stratum` is `None` for a schedule built before `_HeldOutMaskItem`
+        gained this field, or if the underlying mask bank record never
+        had one (defensive, not expected in real use)."""
+        item = self._items[idx % len(self._items)]
+        return {"sample_id": item.sample_id, "stratum": getattr(item, "stratum", None)}
 
     def _resolve_barcodes(self, item) -> tuple[list, list]:
         if isinstance(item, _TrainMaskItem):

@@ -42,12 +42,13 @@ from gen3_multiscale.data.dataset_manifest import load_dataset_manifest
 from gen3_multiscale.evaluation.metrics import (
     aggregate_patient_metrics, embed_pca, pearson_per_gene, rmse, st_fid, st_mmd,
 )
-from gen3_multiscale.models import model_factory
 from gen3_multiscale.models.harmonic import harmonic_interpolation
-from gen3_multiscale.training import checkpoint as checkpoint_module
 from gen3_multiscale.training.gen3_dataset import Gen3SpatialFieldDataset, build_gen3_mask_schedule
 from gen3_multiscale.training.gen3_preflight import load_and_preflight_samples
-from gen3_multiscale.training.train import expected_tile_encoder_provenance, resolved_config
+from gen3_multiscale.training.train import (
+    build_model_for_inference, expected_tile_encoder_provenance, predict_for_metrics, resolved_config,
+    verify_checkpoint_bundle_identity,
+)
 
 
 def per_item_reconstruction_metrics(pred: np.ndarray, true: np.ndarray) -> dict:
@@ -109,24 +110,25 @@ _BASELINE_PREDICTORS = {
 }
 
 
-def _load_model_for_evaluation(config: dict, checkpoint_dir: str | Path, gene_names: list[str], device: torch.device):
-    """Construct the real architecture from `config` and load a real,
-    already-trained checkpoint's trainable weights onto it -- never a
-    random/untrained model. Architecture 4's `gene_basis`/`gene_names`
-    are supplied the same way `train.py` supplies them (loaded via
-    `required_fingerprints.gene_residual_basis`)."""
-    from gen3_multiscale.training.train import maybe_load_gene_basis
-
-    architecture_id = str(config["model"]["architecture"])
-    n_genes = len(gene_names)
-    gex_feature_dim = int(config["data"].get("gex_feature_dim", 128))
-    gene_basis, resolved_gene_names = maybe_load_gene_basis(config, gene_names)
-    model = model_factory.build_architecture(
-        config, n_genes=n_genes, gex_feature_dim=gex_feature_dim, gene_basis=gene_basis,
-        gene_names=resolved_gene_names, seed=int(config["training"].get("seed", 0)),
-    ).to(device)
-    checkpoint_module.verify_gene_names(checkpoint_dir, gene_names)
-    checkpoint_module.load_trainable_state(model, checkpoint_dir)
+def _load_model_for_evaluation(
+    config: dict, checkpoint_dir: str | Path, gene_names: list[str], device: torch.device,
+    dataset_manifest: dict | None = None,
+):
+    """Construct the real architecture and load a real, already-trained
+    checkpoint's trainable weights onto it -- never a random/untrained
+    model. Adam's Step 6 audit #2 of commit a32051b: this now calls the
+    ONE shared `train.py::build_model_for_inference` pipeline, which
+    additionally loads+freezes Architecture 4's exact Architecture 3
+    conditioner -- a real, confirmed gap in the PRIOR version of this
+    function, which built the architecture and loaded trainable weights
+    but never called `maybe_load_pretrained_conditioner_for_architecture4`
+    at all, so Architecture 4 evaluation was silently evaluating a
+    conditioner that was never correctly loaded/frozen from the real
+    Architecture 3 checkpoint the way training did."""
+    model, _info = build_model_for_inference(
+        config, gene_names=gene_names, device=device, checkpoint_dir=checkpoint_dir, smoke=False,
+        dataset_manifest=dataset_manifest,
+    )
     model.eval()
     return model
 
@@ -136,16 +138,30 @@ def evaluate_gen3_checkpoint(
     n_masks_per_sample: int = 8, use_best: bool = True, compute_st_fid_mmd: bool = False,
     allow_test: bool = False, device_str: str = "cpu",
 ) -> dict:
-    """The real Step 7 minimal evaluation entrypoint. Runs a REAL,
-    already-trained checkpoint over the FIXED, deterministic held-out
-    mask schedule for `split`, computing per-item/per-mask PCC+RMSE
-    (with valid-gene counts) for the model AND every baseline, then
+    """The real Step 7 evaluation entrypoint. Runs a REAL, already-trained
+    checkpoint over the FIXED, deterministic held-out mask schedule for
+    `split`, computing per-item/per-mask PCC+RMSE (with valid-gene
+    counts) for the model AND every baseline, then
     `aggregate_patient_metrics` for patient-level means + 95% CIs.
 
     `split` must be "validation" unless `allow_test=True` is passed
     explicitly -- "Never select using test samples" is enforced here
     structurally, not just documented: this function refuses to touch
-    test-split data at all by default."""
+    test-split data at all by default.
+
+    Adam's Step 6 audit #7 of commit a32051b extended this report with:
+    retained per-item records (`per_item_records`, each carrying
+    sample/patient/mask/stratum identity, so a caller can re-slice by any
+    of those after the fact -- the prior version discarded every
+    per-item value the moment it was folded into the aggregate); paired
+    model-vs-baseline deltas with their own patient-level CIs
+    (`per_arm_paired_delta_vs_model`, computed item-by-item, not by
+    comparing two independently-aggregated means); Architecture 4's
+    predictive uncertainty (`predictive_std_mean`, folded into
+    `per_arm_patient_aggregated_metrics["model"]` when available); and a
+    fail-closed check of the checkpoint's own bundle identity against
+    THIS evaluation's dataset/gene-panel before any weights are loaded
+    (audit #4's altered-cache/swapped-checkpoint adversarial scenario)."""
     if split == "test" and not allow_test:
         raise ValueError(
             "evaluate_gen3_checkpoint refuses split='test' unless allow_test=True is passed "
@@ -157,6 +173,7 @@ def evaluate_gen3_checkpoint(
         raise ValueError(f"split must be 'validation' or 'test', got {split!r}")
 
     config = resolved_config(config_path)
+    architecture_id = str(config["model"]["architecture"])
     data_cfg = config["data"]
     dataset_manifest = load_dataset_manifest(data_cfg["gen3_manifest_path"])
     split_ids = list(dataset_manifest[f"{split}_sample_ids"])
@@ -186,28 +203,57 @@ def evaluate_gen3_checkpoint(
     device = torch.device(device_str)
     checkpoint_dir = Path(checkpoint_dir)
     weights_dir = checkpoint_dir / "best" if use_best and (checkpoint_dir / "best").is_dir() else checkpoint_dir
-    model = _load_model_for_evaluation(config, weights_dir, gene_names, device)
+    # Audit #4/#7: fail-closed pre-load verification of a `best/` bundle
+    # against THIS evaluation's own dataset/gene panel -- catches an
+    # altered/corrupted bundle (a file changed after being written) or a
+    # checkpoint selected under different data than what's being
+    # evaluated against now, before any weights are loaded.
+    if (weights_dir / "best_info.json").is_file():
+        verify_checkpoint_bundle_identity(weights_dir, dataset_manifest=dataset_manifest, gene_names=gene_names)
+    model = _load_model_for_evaluation(config, weights_dir, gene_names, device, dataset_manifest=dataset_manifest)
 
     per_item_by_arm: dict[str, list[dict]] = {"model": []}
     for name in _BASELINE_PREDICTORS:
         per_item_by_arm[name] = []
     patient_ids: list[str] = []
+    per_item_records: list[dict] = []
+    predictive_stds: list[float] = []
     real_expression_for_embedding: list[np.ndarray] = []
     model_expression_for_embedding: list[np.ndarray] = []
 
+    # Audit #1: Architecture 4's reported prediction comes from
+    # `sample_predictive_distribution`'s predictive mean, reseeded per
+    # item from (a fixed evaluation seed, idx) so repeated evaluation
+    # runs against the same checkpoint are exactly reproducible.
     with torch.no_grad():
         for idx in range(len(dataset)):
             inputs, targets = dataset[idx]
             true_expression = np.asarray(targets.query_expression, dtype=np.float32)
             patient_ids.append(str(inputs.patient_id))
+            item_identity = dataset.item_identity(idx)
 
-            out = model(inputs)
-            model_pred = np.asarray(out["expression"].detach().cpu().numpy(), dtype=np.float32)
-            per_item_by_arm["model"].append(per_item_reconstruction_metrics(model_pred, true_expression))
+            item_generator = torch.Generator(device=device).manual_seed((idx * 104_729 + 1) % (2**63))
+            prediction = predict_for_metrics(architecture_id, model, inputs, generator=item_generator)
+            model_pred = np.asarray(prediction["expression"].detach().cpu().numpy(), dtype=np.float32)
+            model_item_metrics = per_item_reconstruction_metrics(model_pred, true_expression)
+            if "predictive_std" in prediction:
+                item_predictive_std = float(prediction["predictive_std"].detach().mean().cpu())
+                model_item_metrics["predictive_std_mean"] = item_predictive_std
+                predictive_stds.append(item_predictive_std)
+            per_item_by_arm["model"].append(model_item_metrics)
+
+            record = {
+                "idx": idx, "sample_id": item_identity["sample_id"], "patient_id": str(inputs.patient_id),
+                "stratum": item_identity["stratum"], "model": model_item_metrics,
+            }
 
             for name, predictor in _BASELINE_PREDICTORS.items():
                 baseline_pred = predictor(inputs)
-                per_item_by_arm[name].append(per_item_reconstruction_metrics(baseline_pred, true_expression))
+                baseline_item_metrics = per_item_reconstruction_metrics(baseline_pred, true_expression)
+                per_item_by_arm[name].append(baseline_item_metrics)
+                record[name] = baseline_item_metrics
+
+            per_item_records.append(record)
 
             if compute_st_fid_mmd:
                 real_expression_for_embedding.append(true_expression)
@@ -216,10 +262,29 @@ def evaluate_gen3_checkpoint(
     aggregated = {
         arm: aggregate_patient_metrics(items, patient_ids) for arm, items in per_item_by_arm.items()
     }
+    if predictive_stds:
+        aggregated["model"]["predictive_std_mean"] = float(np.mean(predictive_stds))
+
+    # Audit #7: PAIRED model-vs-baseline deltas -- computed ITEM BY ITEM
+    # (same mask, same sample) rather than by differencing two
+    # independently-aggregated means, then run through the same
+    # `aggregate_patient_metrics` patient-level-CI machinery used for the
+    # raw metrics. Positive pcc_delta / positive rmse_delta both mean
+    # "the model beat this baseline" on that item.
+    paired_deltas = {}
+    for name in _BASELINE_PREDICTORS:
+        deltas = [
+            {
+                "pcc_delta": model_item["pcc"] - baseline_item["pcc"],
+                "rmse_delta": baseline_item["rmse"] - model_item["rmse"],
+            }
+            for model_item, baseline_item in zip(per_item_by_arm["model"], per_item_by_arm[name])
+        ]
+        paired_deltas[name] = aggregate_patient_metrics(deltas, patient_ids)
 
     report = {
-        "version": 1,
-        "kind": "gen3_step7_minimal_evaluation_report",
+        "version": 2,
+        "kind": "gen3_step7_evaluation_report",
         "config_path": str(config_path),
         "checkpoint_dir": str(checkpoint_dir),
         "weights_dir": str(weights_dir),
@@ -228,6 +293,8 @@ def evaluate_gen3_checkpoint(
         "n_items": len(dataset),
         "cache_preflight_report": preflight_report,
         "per_arm_patient_aggregated_metrics": aggregated,
+        "per_arm_paired_delta_vs_model": paired_deltas,
+        "per_item_records": per_item_records,
     }
 
     if compute_st_fid_mmd and len(real_expression_for_embedding) >= 2:

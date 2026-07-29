@@ -109,12 +109,20 @@ def test_checkpoint_history_is_pruned_to_keep_last():
         assert load_training_state(tmp)["step"] == 300
 
 
-def test_checkpoint_history_disabled_when_keep_last_zero():
+def test_checkpoint_history_pruning_disabled_when_keep_last_zero():
+    """Adam's Step 6 audit #5 of commit a32051b made checkpoints
+    transactional: a step's history bundle (history/step_XXXXXXXX/) is
+    now ALWAYS created, since every real loader resolves through it via
+    latest_step.json -- keep_last<=0 now means "prune nothing" (matching
+    _prune_history's own contract), not "no history/transactionality at
+    all" (the old, pre-audit-#5 meaning)."""
     m = _Tiny()
     with tempfile.TemporaryDirectory() as tmp:
         save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=0, keep_last=0)
-        assert list_checkpoint_history(tmp) == []
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=1, keep_last=0)
+        assert list_checkpoint_history(tmp) == [0, 1]
         assert os.path.exists(os.path.join(tmp, "model_config.json"))
+        assert os.path.exists(os.path.join(tmp, "latest_step.json"))
 
 
 def test_rollback_checkpoint_restores_an_earlier_known_good_snapshot():

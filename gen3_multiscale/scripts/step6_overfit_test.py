@@ -47,11 +47,11 @@ from omegaconf import OmegaConf
 
 from gen3_multiscale.data.dataset_manifest import load_dataset_manifest, save_dataset_manifest
 from gen3_multiscale.evaluation.gen3_evaluator import per_item_reconstruction_metrics
-from gen3_multiscale.models import model_factory
-from gen3_multiscale.training import checkpoint as checkpoint_module
 from gen3_multiscale.training.gen3_dataset import Gen3SpatialFieldDataset, build_gen3_mask_schedule
 from gen3_multiscale.training.gen3_preflight import load_and_preflight_samples
-from gen3_multiscale.training.train import expected_tile_encoder_provenance, maybe_load_gene_basis, run_training
+from gen3_multiscale.training.train import (
+    build_model_for_inference, expected_tile_encoder_provenance, predict_for_metrics, run_training,
+)
 
 
 def build_single_sample_config(config_path: str | Path, sample_id: str, n_steps: int, checkpoint_dir: str | Path) -> Path:
@@ -105,13 +105,22 @@ def _build_fixed_eval_item(config: dict, manifest: dict, sample_id: str):
     return dataset[0]
 
 
-def _evaluate_fixed_item(model: torch.nn.Module, item) -> dict:
+def _evaluate_fixed_item(architecture_id: str, model: torch.nn.Module, item, *, generator=None) -> dict:
+    """Adam's Step 6 audit #1 of commit a32051b: Architecture 4's
+    capacity-gate metric must come from `sample_predictive_distribution`'s
+    predictive mean, not `forward()`'s frozen conditioner -- the prior
+    version called `model(inputs)` unconditionally, so an Architecture 4
+    overfit gate could "pass" purely because its ALREADY-TRAINED
+    conditioner reconstructs its one memorized sample well, without the
+    flow apparatus this test is meant to be exercising ever being
+    evaluated at all. `generator`, when given, makes repeated calls
+    (before/after training) reproducible."""
     inputs, targets = item
     model.eval()
     with torch.no_grad():
-        out = model(inputs)
+        prediction = predict_for_metrics(architecture_id, model, inputs, generator=generator)
     model.train()
-    pred = np.asarray(out["expression"].detach().cpu().numpy(), dtype=np.float32)
+    pred = np.asarray(prediction["expression"].detach().cpu().numpy(), dtype=np.float32)
     true = np.asarray(targets.query_expression, dtype=np.float32)
     return per_item_reconstruction_metrics(pred, true)
 
@@ -121,11 +130,27 @@ def run_overfit_gate(
     *, min_rmse_improvement_fraction: float = 0.1,
 ) -> dict:
     """The real overfit/capacity GATE (not just a run): evaluates the
-    SAME fixed mask before training (real synchronized-init weights) and
-    after (the real trained checkpoint), and RAISES if RMSE did not
-    improve by at least `min_rmse_improvement_fraction`. "Merely
-    completing N steps is not a capacity test" (Adam's Step 6 audit #4) --
-    this function is what actually tests capacity."""
+    SAME fixed mask before training (real synchronized-init weights, plus
+    -- for Architecture 4 -- the real, already-trained Architecture 3
+    conditioner) and after (the real trained checkpoint), and RAISES if
+    RMSE did not improve by at least `min_rmse_improvement_fraction`.
+    "Merely completing N steps is not a capacity test" (Adam's Step 6
+    audit #4) -- this function is what actually tests capacity.
+
+    Adam's Step 6 audit #2 of commit a32051b: model construction now goes
+    through the ONE shared `train.py::build_model_for_inference` pipeline
+    -- the prior version of this function built the architecture inline
+    and never called `maybe_load_pretrained_conditioner_for_architecture4`
+    at all, so an Architecture 4 overfit gate was silently evaluating a
+    conditioner that was never correctly loaded/frozen from the real
+    Architecture 3 checkpoint the way training did. Audit #1: both
+    before/after evaluations now use `predict_for_metrics` (Architecture
+    4's real predictive-mean sample, not `forward()`'s frozen
+    conditioner), reseeded from the SAME fixed seed both times, so the
+    ONLY thing that can differ between "before" and "after" is the
+    trained flow weights themselves -- direct behavioral proof, not just
+    documentation, that a passing gate reflects a real change in
+    Architecture 4's reported prediction."""
     overfit_config_path = build_single_sample_config(config_path, sample_id, n_steps, checkpoint_dir)
     config = OmegaConf.to_container(OmegaConf.load(overfit_config_path), resolve=True)
     overfit_manifest = load_dataset_manifest(config["data"]["gen3_manifest_path"])
@@ -133,30 +158,24 @@ def run_overfit_gate(
 
     architecture_id = str(config["model"]["architecture"])
     gene_names = list(overfit_manifest["gene_panel"])
-    n_genes = len(gene_names)
-    gex_feature_dim = int(config["data"].get("gex_feature_dim", 128))
     seed = int(config["training"].get("seed", 0))
-    gene_basis, resolved_gene_names = maybe_load_gene_basis(config, gene_names)
-    torch.manual_seed(seed)
-    model = model_factory.build_architecture(
-        config, n_genes=n_genes, gex_feature_dim=gex_feature_dim, gene_basis=gene_basis,
-        gene_names=resolved_gene_names, seed=seed,
+    device = torch.device(config["training"].get("device", "cpu") if torch.cuda.is_available() else "cpu")
+
+    before_model, _before_info = build_model_for_inference(
+        config, gene_names=gene_names, device=device, checkpoint_dir=None, smoke=False,
+        dataset_manifest=overfit_manifest,
     )
-    synchronized_init_dir = config["training"].get("synchronized_init_dir")
-    if synchronized_init_dir:
-        sync_dir = Path(synchronized_init_dir)
-        sync_manifest = json.loads((sync_dir / "initialization_manifest.json").read_text())
-        architecture_name = f"architecture{architecture_id}"
-        model_factory.load_synchronized_initialization(
-            model, sync_dir / architecture_name, sync_manifest, architecture_name,
-        )
-    before_metrics = _evaluate_fixed_item(model, fixed_item)
+    before_generator = torch.Generator(device=device).manual_seed(seed)
+    before_metrics = _evaluate_fixed_item(architecture_id, before_model, fixed_item, generator=before_generator)
 
     training_summary = run_training(str(overfit_config_path), smoke=False)
 
-    checkpoint_module.verify_gene_names(checkpoint_dir, gene_names)
-    checkpoint_module.load_trainable_state(model, checkpoint_dir)
-    after_metrics = _evaluate_fixed_item(model, fixed_item)
+    after_model, _after_info = build_model_for_inference(
+        config, gene_names=gene_names, device=device, checkpoint_dir=checkpoint_dir, smoke=False,
+        dataset_manifest=overfit_manifest,
+    )
+    after_generator = torch.Generator(device=device).manual_seed(seed)
+    after_metrics = _evaluate_fixed_item(architecture_id, after_model, fixed_item, generator=after_generator)
 
     rmse_before, rmse_after = before_metrics["rmse"], after_metrics["rmse"]
     relative_improvement = (rmse_before - rmse_after) / rmse_before if rmse_before > 0 else float("nan")

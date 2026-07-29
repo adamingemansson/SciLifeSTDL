@@ -711,6 +711,7 @@ class Architecture4(nn.Module):
     @torch.no_grad()
     def sample_predictive_distribution(
         self, inputs: SpatialFieldInputs, n_samples: int | None = None, n_steps: int | None = None,
+        generator: torch.Generator | None = None,
     ) -> dict:
         """Draws multiple low-rank residual-field samples and adds the
         corresponding full-gene residuals to the deterministic transport
@@ -719,7 +720,15 @@ class Architecture4(nn.Module):
         "expression", so this dict is drop-in compatible with the
         conditioner-only forward()'s output for anything that only reads
         "expression"). Also reports predictive_std (uncertainty) and the
-        raw per-sample field for diversity diagnostics (Phase 7)."""
+        raw per-sample field for diversity diagnostics (Phase 7).
+
+        `generator` (Adam's Step 6 audit #1 of commit a32051b): threaded
+        through to `sample_residual_coefficients`'s own x0 draws so that
+        validation/evaluation/overfit-gate callers get IDENTICAL sampled
+        predictions across a resume or repeated evaluation, the same
+        reproducibility guarantee `compute_losses`/`compute_flow_matching_loss`
+        already give the training-time flow loss via their own
+        `generator` argument."""
         # 17th Codex re-audit (Step 5 Part 2 launch blocker, "Important
         # before Step 6/7"): same device-selection bug as
         # _SharedFieldArchitecture.forward() -- self.conditioner's own
@@ -738,6 +747,7 @@ class Architecture4(nn.Module):
         coefficient_samples = sample_residual_coefficients(
             self.velocity_network, n_query, query_coords, query_hidden,
             n_samples=n_samples or self.n_flow_samples, n_steps=n_steps or self.n_ode_steps,
+            generator=generator,
         )
         residual_samples = coefficient_samples @ self._gene_basis_matrix  # GeneResidualBasis.from_coefficients, device-correct  # [S, Nq, G]
         predictive_samples = deterministic_mean[None] + residual_samples

@@ -24,12 +24,21 @@ from gen3_multiscale.data.tile_encoder_preflight import require_consistent_tile_
 from gen3_multiscale.training.gen3_dataset import Gen3SampleData, load_gen3_sample_data
 
 
-def expected_cache_source_labels(sample_ids) -> set[str]:
-    """Exactly two labels per sample -- `<sample>:dense_wsi` and
-    `<sample>:spot_features` -- never more, never fewer."""
+def expected_cache_source_labels(sample_ids, *, require_dense_wsi: bool = True) -> set[str]:
+    """Exactly `<sample>:spot_features` per sample, plus `<sample>:dense_wsi`
+    too when `require_dense_wsi` -- never more, never fewer.
+
+    `require_dense_wsi` (Adam's Step 6 audit #6 of commit a32051b: "do
+    not load dense WSI caches for architectures that do not consume
+    them"): `gen3_dataset.py::load_gen3_sample_data` now skips loading
+    the dense-WSI cache entirely for an architecture with
+    `use_regional_he=false` and `use_global_slide=false` -- this gate
+    must not then demand dense-WSI provenance that was never (and
+    correctly never) produced."""
     labels: set[str] = set()
     for sample_id in sample_ids:
-        labels.add(f"{sample_id}:dense_wsi")
+        if require_dense_wsi:
+            labels.add(f"{sample_id}:dense_wsi")
         labels.add(f"{sample_id}:spot_features")
     return labels
 
@@ -56,18 +65,20 @@ def verify_cache_coverage(expected_labels: set[str], available_labels) -> dict:
     return {"n_expected": len(expected_labels), "n_available": len(available_set), "passed": True}
 
 
-def collect_sample_cache_provenance(sample: Gen3SampleData) -> dict:
-    """The two provenance entries one already-loaded `Gen3SampleData`
-    contributes to a preflight's `provenance_by_source` map."""
-    if sample.tile_encoder_provenance.get("dense_wsi") is None:
-        raise ValueError(
-            f"{sample.sample_id}: no dense-WSI tile-encoder provenance available -- is "
-            "data.slide_context_source configured to dense_wsi_cache for this experiment?"
-        )
-    return {
-        f"{sample.sample_id}:dense_wsi": sample.tile_encoder_provenance["dense_wsi"],
-        f"{sample.sample_id}:spot_features": sample.tile_encoder_provenance["spot_features"],
-    }
+def collect_sample_cache_provenance(sample: Gen3SampleData, *, require_dense_wsi: bool = True) -> dict:
+    """The provenance entries one already-loaded `Gen3SampleData`
+    contributes to a preflight's `provenance_by_source` map -- both
+    `dense_wsi` and `spot_features` when `require_dense_wsi`, only
+    `spot_features` otherwise (see `expected_cache_source_labels`)."""
+    entries = {f"{sample.sample_id}:spot_features": sample.tile_encoder_provenance["spot_features"]}
+    if require_dense_wsi:
+        if sample.tile_encoder_provenance.get("dense_wsi") is None:
+            raise ValueError(
+                f"{sample.sample_id}: no dense-WSI tile-encoder provenance available -- is "
+                "data.slide_context_source configured to dense_wsi_cache for this experiment?"
+            )
+        entries[f"{sample.sample_id}:dense_wsi"] = sample.tile_encoder_provenance["dense_wsi"]
+    return entries
 
 
 def load_and_preflight_samples(
@@ -90,14 +101,25 @@ def load_and_preflight_samples(
     # do the same for each sample individually.
     verify_metadata_csv_provenance(manifest)
 
+    # Adam's Step 6 audit #6 of commit a32051b: mirrors gen3_dataset.py::
+    # load_gen3_sample_data's own use_regional_he/use_global_slide check
+    # -- an architecture using NEITHER never loads (and must not be
+    # required to produce) dense-WSI cache provenance.
+    model_params = cfg.get("model", {}).get("params", {}) or {}
+    require_dense_wsi = bool(model_params.get("use_regional_he", False)) or bool(
+        model_params.get("use_global_slide", False)
+    )
+
     samples: dict[str, Gen3SampleData] = {}
     provenance_by_source: dict[str, dict] = {}
     for sample_id in sample_ids:
         sample = load_gen3_sample_data(cfg, manifest, sample_id)
         samples[sample_id] = sample
-        provenance_by_source.update(collect_sample_cache_provenance(sample))
+        provenance_by_source.update(collect_sample_cache_provenance(sample, require_dense_wsi=require_dense_wsi))
 
-    coverage = verify_cache_coverage(expected_cache_source_labels(sample_ids), provenance_by_source.keys())
+    coverage = verify_cache_coverage(
+        expected_cache_source_labels(sample_ids, require_dense_wsi=require_dense_wsi), provenance_by_source.keys(),
+    )
     require_consistent_tile_encoder_provenance(provenance_by_source, expected_tile_encoder_provenance)
 
     report = {

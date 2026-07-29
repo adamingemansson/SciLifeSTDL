@@ -56,18 +56,32 @@ class GeneResidualBasis:
         return coefficients @ self.basis
 
 
-def fit_gene_residual_basis(residuals: np.ndarray, gene_names: list[str], rank: int = 64) -> GeneResidualBasis:
-    """Fit a FIXED orthonormal low-rank basis via truncated SVD on a
-    TRAINING-only residuals matrix [n_samples, n_genes]. Not centered --
-    this approximates the raw residual space directly (no separate mean
-    to track/store alongside the basis for reconstruction), a truncated-
-    SVD low-rank approximation of "target - deterministic_mean" as
-    computed on training data. gene_names' exact order is hashed and
-    stored alongside the basis so a caller can verify (mirroring
-    checkpoint.verify_gene_names' fail-closed discipline elsewhere in
-    this project) that a later use of this basis has the same gene
-    ordering it was fit against.
-    """
+def fit_gene_residual_basis(
+    residuals: np.ndarray, gene_names: list[str], rank: int = 64, *, random_state: int = 0,
+) -> GeneResidualBasis:
+    """Fit a FIXED orthonormal low-rank basis via a DETERMINISTIC
+    randomized truncated SVD on a TRAINING-only residuals matrix
+    [n_samples, n_genes]. Not centered -- this approximates the raw
+    residual space directly (no separate mean to track/store alongside
+    the basis for reconstruction), a truncated-SVD low-rank approximation
+    of "target - deterministic_mean" as computed on training data.
+    gene_names' exact order is hashed and stored alongside the basis so a
+    caller can verify (mirroring checkpoint.verify_gene_names' fail-closed
+    discipline elsewhere in this project) that a later use of this basis
+    has the same gene ordering it was fit against.
+
+    Adam's Step 6 audit #6 of commit a32051b: "Replace full residual SVD
+    with deterministic randomized/incremental truncated SVD." A real
+    ~17,000-gene panel with many pooled training rows made
+    `np.linalg.svd(residuals, full_matrices=False)` -- a FULL dense SVD
+    over the whole matrix -- large, memory- and compute-heavy for a
+    result that only ever keeps `rank` (typically 32-64) singular
+    vectors. `sklearn.utils.extmath.randomized_svd` computes only the
+    requested number of components directly, with a FIXED `random_state`
+    (never left to the global numpy RNG) so the fitted basis stays
+    exactly reproducible given the same residuals/rank/random_state --
+    "fixed thereafter" per this module's own docstring must also mean
+    the FIT ITSELF is deterministic, not just its later use."""
     if residuals.ndim != 2:
         raise ValueError(f"residuals must be 2-D [n_samples, n_genes], got shape {residuals.shape}")
     if residuals.shape[1] != len(gene_names):
@@ -83,7 +97,9 @@ def fit_gene_residual_basis(residuals: np.ndarray, gene_names: list[str], rank: 
     if effective_rank < 1:
         raise ValueError("rank must be positive")
 
-    _u, _s, vt = np.linalg.svd(residuals, full_matrices=False)
+    from sklearn.utils.extmath import randomized_svd
+
+    _u, _s, vt = randomized_svd(residuals, n_components=effective_rank, random_state=random_state)
     basis = vt[:effective_rank]  # [effective_rank, n_genes], orthonormal rows by construction
 
     gene_names_hash = hashlib.sha256("\0".join(gene_names).encode()).hexdigest()

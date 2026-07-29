@@ -5214,7 +5214,350 @@ per architecture. `split='test'` must never be used for this diagnostic
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 51. Response to the Codex audit of commit a32051b -- 9 fixes before any longer run, plus adversarial integration tests
+
+Adam: "Audit commit a32051b before any long run. Please fix these as one
+contained integration round," followed by 9 mandatory fixes and an
+explicit request for adversarial integration tests. All 9 are
+implemented and tested this round; every claim was verified against the
+real code before being fixed (see the verification notes inline below --
+all 9 were confirmed real, precise gaps, none were rejected). **No
+24-hour run has been started.**
+
+**#1 -- Architecture 4's reported metric now comes from
+`sample_predictive_distribution`, never `forward()`'s frozen
+conditioner.** Confirmed real: `compute_deterministic_reconstruction_losses`
+(the sole function driving validation/best-checkpoint selection),
+`gen3_evaluator.py`'s per-item evaluation loop, and
+`step6_overfit_test.py`'s before/after capacity check all called
+`model(inputs)` unconditionally -- for Architecture 4 that is
+`Architecture4.forward()`, which returns ONLY `self.conditioner(inputs)`
+and never touches the trained flow apparatus at all. A passing overfit
+gate or a "good" validation loss for Architecture 4 could therefore be
+entirely explained by the frozen, already-good conditioner, with the
+flow weights contributing nothing ever measured.
+
+Fixed with one new shared function, `train.py::predict_for_metrics(architecture_id,
+model, inputs, *, generator=None)`: for Architecture 4 it calls
+`model.sample_predictive_distribution(inputs, generator=generator)` and
+returns its `predictive_mean` as `"expression"`, plus
+`conditioner_only_expression` and `predictive_std` as secondary fields;
+for Architectures 1-3, `forward()`'s own output is already the real
+model, unchanged. `sample_predictive_distribution` gained a `generator`
+parameter (threaded straight through to `sample_residual_coefficients`,
+which already accepted one) so the sampled prediction is exactly
+reproducible given the same seed -- required for both resume-exact
+validation and repeated evaluation. `compute_deterministic_reconstruction_losses`
+now calls `predict_for_metrics` and additionally reports
+`conditioner_only_total` when present (Architecture 4's OLD, no-longer-
+selected-on metric, logged as a diagnostic, never used for selection);
+`_run_validation` reseeds a fresh `torch.Generator` from `(seed, current_step)`
+every call (not one run-lifetime generator), so the same step always
+resamples identically across a resume. `gen3_evaluator.py`'s main loop
+and `step6_overfit_test.py`'s `_evaluate_fixed_item` were switched to the
+same `predict_for_metrics` call. Direct behavioral proof (not just a
+docstring claim) is in `test_a32051b_adversarial.py::
+test_architecture4_predictive_mean_changes_when_only_flow_weights_change`:
+two Architecture4 instances with IDENTICAL conditioners but different
+`velocity_network` weights, evaluated with the SAME generator seed,
+produce identical `deterministic_mean` but DIFFERENT `predictive_mean`.
+
+**#2 -- one shared model-reconstruction function.** Confirmed real: four
+independent inline duplicates existed (`train.py::run_training`,
+`gen3_evaluator.py::_load_model_for_evaluation`,
+`step6_overfit_test.py::run_overfit_gate`,
+`fit_architecture4_residual_basis.py::fit_and_save_architecture4_basis`)
+-- and three of the four (evaluator, overfit gate, basis fitter) never
+called `maybe_load_pretrained_conditioner_for_architecture4` at all. This
+mattered concretely: `save_trainable_state` only saves parameters with
+`requires_grad=True`; a frozen Architecture 4 conditioner's weights are
+therefore NEVER present in `trainable_weights.pt`, so
+`checkpoint_module.load_trainable_state` alone cannot restore them --
+without the missing conditioner-loading step, those three call sites
+built Architecture 4 with a synchronized-init (or random) conditioner
+instead of the real, trained Architecture 3 checkpoint the run actually
+used, silently corrupting evaluation/overfit-testing/basis-fitting for
+every Architecture 4 config.
+
+Fixed with `train.py::build_model_for_inference(config, *, gene_names,
+device, checkpoint_dir=None, smoke=False, staged_smoke=False,
+dataset_manifest=None)`: builds the architecture (incl. a real
+`FrozenGigaPathSlideEncoder` when needed), loads verified synchronized
+initialization, loads+freezes Architecture 4's exact Architecture 3
+conditioner, then optionally loads `checkpoint_dir`'s trainable weights.
+All four call sites now use it exclusively; `run_training` calls it once
+for construction (`checkpoint_dir=None`) and keeps its own separate
+resume-loading block (which additionally restores optimizer/RNG state).
+
+**#3 -- `best/` is now a complete, independently verifiable inference
+bundle.** Confirmed real: `best/` held only `trainable_weights.pt` plus a
+2-field `best_info.json` (`step`, `total`) -- no `gene_names.json`, no
+config/run-manifest identity, no external-artifact hashes; not
+loadable/verifiable separately from the live `checkpoint_dir`.
+
+Fixed with `train.py::save_best_checkpoint_bundle`: stages the complete
+bundle (weights, `gene_names.json`, and a `best_info.json` recording
+step/loss plus every identity field the run manifest already tracks --
+`config_identity_fingerprint`, `dataset_manifest_fingerprint`,
+`gene_panel_hash`, `synchronized_init_manifest_sha256`,
+`gigapath_checkpoint_sha256`, `gene_residual_basis_gene_names_hash`,
+`gene_residual_basis_sha256`, `gene_scale_sha256`,
+`architecture3_conditioner_checkpoint_sha256`/`_step`, `code_commit_hash`,
+and a per-file sha256 map) in a temp directory, then swaps it in with a
+single `os.replace` -- `best/` is therefore always either the complete
+PREVIOUS bundle or the complete NEW one. `train.py::
+verify_checkpoint_bundle_identity` re-verifies every per-file hash plus
+dataset/gene-panel identity before a caller loads it;
+`evaluate_gen3_checkpoint` calls it automatically whenever `best/` is
+used.
+
+**#4 -- exact numeric-content binding + no premature overwrite before
+resume verification.** Confirmed real (three sub-gaps): (a)
+`gene_residual_basis_gene_names_hash` only proves gene ORDERING matches,
+never the basis's own numeric content -- a basis re-fit to different
+residuals with the identical gene panel would pass every existing check;
+(b) `architecture3_conditioner_checkpoint` was never bound to any
+identity at all in the run manifest; (c) `run_training` called
+`save_gene_scale(...)` (an unconditional overwrite of
+`checkpoint_dir/gene_scale.npy`) BEFORE `verify_resume_consistency` --
+a resume that gets correctly refused had already destroyed the prior
+run's `gene_scale.npy` on its way to being refused.
+
+Fixed: `build_run_manifest` now records `gene_residual_basis_sha256`
+(sha256 of the basis TENSOR's own bytes, not just its gene names) and
+`architecture3_conditioner_checkpoint_sha256`/`_step` (returned by
+`maybe_load_pretrained_conditioner_for_architecture4`, which now returns
+a dict instead of a bool); both are new members of
+`_RESUME_CONSISTENCY_FIELDS`. `run_training`'s ordering is now: build the
+new manifest in memory -> verify against the old one (if any) -> ONLY
+THEN write `gene_scale.npy`. `maybe_load_gene_basis` additionally
+validates a `<basis_path>.provenance.json` sidecar (written by
+`fit_architecture4_residual_basis.py`) against the CURRENT run's dataset
+manifest fingerprint and the configured Architecture 3 checkpoint's own
+weights sha256 when both are available -- catching a basis fit against
+different training data or a different conditioner before it is even
+loaded. Mask-schedule identity is deliberately NOT bound to the basis:
+it is fit from POOLED residuals across many independent mask draws, not
+one exact schedule, so pinning it to a schedule fingerprint would
+incorrectly reject legitimate re-diversified training-mask schedules.
+Two direct adversarial tests: `test_resume_refuses_a_basis_with_the_same_gene_order_but_different_numeric_content`
+and `test_resume_refuses_a_swapped_architecture3_conditioner_checkpoint`
+(the latter overwrites the SAME configured checkpoint path with a
+DIFFERENTLY-trained Architecture 3 checkpoint via a real `save_checkpoint`
+call, so `config_identity_fingerprint` stays unchanged and the failure is
+proven to come specifically from `architecture3_conditioner_checkpoint_sha256`).
+
+**#5 -- transactional checkpoints.** Confirmed real:
+`checkpoint.py::save_checkpoint` wrote `checkpoint_dir`'s root files
+individually (each internally atomic via temp-then-`os.replace`, but NOT
+atomic as a GROUP) before hard-linking a snapshot into history -- a crash
+between two of those writes could leave a root checkpoint with
+mismatched per-step files (e.g. `trainable_weights.pt` from step N but
+`training_state.json` still from step N-1), with nothing that would ever
+detect it on the next load.
+
+Fixed: every save now stages the COMPLETE step bundle (weights, config,
+gene names, training state, optional optimizer/RNG state) in a temp
+directory, writes a `manifest.json` of per-file sha256 hashes LAST inside
+that staging directory, then materializes it as
+`history/step_XXXXXXXX/` with a single atomic `os.replace` -- that
+directory is therefore always either absent or fully complete.
+`checkpoint_dir`'s root files are refreshed afterward purely as a
+convenience mirror; every real loader (`load_trainable_state`,
+`load_training_state`, `verify_gene_names`, `load_optimizer_and_rng_state`)
+now resolves through a new `_resolve_checkpoint_source`, which follows
+the atomic `latest_step.json` pointer (written last of all) to the
+immutable bundle and re-verifies every file's hash against the bundle's
+own manifest before trusting it, raising `RuntimeError` naming the
+corrupted/missing file otherwise. `rollback_checkpoint` now also moves
+the `latest_step.json` pointer. A step bundle is now always created
+regardless of `checkpoint_keep_last` (previously `keep_last<=0` meant
+"no history/transactionality at all"; it now only means "prune nothing,"
+matching `_prune_history`'s own existing contract -- transactionality is
+no longer optional). Direct adversarial test,
+`test_checkpoint_load_refuses_a_bundle_file_corrupted_after_writing`:
+flips `trainable_weights.pt`'s bytes inside an already-written history
+bundle and confirms both `load_trainable_state` and `verify_gene_names`
+raise `RuntimeError` naming the sha256 mismatch. `test_train.py`'s
+pre-existing optimizer-resume regression test was updated to corrupt the
+IMMUTABLE bundle (not just the now-merely-a-mirror root file) to keep
+testing a real gap.
+
+**#6 -- production memory fixes.** Four sub-items, verified individually:
+- *Full SVD in basis fitting* (confirmed real): `gene_basis.py::
+  fit_gene_residual_basis` called `np.linalg.svd(residuals, full_matrices=False)`
+  -- a full dense SVD over the WHOLE residuals matrix for a result that
+  only ever keeps `rank` (typically 32-64) components. Replaced with
+  `sklearn.utils.extmath.randomized_svd(residuals, n_components=effective_rank,
+  random_state=0)` -- a fixed `random_state` keeps the fit deterministic
+  and reproducible, matching this module's own "fixed thereafter"
+  contract, which must also mean the FIT itself is deterministic.
+- *Non-streaming gene-scale computation* (confirmed real):
+  `train.py::compute_training_gene_scale` densified EVERY training
+  sample's FULL `adata.X` and concatenated them all into one pooled
+  matrix before `.std(axis=0)` -- the entire training dataset, densified,
+  simultaneously in memory. Replaced with a chunked streaming
+  implementation: each sample's matrix is sparse-SLICED into row chunks
+  first (only the chunk is ever densified) and folded into a running
+  per-gene sum/sum-of-squares/count (`Var[X] = E[X^2] - E[X]^2`, float64).
+  `test_compute_training_gene_scale_streaming_matches_naive_dense_pooled_std`
+  proves numeric equivalence to the old computation (within float
+  tolerance) across three different `chunk_size` values, including
+  `chunk_size=1`.
+- *Dense-WSI cache loaded for architectures that don't consume it*
+  (confirmed real -- and confirmed that `architecture1.yaml`/
+  `architecture2.yaml` were paying for it: both set
+  `slide_context_source: dense_wsi_cache` purely to satisfy a preflight
+  gate that unconditionally demanded dense-WSI provenance for every
+  sample, regardless of architecture): `gen3_dataset.py::load_gen3_sample_data`
+  loaded `slide_context_record` whenever `data.slide_context_source !=
+  "disabled"`, independent of whether the architecture's `use_regional_he`/
+  `use_global_slide` actually consume it. Fixed by gating the load on
+  `model.params.use_regional_he or model.params.use_global_slide` (both
+  flags checked -- the same dense-WSI fields feed BOTH regional-token
+  pooling and the global LongNet vector, so gating on `use_global_slide`
+  alone would have silently broken a `use_regional_he`-only config).
+  `gen3_preflight.py::expected_cache_source_labels`/
+  `collect_sample_cache_provenance`/`load_and_preflight_samples` gained a
+  matching `require_dense_wsi` flag (mirroring the same model-params
+  check) so the preflight gate no longer demands provenance that a
+  correctly-configured architecture never produces.
+- *Raw patches held past spot-cache validation*: investigated and found
+  NOT applicable to this codebase -- `Gen3SampleData.patches` is read on
+  EVERY `Gen3SpatialFieldDataset.__getitem__` call (via
+  `example_builder.build_spatial_field_example`, for real per-item
+  image-space hole masking when `image_mode` needs it), not merely once
+  for spot-cache validation at load time. Releasing them after validation
+  would break every subsequent training item drawn from that sample. No
+  code change made; documented here rather than silently skipped, per
+  this project's "never accept an audit claim on faith, but never
+  fabricate a fix for a false premise either" discipline.
+
+**#7 -- extended evaluator reports.** Confirmed real:
+`evaluate_gen3_checkpoint` discarded every per-item value the moment it
+was folded into `aggregate_patient_metrics`' output (no re-slicing by
+sample/patient/mask/stratum possible afterward), never computed PAIRED
+model-vs-baseline deltas (model and baselines were aggregated
+independently, never compared item-by-item), never reported Architecture
+4's predictive uncertainty, and never verified a `best/` bundle's own
+identity against the evaluation's inputs before loading.
+
+Fixed: the main loop now retains `per_item_records` (one dict per item,
+carrying `idx`/`sample_id`/`patient_id`/`stratum` -- `gen3_dataset.py::
+_HeldOutMaskItem` gained a `stratum` field, populated from the mask
+bank's own per-record `stratum`, previously dropped when building
+held-out schedule items -- plus each arm's metrics for that item);
+`per_arm_paired_delta_vs_model` computes `pcc_delta`/`rmse_delta`
+item-by-item against every baseline, then runs those deltas through the
+SAME `aggregate_patient_metrics` machinery for patient-level CIs;
+Architecture 4's `predictive_std_mean` (from `predict_for_metrics`) is
+folded into `per_arm_patient_aggregated_metrics["model"]` when available;
+`verify_checkpoint_bundle_identity` is now called automatically before
+loading a `best/` bundle. "Full-gene plus named gene-panel PCC/RMSE" was
+scoped down: this dataset provides one unnamed, full gene panel with no
+curated named subset anywhere in the codebase, so "named gene-panel"
+metrics have no real referent here -- `per_item_reconstruction_metrics`
+already reports full-panel PCC/RMSE with valid-gene counts, which is
+retained per-item now.
+
+**#8 -- launcher preflight requires Architecture 4's conditioner
+checkpoint; construction-only vs staged smoke.** Confirmed real:
+`check_required_fingerprints` never checked
+`architecture3_conditioner_checkpoint` at all, even though
+`train.py::maybe_load_pretrained_conditioner_for_architecture4` DOES
+require it for any non-smoke run -- the launcher's own preflight gate was
+weaker than the trainer's runtime check it exists to front-run.
+
+Fixed: `check_required_fingerprints(config, *, smoke_only=False)` now
+additionally requires `architecture3_conditioner_checkpoint` for
+Architecture 4 whenever `not smoke_only`; `launch_suite` passes its own
+`smoke_only` through. `train.py::run_training` gained a `staged_smoke`
+parameter (and `--staged-smoke` CLI flag): a plain `--smoke` stays
+CONSTRUCTION-ONLY (exempt, matching every other "not required for
+--smoke" gate), while `--smoke --staged-smoke` behaves exactly like a
+non-smoke run for conditioner-loading purposes -- the "clearly named
+construction-only vs real staged smoke" distinction the audit asked for.
+`maybe_load_pretrained_conditioner_for_architecture4` now returns a dict
+(`loaded`, `checkpoint_dir`, `checkpoint_sha256`, `checkpoint_step`)
+instead of a bare bool, both for the launcher/#4's identity binding and
+for callers needing to know exactly which checkpoint was loaded.
+
+**#9 -- explicit optimizer/flow_weight in YAML, environment versions,
+no false determinism claim.** Confirmed real: `training.optimizer.
+{weight_decay,betas,eps}` and `loss.flow_weight` existed only as
+Python-level defaults inside `train.py`, invisible from the committed
+YAML alone; nothing recorded environment versions; `verify_resume_consistency`'s
+"scientifically exact resume" language could be read as a bit-exact GPU
+reproducibility claim this codebase does not actually enforce (no
+`torch.use_deterministic_algorithms` call anywhere).
+
+Fixed: all four `configs/architectureN.yaml` now declare
+`training.optimizer.{weight_decay: 0.01, betas: [0.9, 0.999], eps: 1.0e-8}`
+and `loss.flow_weight: 1.0` explicitly (identical values to the prior
+Python defaults -- not a behavior change, a visibility change;
+`static_config_audit` still passes since the values agree across all
+four). `build_run_manifest` now records `environment_versions`
+(python/torch/cuda/cuda_available/platform, via a new
+`_environment_versions()`, never raises) and `code_commit_hash` (best-
+effort `git rev-parse HEAD`, `None` outside a git checkout -- both purely
+informational, excluded from `_RESUME_CONSISTENCY_FIELDS`).
+`verify_resume_consistency`'s docstring gained an explicit scope caveat:
+it verifies IDENTITY (config/dataset/gene-panel/architecture/init/
+conditioner/basis/gene-scale), never bit-exact floating-point
+reproducibility on GPU.
+
+**Adversarial integration tests** (`gen3_multiscale/tests/
+test_a32051b_adversarial.py`, 6 tests) cover: (g) Architecture 4's
+reported prediction genuinely changing when only trained flow weights
+change, with reproducibility proven too (#1, above); (c) a gene-residual
+basis re-fit to different numeric content with the identical gene
+ordering, caught via `gene_residual_basis_sha256` (#4); (d) an
+Architecture 3 conditioner checkpoint swapped in-place for a differently-
+trained one, caught via `architecture3_conditioner_checkpoint_sha256`
+specifically (not merely the coarser config-identity check a changed
+path would also trip) (#4/#5); (f) a checkpoint bundle file corrupted
+after writing, caught by fail-closed transactional loading (#5); (b)/(e)
+a `best/` bundle's weights altered after writing, and a `best/` bundle's
+recorded `dataset_manifest_fingerprint` mismatching the evaluation's
+actual dataset, both refused before any weights load (#3/#7).
+
+**`use_global_slide=True` for Architecture 3/4 was NOT exercised** --
+this is the one adversarial scenario Adam asked for that remains
+genuinely blocked in this sandbox: `models/slide_encoder.py::
+FrozenGigaPathSlideEncoder.__init__` does `import gigapath.slide_encoder`
+and requires a real Prov-GigaPath LongNet checkpoint; neither the
+package nor a checkpoint exists here. This is the SAME limitation
+`test_train.py`'s own module docstring already documented before this
+round ("validated separately on real hardware... not re-exercised
+here") -- unchanged by this round's work. Every other adversarial
+scenario requested was exercised for real, including the closely related
+`use_regional_he=True` dense-WSI path, which needs no external package.
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 636 passed (23 hest1k-catalog + 5 gene-panel-compat
+  + 4 query-overlap-report + 27 example-schema + 11 boundary-graph +
+  36 slide-context + 9 slide-encoder + 2 debug-plot + 18 transport-head +
+  10 tokens + 16 attention + 10 global-context + 7 harmonic +
+  7 geometry-utils + 9 backbone + 31 architectures + 9 gene-basis +
+  11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  29 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 21 dataset-manifest + 31 example-builder +
+  46 mask-fingerprint + 22 novae-graph + 4 loaders + 17 spot-feature-cache
+  + 12 tile-encoder-preflight + 15 gen3-dataset + 10 gen3-preflight +
+  25 train + 8 step6-scripts + 10 gen3-evaluator +
+  5 fit-architecture4-residual-basis + 6 a32051b-adversarial)
+gen2_architectures + gen3_multiscale: 809 passed, 1 skipped
+(repo-root tests/: 322 passed, 1 pre-existing unrelated failure --
+  tests/test_multi_sample.py::test_inject_multi_sample_n_genes, confirmed
+  failing identically before this round's changes; not touched by
+  anything in this round)
+```
+
+The block immediately below (pre-a32051b-audit-response test counts) is
+kept for historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 627 passed (45 reused-infra + 27 example-schema +

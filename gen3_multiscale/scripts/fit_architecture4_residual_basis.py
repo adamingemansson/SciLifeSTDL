@@ -40,13 +40,12 @@ import torch
 from omegaconf import OmegaConf
 
 from gen3_multiscale.data.dataset_manifest import gene_panel_hash, load_dataset_manifest
-from gen3_multiscale.models import model_factory
 from gen3_multiscale.models.gene_basis import fit_gene_residual_basis, save_gene_residual_basis
-from gen3_multiscale.training import checkpoint as checkpoint_module
 from gen3_multiscale.training.gen3_dataset import Gen3SpatialFieldDataset, build_gen3_mask_schedule
 from gen3_multiscale.training.gen3_preflight import load_and_preflight_samples
 from gen3_multiscale.training.train import (
-    config_fingerprint, dataset_manifest_fingerprint, expected_tile_encoder_provenance, file_sha256, resolved_config,
+    build_model_for_inference, config_fingerprint, dataset_manifest_fingerprint,
+    expected_tile_encoder_provenance, file_sha256, resolved_config,
 )
 
 
@@ -109,15 +108,19 @@ def fit_and_save_architecture4_basis(
     train_dataset = Gen3SpatialFieldDataset(dataset_manifest, samples, train_schedule, strata)
 
     gene_names = list(dataset_manifest["gene_panel"])
-    n_genes = len(gene_names)
-    gex_feature_dim = int(data_cfg.get("gex_feature_dim", 128))
     device = torch.device(device_str)
 
-    architecture3_model = model_factory.build_architecture(
-        config, n_genes=n_genes, gex_feature_dim=gex_feature_dim, seed=int(config["training"].get("seed", 0)),
-    ).to(device)
-    checkpoint_module.verify_gene_names(architecture3_checkpoint_dir, gene_names)
-    checkpoint_module.load_trainable_state(architecture3_model, architecture3_checkpoint_dir)
+    # Audit #2 of commit a32051b: the ONE shared model-reconstruction
+    # pipeline (`train.py::build_model_for_inference`) -- this is
+    # Architecture 3, so the Architecture-4-conditioner step is a
+    # structural no-op here, but this call site now shares the exact
+    # same construction + synchronized-init + checkpoint-loading logic
+    # every other caller uses, rather than its own fourth independent
+    # inline duplicate.
+    architecture3_model, _info = build_model_for_inference(
+        config, gene_names=gene_names, device=device, checkpoint_dir=architecture3_checkpoint_dir, smoke=False,
+        dataset_manifest=dataset_manifest,
+    )
 
     residuals = compute_training_residuals(architecture3_model, train_dataset, device)
     basis = fit_gene_residual_basis(residuals, gene_names, rank=rank)
@@ -134,7 +137,7 @@ def fit_and_save_architecture4_basis(
         "architecture3_checkpoint_trainable_weights_sha256": checkpoint_sha256,
         "dataset_manifest_fingerprint": dataset_manifest_fingerprint(dataset_manifest),
         "gene_panel_hash": gene_panel_hash(gene_names),
-        "n_genes": n_genes,
+        "n_genes": len(gene_names),
         "train_sample_ids": sorted(train_ids),
         "n_masks_per_sample": int(n_masks_per_sample),
         "n_residual_rows": int(residuals.shape[0]),

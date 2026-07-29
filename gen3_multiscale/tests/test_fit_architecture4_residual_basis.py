@@ -106,10 +106,16 @@ def test_maybe_load_pretrained_conditioner_requires_a_real_architecture3_checkpo
         train_module.maybe_load_pretrained_conditioner_for_architecture4(
             model, {"required_fingerprints": {}}, "4", gene_names, smoke=False,
         )
-    # smoke is exempt.
+    # smoke is exempt (construction-only smoke, audit #8 of commit a32051b).
     assert train_module.maybe_load_pretrained_conditioner_for_architecture4(
         model, {"required_fingerprints": {}}, "4", gene_names, smoke=True,
-    ) is False
+    )["loaded"] is False
+    # staged smoke (require_for_smoke=True) is NOT exempt -- it must
+    # raise exactly like a non-smoke run.
+    with pytest.raises(ValueError, match="architecture3_conditioner_checkpoint"):
+        train_module.maybe_load_pretrained_conditioner_for_architecture4(
+            model, {"required_fingerprints": {}}, "4", gene_names, smoke=True, require_for_smoke=True,
+        )
 
 
 def test_maybe_load_pretrained_conditioner_loads_and_freezes_the_real_conditioner(tmp_path, monkeypatch):
@@ -130,10 +136,16 @@ def test_maybe_load_pretrained_conditioner_loads_and_freezes_the_real_conditione
         "model": {"architecture": "4", "params": {}},
         "required_fingerprints": {"architecture3_conditioner_checkpoint": str(arch3_checkpoint_dir)},
     }
-    loaded = train_module.maybe_load_pretrained_conditioner_for_architecture4(
+    conditioner_info = train_module.maybe_load_pretrained_conditioner_for_architecture4(
         model, config, "4", gene_names, smoke=False,
     )
-    assert loaded is True
+    assert conditioner_info["loaded"] is True
+    # Audit #4 of commit a32051b: the exact conditioner checkpoint's
+    # identity (sha256 + step) is now returned so callers can bind
+    # resume/evaluation to it.
+    assert conditioner_info["checkpoint_dir"] == str(arch3_checkpoint_dir)
+    assert conditioner_info["checkpoint_sha256"] is not None
+    assert conditioner_info["checkpoint_step"] is not None
     assert all(not p.requires_grad for p in model.conditioner.parameters())
     assert any(p.requires_grad for p in model.velocity_network.parameters())
 

@@ -166,9 +166,43 @@ def test_check_required_fingerprints_requires_gene_residual_basis_only_for_archi
 
     present = tmp_path / "basis.pt"
     present.write_text("fake basis bytes")
+    checkpoint_present = tmp_path / "arch3_ckpt" / "trainable_weights.pt"
+    checkpoint_present.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_present.write_text("fake checkpoint bytes")
     assert check_required_fingerprints({
-        "model": {"architecture": "4", "params": {}}, "required_fingerprints": {"gene_residual_basis": str(present)},
+        "model": {"architecture": "4", "params": {}},
+        "required_fingerprints": {
+            "gene_residual_basis": str(present),
+            "architecture3_conditioner_checkpoint": str(checkpoint_present.parent),
+        },
     }) == []
+
+
+def test_check_required_fingerprints_requires_architecture3_conditioner_checkpoint_for_architecture_4_non_smoke(tmp_path):
+    """Adam's Step 6 audit #8 of commit a32051b: "Require Architecture
+    4's conditioner checkpoint in launcher preflight." A non-smoke
+    (smoke_only=False, the default) Architecture 4 launch must refuse to
+    start without a real, on-disk architecture3_conditioner_checkpoint --
+    matching train.py's own runtime requirement exactly, so the launcher
+    catches this BEFORE spawning a subprocess rather than the subprocess
+    failing deep inside training. A smoke_only=True launch (construction-
+    only, per train.py's own --smoke default) is exempt."""
+    config = {
+        "model": {"architecture": "4", "params": {}},
+        "required_fingerprints": {"gene_residual_basis": None, "architecture3_conditioner_checkpoint": None},
+    }
+    missing = check_required_fingerprints(config)
+    assert any("architecture3_conditioner_checkpoint" in m for m in missing)
+    # smoke_only exempts it (construction-only smoke never touches it).
+    smoke_missing = check_required_fingerprints(config, smoke_only=True)
+    assert not any("architecture3_conditioner_checkpoint" in m for m in smoke_missing)
+
+    present_dir = tmp_path / "arch3_ckpt"
+    present_dir.mkdir()
+    config["required_fingerprints"]["architecture3_conditioner_checkpoint"] = str(present_dir)
+    config["required_fingerprints"]["gene_residual_basis"] = str(tmp_path / "basis.pt")
+    (tmp_path / "basis.pt").write_text("fake basis bytes")
+    assert check_required_fingerprints(config) == []
 
 
 def test_check_required_fingerprints_empty_when_no_fingerprints_declared():

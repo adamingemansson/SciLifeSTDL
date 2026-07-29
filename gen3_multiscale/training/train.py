@@ -35,7 +35,10 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import random
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -93,13 +96,32 @@ def maybe_build_slide_encoder(config: dict):
     return encoder, encoder.checkpoint_sha256
 
 
-def maybe_load_gene_basis(config: dict, gene_names: list[str]):
+def maybe_load_gene_basis(config: dict, gene_names: list[str], dataset_manifest: dict | None = None):
     """Architecture 4 only: `required_fingerprints.gene_basis` must point
     at an already-fit, saved `GeneResidualBasis`
     (`models/gene_basis.py::save_gene_residual_basis`) -- fit OFFLINE, on
     TRAINING-split residuals only, per Architecture4's own docstring.
     This trainer never fits one itself (it would need a trained
-    conditioner's own residuals to fit against in the first place)."""
+    conditioner's own residuals to fit against in the first place).
+
+    Adam's Step 6 audit #4 of commit a32051b: "Validate the basis
+    provenance sidecar against the dataset, gene panel, mask schedule,
+    and conditioner checkpoint." Gene panel is already checked via
+    `verify_gene_residual_basis`'s gene-name-hash comparison. When
+    `fit_architecture4_residual_basis.py` produced a
+    `<path>.provenance.json` sidecar (it always does), this additionally
+    checks that sidecar's `dataset_manifest_fingerprint` (when
+    `dataset_manifest` is given) and `architecture3_checkpoint_
+    trainable_weights_sha256` (when `required_fingerprints.
+    architecture3_conditioner_checkpoint` is configured) against the
+    CURRENT run -- catching a basis fit on different training data, or
+    against a DIFFERENT Architecture 3 checkpoint than the one this run
+    is actually loading. Mask-schedule identity is deliberately NOT
+    bound here: the basis is fit against POOLED residuals from many
+    (`n_masks_per_sample`) independent mask draws, not one specific
+    realized schedule, so pinning it to an exact mask-schedule
+    fingerprint would incorrectly reject a legitimate basis whenever the
+    training mask schedule is (deliberately) re-diversified."""
     architecture_id = str((config.get("model") or {}).get("architecture", ""))
     if architecture_id != "4":
         return None, None
@@ -114,12 +136,42 @@ def maybe_load_gene_basis(config: dict, gene_names: list[str]):
         )
     basis = load_gene_residual_basis(path)
     verify_gene_residual_basis(basis, gene_names)
+
+    provenance_path = Path(f"{path}.provenance.json")
+    if provenance_path.is_file():
+        provenance = json.loads(provenance_path.read_text())
+        if dataset_manifest is not None:
+            expected_fp = dataset_manifest_fingerprint(dataset_manifest)
+            recorded_fp = provenance.get("dataset_manifest_fingerprint")
+            if recorded_fp is not None and recorded_fp != expected_fp:
+                raise ValueError(
+                    f"gene residual basis at {path} was fit against a dataset manifest "
+                    f"(fingerprint {recorded_fp!r}) that does not match this run's dataset manifest "
+                    f"(fingerprint {expected_fp!r}) -- refusing to use a basis fit on different data"
+                )
+        conditioner_checkpoint_dir = (config.get("required_fingerprints") or {}).get(
+            "architecture3_conditioner_checkpoint",
+        )
+        recorded_checkpoint_sha256 = provenance.get("architecture3_checkpoint_trainable_weights_sha256")
+        if conditioner_checkpoint_dir and recorded_checkpoint_sha256 is not None:
+            configured_weights_path = Path(conditioner_checkpoint_dir) / "trainable_weights.pt"
+            if configured_weights_path.is_file():
+                actual_sha256 = file_sha256(configured_weights_path)
+                if actual_sha256 != recorded_checkpoint_sha256:
+                    raise ValueError(
+                        f"gene residual basis at {path} was fit against a different Architecture 3 "
+                        f"checkpoint (trainable_weights.pt sha256 {recorded_checkpoint_sha256!r}) than "
+                        f"the one configured for this run (sha256 {actual_sha256!r} at "
+                        f"{configured_weights_path}) -- refusing to use a basis fit against a "
+                        "different conditioner's residuals"
+                    )
     return basis, gene_names
 
 
 def maybe_load_pretrained_conditioner_for_architecture4(
     model, config: dict, architecture_id: str, gene_names: list[str], smoke: bool,
-) -> bool:
+    *, require_for_smoke: bool = False,
+) -> dict:
     """Adam's Step 6 audit #11 (confirmed real gap): "There is no real
     pipeline for fitting [Architecture 4's] residual basis... initialize
     Architecture 4 from that exact Architecture 3 conditioner and
@@ -143,16 +195,31 @@ def maybe_load_pretrained_conditioner_for_architecture4(
     stops the OPTIMIZER from updating the conditioner's own weights at
     all while `total_steps` is spent on the flow apparatus, matching
     Adam's "initially freeze" instruction literally, not merely via
-    gradient-flow detachment. Returns True if a pretrained conditioner
-    was loaded (smoke runs are exempt, matching every other "not required
-    for --smoke" gate in this trainer); False for any non-Architecture-4
-    run."""
+    gradient-flow detachment.
+
+    Returns a dict identifying exactly which checkpoint was loaded (or
+    that none was) -- Adam's Step 6 audit #4 of commit a32051b ("bind
+    resume/evaluation to... exact Architecture 3 conditioner weights/
+    step"): `run_training` records `checkpoint_sha256`/`checkpoint_step`
+    into the run manifest so a resume or evaluation can be verified
+    against the EXACT trained conditioner a run started from, not merely
+    "some checkpoint was present at this path."
+
+    `require_for_smoke` (Adam's Step 6 audit #8: "Separate a clearly
+    named construction-only Architecture 4 smoke from the real staged
+    smoke using the trained conditioner"): a plain `--smoke` run is
+    CONSTRUCTION-ONLY by default (exempt from needing a real conditioner
+    checkpoint, matching every other "not required for --smoke" gate in
+    this trainer) unless a caller explicitly asks for the real staged
+    smoke (`run_training(..., smoke=True, staged_smoke=True)`), in which
+    case this behaves exactly like a non-smoke run and raises if no real
+    checkpoint is configured."""
     if architecture_id != "4":
-        return False
+        return {"loaded": False, "checkpoint_dir": None, "checkpoint_sha256": None, "checkpoint_step": None}
     checkpoint_dir = (config.get("required_fingerprints") or {}).get("architecture3_conditioner_checkpoint")
     if not checkpoint_dir:
-        if smoke:
-            return False
+        if smoke and not require_for_smoke:
+            return {"loaded": False, "checkpoint_dir": None, "checkpoint_sha256": None, "checkpoint_step": None}
         raise ValueError(
             "Architecture 4 requires required_fingerprints.architecture3_conditioner_checkpoint -- "
             "a real, already-trained Architecture 3 checkpoint_dir. Train Architecture 3 to "
@@ -166,10 +233,132 @@ def maybe_load_pretrained_conditioner_for_architecture4(
     if freeze:
         for p in model.conditioner.parameters():
             p.requires_grad = False
-    return True
+    weights_path = Path(checkpoint_dir) / "trainable_weights.pt"
+    checkpoint_sha256 = file_sha256(weights_path) if weights_path.is_file() else None
+    checkpoint_step = checkpoint_module.load_training_state(checkpoint_dir).get("step")
+    return {
+        "loaded": True, "checkpoint_dir": str(checkpoint_dir),
+        "checkpoint_sha256": checkpoint_sha256, "checkpoint_step": checkpoint_step,
+    }
 
 
-def compute_training_gene_scale(train_samples: dict) -> np.ndarray:
+def build_model_for_inference(
+    config: dict, *, gene_names: list[str], device: torch.device,
+    checkpoint_dir: str | Path | None = None, smoke: bool = False, staged_smoke: bool = False,
+    dataset_manifest: dict | None = None,
+) -> tuple[torch.nn.Module, dict]:
+    """The ONE real model-reconstruction pipeline -- construct the
+    architecture (with a real `FrozenGigaPathSlideEncoder` when
+    `use_global_slide` needs one), load its verified synchronized
+    initialization when configured, load+freeze Architecture 4's exact
+    Architecture 3 conditioner, then optionally load `checkpoint_dir`'s
+    trainable weights on top.
+
+    Adam's Step 6 audit #2 of commit a32051b: "Create one shared
+    inference/model-reconstruction function used by trainer, evaluator,
+    overfit gate, and residual-basis fitter." Before this function
+    existed, `train.py::run_training`, `gen3_evaluator.py::
+    _load_model_for_evaluation`, `step6_overfit_test.py::run_overfit_gate`,
+    and `fit_architecture4_residual_basis.py::fit_and_save_architecture4_basis`
+    each independently duplicated this construction -- and three of the
+    four (evaluator, overfit gate, basis fitter) silently OMITTED the
+    Architecture-4-conditioner step, meaning Architecture 4 evaluation/
+    overfit-testing loaded trainable weights onto a conditioner that was
+    never correctly loaded/frozen from the real Architecture 3 checkpoint
+    the way training did. All four now call this one function.
+
+    `checkpoint_dir=None` returns a freshly (synchronized-init +
+    Architecture-4-conditioner) initialized model with no trainable-
+    weight checkpoint loaded on top -- used for the overfit gate's
+    "before training" baseline. A real `checkpoint_dir` additionally
+    verifies gene names and loads that checkpoint's trainable weights,
+    failing closed on a mismatched gene panel or incomplete checkpoint,
+    exactly as every other checkpoint load in this package."""
+    architecture_id = str((config.get("model") or {}).get("architecture", ""))
+    training_cfg = config.get("training") or {}
+    data_cfg = config.get("data") or {}
+    n_genes = len(gene_names)
+    gex_feature_dim = int(data_cfg.get("gex_feature_dim", 128))
+    seed = int(training_cfg.get("seed", 0))
+
+    slide_encoder, gigapath_checkpoint_sha256 = maybe_build_slide_encoder(config)
+    gene_basis, resolved_gene_names = maybe_load_gene_basis(config, gene_names, dataset_manifest=dataset_manifest)
+
+    torch.manual_seed(seed)  # re-seed immediately before construction -- shared init discipline
+    model = model_factory.build_architecture(
+        config, n_genes=n_genes, gex_feature_dim=gex_feature_dim, gene_basis=gene_basis,
+        gene_names=resolved_gene_names, slide_encoder=slide_encoder,
+        gigapath_checkpoint_sha256=gigapath_checkpoint_sha256, seed=seed,
+    ).to(device)
+
+    synchronized_init_manifest_path = None
+    synchronized_init_dir = training_cfg.get("synchronized_init_dir")
+    if synchronized_init_dir:
+        sync_dir = Path(synchronized_init_dir)
+        synchronized_init_manifest_path = sync_dir / "initialization_manifest.json"
+        sync_manifest = json.loads(synchronized_init_manifest_path.read_text())
+        architecture_name = f"architecture{architecture_id}"
+        model_factory.load_synchronized_initialization(
+            model, sync_dir / architecture_name, sync_manifest, architecture_name,
+        )
+    elif not smoke:
+        raise ValueError(
+            "training.synchronized_init_dir must be set for a real (non-smoke) run -- Step 6 "
+            "requires a verified, persisted synchronized initialization for every architecture "
+            "(persist_four_architecture_initializations); refusing to build a model from four "
+            "independently-random starting points"
+        )
+
+    conditioner_info = maybe_load_pretrained_conditioner_for_architecture4(
+        model, config, architecture_id, gene_names, smoke, require_for_smoke=staged_smoke,
+    )
+
+    if checkpoint_dir is not None:
+        checkpoint_module.verify_gene_names(checkpoint_dir, gene_names)
+        checkpoint_module.load_trainable_state(model, checkpoint_dir)
+
+    info = {
+        "architecture_id": architecture_id,
+        "gene_basis": gene_basis,
+        "gigapath_checkpoint_sha256": gigapath_checkpoint_sha256,
+        "synchronized_init_manifest_path": synchronized_init_manifest_path,
+        "architecture3_conditioner": conditioner_info,
+    }
+    return model, info
+
+
+def predict_for_metrics(
+    architecture_id: str, model, inputs, *, generator: torch.Generator | None = None,
+) -> dict:
+    """The metric-basis prediction for `inputs` -- Adam's Step 6 audit #1
+    of commit a32051b: "Architecture 4 validation/evaluation/overfit must
+    evaluate a deterministic fixed-seed predictive mean from
+    `sample_predictive_distribution`, not `forward()`'s frozen
+    conditioner. Log conditioner-only metrics separately." Architectures
+    1-3's `forward()` already IS the real model, so their `expression`
+    output is used directly and there is no separate "conditioner-only"
+    number to report.
+
+    Returns `{"expression": <the metric-basis prediction>}` for every
+    architecture, plus (Architecture 4 only) `"conditioner_only_expression"`
+    (the frozen conditioner's own, secondary, mean -- never the reported
+    headline metric) and `"predictive_std"` (per-query sampled-residual
+    uncertainty). `generator`, when given, makes Architecture 4's
+    stochastic sampling reproducible -- required for exact resume/
+    evaluation consistency (same audit item)."""
+    if architecture_id == "4":
+        conditioner_out = model(inputs)
+        predictive = model.sample_predictive_distribution(inputs, generator=generator)
+        return {
+            "expression": predictive["predictive_mean"],
+            "conditioner_only_expression": conditioner_out["expression"],
+            "predictive_std": predictive["predictive_std"],
+        }
+    out = model(inputs)
+    return {"expression": out["expression"]}
+
+
+def compute_training_gene_scale(train_samples: dict, *, chunk_size: int = 512) -> np.ndarray:
     """Real, TRAINING-ONLY per-gene standardization scale for
     `spatial_gradient_loss`'s `per_gene_scale` -- Adam's Step 6 audit #9
     (confirmed real gap): "Compute spatial-gradient gene scales from
@@ -186,16 +375,51 @@ def compute_training_gene_scale(train_samples: dict) -> np.ndarray:
     A pure function of the training samples already loaded by preflight,
     so it is naturally reproducible across a resume as long as the same
     training data passed content-provenance verification (see
-    `dataset_manifest.verify_content_provenance`)."""
+    `dataset_manifest.verify_content_provenance`).
+
+    Adam's Step 6 audit #6 of commit a32051b: "sparse-slice expression
+    before densifying; streaming train-gene mean/variance." The prior
+    version densified EVERY training sample's FULL `adata.X` at once,
+    then concatenated ALL of them into one pooled matrix before calling
+    `.std(axis=0)` -- for a real ~17,000-gene panel with many training
+    samples, that materializes the entire training expression dataset,
+    densified, in memory simultaneously. This streams instead: each
+    sample's (typically sparse) matrix is SLICED into row chunks first
+    (sparse slicing is cheap; only the chunk itself is ever densified)
+    and folded into a running per-gene sum/sum-of-squares/count, so at
+    most one chunk's dense array is ever resident at a time -- no
+    sample's full matrix, let alone the pooled matrix across every
+    sample, is ever materialized. Mathematically identical result to the
+    prior pooled `.std(axis=0)` (population std, ddof=0): Var[X] =
+    E[X^2] - E[X]^2, accumulated in float64."""
     if not train_samples:
         raise ValueError("compute_training_gene_scale: no training samples given")
-    pooled = []
+    n_genes = None
+    total_sum: np.ndarray | None = None
+    total_sumsq: np.ndarray | None = None
+    total_count = 0
     for sample in train_samples.values():
         X = sample.adata.X
-        X = X.toarray() if hasattr(X, "toarray") else np.asarray(X)
-        pooled.append(np.asarray(X, dtype=np.float64))
-    pooled_matrix = np.concatenate(pooled, axis=0)
-    scale = pooled_matrix.std(axis=0)
+        n_rows = X.shape[0]
+        if n_genes is None:
+            n_genes = X.shape[1]
+            total_sum = np.zeros(n_genes, dtype=np.float64)
+            total_sumsq = np.zeros(n_genes, dtype=np.float64)
+        elif X.shape[1] != n_genes:
+            raise ValueError(f"compute_training_gene_scale: gene-dimension mismatch ({X.shape[1]} vs {n_genes})")
+        for start in range(0, n_rows, chunk_size):
+            end = min(start + chunk_size, n_rows)
+            chunk = X[start:end]  # sparse-slice FIRST -- cheap, no densification yet
+            chunk = chunk.toarray() if hasattr(chunk, "toarray") else np.asarray(chunk)
+            chunk = np.asarray(chunk, dtype=np.float64)
+            total_sum += chunk.sum(axis=0)
+            total_sumsq += (chunk ** 2).sum(axis=0)
+            total_count += chunk.shape[0]
+    if total_count == 0:
+        raise ValueError("compute_training_gene_scale: zero rows across all training samples")
+    mean = total_sum / total_count
+    variance = np.clip(total_sumsq / total_count - mean ** 2, 0.0, None)
+    scale = np.sqrt(variance)
     return np.clip(scale, 1e-6, None).astype(np.float32)
 
 
@@ -301,25 +525,37 @@ def compute_step_losses(architecture_id: str, model, inputs, target_expression: 
 
 
 def compute_deterministic_reconstruction_losses(
-    model, inputs, target_expression: torch.Tensor, query_coords: torch.Tensor,
+    architecture_id: str, model, inputs, target_expression: torch.Tensor, query_coords: torch.Tensor,
     gradient_weight: float, k_neighbors: int, per_gene_scale: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
 ) -> dict:
-    """Architecture-GENERIC deterministic reconstruction objective, used
-    for VALIDATION/model-selection (Adam's Step 6 audit #8: "Use the
-    common deterministic reconstruction metrics for model selection; log
-    flow loss separately with a fixed generator if desired"). `model(inputs)`
-    works identically for all four architectures -- Architecture4.forward()
-    is defined to return exactly its conditioner's own output (the same
-    shape Architectures 1-3 return), and never touches the stochastic flow
-    apparatus at all. This is the ONLY loss function whose value ever
-    drives a validation-based decision (best-checkpoint selection); the
-    flow loss, for Architecture 4, is logged separately (see
-    `compute_step_losses`' `flow_generator`) and never mixed into it."""
-    out = model(inputs)
-    return combined_reconstruction_loss(
-        out["expression"], target_expression, query_coords,
+    """The reconstruction objective used for VALIDATION/model-selection
+    (Adam's Step 6 audit #8, then corrected by audit #1 of commit
+    a32051b). For Architectures 1-3, `model(inputs)` (their real forward
+    pass) is used directly. For Architecture 4, audit #1 is explicit:
+    "Architecture 4 validation/evaluation/overfit must evaluate a
+    deterministic fixed-seed predictive mean from
+    `sample_predictive_distribution`, not `forward()`'s frozen
+    conditioner." `forward()` never touches the trained flow apparatus at
+    all -- selecting on it would let Architecture 4's flow weights train
+    for hours while the ONLY metric ever checked is blind to whether they
+    learned anything. `predict_for_metrics` (with a caller-supplied,
+    fixed-per-step `generator` for resume-exact reproducibility) is now
+    used for every architecture; the result additionally carries
+    `conditioner_only_total` for Architecture 4 -- a SECONDARY diagnostic
+    logged alongside the real metric, never used for selection."""
+    prediction = predict_for_metrics(architecture_id, model, inputs, generator=generator)
+    result = combined_reconstruction_loss(
+        prediction["expression"], target_expression, query_coords,
         gradient_weight=gradient_weight, k_neighbors=k_neighbors, per_gene_scale=per_gene_scale,
     )
+    if "conditioner_only_expression" in prediction:
+        conditioner_only = combined_reconstruction_loss(
+            prediction["conditioner_only_expression"], target_expression, query_coords,
+            gradient_weight=gradient_weight, k_neighbors=k_neighbors, per_gene_scale=per_gene_scale,
+        )
+        result = {**result, "conditioner_only_total": conditioner_only["total"]}
+    return result
 
 
 def dataset_manifest_fingerprint(manifest: dict) -> str:
@@ -368,12 +604,50 @@ def file_sha256(path: str | Path) -> str:
     return h.hexdigest()
 
 
+def _environment_versions() -> dict:
+    """Best-effort, informational-only record of the software environment
+    a run actually executed under -- Adam's Step 6 audit #9 of commit
+    a32051b: "Record environment versions." Never raises: an environment
+    lookup failing (e.g. `torch.version.cuda` on a CPU-only build) must
+    never fail a real training run over a diagnostics field."""
+    try:
+        cuda_version = torch.version.cuda
+    except Exception:
+        cuda_version = None
+    return {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda": cuda_version,
+        "cuda_available": bool(torch.cuda.is_available()),
+        "platform": platform.platform(),
+    }
+
+
+def _code_commit_hash() -> str | None:
+    """Best-effort git commit SHA of the code that produced this run --
+    Adam's Step 6 audit #9: "Record... code commit." None (not an error)
+    outside a git checkout or if git itself is unavailable; a run
+    manifest missing this field is a real, honestly-reported limitation,
+    never a reason to fail the run."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parent,
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
 def build_run_manifest(
     *, config: dict, config_path: str, dataset_manifest: dict, gene_names: list[str], seed: int,
     preflight_report: dict, train_schedule, val_schedule, architecture_id: str,
     checkpoint_dir: Path, synchronized_init_manifest_path: Path | None,
     gigapath_checkpoint_sha256: str | None = None, gene_residual_basis_gene_names_hash: str | None = None,
-    gene_scale_sha256: str | None = None,
+    gene_residual_basis_sha256: str | None = None, gene_scale_sha256: str | None = None,
+    architecture3_conditioner_info: dict | None = None,
 ) -> dict:
     """Requirement #8: one artifact binding dataset, gene panel, split,
     mask, cache, model/checkpoint, configuration, and seed fingerprints
@@ -423,14 +697,31 @@ def build_run_manifest(
         "synchronized_init_manifest_sha256": synchronized_init_manifest_sha256,
         "gigapath_checkpoint_sha256": gigapath_checkpoint_sha256,
         "gene_residual_basis_gene_names_hash": gene_residual_basis_gene_names_hash,
+        "gene_residual_basis_sha256": gene_residual_basis_sha256,
         "gene_scale_sha256": gene_scale_sha256,
+        # Audit #4: Architecture 4's conditioner must be bound to the
+        # EXACT Architecture 3 checkpoint (weights sha256 + step) it was
+        # loaded from, not merely "some path was configured."
+        "architecture3_conditioner_checkpoint_dir": (architecture3_conditioner_info or {}).get("checkpoint_dir"),
+        "architecture3_conditioner_checkpoint_sha256": (architecture3_conditioner_info or {}).get("checkpoint_sha256"),
+        "architecture3_conditioner_checkpoint_step": (architecture3_conditioner_info or {}).get("checkpoint_step"),
+        # Audit #9: informational-only (never part of resume-consistency
+        # verification -- a different torch/CUDA patch version resuming
+        # the same run is not itself a scientific-identity change).
+        "environment_versions": _environment_versions(),
+        "code_commit_hash": _code_commit_hash(),
     }
 
 
 _RESUME_CONSISTENCY_FIELDS = (
     "config_identity_fingerprint", "dataset_manifest_fingerprint", "gene_panel_hash", "model_architecture",
     "synchronized_init_manifest_sha256", "gigapath_checkpoint_sha256",
-    "gene_residual_basis_gene_names_hash", "gene_scale_sha256",
+    "gene_residual_basis_gene_names_hash", "gene_residual_basis_sha256", "gene_scale_sha256",
+    # Audit #4: a resume must refuse to continue if Architecture 4's
+    # conditioner checkpoint was swapped for a DIFFERENT Architecture 3
+    # checkpoint (same or different path) between runs -- exact weight
+    # identity, not merely "some checkpoint is configured."
+    "architecture3_conditioner_checkpoint_sha256", "architecture3_conditioner_checkpoint_step",
 )
 
 
@@ -445,7 +736,19 @@ def verify_resume_consistency(old_run_manifest: dict, new_run_manifest: dict) ->
     basis. Called BEFORE any checkpoint state is loaded and BEFORE the new
     run_manifest.json is written over the old one -- a caller must not
     overwrite the evidence of a real config-drift bug before it has been
-    checked."""
+    checked.
+
+    Scope caveat (Adam's Step 6 audit #9 of commit a32051b): this
+    verifies IDENTITY -- the same config/dataset/gene-panel/architecture/
+    synchronized-init/conditioner-checkpoint/basis/gene-scale a resumed
+    run started from -- never BIT-EXACT FLOATING-POINT reproducibility
+    of training on a GPU. Nothing in this trainer calls
+    `torch.use_deterministic_algorithms` or otherwise enforces
+    deterministic CUDA kernels/cuDNN algorithm selection; a resumed run
+    on GPU can therefore diverge numerically step-by-step from an
+    unbroken run even with every field this function checks unchanged --
+    `environment_versions` is recorded in the run manifest for this
+    reason, as informational context, not as a determinism guarantee."""
     for field in _RESUME_CONSISTENCY_FIELDS:
         old_value = old_run_manifest.get(field)
         new_value = new_run_manifest.get(field)
@@ -471,17 +774,124 @@ def save_run_manifest(run_manifest: dict, path: str | Path) -> Path:
     return _save_json_atomic(run_manifest, path)
 
 
+def save_best_checkpoint_bundle(
+    model, gene_names: list[str], best_dir: str | Path, *, step: int, val_loss: float, run_manifest: dict,
+) -> Path:
+    """Atomically (re)write `best/` as a COMPLETE, independently
+    verifiable inference bundle -- Adam's Step 6 audit #3 of commit
+    a32051b: "Make best/ a complete, verifiable inference bundle... or an
+    immutable pointer to one... including gene names, config/run-manifest
+    identity, external artifact hashes, selected step, and weights."
+    Before this function existed, `best/` held only `trainable_weights.pt`
+    plus a 2-field `best_info.json` -- not independently loadable/
+    verifiable as a standalone artifact separate from the live
+    `checkpoint_dir` state.
+
+    Staged in a temp directory and swapped in with a single `os.replace`
+    so `best/` is always either the complete PREVIOUS bundle or the
+    complete NEW one, never a partially-written mix of the two (mirrors
+    `checkpoint.py`'s existing atomic-write discipline, extended here to
+    the whole directory rather than one file at a time)."""
+    best_dir = Path(best_dir)
+    tmp_dir = best_dir.parent / f".{best_dir.name}.tmp{os.getpid()}"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_module.save_trainable_state(model, tmp_dir)
+    (tmp_dir / "gene_names.json").write_text(json.dumps(list(gene_names), indent=2))
+
+    file_hashes = {
+        name: file_sha256(tmp_dir / name)
+        for name in ("trainable_weights.pt", "gene_names.json") if (tmp_dir / name).is_file()
+    }
+    bundle_info = {
+        "step": int(step), "total": float(val_loss), "files": file_hashes,
+        "config_path": run_manifest.get("config_path"),
+        "config_identity_fingerprint": run_manifest.get("config_identity_fingerprint"),
+        "dataset_manifest_fingerprint": run_manifest.get("dataset_manifest_fingerprint"),
+        "gene_panel_hash": run_manifest.get("gene_panel_hash"),
+        "model_architecture": run_manifest.get("model_architecture"),
+        "synchronized_init_manifest_sha256": run_manifest.get("synchronized_init_manifest_sha256"),
+        "gigapath_checkpoint_sha256": run_manifest.get("gigapath_checkpoint_sha256"),
+        "gene_residual_basis_gene_names_hash": run_manifest.get("gene_residual_basis_gene_names_hash"),
+        "gene_residual_basis_sha256": run_manifest.get("gene_residual_basis_sha256"),
+        "gene_scale_sha256": run_manifest.get("gene_scale_sha256"),
+        "architecture3_conditioner_checkpoint_sha256": run_manifest.get("architecture3_conditioner_checkpoint_sha256"),
+        "architecture3_conditioner_checkpoint_step": run_manifest.get("architecture3_conditioner_checkpoint_step"),
+        "code_commit_hash": run_manifest.get("code_commit_hash"),
+    }
+    # Written LAST -- a reader can treat best_info.json's presence (and
+    # its own per-file hashes matching) as proof the bundle is complete.
+    (tmp_dir / "best_info.json").write_text(json.dumps(bundle_info, indent=2, sort_keys=True, default=str))
+
+    if best_dir.exists():
+        shutil.rmtree(best_dir)
+    os.replace(tmp_dir, best_dir)
+    return best_dir
+
+
+def verify_checkpoint_bundle_identity(
+    bundle_dir: str | Path, *, dataset_manifest: dict, gene_names: list[str],
+) -> dict:
+    """Fail-closed pre-load check for a `save_best_checkpoint_bundle`
+    bundle -- Adam's Step 6 audit #7: "Verify the checkpoint run manifest
+    against evaluation inputs before loading." Confirms every per-file
+    hash the bundle's own `best_info.json` recorded still matches the
+    file on disk right now (catches altered/corrupted bundle contents --
+    audit #4's adversarial scenario) and that the bundle's
+    `dataset_manifest_fingerprint`/`gene_panel_hash` agree with what the
+    CALLER is about to evaluate against, before any weights are loaded.
+    Returns the bundle's own info dict on success."""
+    bundle_dir = Path(bundle_dir)
+    info_path = bundle_dir / "best_info.json"
+    if not info_path.is_file():
+        raise ValueError(f"{bundle_dir} has no best_info.json -- not a complete, verifiable inference bundle")
+    info = json.loads(info_path.read_text())
+    for name, expected_hash in (info.get("files") or {}).items():
+        file_path = bundle_dir / name
+        if not file_path.is_file():
+            raise ValueError(f"{bundle_dir}: best_info.json references {name} but it is missing")
+        if file_sha256(file_path) != expected_hash:
+            raise ValueError(
+                f"{bundle_dir}: {name} does not match the sha256 recorded in best_info.json -- "
+                "the bundle's contents were altered after being written, refusing to load"
+            )
+    expected_dataset_fp = dataset_manifest_fingerprint(dataset_manifest)
+    if info.get("dataset_manifest_fingerprint") not in (None, expected_dataset_fp):
+        raise ValueError(
+            f"{bundle_dir}: was selected under dataset_manifest_fingerprint="
+            f"{info.get('dataset_manifest_fingerprint')!r} but this evaluation's dataset manifest "
+            f"fingerprints to {expected_dataset_fp!r} -- refusing to evaluate a checkpoint against "
+            "different data than it was trained/selected on"
+        )
+    expected_gene_hash = gene_panel_hash(gene_names)
+    if info.get("gene_panel_hash") not in (None, expected_gene_hash):
+        raise ValueError(
+            f"{bundle_dir}: was selected under gene_panel_hash={info.get('gene_panel_hash')!r} but this "
+            f"evaluation's gene panel hashes to {expected_gene_hash!r} -- refusing to load"
+        )
+    return info
+
+
 def _log_step(step: int, split: str, losses: dict, extra: str = "") -> None:
     parts = ", ".join(f"{k}={float(v.detach()) if torch.is_tensor(v) else float(v):.6f}" for k, v in losses.items())
     print(f"[step {step}] {split}: {parts}{extra}", flush=True)
 
 
-def run_training(config_path: str, smoke: bool = False) -> dict:
+def run_training(config_path: str, smoke: bool = False, staged_smoke: bool = False) -> dict:
     """The real Step 6 training entrypoint. Returns a small summary dict
     (never a live model/optimizer -- those are process-local); a caller
     that wants the trained model runs this in-process and reads
     `checkpoint_dir` afterward, matching every other artifact-based
-    hand-off in this package."""
+    hand-off in this package.
+
+    `staged_smoke` (Adam's Step 6 audit #8 of commit a32051b): only
+    meaningful together with `smoke=True`. A plain `--smoke` is
+    CONSTRUCTION-ONLY -- it never requires Architecture 4's real
+    Architecture 3 conditioner checkpoint. `staged_smoke=True` runs the
+    real, one-step "staged" smoke: Architecture 4 must have a real
+    conditioner checkpoint configured, exactly like a non-smoke run."""
     config = resolved_config(config_path)
     data_cfg = config["data"]
     training_cfg = config["training"]
@@ -560,62 +970,56 @@ def run_training(config_path: str, smoke: bool = False) -> dict:
     sample_rng = random.Random(seed)
 
     gene_names = list(dataset_manifest["gene_panel"])
-    n_genes = len(gene_names)
-    gex_feature_dim = int(data_cfg.get("gex_feature_dim", 128))
-    slide_encoder, gigapath_checkpoint_sha256 = maybe_build_slide_encoder(config)
-    gene_basis, resolved_gene_names = maybe_load_gene_basis(config, gene_names)
-
     device = torch.device(training_cfg.get("device", "cpu") if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(seed)  # re-seed immediately before construction -- shared init discipline (model_factory.build_architecture mirrors this)
-    model = model_factory.build_architecture(
-        config, n_genes=n_genes, gex_feature_dim=gex_feature_dim, gene_basis=gene_basis,
-        gene_names=resolved_gene_names, slide_encoder=slide_encoder,
-        gigapath_checkpoint_sha256=gigapath_checkpoint_sha256, seed=seed,
-    ).to(device)
 
-    # Requirement #7: mandatory, verified synchronized initialization --
-    # fails closed if it cannot be verified.
-    synchronized_init_manifest_path = None
-    synchronized_init_dir = training_cfg.get("synchronized_init_dir")
-    if synchronized_init_dir:
-        sync_dir = Path(synchronized_init_dir)
-        synchronized_init_manifest_path = sync_dir / "initialization_manifest.json"
-        sync_manifest = json.loads(synchronized_init_manifest_path.read_text())
-        architecture_name = f"architecture{architecture_id}"
-        model_factory.load_synchronized_initialization(
-            model, sync_dir / architecture_name, sync_manifest, architecture_name,
-        )
-    elif not smoke:
-        raise ValueError(
-            "training.synchronized_init_dir must be set for a real (non-smoke) run -- Step 6 "
-            "requires a verified, persisted synchronized initialization for every architecture "
-            "(persist_four_architecture_initializations); refusing to train four architectures "
-            "from four independently-random starting points"
-        )
-
-    # Audit #11: Architecture 4 must never train from a random or merely
-    # synchronized-init conditioner -- overwrite it with a REAL, already-
-    # trained Architecture 3 checkpoint (and freeze it) before anything
-    # else touches the model.
-    maybe_load_pretrained_conditioner_for_architecture4(model, config, architecture_id, gene_names, smoke)
+    # Audit #2: the ONE shared model-reconstruction pipeline -- builds the
+    # architecture, loads verified synchronized initialization (fails
+    # closed for a real run), and loads+freezes Architecture 4's exact
+    # Architecture 3 conditioner. `checkpoint_dir=None` here: whether to
+    # resume THIS run's own checkpoint is decided further down, gated on
+    # `training_state.get("step", 0) > 0`.
+    model, model_info = build_model_for_inference(
+        config, gene_names=gene_names, device=device, checkpoint_dir=None,
+        smoke=smoke, staged_smoke=staged_smoke, dataset_manifest=dataset_manifest,
+    )
+    gene_basis = model_info["gene_basis"]
+    gigapath_checkpoint_sha256 = model_info["gigapath_checkpoint_sha256"]
+    synchronized_init_manifest_path = model_info["synchronized_init_manifest_path"]
+    architecture3_conditioner_info = model_info["architecture3_conditioner"]
 
     # Requirement #9: real, TRAINING-ONLY per-gene standardization scale
-    # for the spatial-gradient loss -- computed once here (train_samples
-    # are already loaded by preflight) and persisted, never re-derived
-    # from each query target at loss-computation time.
+    # for the spatial-gradient loss -- computed here (train_samples are
+    # already loaded by preflight) but NOT YET WRITTEN to disk. Audit #4
+    # of commit a32051b ("Do not overwrite gene_scale.npy or other
+    # checkpoint artifacts before resume verification passes"): the
+    # actual `save_gene_scale` write now happens further below, AFTER
+    # `verify_resume_consistency` has passed -- a resume that gets
+    # refused must never have already clobbered the prior run's
+    # gene_scale.npy on its way to being refused.
     gene_scale = compute_training_gene_scale(train_samples)
-    gene_scale_path = save_gene_scale(gene_scale, checkpoint_dir / "gene_scale.npy")
     gene_scale_sha256 = hashlib.sha256(np.ascontiguousarray(gene_scale).tobytes()).hexdigest()
     gene_scale_tensor = torch.as_tensor(gene_scale, dtype=torch.float32, device=device)
 
     gene_residual_basis_gene_names_hash = gene_basis.gene_names_hash if gene_basis is not None else None
+    # Audit #4: "bind resume/evaluation to exact numeric basis SHA256" --
+    # gene_residual_basis_gene_names_hash alone only proves the GENE
+    # ORDERING matches; it says nothing about the basis's own numeric
+    # CONTENT, so a basis file re-fit (or hand-edited) to different
+    # numeric values with the identical gene ordering would silently
+    # pass every check that existed before this hash.
+    gene_residual_basis_sha256 = (
+        hashlib.sha256(np.ascontiguousarray(gene_basis.basis.detach().cpu().numpy()).tobytes()).hexdigest()
+        if gene_basis is not None else None
+    )
 
     # Requirement #5: build the NEW run manifest in memory (never yet
     # written) and, if a PRIOR run_manifest.json already exists in this
     # checkpoint_dir, verify every identity-bearing fingerprint agrees
-    # with it BEFORE loading any checkpoint state and BEFORE overwriting
-    # that prior manifest -- "Refuse changed configs or artifacts... Do
-    # not overwrite the old run manifest before verifying it."
+    # with it BEFORE loading any checkpoint state, BEFORE writing
+    # gene_scale.npy, and BEFORE overwriting that prior manifest --
+    # "Refuse changed configs or artifacts... Do not overwrite the old
+    # run manifest -- or gene_scale.npy, or any other checkpoint artifact
+    # -- before verifying it" (audit #4).
     run_manifest = build_run_manifest(
         config=config, config_path=str(config_path), dataset_manifest=dataset_manifest, gene_names=gene_names,
         seed=seed, preflight_report=preflight_report, train_schedule=train_schedule, val_schedule=val_schedule,
@@ -623,12 +1027,19 @@ def run_training(config_path: str, smoke: bool = False) -> dict:
         synchronized_init_manifest_path=synchronized_init_manifest_path,
         gigapath_checkpoint_sha256=gigapath_checkpoint_sha256,
         gene_residual_basis_gene_names_hash=gene_residual_basis_gene_names_hash,
+        gene_residual_basis_sha256=gene_residual_basis_sha256,
         gene_scale_sha256=gene_scale_sha256,
+        architecture3_conditioner_info=architecture3_conditioner_info,
     )
     existing_run_manifest_path = checkpoint_dir / "run_manifest.json"
     if existing_run_manifest_path.is_file():
         old_run_manifest = json.loads(existing_run_manifest_path.read_text())
         verify_resume_consistency(old_run_manifest, run_manifest)
+
+    # Only now, having passed resume-consistency verification (or there
+    # being no prior run to verify against), is it safe to overwrite this
+    # checkpoint_dir's gene_scale.npy -- audit #4.
+    gene_scale_path = save_gene_scale(gene_scale, checkpoint_dir / "gene_scale.npy")
 
     resume_step = 0
     optimizer_cfg = training_cfg.get("optimizer") or {}
@@ -692,22 +1103,37 @@ def run_training(config_path: str, smoke: bool = False) -> dict:
     def _run_validation(current_step: int) -> dict | None:
         if val_loader is None:
             return None
+        # Audit #1 of commit a32051b: Architecture 4's SELECTION metric
+        # now samples from `sample_predictive_distribution` -- reseeded
+        # from (seed, current_step) rather than a single run-lifetime
+        # generator, so the EXACT same predictive samples (and therefore
+        # the exact same selection metric) are produced whether this
+        # validation call happens in the original run or after a resume
+        # at the identical step.
+        predictive_val_generator = torch.Generator(device=device).manual_seed(
+            (int(seed) * 7_919 + int(current_step)) % (2**63)
+        )
         model.eval()
         with torch.no_grad():
             val_totals: list[float] = []
+            val_conditioner_only_totals: list[float] = []
             val_flow_losses: list[float] = []
             for val_inputs, val_targets in val_loader:
                 val_target_expression = torch.as_tensor(val_targets.query_expression, dtype=torch.float32, device=device)
                 val_query_coords = torch.as_tensor(val_inputs.query_coords, dtype=torch.float32, device=device)
-                # Requirement #8: model selection ALWAYS uses the common,
-                # deterministic reconstruction objective -- never
-                # Architecture 4's stochastic flow loss, which used to be
-                # silently mixed into "total" during validation too.
+                # Requirement #8/audit #1: model selection ALWAYS uses the
+                # real predictive distribution (Architecture 4) or real
+                # forward() (Architectures 1-3) -- never Architecture 4's
+                # frozen-conditioner-only forward(), which used to be
+                # silently used for its selection metric.
                 det_losses = compute_deterministic_reconstruction_losses(
-                    model, val_inputs, val_target_expression, val_query_coords,
+                    architecture_id, model, val_inputs, val_target_expression, val_query_coords,
                     gradient_weight=gradient_weight, k_neighbors=k_neighbors, per_gene_scale=gene_scale_tensor,
+                    generator=predictive_val_generator,
                 )
                 val_totals.append(float(det_losses["total"]))
+                if "conditioner_only_total" in det_losses:
+                    val_conditioner_only_totals.append(float(det_losses["conditioner_only_total"]))
                 if architecture_id == "4":
                     flow_loss = model.compute_flow_matching_loss(
                         val_inputs, val_target_expression, generator=flow_val_generator,
@@ -729,6 +1155,12 @@ def run_training(config_path: str, smoke: bool = False) -> dict:
             entry = {"step": int(current_step), "total": mean_val_loss}
             if val_flow_losses:
                 entry["flow_loss_mean_fixed_generator"] = float(np.mean(val_flow_losses))
+            if val_conditioner_only_totals:
+                # Audit #1: the frozen-conditioner-only reconstruction
+                # loss, reported ONLY as a secondary diagnostic -- never
+                # read for selection ("total" above always comes from the
+                # real predictive mean for Architecture 4).
+                entry["conditioner_only_total_mean_fixed_generator"] = float(np.mean(val_conditioner_only_totals))
             _log_step(current_step, "validation", {"total": mean_val_loss})
         model.train()
         return entry
@@ -826,10 +1258,9 @@ def run_training(config_path: str, smoke: bool = False) -> dict:
                 if entry["total"] < best_val_loss:
                     best_val_loss = entry["total"]
                     if not smoke:
-                        best_dir = checkpoint_dir / "best"
-                        checkpoint_module.save_trainable_state(model, best_dir)
-                        _save_json_atomic(
-                            {"step": int(step), "total": entry["total"]}, best_dir / "best_info.json",
+                        save_best_checkpoint_bundle(
+                            model, gene_names, checkpoint_dir / "best",
+                            step=step, val_loss=entry["total"], run_manifest=run_manifest,
                         )
 
         step += 1
@@ -861,8 +1292,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--smoke", action="store_true", help="Run exactly one training (and one validation) step, then exit.")
+    parser.add_argument(
+        "--staged-smoke", action="store_true",
+        help="Only meaningful with --smoke. Architecture 4's real, already-trained "
+             "architecture3_conditioner_checkpoint is required (exactly like a non-smoke run), unlike a plain "
+             "--smoke, which is construction-only and exempt. Adam's Step 6 audit #8 of commit a32051b.",
+    )
     args = parser.parse_args()
-    run_training(args.config, smoke=args.smoke)
+    run_training(args.config, smoke=args.smoke, staged_smoke=args.staged_smoke)
 
 
 if __name__ == "__main__":

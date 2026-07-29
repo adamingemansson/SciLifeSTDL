@@ -67,6 +67,14 @@ model:
 loss:
   gradient_weight: 0.05
   k_neighbors: 6
+  # Adam's Step 6 audit #9 of commit a32051b: "Put optimizer values and
+  # loss.flow_weight explicitly into all YAML configs." Architecture 4
+  # is the one architecture that ACTUALLY reads this (train.py::
+  # compute_step_losses's `total = recon["total"] + flow_weight *
+  # out["flow_loss"]`) -- previously only a Python-level default inside
+  # train.py, now explicit so it is visible/diffable from this committed
+  # YAML alone rather than something a reader has to go find in code.
+  flow_weight: 1.0
 
 masking:
   strata:
@@ -143,3 +151,8 @@ training:
   checkpoint_dir: gen3_multiscale/results/architecture4
   eval_every_n_steps: 2000
   synchronized_init_dir: null   # dir written by model_factory.persist_four_architecture_initializations -- required for any non-smoke run (train.py fails closed without it)
+  # Adam's Step 6 audit #9 of commit a32051b -- see architecture1.yaml's identical comment.
+  optimizer:
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
