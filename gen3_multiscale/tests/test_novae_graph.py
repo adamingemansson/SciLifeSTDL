@@ -130,11 +130,15 @@ def test_build_context_only_novae_input_var_is_index_only_not_full_slide_gene_st
 
 
 def test_build_context_only_novae_input_includes_all_gex_available_context_spots_even_with_he_overlap():
-    """The core requirement Step 4 exists to satisfy: unlike
-    build_spatial_field_example (which excludes context spots whose H&E
-    patch physically overlaps the query hole), the Novae input must
-    include EVERY GEX-available context spot regardless of H&E
-    availability."""
+    """The core requirement Step 4 exists to satisfy: the Novae input
+    must include EVERY GEX-available context spot regardless of H&E
+    availability -- Novae operates on GEX alone and has no H&E-overlap
+    concept at all. (15th Codex re-audit, Step 5: build_spatial_field_example
+    ALSO now retains every GEX-available spot -- see
+    test_example_builder.py's *_flags_but_retains_* test -- but it
+    additionally tracks per-spot H&E availability as an explicit flag,
+    a concept Novae's context-only AnnData has no field for and does not
+    need, since it never reads image features at all.)"""
     adata = _square_grid_adata(n_side=6, spacing=10.0)
     patches = np.zeros((adata.n_obs, 4, 4, 3), dtype=np.uint8)
     barcodes = list(adata.obs_names)
@@ -157,10 +161,12 @@ def test_build_context_only_novae_input_includes_all_gex_available_context_spots
         adata, patches, context, [query_barcode], _stub_image_feature_fn,
         sample_id="S0", patient_id="P0", patch_size_fullres=30.0, require_full_sample_coords=False,
     )
-    assert neighbor_barcode not in example_inputs.observed_barcodes.tolist()
+    assert neighbor_barcode in example_inputs.observed_barcodes.tolist()  # GEX retained
+    neighbor_pos = example_inputs.observed_barcodes.tolist().index(neighbor_barcode)
+    assert example_inputs.observed_image_available[neighbor_pos] == False  # noqa: E712 -- but H&E flagged unavailable
 
     novae_inputs = build_context_only_novae_input(adata, context, [query_barcode], sample_id="S0")
-    assert neighbor_barcode in novae_inputs.node_barcodes.tolist()
+    assert neighbor_barcode in novae_inputs.node_barcodes.tolist()  # Novae has no H&E-availability concept at all
 
 
 def test_build_context_only_novae_input_rejects_missing_barcodes():

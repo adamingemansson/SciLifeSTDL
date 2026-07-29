@@ -3583,7 +3583,133 @@ was missing); `EmptyMaskRealizationError`'s narrow retry scoping.
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 40. Real Gen3 data builder -- Step 5, part 1: per-spot H&E availability and WSI-context schema
+
+Adam's Step 5 instruction ("wire real regional/global GigaPath WSI
+context into Architectures 3/4") comes with a long, specific acceptance
+list. This section covers only the DATA-LAYER foundation -- the actual
+regional/global wiring into `_SharedFieldArchitecture.forward()` (still
+`NotImplementedError` for `use_regional_he`/`use_global_slide`), config
+changes, and the adversarial hole-vs-visible-tile independence tests are
+NOT done yet and are explicitly NOT claimed here. This section is
+honest about scope: what follows is real, tested, and pushed, but it is
+Step 5's foundation, not its completion.
+
+**Per-spot H&E availability (real gap, confirmed against the actual
+code before fixing).** `example_builder.build_spatial_field_example`
+previously EXCLUDED a context spot from `observed_*` entirely whenever
+its H&E patch footprint physically overlapped the query hole, even
+though that spot's GEX is real, measured, and available -- GEX and
+imaging are independent real-world failure modes (imaging can fail
+locally while transcriptomics stays readable), and dropping the GEX too
+throws away real signal for no reason. `_SharedFieldArchitecture`'s own
+`modality_flags` input (consumed by `SpotTokenProjection`, already
+built) was correspondingly hardcoded to `torch.ones` -- a real flag
+input with nothing real behind it yet.
+
+Fixed: every GEX-available context spot is now retained.
+`SpatialFieldInputs` gained a new required field
+`observed_image_available: np.ndarray` ([n_observed] bool);
+`validate_spatial_field_example` enforces its shape/dtype AND
+structurally enforces that any spot flagged unavailable has an
+EXPLICITLY zeroed `observed_gigapath_features` row -- never a real or
+garbage feature value with no flag to distinguish it (this is checked
+both directions: a non-zero feature for a flagged-unavailable spot
+raises, and a correctly-zeroed one passes).
+`build_spatial_field_example` now computes this flag via the
+already-audited `slide_context.nonoverlapping_context_patch_mask`,
+feeds `image_feature_fn` ONLY the available patches (an unavailable
+spot's real pixels are never even touched, modeling the actual
+deployment scenario where that image would not exist), and zero-fills
+the rest. When EVERY context spot is H&E-unavailable, `image_feature_fn`
+has nothing to call at all -- `expected_feature_width` is then required
+(raises a clear, actionable error if omitted) so a correctly-shaped
+all-zero feature array can still be built. Verified by 4 new tests in
+`test_example_builder.py` (retained-but-flagged, zero-feature
+enforcement in both directions via `test_example.py`, and the
+all-unavailable edge case) plus updates to the 2 pre-existing tests that
+asserted the OLD drop-the-spot behavior (`test_novae_graph.py`'s
+GEX-availability contrast test updated to reflect that
+`build_spatial_field_example` now ALSO retains every GEX-available
+spot, differing from Novae's context-only input only in that it tracks
+per-spot H&E availability as an explicit flag -- a concept Novae's
+input has no field for and does not need).
+
+**WSI-context schema (groundwork for the regional/global wiring still
+to come).** `SpatialFieldInputs` gained `full_slide_coord_bounds:
+tuple[float,float,float,float] | None` (the complete-slide bounds
+`models.slide_encoder.pool_regional_tokens` requires so a regional grid
+cell refers to the same physical region across every example on a
+slide, regardless of which hole was cut) and `slide_cache_namespace:
+str | None` (real cache-key material -- content hash + visible-tile-set
+identity -- a caller combines with the loaded GigaPath checkpoint's own
+SHA256 to form the complete LongNet cache namespace; this dataclass
+never assumes a specific checkpoint). `validate_spatial_field_example`
+enforces `wsi_tile_features`/`wsi_tile_coords`/`full_slide_coord_bounds`
+are set together (all three or none), that bounds are non-degenerate,
+and that every visible tile coordinate actually falls within them (a
+visible tile outside the complete-slide bounds would mean the bounds
+were computed from stale or mismatched data). Verified by 5 new tests
+in `test_example.py`.
+
+**GigaPath cache-key strengthening (`slide_context.py`, one of Step 5's
+explicit acceptance items, addressed independently of the regional/
+global wiring since it's fully self-contained).** `load_slide_context`'s
+`context_id` previously identified a dense WSI tile cache by file
+path+size+mtime -- a proxy for content, not content itself (a file
+replaced in-place with different bytes at the same size, at a moment
+that rounds to the same mtime granularity, would silently collide).
+Fixed: `context_id` is now a real SHA256 over the actual tile feature/
+coordinate/tile-size bytes. `visible_slide_context`'s own `context_id`
+previously appended only the literal `image_mode` string -- two
+DIFFERENT query holes on the SAME cached slide produce two different
+VISIBLE tile sets (the whole point of `target_zero` filtering) but
+would collide on an identical `context_id`, risking a cached LongNet
+global vector computed for the WRONG visible-tile set being silently
+reused. Fixed: the visible tile coordinates themselves (post-filtering)
+are now hashed into `context_id`. Verified by 3 new tests in
+`test_slide_context.py` (content-hash binding for the base cache,
+visible-set binding for two different holes, and stability for the
+same hole).
+
+**Explicitly still open (Step 5 is not closed by this section):**
+wiring `pool_regional_tokens`/`FrozenGigaPathSlideEncoder` into
+`_SharedFieldArchitecture.forward()` (both branches still raise
+`NotImplementedError`); `configs/architecture3.yaml`/`architecture4.yaml`
+actually enabling `use_regional_he`/`use_global_slide`; the adversarial
+test proving a corrupted query-hole-overlapping tile cannot affect any
+model input or prediction while a corrupted VISIBLE tile can; the
+structural/test proof that regional/global H&E hidden state never
+enters the untouched GEX value-candidate pool (true by construction
+today, per `_SharedFieldArchitecture.forward()`'s existing
+`shared_expression_parts` composition, but not yet exercised by a
+dedicated regression test against the real regional/global wiring since
+that wiring doesn't exist yet); Architecture 4 constructing its
+conditioner with the checkpoint-SHA256/slide-encoder apparatus threaded
+through; and the real A100 smoke-test script (frozen/eval-mode LongNet,
+FP16/FlashAttention, bounded memory) -- undeliverable as anything other
+than a script for the user to run themselves, per this session's
+standing "cannot execute on the remote GPU server directly" constraint.
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 459 passed (45 reused-infra + 20 example-schema +
+  11 boundary-graph + 8 slide-context + 7 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 23 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 17 dataset-manifest + 17 example-builder +
+  46 mask-fingerprint + 22 novae-graph)
+gen2_architectures + gen3_multiscale: 632 passed, 1 skipped
+```
+
+The block immediately below (pre-Step-5-part-1 test counts) is kept for
+historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 447 passed (45 reused-infra + 12 example-schema +

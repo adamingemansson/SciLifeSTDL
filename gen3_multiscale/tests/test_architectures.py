@@ -35,6 +35,7 @@ def _synthetic_inputs(n_genes=6, gex_dim=4, image_dim=8, seed=0):
         query_coords=query_coords.astype(np.float32),
         observed_full_gene_expression=rng.normal(size=(n_observed, n_genes)).astype(np.float32),
         observed_gigapath_features=rng.normal(size=(n_observed, image_dim)).astype(np.float32),
+        observed_image_available=np.ones(n_observed, dtype=bool),
         query_local_neighbor_idx=result.query_local_neighbor_idx,
         boundary_idx=result.boundary_idx,
         boundary_ring=result.boundary_ring,

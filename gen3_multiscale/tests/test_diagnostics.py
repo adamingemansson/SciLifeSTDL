@@ -37,6 +37,7 @@ def _synthetic_inputs(n_genes=6, gex_dim=4, image_dim=8, seed=0):
         query_coords=query_coords.astype(np.float32),
         observed_full_gene_expression=rng.normal(size=(n_observed, n_genes)).astype(np.float32),
         observed_gigapath_features=rng.normal(size=(n_observed, image_dim)).astype(np.float32),
+        observed_image_available=np.ones(n_observed, dtype=bool),
         query_local_neighbor_idx=result.query_local_neighbor_idx,
         boundary_idx=result.boundary_idx,
         boundary_ring=result.boundary_ring,
@@ -129,6 +130,7 @@ def test_shuffle_boundary_gex_leaves_locally_referenced_and_non_boundary_spots_u
         query_coords=np.array([[10.0, 0.0]], dtype=np.float32),
         observed_full_gene_expression=full_expr,
         observed_gigapath_features=np.zeros((n_observed, 4), dtype=np.float32),
+        observed_image_available=np.ones(n_observed, dtype=bool),
         query_local_neighbor_idx=np.array([[0, 1]]),  # local positions {0, 1}
         boundary_idx=np.array([1, 2, 3, 4]),  # position 1 overlaps with local
         boundary_ring=np.array([1, 1, 2, 2]),
@@ -163,6 +165,7 @@ def test_shuffle_boundary_gex_is_a_noop_when_fewer_than_two_shufflable_positions
         query_coords=np.array([[10.0, 0.0]], dtype=np.float32),
         observed_full_gene_expression=np.arange(n_observed * 2, dtype=np.float32).reshape(n_observed, 2),
         observed_gigapath_features=np.zeros((n_observed, 4), dtype=np.float32),
+        observed_image_available=np.ones(n_observed, dtype=bool),
         query_local_neighbor_idx=np.array([[0, 1, 2]]),  # local covers everything boundary has
         boundary_idx=np.array([1, 2]),  # entirely overlapping with local -- nothing shufflable
         boundary_ring=np.array([1, 1]),

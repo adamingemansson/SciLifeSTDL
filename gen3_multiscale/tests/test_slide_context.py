@@ -5,8 +5,11 @@ slide_context.py logic -- kept self-contained here rather than imported,
 since gen3_multiscale's copy must be independently verified, not just
 assumed identical."""
 import numpy as np
+from omegaconf import OmegaConf
 
-from gen3_multiscale.data.slide_context import nonoverlapping_context_patch_mask, visible_slide_context
+from gen3_multiscale.data.slide_context import (
+    load_slide_context, nonoverlapping_context_patch_mask, visible_slide_context,
+)
 
 
 def _slide_context():
@@ -71,3 +74,59 @@ def test_local_context_patch_overlap_is_removed():
     # footprint intersects the hole and must be removed. The second
     # (x=700, distance 600) is well clear.
     assert list(keep) == [False, True]
+
+
+def test_visible_slide_context_id_changes_when_the_visible_tile_set_changes():
+    """15th Codex re-audit (Step 5 acceptance criteria), CONFIRMED: a
+    prior version's context_id only appended the literal image_mode
+    string -- two DIFFERENT query holes on the SAME cached slide produce
+    two different VISIBLE tile sets but would collide on an identical
+    context_id, risking a cached LongNet global vector computed for the
+    wrong visible-tile set being silently reused."""
+    ctx = _slide_context()
+    hole_a = visible_slide_context(
+        ctx, np.asarray([[384, 128, 0]], dtype=np.float32), image_mode="target_zero", query_patch_size=224.0,
+    )
+    hole_b = visible_slide_context(
+        ctx, np.asarray([[0, 0, 0]], dtype=np.float32), image_mode="target_zero", query_patch_size=224.0,
+    )
+    assert hole_a["n_visible"] != hole_b["n_visible"] or not np.array_equal(hole_a["coords"], hole_b["coords"])
+    assert hole_a["context_id"] != hole_b["context_id"]
+
+
+def test_visible_slide_context_id_is_stable_for_the_same_hole():
+    ctx = _slide_context()
+    query = np.asarray([[384, 128, 0]], dtype=np.float32)
+    a = visible_slide_context(ctx, query, image_mode="target_zero", query_patch_size=224.0)
+    b = visible_slide_context(ctx, query, image_mode="target_zero", query_patch_size=224.0)
+    assert a["context_id"] == b["context_id"]
+
+
+def _write_dense_wsi_cache(path, features, coords, tile_size=256.0):
+    np.savez(
+        path, features=features, coords=coords, tile_size=np.asarray(tile_size),
+        coords_are_centers=np.asarray(False),
+    )
+
+
+def test_load_slide_context_id_is_bound_to_real_content_not_just_file_stat(tmp_path):
+    """15th Codex re-audit (Step 5 acceptance criteria), CONFIRMED: a
+    prior version identified the cache by file path+size+mtime -- a
+    proxy for content, not content itself. Two files with genuinely
+    different tile feature content (same shape) must produce different
+    context_ids."""
+    cache_dir = tmp_path / "hest1k" / "gigapath_slide_cache"
+    cache_dir.mkdir(parents=True)
+    coords = np.asarray([[0, 0], [256, 0]], dtype=np.float32)
+
+    features_a = np.ones((2, 1536), dtype=np.float32)
+    _write_dense_wsi_cache(cache_dir / "S0.npz", features_a, coords)
+    cfg = OmegaConf.create({"data": {"slide_context_source": "dense_wsi_cache", "hest_data_dir": str(tmp_path / "hest1k")}})
+    spot_coords = np.asarray([[10, 10]], dtype=np.float32)
+    ctx_a = load_slide_context(cfg, "S0", None, spot_coords)
+
+    features_b = features_a * 2.0  # genuinely different content, same shape/size
+    _write_dense_wsi_cache(cache_dir / "S0.npz", features_b, coords)
+    ctx_b = load_slide_context(cfg, "S0", None, spot_coords)
+
+    assert ctx_a["context_id"] != ctx_b["context_id"]

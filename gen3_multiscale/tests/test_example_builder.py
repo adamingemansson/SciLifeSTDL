@@ -65,11 +65,14 @@ def test_build_spatial_field_example_basic_shapes_and_disjointness():
     assert inputs.sample_id == "S0" and inputs.patient_id == "P0"
 
 
-def test_build_spatial_field_example_excludes_context_patches_overlapping_the_hole():
-    """The core physical-safety requirement this module exists for: a
-    context spot whose barcode is NOT a query barcode, but whose patch
-    footprint physically overlaps a query spot's footprint, must be
-    excluded from the observed set entirely."""
+def test_build_spatial_field_example_flags_but_retains_context_patches_overlapping_the_hole():
+    """15th Codex re-audit (Step 5 acceptance criteria): a context spot
+    whose barcode is NOT a query barcode, but whose patch footprint
+    physically overlaps a query spot's footprint, must be RETAINED in
+    the observed set (its GEX is real and available) but explicitly
+    flagged observed_image_available=False, with its
+    observed_gigapath_features row zeroed -- never dropped entirely, and
+    never a real/garbage feature with no flag."""
     adata = _square_grid_adata(n_side=6, spacing=10.0)
     patches = _matching_patches(adata)
     barcodes = list(adata.obs_names)
@@ -92,17 +95,52 @@ def test_build_spatial_field_example_excludes_context_patches_overlapping_the_ho
         sample_id="S0", patient_id="P0", patch_size_fullres=30.0,  # large enough to guarantee overlap with the 10-unit-spaced neighbor
         require_full_sample_coords=False,
     )
-    assert neighbor_barcode not in inputs.observed_barcodes.tolist()
-    assert inputs.provenance["n_context_excluded_for_physical_he_overlap"] >= 1
+    assert neighbor_barcode in inputs.observed_barcodes.tolist()  # retained, not dropped
+    neighbor_pos = inputs.observed_barcodes.tolist().index(neighbor_barcode)
+    assert inputs.observed_image_available[neighbor_pos] == False  # noqa: E712 -- real numpy bool, not `is False`
+    assert np.all(inputs.observed_gigapath_features[neighbor_pos] == 0.0)
+    assert inputs.provenance["n_context_image_unavailable_for_physical_he_overlap"] >= 1
 
-    # With a tiny patch size, the same neighbor must NOT be excluded.
+    # With a tiny patch size, the same neighbor must be marked available.
     inputs_small_patch, _ = build_spatial_field_example(
         adata, patches, context, [query_barcode], _stub_image_feature_fn,
         sample_id="S0", patient_id="P0", patch_size_fullres=0.01,
         require_full_sample_coords=False,
     )
     assert neighbor_barcode in inputs_small_patch.observed_barcodes.tolist()
-    assert inputs_small_patch.provenance["n_context_excluded_for_physical_he_overlap"] == 0
+    small_pos = inputs_small_patch.observed_barcodes.tolist().index(neighbor_barcode)
+    assert inputs_small_patch.observed_image_available[small_pos] == True  # noqa: E712
+    assert inputs_small_patch.provenance["n_context_image_unavailable_for_physical_he_overlap"] == 0
+
+
+def test_build_spatial_field_example_all_he_unavailable_requires_expected_feature_width():
+    """15th Codex re-audit (Step 5 acceptance criteria): when EVERY
+    context spot's H&E overlaps the hole, image_feature_fn is never
+    called at all (nothing available to feed it) -- expected_feature_width
+    must be supplied so a correctly-shaped all-zero
+    observed_gigapath_features can still be built; omitting it must fail
+    loudly rather than guess a width."""
+    adata = _square_grid_adata(n_side=3, spacing=10.0)
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query = [barcodes[4]]  # center spot
+    context = [b for b in barcodes if b != barcodes[4]]
+
+    with pytest.raises(ValueError, match="expected_feature_width"):
+        build_spatial_field_example(
+            adata, patches, context, query, _stub_image_feature_fn,
+            sample_id="S0", patient_id="P0", patch_size_fullres=1000.0,  # huge -- overlaps every context spot
+            require_full_sample_coords=False,
+        )
+
+    inputs, _ = build_spatial_field_example(
+        adata, patches, context, query, _stub_image_feature_fn,
+        sample_id="S0", patient_id="P0", patch_size_fullres=1000.0,
+        require_full_sample_coords=False, expected_feature_width=_N_FEATURES,
+    )
+    assert not inputs.observed_image_available.any()
+    assert inputs.observed_gigapath_features.shape == (len(context), _N_FEATURES)
+    assert np.all(inputs.observed_gigapath_features == 0.0)
 
 
 def test_build_spatial_field_example_rejects_missing_barcodes():

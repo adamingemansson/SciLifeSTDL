@@ -95,8 +95,20 @@ def load_slide_context(
             np.asarray(cached["wsi_dimensions"], dtype=np.float64)
             if "wsi_dimensions" in cached.files else None
         )
-        stat = path.stat()
-        identity = f"{sample_id}:dense:{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+        # 15th Codex re-audit (Step 5 acceptance criteria), CONFIRMED: a
+        # prior version identified the cache by file path+size+mtime --
+        # a proxy for content, not content itself (a file replaced
+        # in-place with different bytes but the same size, at a moment
+        # that rounds to the same mtime granularity, would silently
+        # collide). Hash the REAL tile-cache content -- features, coords,
+        # and tile_size together -- so any content change invalidates
+        # every downstream cache keyed off context_id, regardless of
+        # what the filesystem metadata says.
+        content_digest = hashlib.sha256()
+        content_digest.update(np.ascontiguousarray(features).tobytes())
+        content_digest.update(np.ascontiguousarray(coords).tobytes())
+        content_digest.update(str(tile_size).encode())
+        identity = f"{sample_id}:dense:{content_digest.hexdigest()}"
     else:
         raise ValueError(
             "data.slide_context_source must be disabled, spot_aligned, or dense_wsi_cache"
@@ -216,13 +228,23 @@ def visible_slide_context(
         raise ValueError(f"unsupported slide image mode {image_mode!r}")
     if not visible.any():
         raise ValueError("physical missing-tissue mask removed every WSI context tile")
+    # 15th Codex re-audit (Step 5 acceptance criteria), CONFIRMED: a prior
+    # version's context_id appended only the LITERAL mode string
+    # (e.g. "target_zero"), never anything about WHICH tiles the hole
+    # actually removed -- two different query holes on the SAME cached
+    # slide produce two different VISIBLE tile sets but would collide on
+    # an identical context_id, silently reusing a cached LongNet global
+    # vector computed for the wrong visible-tile set. Bind the real,
+    # ordered visible tile coordinates (post-filtering) into the id.
+    visible_coords = coords[visible]
+    visible_digest = hashlib.sha256(np.ascontiguousarray(visible_coords).tobytes()).hexdigest()[:24]
     return {
         "available": True,
         "features": features[visible],
         # GigaPath expects level-0 tile coordinates. Preserve the cached
         # convention (top-left for dense WSI, centers for spot fallback).
-        "coords": coords[visible],
-        "context_id": f"{slide_context['context_id']}:{image_mode}",
+        "coords": visible_coords,
+        "context_id": f"{slide_context['context_id']}:{image_mode}:{visible_digest}",
         "n_total": int(features.shape[0]),
         "n_visible": int(visible.sum()),
     }

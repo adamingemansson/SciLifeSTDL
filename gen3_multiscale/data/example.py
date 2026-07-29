@@ -105,7 +105,26 @@ class SpatialFieldInputs:
     # itself, from observed_full_gene_expression below -- the only gene
     # array this dataclass carries.
     observed_full_gene_expression: np.ndarray  # [n_observed, n_genes] untouched real values, transported not decoded
-    observed_gigapath_features: np.ndarray  # [n_observed, 1536] frozen local H&E tile embeddings
+    observed_gigapath_features: np.ndarray  # [n_observed, 1536] frozen local H&E tile embeddings, zeroed where unavailable
+
+    # 15th Codex re-audit (Step 5 acceptance criteria), CONFIRMED real:
+    # a prior version had NO per-spot H&E-availability signal at all --
+    # SpotTokenProjection's modality_flags input (models/tokens.py) was
+    # hardcoded to "always available" in _SharedFieldArchitecture, and
+    # example_builder.py DROPPED an entire context spot (both GEX and
+    # image) whenever its H&E patch physically overlapped the query hole,
+    # even though that spot's GEX is real, measured, and available. GEX
+    # availability and H&E availability are two INDEPENDENT real-world
+    # failure modes (imaging can fail locally while transcriptomics
+    # stays readable) and must be tracked as two independent per-spot
+    # facts, not conflated into one drop decision. observed_* arrays now
+    # include EVERY GEX-available context spot; observed_image_available
+    # is the explicit per-spot flag SpotTokenProjection's modality_flags
+    # input is built from -- a spot with image_available=False ALWAYS has
+    # its observed_gigapath_features row zeroed (never garbage, never a
+    # real patch feature the deployment scenario wouldn't actually have),
+    # and the flag -- not the zero value -- is what tells the model so.
+    observed_image_available: np.ndarray  # [n_observed] bool, True iff this spot's H&E patch does not overlap the hole
 
     # Boundary/local structure -- all index values are positions WITHIN
     # the observed_* arrays (i.e. in [0, n_observed)).
@@ -114,10 +133,32 @@ class SpatialFieldInputs:
     boundary_ring: np.ndarray  # [n_boundary] int in {1, 2, 3}, aligned with boundary_idx
     query_depth_to_boundary: np.ndarray  # [n_query] int, BFS hops from the nearest observed spot
 
-    # Optional dense WSI context (Phase 3) -- tiles whose footprint does
-    # NOT overlap the hole. None until Phase 3 wires the mask-aware path.
-    wsi_tile_features: np.ndarray | None = None  # [n_tiles, 1536]
-    wsi_tile_coords: np.ndarray | None = None  # [n_tiles, 2], same normalization as observed_coords
+    # Dense WSI context (Phase 3 / Step 5) -- tiles whose footprint does
+    # NOT overlap the hole (real deployment-visible tiles only; already
+    # filtered by slide_context.visible_slide_context before reaching
+    # here). None together (all three or none) until a caller wires in a
+    # real slide_context.load_slide_context result.
+    wsi_tile_features: np.ndarray | None = None  # [n_visible_tiles, 1536]
+    wsi_tile_coords: np.ndarray | None = None  # [n_visible_tiles, 2], same normalization as observed_coords
+    # (xmin, xmax, ymin, ymax) computed from the COMPLETE tile set BEFORE
+    # hole filtering, in the SAME normalized frame as wsi_tile_coords --
+    # models.slide_encoder.pool_regional_tokens's own required input, so
+    # regional grid cell (i, j) refers to the SAME physical region across
+    # every example on this slide regardless of which hole was cut for
+    # this particular item (15th Codex re-audit's "regional-grid bounds
+    # must come from the complete slide before masking" requirement).
+    full_slide_coord_bounds: tuple[float, float, float, float] | None = None
+    # Real cache-key material for the frozen LongNet global vector (15th
+    # Codex re-audit's "the existing coordinate-only in-memory LongNet
+    # cache key must be strengthened" requirement) -- binds the ACTUAL
+    # tile-cache content hash, the real tile coordinates, and the
+    # specific VISIBLE-tile set this example's hole produced
+    # (slide_context.visible_slide_context's own context_id, itself now
+    # bound to real content -- see that module). A caller combines this
+    # with the loaded GigaPath checkpoint's own SHA256 (a property of
+    # WHICH model is running, not of this example) to form the complete
+    # cache namespace; this dataclass never assumes a specific checkpoint.
+    slide_cache_namespace: str | None = None
 
     # Free-form, not consumed by any forward() -- fingerprints/labels a
     # model must never read but a training/eval harness needs (mirrors
@@ -166,6 +207,22 @@ def validate_spatial_field_example(inputs: SpatialFieldInputs, targets: SpatialF
         if not np.all(np.isfinite(arr)):
             raise ValueError(f"{name} contains non-finite values")
 
+    image_available = np.asarray(inputs.observed_image_available)
+    if image_available.shape != (n_observed,):
+        raise ValueError(
+            f"observed_image_available must be [n_observed]=[{n_observed}], got shape "
+            f"{image_available.shape}"
+        )
+    if not np.array_equal(image_available, image_available.astype(bool)):
+        raise ValueError("observed_image_available must be a boolean (0/1) array")
+    unavailable = ~image_available.astype(bool)
+    if unavailable.any() and not np.all(inputs.observed_gigapath_features[unavailable] == 0.0):
+        raise ValueError(
+            "observed_gigapath_features has non-zero value(s) for a spot marked "
+            "observed_image_available=False -- an unavailable image must be an explicit zero, "
+            "never a real (or garbage) feature the model could learn to read"
+        )
+
     if inputs.query_local_neighbor_idx.shape[0] != n_query:
         raise ValueError(
             f"query_local_neighbor_idx has {inputs.query_local_neighbor_idx.shape[0]} rows, "
@@ -196,11 +253,35 @@ def validate_spatial_field_example(inputs: SpatialFieldInputs, targets: SpatialF
     if np.any(inputs.query_depth_to_boundary < 0):
         raise ValueError("query_depth_to_boundary must be non-negative (BFS hop count)")
 
+    wsi_fields_set = (
+        inputs.wsi_tile_features is not None, inputs.wsi_tile_coords is not None,
+        inputs.full_slide_coord_bounds is not None,
+    )
+    if any(wsi_fields_set) and not all(wsi_fields_set):
+        raise ValueError(
+            "wsi_tile_features, wsi_tile_coords, and full_slide_coord_bounds must be set together "
+            "(all three or none) -- regional/global GigaPath context requires all of them"
+        )
     if inputs.wsi_tile_features is not None:
-        if inputs.wsi_tile_coords is None:
-            raise ValueError("wsi_tile_features is set but wsi_tile_coords is None")
         if inputs.wsi_tile_features.shape[0] != inputs.wsi_tile_coords.shape[0]:
             raise ValueError("wsi_tile_features and wsi_tile_coords must have the same row count")
+        if inputs.wsi_tile_features.shape[0] == 0:
+            raise ValueError("wsi_tile_features is set but has zero rows -- pass None instead of an empty array")
+        if not np.all(np.isfinite(inputs.wsi_tile_features)) or not np.all(np.isfinite(inputs.wsi_tile_coords)):
+            raise ValueError("wsi_tile_features/wsi_tile_coords contain non-finite values")
+        xmin, xmax, ymin, ymax = inputs.full_slide_coord_bounds
+        if not (xmax > xmin and ymax > ymin):
+            raise ValueError(f"full_slide_coord_bounds {inputs.full_slide_coord_bounds} is degenerate/invalid")
+        tile_xy = np.asarray(inputs.wsi_tile_coords, dtype=np.float64)
+        outside = (
+            (tile_xy[:, 0] < xmin) | (tile_xy[:, 0] > xmax) | (tile_xy[:, 1] < ymin) | (tile_xy[:, 1] > ymax)
+        )
+        if outside.any():
+            raise ValueError(
+                f"{int(outside.sum())} wsi_tile_coords row(s) fall outside full_slide_coord_bounds "
+                f"{inputs.full_slide_coord_bounds} -- the visible tile set must be a subset of the "
+                "complete slide the bounds were computed from"
+            )
 
     if targets.query_expression.shape[0] != n_query:
         raise ValueError(

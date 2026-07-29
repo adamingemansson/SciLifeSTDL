@@ -21,6 +21,7 @@ def _valid_example(n_observed=6, n_query=3, n_genes=5, local_k=2):
         query_coords=rng.normal(size=(n_query, 2)).astype(np.float32),
         observed_full_gene_expression=rng.normal(size=(n_observed, n_genes)).astype(np.float32),
         observed_gigapath_features=rng.normal(size=(n_observed, 1536)).astype(np.float32),
+        observed_image_available=np.ones(n_observed, dtype=bool),
         query_local_neighbor_idx=rng.integers(0, n_observed, size=(n_query, local_k)),
         boundary_idx=np.array([0, 1, 2]),
         boundary_ring=np.array([1, 1, 2]),
@@ -115,6 +116,93 @@ def test_rejects_mismatched_query_raw_counts_shape():
     )
     with pytest.raises(ValueError, match="query_raw_counts"):
         validate_spatial_field_example(inputs, bad_targets)
+
+
+def test_rejects_observed_image_available_shape_mismatch():
+    inputs, targets = _valid_example(n_observed=6)
+    bad_inputs = _replace(inputs, observed_image_available=np.ones(3, dtype=bool))
+    with pytest.raises(ValueError, match="observed_image_available must be"):
+        validate_spatial_field_example(bad_inputs, targets)
+
+
+def test_rejects_non_boolean_observed_image_available():
+    inputs, targets = _valid_example(n_observed=6)
+    bad_flags = np.zeros(6)
+    bad_flags[0] = 0.5  # not a real boolean/0-1 value
+    bad_inputs = _replace(inputs, observed_image_available=bad_flags)
+    with pytest.raises(ValueError, match="boolean"):
+        validate_spatial_field_example(bad_inputs, targets)
+
+
+def test_rejects_a_nonzero_image_feature_for_an_unavailable_spot():
+    """15th Codex re-audit (Step 5 acceptance criteria): missing images
+    must never be represented as an ordinary (non-zero) image feature
+    with no flag -- the converse must also be structurally impossible:
+    a spot FLAGGED unavailable must have an explicitly zeroed feature,
+    never a leftover real/garbage value."""
+    inputs, targets = _valid_example(n_observed=6)
+    flags = np.ones(6, dtype=bool)
+    flags[0] = False
+    bad_inputs = _replace(inputs, observed_image_available=flags)  # features NOT zeroed for spot 0
+    with pytest.raises(ValueError, match="explicit zero"):
+        validate_spatial_field_example(bad_inputs, targets)
+
+
+def test_accepts_a_zeroed_image_feature_for_an_unavailable_spot():
+    inputs, targets = _valid_example(n_observed=6)
+    flags = np.ones(6, dtype=bool)
+    flags[0] = False
+    features = inputs.observed_gigapath_features.copy()
+    features[0] = 0.0
+    good_inputs = _replace(inputs, observed_image_available=flags, observed_gigapath_features=features)
+    validate_spatial_field_example(good_inputs, targets)  # must not raise
+
+
+def test_rejects_wsi_fields_set_partially():
+    inputs, targets = _valid_example()
+    bad_inputs = _replace(inputs, wsi_tile_features=np.zeros((2, 1536), dtype=np.float32))
+    with pytest.raises(ValueError, match="must be set together"):
+        validate_spatial_field_example(bad_inputs, targets)
+
+
+def test_rejects_degenerate_full_slide_coord_bounds():
+    inputs, targets = _valid_example()
+    bad_inputs = _replace(
+        inputs,
+        wsi_tile_features=np.zeros((2, 1536), dtype=np.float32),
+        wsi_tile_coords=np.asarray([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32),
+        full_slide_coord_bounds=(0.0, 0.0, -5.0, 5.0),  # xmax == xmin
+    )
+    with pytest.raises(ValueError, match="degenerate"):
+        validate_spatial_field_example(bad_inputs, targets)
+
+
+def test_rejects_a_visible_tile_outside_the_full_slide_bounds():
+    """15th Codex re-audit (Step 5 acceptance criteria): regional-grid
+    bounds must come from the COMPLETE slide -- a visible tile falling
+    outside those bounds indicates a mismatched/stale bounds computation,
+    which would make regional grid cell (i, j) refer to inconsistent
+    physical regions across examples."""
+    inputs, targets = _valid_example()
+    bad_inputs = _replace(
+        inputs,
+        wsi_tile_features=np.zeros((1, 1536), dtype=np.float32),
+        wsi_tile_coords=np.asarray([[100.0, 100.0]], dtype=np.float32),
+        full_slide_coord_bounds=(-5.0, 5.0, -5.0, 5.0),  # tile at (100,100) is well outside
+    )
+    with pytest.raises(ValueError, match="outside full_slide_coord_bounds"):
+        validate_spatial_field_example(bad_inputs, targets)
+
+
+def test_accepts_valid_wsi_context_fields():
+    inputs, targets = _valid_example()
+    good_inputs = _replace(
+        inputs,
+        wsi_tile_features=np.zeros((2, 1536), dtype=np.float32),
+        wsi_tile_coords=np.asarray([[-1.0, -1.0], [1.0, 1.0]], dtype=np.float32),
+        full_slide_coord_bounds=(-5.0, 5.0, -5.0, 5.0),
+    )
+    validate_spatial_field_example(good_inputs, targets)  # must not raise
 
 
 def test_targets_are_a_distinct_type_from_inputs():

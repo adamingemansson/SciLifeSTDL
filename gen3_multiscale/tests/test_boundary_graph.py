@@ -148,6 +148,7 @@ def test_output_integrates_cleanly_into_the_shared_example_object():
         query_coords=query.astype(np.float32),
         observed_full_gene_expression=rng.normal(size=(n_observed, n_genes)).astype(np.float32),
         observed_gigapath_features=rng.normal(size=(n_observed, 1536)).astype(np.float32),
+        observed_image_available=np.ones(n_observed, dtype=bool),
         query_local_neighbor_idx=result.query_local_neighbor_idx,
         boundary_idx=result.boundary_idx,
         boundary_ring=result.boundary_ring,

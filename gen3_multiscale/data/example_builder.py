@@ -15,11 +15,21 @@ Physical H&E safety goes further than barcode-level safety: a context
 spot's H&E patch can PHYSICALLY OVERLAP the query hole even though its
 own barcode is disjoint from every query barcode -- the patch footprint
 is a real square of pixels centered on the spot's coordinate, not a
-point. Such spots are EXCLUDED from the observed set entirely here (not
-merely from the barcode-level check), via
-slide_context.nonoverlapping_context_patch_mask -- already-audited
-overlap geometry, reused, not reimplemented. Query spots are already
-structurally absent from every observed_* array (validate_spatial_field_example
+point. 15th Codex re-audit (Step 5 acceptance criteria), CONFIRMED real:
+an earlier version DROPPED such a spot from the observed set entirely
+(both GEX and image) -- but GEX and H&E are independent real-world
+failure modes (imaging can fail locally while transcriptomics stays
+readable), and dropping the GEX too throws away real, available signal
+for no reason. Every GEX-available context spot is now RETAINED;
+`slide_context.nonoverlapping_context_patch_mask` (already-audited
+overlap geometry, reused, not reimplemented) instead produces an
+explicit per-spot `observed_image_available` flag -- a spot with that
+flag False gets its `observed_gigapath_features` row EXPLICITLY zeroed
+(the real patch is never even fed to `image_feature_fn`, modeling the
+actual deployment scenario where that image would not exist) and the
+flag itself (not the zero value) is what SpotTokenProjection's
+`modality_flags` input reads. Query spots are already structurally
+absent from every observed_* array (validate_spatial_field_example
 enforces disjoint observed/query barcodes, unconditionally); this module
 never even reads a query spot's expression or patch for anything other
 than the physical-overlap geometry check and SpatialFieldTargets itself.
@@ -220,17 +230,22 @@ def build_spatial_field_example(
     context_pos_all = np.asarray([barcode_to_pos[b] for b in context_barcodes], dtype=int)
     context_coords_all_raw = all_coords[context_pos_all]
 
-    # Physical H&E safety: exclude context spots whose patch FOOTPRINT
-    # overlaps the query hole, not just ones whose barcode happens to be
-    # a query barcode.
-    safe_mask = nonoverlapping_context_patch_mask(context_coords_all_raw, query_coords_raw, patch_size_fullres)
-    n_excluded_for_overlap = int((~safe_mask).sum())
-    context_pos = context_pos_all[safe_mask]
-    if context_pos.size == 0:
-        raise ValueError(
-            f"{sample_id}: every context spot's H&E patch overlaps the query hole -- no safe "
-            "observed context remains"
-        )
+    # 15th Codex re-audit (Step 5 acceptance criteria), CONFIRMED real:
+    # a prior version DROPPED an entire context spot (both GEX and H&E)
+    # whenever its H&E patch FOOTPRINT physically overlapped the query
+    # hole -- but that spot's GEX is still real, measured, and available
+    # (GEX and imaging are independent real-world failure modes; imaging
+    # can fail locally while transcriptomics stays readable). Every
+    # GEX-available context spot is now RETAINED; H&E availability is
+    # tracked as an explicit per-spot flag instead
+    # (SpatialFieldInputs.observed_image_available), consumed by
+    # SpotTokenProjection's modality_flags input -- never silently
+    # inferred from a zero-valued image feature.
+    context_pos = context_pos_all
+    observed_image_available = nonoverlapping_context_patch_mask(
+        context_coords_all_raw, query_coords_raw, patch_size_fullres,
+    )
+    n_image_unavailable = int((~observed_image_available).sum())
 
     observed_barcodes = obs_names[context_pos]
     observed_coords_raw = all_coords[context_pos]
@@ -278,25 +293,43 @@ def build_spatial_field_example(
     observed_full_gene_expression = np.asarray(X[context_pos], dtype=np.float32)
     query_expression = np.asarray(X[query_pos], dtype=np.float32)
 
-    observed_patches = patches[context_pos]
-    observed_gigapath_features = np.asarray(image_feature_fn(observed_patches), dtype=np.float32)
-    if observed_gigapath_features.ndim != 2:
+    # Only feed AVAILABLE patches to image_feature_fn -- a spot whose H&E
+    # overlaps the synthetic hole models a REAL deployment scenario where
+    # that patch would not exist; its real (undamaged, in this training
+    # setup) pixels must never reach the encoder just because they
+    # happen to still be present on disk.
+    available_pos = np.flatnonzero(observed_image_available)
+    if available_pos.size > 0:
+        computed_features = np.asarray(image_feature_fn(patches[context_pos[available_pos]]), dtype=np.float32)
+        if computed_features.ndim != 2:
+            raise ValueError(
+                f"{sample_id}: image_feature_fn must return a 2D [N, feature_dim] array, got shape "
+                f"{computed_features.shape}"
+            )
+        if computed_features.shape[0] != available_pos.shape[0]:
+            raise ValueError(
+                f"{sample_id}: image_feature_fn returned {computed_features.shape[0]} rows for "
+                f"{available_pos.shape[0]} available observed patches"
+            )
+        if not np.isfinite(computed_features).all():
+            raise ValueError(f"{sample_id}: image_feature_fn returned non-finite feature values")
+        feature_width = computed_features.shape[1]
+    elif expected_feature_width is not None:
+        computed_features = np.zeros((0, expected_feature_width), dtype=np.float32)
+        feature_width = expected_feature_width
+    else:
         raise ValueError(
-            f"{sample_id}: image_feature_fn must return a 2D [N, feature_dim] array, got shape "
-            f"{observed_gigapath_features.shape}"
+            f"{sample_id}: every context spot's H&E patch overlaps the query hole (all "
+            f"{context_pos.shape[0]} image-unavailable) -- pass expected_feature_width so a "
+            "correctly-shaped all-zero observed_gigapath_features can be built"
         )
-    if observed_gigapath_features.shape[0] != context_pos.shape[0]:
+    if expected_feature_width is not None and feature_width != expected_feature_width:
         raise ValueError(
-            f"{sample_id}: image_feature_fn returned {observed_gigapath_features.shape[0]} rows "
-            f"for {context_pos.shape[0]} observed patches"
+            f"{sample_id}: image_feature_fn returned feature width {feature_width}, expected "
+            f"{expected_feature_width}"
         )
-    if not np.isfinite(observed_gigapath_features).all():
-        raise ValueError(f"{sample_id}: image_feature_fn returned non-finite feature values")
-    if expected_feature_width is not None and observed_gigapath_features.shape[1] != expected_feature_width:
-        raise ValueError(
-            f"{sample_id}: image_feature_fn returned feature width "
-            f"{observed_gigapath_features.shape[1]}, expected {expected_feature_width}"
-        )
+    observed_gigapath_features = np.zeros((context_pos.shape[0], feature_width), dtype=np.float32)
+    observed_gigapath_features[available_pos] = computed_features
 
     boundary = extract_boundary_and_local_context(
         observed_coords, query_coords, k_neighbors=k_neighbors, local_k=local_k,
@@ -312,13 +345,14 @@ def build_spatial_field_example(
         query_coords=query_coords,
         observed_full_gene_expression=observed_full_gene_expression,
         observed_gigapath_features=observed_gigapath_features,
+        observed_image_available=observed_image_available,
         query_local_neighbor_idx=boundary.query_local_neighbor_idx,
         boundary_idx=boundary.boundary_idx,
         boundary_ring=boundary.boundary_ring,
         query_depth_to_boundary=boundary.query_depth_to_boundary,
         provenance={
             "n_context_requested": len(context_barcodes),
-            "n_context_excluded_for_physical_he_overlap": n_excluded_for_overlap,
+            "n_context_image_unavailable_for_physical_he_overlap": n_image_unavailable,
             "spot_spacing_scale": scale,
             **boundary.diagnostic,
         },
