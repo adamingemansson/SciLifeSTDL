@@ -358,34 +358,46 @@ def build_dataset_manifest(
             f"missing gene(s) from the final frozen {len(gene_panel)}-gene panel (examples: "
             f"{dropped_for_final_panel[:20]})"
         )
-        # 12th Codex re-audit of commit 1bb66d6, finding #8 (CONFIRMED):
-        # resolve_sample_selection guarantees EXACTLY n_validation_per_organ/
-        # n_test_per_organ distinct PATIENTS for every organ it keeps at
-        # all (it skips an organ entirely otherwise -- see its own
-        # `len(patients) < n_validation_per_organ + n_test_per_organ + 1`
-        # precondition) -- but dropping held-out samples for a final-panel
-        # mismatch AFTER that point can silently leave an organ short of
-        # its requested quota, or distort per-organ balance, without
-        # anyone noticing. Fail closed rather than silently proceeding
-        # with a manifest that no longer matches what the caller asked for.
-        for organ in split["organ_vocab"]:
-            val_patients_remaining = {
-                split["patient_by_sample"][sid] for sid in validation_ids
-                if split["organ_by_sample"][sid] == organ
-            }
-            test_patients_remaining = {
-                split["patient_by_sample"][sid] for sid in test_ids
-                if split["organ_by_sample"][sid] == organ
-            }
-            if len(val_patients_remaining) < n_validation_per_organ or len(test_patients_remaining) < n_test_per_organ:
-                raise ValueError(
-                    f"organ {organ!r} no longer meets the requested validation/test patient quotas "
-                    f"(n_validation_per_organ={n_validation_per_organ}, n_test_per_organ={n_test_per_organ}) "
-                    f"after excluding held-out sample(s) missing genes from the final frozen panel -- "
-                    f"has {len(val_patients_remaining)} validation, {len(test_patients_remaining)} test "
-                    "patient(s) remaining; rerun with a different split_seed, a smaller quota, or "
-                    "investigate why these samples' real gene panels diverged from the training cohort's"
-                )
+    # 12th Codex re-audit of commit 1bb66d6, finding #8 (CONFIRMED):
+    # resolve_sample_selection guarantees EXACTLY n_validation_per_organ/
+    # n_test_per_organ distinct PATIENTS for every organ it keeps at
+    # all (it skips an organ entirely otherwise -- see its own
+    # `len(patients) < n_validation_per_organ + n_test_per_organ + 1`
+    # precondition) -- but dropping held-out samples for a final-panel
+    # mismatch AFTER that point can silently leave an organ short of
+    # its requested quota, or distort per-organ balance, without
+    # anyone noticing. Fail closed rather than silently proceeding
+    # with a manifest that no longer matches what the caller asked for.
+    #
+    # 13th Codex re-audit of commit 65611c7, finding #6 (CONFIRMED): this
+    # check must run UNCONDITIONALLY, not only when THIS function's own
+    # final-panel filter happened to drop something. resolve_sample_selection
+    # (its coarse resolve_compatible_sample_ids/
+    # _filter_held_out_ids_against_reference_panel pre-filter, and its
+    # _resolve_cross_organ_patient_conflicts cross-organ patient
+    # deduplication) can ALSO remove validation/test samples/patients
+    # before this function ever sees the split -- neither of those paths
+    # ever set dropped_for_final_panel, so gating this check behind it
+    # let an organ silently fall short of quota for either of those
+    # other two reasons.
+    for organ in split["organ_vocab"]:
+        val_patients_remaining = {
+            split["patient_by_sample"][sid] for sid in validation_ids
+            if split["organ_by_sample"][sid] == organ
+        }
+        test_patients_remaining = {
+            split["patient_by_sample"][sid] for sid in test_ids
+            if split["organ_by_sample"][sid] == organ
+        }
+        if len(val_patients_remaining) < n_validation_per_organ or len(test_patients_remaining) < n_test_per_organ:
+            raise ValueError(
+                f"organ {organ!r} no longer meets the requested validation/test patient quotas "
+                f"(n_validation_per_organ={n_validation_per_organ}, n_test_per_organ={n_test_per_organ}) "
+                f"after sample-selection/held-out-panel filtering -- has "
+                f"{len(val_patients_remaining)} validation, {len(test_patients_remaining)} test "
+                "patient(s) remaining; rerun with a different split_seed, a smaller quota, or "
+                "investigate why these samples' real gene panels diverged from the training cohort's"
+            )
 
     all_ids = sorted(set(train_ids) | set(validation_ids) | set(test_ids))
 

@@ -83,10 +83,25 @@ import numpy as np
 
 from gen3_multiscale.data import mask_bank
 from gen3_multiscale.data.dataset_manifest import composite_spot_id
-from gen3_multiscale.data.mask_schedule import _STRATUM_SEED_STRIDE, strata_fingerprint, stratum_to_masking_cfg
+from gen3_multiscale.data.mask_schedule import (
+    _MASK_GENERATION_VERSION, _STRATUM_SEED_STRIDE, strata_fingerprint, stratum_to_masking_cfg,
+)
 
-_REPORT_VERSION = 2
-_SCHEDULE_VERSION = 1
+_REPORT_VERSION = 3
+_SCHEDULE_VERSION = 2
+
+
+class EmptyMaskRealizationError(ValueError):
+    """Raised by `realize_seed_and_fingerprint` ONLY when a
+    (masking_cfg, seed) draw produces an empty context or query -- the
+    one realization failure `build_collision_free_training_schedule`'s
+    seed-retry loop may treat as "try the next seed" (13th Codex
+    re-audit finding #8, CONFIRMED: a bare `except ValueError: continue`
+    also swallowed structural errors -- a manifest mismatch, a malformed
+    masking_cfg -- retrying up to `max_attempts_per_item` times on an
+    error that could never succeed on a different seed, instead of
+    failing immediately). Subclasses ValueError so any EXISTING `except
+    ValueError` caller elsewhere in this codebase is unaffected."""
 
 
 def sorted_composite_query_fingerprint(sample_id: str, query_obs_names: Iterable[str]) -> str:
@@ -160,7 +175,7 @@ def realize_seed_and_fingerprint(
         context, max_context, seed, coords3d=coords3d, query_mask=query, selection=context_selection,
     )
     if not query.any() or not context.any():
-        raise ValueError(f"mask seed {seed} produced an empty context or query")
+        raise EmptyMaskRealizationError(f"mask seed {seed} produced an empty context or query")
     context_obs_names = names[context].tolist()
     query_obs_names = names[query].tolist()
     if manifest is not None:
@@ -329,11 +344,24 @@ def build_collision_free_training_schedule(
     counter (using the same `_STRATUM_SEED_STRIDE` offset convention
     `mask_schedule.py` already uses, so seeds from this function never
     collide with that module's own seed ranges), advancing by 1 on
-    every rejected attempt (an empty-context/query realization, a
-    reserved-identity collision, or a duplicate), up to
+    every rejected attempt (ONLY an `EmptyMaskRealizationError` --
+    context/query genuinely empty for this seed -- a reserved-identity
+    collision, or a duplicate; any OTHER exception, e.g. a manifest
+    mismatch, propagates immediately rather than burning through
+    `max_attempts_per_item` retries on an error no seed could fix --
+    13th Codex re-audit finding #8, CONFIRMED), up to
     `max_attempts_per_item` -- raises (fail-closed, never silently
     accepts a colliding mask) if no valid seed is found within budget
-    for any item."""
+    for any item.
+
+    The returned schedule records `reserved_composite_ids_fingerprint`
+    -- a SHA256 of the sorted `reserved_query_composite_ids` SET itself,
+    not merely its count (13th Codex re-audit finding #3, CONFIRMED: a
+    count alone cannot detect the reserved set CHANGING while staying
+    the same size) -- so `validate_collision_free_training_schedule`
+    can later confirm the schedule was built to avoid the SAME reserved
+    identities a caller is currently trying to protect, not merely a
+    same-sized different set."""
     n_items = int(n_items)
     base_seed = int(base_seed)
     if n_items < 1:
@@ -369,7 +397,7 @@ def build_collision_free_training_schedule(
                 record = realize_seed_and_fingerprint(
                     coords3d, slice_ids, obs_names, sample_id, masking_cfg, seed, manifest=manifest,
                 )
-            except ValueError:
+            except EmptyMaskRealizationError:
                 continue  # empty context/query for this seed -- try the next one
             fp = record["query_composite_fingerprint"]
             query_composite_ids = {composite_spot_id(sample_id, b) for b in record["query_obs_names"]}
@@ -397,6 +425,7 @@ def build_collision_free_training_schedule(
         "strata": stratum_names,
         "strata_fingerprint": strata_fingerprint(strata),
         "n_reserved_composite_ids": len(reserved_query_composite_ids),
+        "reserved_composite_ids_fingerprint": _composite_id_set_fingerprint(reserved_query_composite_ids),
         "items": [{"stratum": it["stratum"], "seed": it["seed"]} for it in accepted_items],
         "realized_query_composite_fingerprints": [it["query_composite_fingerprint"] for it in accepted_items],
     }
@@ -410,25 +439,123 @@ def _mask_bank_records_fingerprint(records: list[dict]) -> str:
     return sha256(json.dumps(records, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
+def _composite_id_set_fingerprint(composite_ids: Iterable[str]) -> str:
+    """Order-independent SHA256 of a SET of composite spot identities --
+    used both for a training schedule's `reserved_query_composite_ids`
+    (13th Codex re-audit finding #3) and available for any other
+    identity-set binding a caller needs."""
+    return sha256("\n".join(sorted(str(c) for c in composite_ids)).encode("utf-8")).hexdigest()
+
+
+def _observation_order_fingerprint(obs_names: Iterable[str]) -> str:
+    """SHA256 of the obs_names sequence IN ORDER -- order matters here
+    (unlike the composite-id SET fingerprints above), since
+    `realize_seed_and_fingerprint`'s `names = np.asarray([str(x) for x
+    in obs_names])` indexes by position, so a report is only meaningful
+    for the exact ordered observation sequence it was computed against
+    (13th Codex re-audit finding #2, CONFIRMED: a prior report bound
+    only manifest/spatial/strata fingerprints, never the ordered
+    identity sequence realization itself depends on)."""
+    return sha256("\n".join(str(b) for b in obs_names).encode("utf-8")).hexdigest()
+
+
 def _input_fingerprints(
-    manifest: dict, coords3d: np.ndarray, slice_ids: np.ndarray, strata: list[dict],
+    manifest: dict, coords3d: np.ndarray, slice_ids: np.ndarray, strata: list[dict], obs_names: Iterable[str],
 ) -> dict:
     """SHA256 fingerprints binding a report to the exact inputs it was
     built from -- 12th Codex re-audit of commit 1bb66d6, finding #6
     (CONFIRMED: a prior report recorded only summary counts, so a stale
     report file could later be silently accepted for different
-    underlying data). A consumer (Step 8's preflight gate, or the
-    trainer itself) is expected to recompute these same fingerprints
-    from its own live manifest/coords/strata and refuse to trust a
-    report whose fingerprints don't match -- this module only RECORDS
-    them, it does not itself re-verify a loaded report against live
-    data (that check belongs to whichever caller has the live data to
-    compare against)."""
+    underlying data), extended by 13th Codex re-audit finding #2
+    (CONFIRMED: the manifest/spatial/strata fingerprints alone say
+    nothing about the ORDERED observation sequence a report's realized
+    masks actually depend on). A consumer (Step 8's preflight gate, or
+    the trainer itself) is expected to recompute these same fingerprints
+    from its own live manifest/coords/strata/obs_names and refuse to
+    trust a report whose fingerprints don't match -- this module only
+    RECORDS them, it does not itself re-verify a loaded report against
+    live data (that check belongs to whichever caller has the live data
+    to compare against)."""
     return {
         "manifest_fingerprint": _manifest_fingerprint(manifest),
         "spatial_fingerprint": mask_bank.spatial_fingerprint(coords3d, slice_ids),
         "strata_fingerprint": strata_fingerprint(strata),
+        "observation_order_fingerprint": _observation_order_fingerprint(obs_names),
     }
+
+
+def validate_collision_free_training_schedule(
+    schedule: dict, coords3d: np.ndarray, slice_ids: np.ndarray, obs_names: Iterable[str], sample_id: str,
+    strata: list[dict], reserved_query_composite_ids: set[str], *, manifest: dict | None = None,
+) -> dict:
+    """Fail-closed re-verification of a (typically LOADED-from-disk)
+    `build_collision_free_training_schedule` output against LIVE data
+    (13th Codex re-audit of commit 65611c7, finding #3, CONFIRMED: no
+    function existed to re-verify a persisted schedule still matched the
+    generation it accompanies -- a report could reference an on-disk
+    schedule file whose CONTENT nothing ever re-checked).
+
+    Checks, in order: schema version and kind; `sample_id` match; strata
+    identity AND `strata_fingerprint` match; the reserved-set
+    fingerprint (a SHA256 of the actual SET, not merely a count --
+    finding #3's other half: a same-SIZED but DIFFERENT reserved set
+    would pass a count-only check) match; internal item-count
+    consistency; then, the strongest check, RE-REALIZES every stored
+    (stratum, seed) item from scratch and confirms its freshly-realized
+    query composite fingerprint matches the one on record, in order,
+    with no reserved-identity collisions and no internal duplicates.
+    This is the only way to actually prove a stored schedule still
+    matches what `build_collision_free_training_schedule` would produce
+    against this exact live data today, rather than trusting the file's
+    own self-reported summary fields."""
+    if schedule.get("version") != _SCHEDULE_VERSION:
+        raise ValueError(
+            f"schedule version {schedule.get('version')!r} != expected {_SCHEDULE_VERSION!r} -- "
+            "regenerate the schedule"
+        )
+    if schedule.get("kind") != "collision_free_training_schedule":
+        raise ValueError(f"schedule kind {schedule.get('kind')!r} is not 'collision_free_training_schedule'")
+    if schedule.get("sample_id") != sample_id:
+        raise ValueError(f"schedule was built for sample {schedule.get('sample_id')!r}, not {sample_id!r}")
+    stratum_names = [s.get("name") for s in strata]
+    if schedule.get("strata") != stratum_names:
+        raise ValueError(f"schedule strata {schedule.get('strata')!r} != live strata {stratum_names!r}")
+    if schedule.get("strata_fingerprint") != strata_fingerprint(strata):
+        raise ValueError("schedule strata_fingerprint does not match the live strata")
+    live_reserved_fp = _composite_id_set_fingerprint(reserved_query_composite_ids)
+    if schedule.get("reserved_composite_ids_fingerprint") != live_reserved_fp:
+        raise ValueError(
+            "schedule reserved_composite_ids_fingerprint does not match the live reserved set -- the "
+            "validation/test mask bank this schedule was built to avoid colliding with has changed"
+        )
+    items = schedule.get("items", [])
+    fingerprints = schedule.get("realized_query_composite_fingerprints", [])
+    if len(items) != len(fingerprints):
+        raise ValueError("schedule items/realized_query_composite_fingerprints length mismatch")
+    if len(items) != schedule.get("n_items"):
+        raise ValueError("schedule items length does not match its own recorded n_items")
+
+    masking_cfg_by_stratum = {s["name"]: stratum_to_masking_cfg(s) for s in strata}
+    seen_fingerprints: set[str] = set()
+    for i, (item, recorded_fp) in enumerate(zip(items, fingerprints)):
+        masking_cfg = masking_cfg_by_stratum[item["stratum"]]
+        record = realize_seed_and_fingerprint(
+            coords3d, slice_ids, obs_names, sample_id, masking_cfg, item["seed"], manifest=manifest,
+        )
+        fresh_fp = record["query_composite_fingerprint"]
+        if fresh_fp != recorded_fp:
+            raise ValueError(
+                f"schedule item {i} (stratum {item['stratum']!r}, seed {item['seed']}) re-realizes to "
+                f"fingerprint {fresh_fp!r}, but the schedule recorded {recorded_fp!r} -- the schedule "
+                "no longer matches what it would produce against this live data"
+            )
+        query_composite_ids = {composite_spot_id(sample_id, b) for b in record["query_obs_names"]}
+        if query_composite_ids & reserved_query_composite_ids:
+            raise ValueError(f"schedule item {i} queries a reserved composite identity on re-realization")
+        if fresh_fp in seen_fingerprints:
+            raise ValueError(f"schedule item {i} duplicates an earlier item's realized query fingerprint")
+        seen_fingerprints.add(fresh_fp)
+    return {"n_items": len(items), "passed": True}
 
 
 def build_training_sample_mask_report(
@@ -456,7 +583,22 @@ def build_training_sample_mask_report(
     records realized on THIS SAME sample -- reported under a clearly
     separate `"same_sample_capacity_diagnostic"` section, cross-checked
     for leakage against the primary training schedule, but never
-    conflated with primary held-out evaluation."""
+    conflated with primary held-out evaluation.
+
+    13th Codex re-audit of commit 65611c7, finding #4 (CONFIRMED): this
+    now REQUIRES `manifest["samples"][sample_id]["split"] == "train"` --
+    a prior version accepted any sample_id the training_schedule itself
+    claimed, never cross-checking it against the manifest's own role
+    assignment."""
+    if sample_id not in manifest["samples"]:
+        raise ValueError(f"{sample_id!r} is not a sample the dataset manifest declares")
+    manifest_split = manifest["samples"][sample_id].get("split")
+    if manifest_split != "train":
+        raise ValueError(
+            f"{sample_id}: dataset manifest assigns split {manifest_split!r}, not 'train' -- refusing "
+            "to build a training-sample mask report for a sample the manifest does not consider a "
+            "training sample"
+        )
     if sample_id != training_schedule["sample_id"]:
         raise ValueError(
             f"training_schedule was built for sample {training_schedule['sample_id']!r}, not {sample_id!r}"
@@ -482,7 +624,11 @@ def build_training_sample_mask_report(
         "kind": "training_sample_mask_report",
         "sample_id": sample_id,
         "role": "train",
-        "input_fingerprints": _input_fingerprints(manifest, coords3d, slice_ids, strata),
+        "input_fingerprints": _input_fingerprints(manifest, coords3d, slice_ids, strata, obs_names),
+        "training_schedule_content_fingerprint": _mask_bank_records_fingerprint(training_schedule["items"]),
+        "realized_query_composite_fingerprints_fingerprint": _composite_id_set_fingerprint(
+            training_schedule["realized_query_composite_fingerprints"]
+        ),
         "primary": {
             "n_items": len(training_schedule["items"]),
             "n_unique_masks": pool_result["n_unique_realized_masks"],
@@ -492,6 +638,7 @@ def build_training_sample_mask_report(
     if same_sample_diagnostic_mask_bank is not None:
         diagnostic_ids_by_split: dict[str, set[str]] = {}
         diagnostic_n_records: dict[str, int] = {}
+        diagnostic_content_fingerprint_by_split: dict[str, str] = {}
         for split in ("validation", "test"):
             records = [r for r in same_sample_diagnostic_mask_bank["records"] if r["split"] == split]
             if not records:
@@ -502,6 +649,7 @@ def build_training_sample_mask_report(
             verify_no_duplicate_masks_within_split(sample_id, records)
             diagnostic_ids_by_split[split] = realized_query_composite_ids(sample_id, records)
             diagnostic_n_records[split] = len(records)
+            diagnostic_content_fingerprint_by_split[split] = _mask_bank_records_fingerprint(records)
         leakage_result = verify_no_cross_split_query_leakage({"train": train_query_ids, **diagnostic_ids_by_split})
         report["same_sample_capacity_diagnostic"] = {
             "note": (
@@ -512,6 +660,7 @@ def build_training_sample_mask_report(
             ),
             "n_records_by_split": diagnostic_n_records,
             "n_composite_query_ids_by_split": leakage_result["n_ids_by_split"],
+            "content_fingerprint_by_split": diagnostic_content_fingerprint_by_split,
         }
 
     report["passed"] = True
@@ -531,9 +680,65 @@ def build_held_out_sample_mask_report(
     DIFFERENT split -- a real methodological error under this project's
     split discipline: a held-out sample must never carry
     training-labeled masks, and a validation sample must never carry
-    test-labeled masks or vice versa (12th Codex re-audit finding #7/#8)."""
+    test-labeled masks or vice versa (12th Codex re-audit finding #7/#8).
+
+    13th Codex re-audit of commit 65611c7 (CONFIRMED):
+    - finding #4: now REQUIRES `manifest["samples"][sample_id]["split"]
+      == split` -- a prior version accepted any sample_id/split pair the
+      caller claimed, never cross-checking against the manifest's own
+      role assignment; also now REJECTS an empty `records` list (a prior
+      version let a held-out mask bank with zero records for this split
+      silently "pass" with `n_records=0`).
+    - finding #5: `stratified_mask_bank`'s own recorded
+      `dataset_fingerprint`/`spatial_fingerprint`/`strata_fingerprint`/
+      `mask_generation_version` are now validated against the LIVE
+      obs_names/coords3d/slice_ids/strata (mirroring
+      `mask_schedule.load_stratified_mask_bank`'s own staleness checks,
+      but for an in-memory bank a caller already has rather than one
+      re-read from disk) -- a prior version trusted the bank's records
+      without ever confirming the bank itself was built from the same
+      underlying data. Expected per-split, per-stratum record counts
+      (from the bank's own `split_counts`) are checked, and every
+      record's context/query sets are confirmed non-empty and disjoint."""
     if split not in ("validation", "test"):
         raise ValueError(f"split must be 'validation' or 'test', got {split!r}")
+    if sample_id not in manifest["samples"]:
+        raise ValueError(f"{sample_id!r} is not a sample the dataset manifest declares")
+    manifest_split = manifest["samples"][sample_id].get("split")
+    if manifest_split != split:
+        raise ValueError(
+            f"{sample_id}: dataset manifest assigns split {manifest_split!r}, not the requested "
+            f"{split!r} -- refusing to build a held-out report under the wrong sample role"
+        )
+
+    obs_names_list = [str(b) for b in obs_names]
+    expected_dataset_fp = mask_bank.dataset_fingerprint(np.asarray(obs_names_list))
+    if stratified_mask_bank.get("dataset_fingerprint") != expected_dataset_fp:
+        raise ValueError(
+            f"{sample_id}: stratified_mask_bank's dataset_fingerprint does not match the live "
+            "obs_names -- this mask bank was built for different observation data"
+        )
+    expected_spatial_fp = mask_bank.spatial_fingerprint(coords3d, slice_ids)
+    if stratified_mask_bank.get("spatial_fingerprint") != expected_spatial_fp:
+        raise ValueError(
+            f"{sample_id}: stratified_mask_bank's spatial_fingerprint does not match the live "
+            "coordinates/slice IDs -- this mask bank was built for different spatial data"
+        )
+    expected_strata_fp = strata_fingerprint(
+        strata, stratified_mask_bank.get("split_counts"), stratified_mask_bank.get("split_seeds"),
+    )
+    if stratified_mask_bank.get("strata_fingerprint") != expected_strata_fp:
+        raise ValueError(
+            f"{sample_id}: stratified_mask_bank's strata_fingerprint does not match the live strata "
+            "(or this bank's own recorded split_counts/split_seeds)"
+        )
+    if stratified_mask_bank.get("mask_generation_version") != _MASK_GENERATION_VERSION:
+        raise ValueError(
+            f"{sample_id}: stratified_mask_bank was built with mask-generation algorithm version "
+            f"{stratified_mask_bank.get('mask_generation_version')!r}, expected "
+            f"{_MASK_GENERATION_VERSION!r} -- regenerate the mask bank"
+        )
+
     other_splits = {r["split"] for r in stratified_mask_bank["records"]} - {split}
     if other_splits:
         raise ValueError(
@@ -542,9 +747,35 @@ def build_held_out_sample_mask_report(
             "masks from a different split"
         )
     records = [r for r in stratified_mask_bank["records"] if r["split"] == split]
+    if not records:
+        raise ValueError(
+            f"{sample_id}: no {split!r} record(s) found in stratified_mask_bank -- an empty held-out "
+            "mask bank must never silently pass as a valid evaluation report"
+        )
+    split_counts = stratified_mask_bank.get("split_counts") or {}
+    expected_count = int(split_counts.get(split, 0)) * len(strata)
+    if expected_count and len(records) != expected_count:
+        raise ValueError(
+            f"{sample_id}: expected {expected_count} {split!r} record(s) "
+            f"({split_counts.get(split)} per stratum x {len(strata)} strata), found {len(records)}"
+        )
+    for stratum in strata:
+        stratum_name = stratum.get("name")
+        if not any(r.get("stratum") == stratum_name for r in records):
+            raise ValueError(f"{sample_id}: stratum {stratum_name!r} has zero {split!r} record(s)")
     for record in records:
         validate_realized_barcodes_against_manifest(manifest, sample_id, record["context_obs_names"])
         validate_realized_barcodes_against_manifest(manifest, sample_id, record["query_obs_names"])
+        context_set = set(record["context_obs_names"])
+        query_set = set(record["query_obs_names"])
+        if not context_set:
+            raise ValueError(f"{sample_id}: {split} record index {record.get('index')} has an empty context set")
+        if not query_set:
+            raise ValueError(f"{sample_id}: {split} record index {record.get('index')} has an empty query set")
+        if context_set & query_set:
+            raise ValueError(
+                f"{sample_id}: {split} record index {record.get('index')} has overlapping context/query barcodes"
+            )
     dedup_result = verify_no_duplicate_masks_within_split(sample_id, records)
 
     return {
@@ -552,7 +783,8 @@ def build_held_out_sample_mask_report(
         "kind": "held_out_sample_mask_report",
         "sample_id": sample_id,
         "role": split,
-        "input_fingerprints": _input_fingerprints(manifest, coords3d, slice_ids, strata),
+        "input_fingerprints": _input_fingerprints(manifest, coords3d, slice_ids, strata, obs_names_list),
+        "mask_bank_content_fingerprint": _mask_bank_records_fingerprint(records),
         "primary": {
             "n_records": dedup_result["n_records"],
             "n_unique_masks": dedup_result["n_unique_masks"],

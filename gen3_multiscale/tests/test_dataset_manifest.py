@@ -525,3 +525,41 @@ def test_all_composite_spot_ids_can_be_restricted_to_a_subset_of_samples(tmp_pat
     everyone = all_composite_spot_ids(manifest)
     assert only_l0 == set(manifest["samples"]["L0"]["composite_spot_ids"])
     assert everyone == only_l0 | set(manifest["samples"]["L1"]["composite_spot_ids"])
+
+
+def test_quota_check_fires_even_when_this_functions_own_final_panel_filter_drops_nothing(tmp_path, monkeypatch):
+    """13th Codex re-audit finding #6 (CONFIRMED): the per-organ quota
+    re-validation used to run ONLY inside `if dropped_for_final_panel:`
+    -- i.e. only when THIS function's own final-exact-panel filter
+    happened to drop a held-out sample. But resolve_sample_selection's
+    OWN internal filtering (its coarse compatibility pre-filter, or its
+    cross-organ patient conflict resolution) can also leave an organ
+    short of its requested validation/test patient quota, without ever
+    causing THIS function to drop anything itself. Regression: monkeypatch
+    resolve_sample_selection to return a split where organ "Lung" has
+    ZERO validation patients (quota violated) but every returned sample's
+    gene panel is fully compatible with the frozen training panel, so
+    dropped_validation/dropped_test are BOTH empty -- the exact condition
+    that used to skip the quota check entirely."""
+    import gen3_multiscale.data.dataset_manifest as dataset_manifest_module
+
+    hest_dir, meta_path, gene_names = _make_synthetic_hest1k(tmp_path, {"Lung": ["L0", "L1"]})
+
+    fake_split = {
+        "train_sample_ids": ["L0", "L1"],
+        "validation_sample_ids": [],  # quota violated: 0 patients, but n_validation_per_organ=1 requested below
+        "test_sample_ids": [],
+        "organ_by_sample": {"L0": "Lung", "L1": "Lung"},
+        "tech_by_sample": {"L0": "Visium", "L1": "Visium"},
+        "patient_by_sample": {"L0": "P0", "L1": "P1"},
+        "organ_vocab": ["Lung"],
+        "tech_vocab": ["Visium"],
+    }
+    monkeypatch.setattr(dataset_manifest_module, "resolve_sample_selection", lambda *a, **k: fake_split)
+
+    with pytest.raises(ValueError, match="no longer meets the requested validation/test patient quotas"):
+        build_dataset_manifest(
+            hest_dir, str(meta_path), organs="all", min_samples_per_organ=2,
+            n_validation_per_organ=1, n_test_per_organ=0, split_seed=0,
+            **_SMALL_BUILD_KWARGS,
+        )

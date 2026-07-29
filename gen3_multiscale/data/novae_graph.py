@@ -87,10 +87,28 @@ spot, exactly as instructed.
 The actual Novae model/checkpoint is never called here (no such
 dependency exists anywhere in this repo -- confirmed: no `novae` or
 `torch_geometric` package is installed). `novae_feature_fn` is
-INJECTED and receives the context-only AnnData ITSELF (never the full
-adata, and never through a closure that could smuggle in the full
-adata either -- this module builds a genuinely new `adata[...].copy()`
-subset object and passes only that)."""
+INJECTED and receives the context-only AnnData ITSELF, never the full
+adata.
+
+**Sanitized construction (13th Codex re-audit of commit 65611c7,
+finding #1, CONFIRMED).** That AnnData is now built EXPLICITLY,
+field-by-field -- `X` (row-subset), `var` (gene identities Novae needs
+to match its own vocabulary by name), `obsm['spatial']` (row-subset),
+and only an explicit whitelist of `.uns` keys (`_ALLOWED_CONTEXT_UNS_KEYS`
+below, exactly the keys `_adata_feature_signature` itself reads) --
+rather than via `adata[node_pos].copy()`'s blanket inheritance of
+every `.obsm`/`.obsp`/`.layers`/`.uns`/`.raw` entry on the original
+object. Array-shaped obs-indexed fields ARE correctly row-subset by
+that blanket copy, but arbitrary non-obs-indexed `.uns` entries (e.g.
+a full-slide summary statistic computed once and stashed in `.uns`)
+are not meaningfully "subset" at all and would have carried forward
+into the context-only object unchanged -- a real, if narrow, leakage
+surface the prior version left open. This module cannot prevent an
+injected `novae_feature_fn` from independently capturing the original
+`adata` via its own Python closure -- no callee can ever police what a
+caller's closure captures -- which is why that specific claim is
+listed under `not_provable_from_this_module_alone` in
+`build_novae_preflight_report`, not asserted as verified."""
 from __future__ import annotations
 
 import json
@@ -99,7 +117,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
+import anndata as ad
 import numpy as np
+import pandas as pd
 
 from gen2_architectures.data.context_features import _adata_feature_signature
 from gen3_multiscale.data.dataset_manifest import composite_spot_id
@@ -113,7 +133,57 @@ _REPORT_VERSION = 2
 # unchanged.
 _CACHE_SCHEMA_VERSION = "1"
 
+# The ONLY .uns keys carried forward into a context-only AnnData (13th
+# Codex re-audit finding #1) -- exactly the keys
+# gen2_architectures.data.context_features._adata_feature_signature
+# itself reads (`expression_state` / `legacy_expression_preprocessing`
+# there). Anything else in the original adata's .uns is real-slide
+# metadata with no obs-indexed subsetting semantics and must never be
+# assumed safe to carry forward into a context-only object.
+_ALLOWED_CONTEXT_UNS_KEYS = ("_scilifestdl_expression_state", "expression_preprocessing")
+
+# Required keys of a structured Novae checkpoint provenance dict (13th
+# Codex re-audit finding #7, CONFIRMED: an optional, default-empty
+# `checkpoint_signature: str = ""` meant a caller could silently omit
+# real checkpoint identity and still get a cache hit/preflight pass).
+# `checkpoint_revision` may be a real repo revision (for a
+# HuggingFace-style `checkpoint_repo`) OR a local checkpoint file's own
+# SHA256 -- either way it must be a real, non-empty identity string, not
+# a guess. `spatial_neighbors_settings` records whatever real settings
+# (e.g. technology, n_neighs) the caller's adapter passes to Novae's own
+# `spatial_neighbors(adata)` call, since that call's OWN graph
+# construction is part of what determines the embeddings, not just the
+# model checkpoint.
+_REQUIRED_CHECKPOINT_PROVENANCE_KEYS = (
+    "checkpoint_repo", "checkpoint_revision", "novae_package_version",
+    "adapter_version", "spatial_neighbors_settings",
+)
+
 NovaeFeatureFn = Callable[[object], np.ndarray]  # (context_only_adata) -> [n_context, dim]
+
+
+def _validate_checkpoint_provenance(checkpoint_provenance: dict) -> str:
+    """Validate a REQUIRED structured Novae checkpoint provenance dict
+    and return its canonical (sorted-key JSON) signature string for
+    folding into the cache fingerprint. Fails closed on a missing dict,
+    a missing required key, or an empty/whitespace-only value for a
+    required key -- this module has no way to verify the CONTENT of a
+    caller-supplied identity string is actually correct (that's why it
+    stays under `not_provable_from_this_module_alone`), but it can and
+    does refuse to accept the absence of one entirely."""
+    if not isinstance(checkpoint_provenance, dict):
+        raise TypeError(
+            f"checkpoint_provenance must be a dict with keys {_REQUIRED_CHECKPOINT_PROVENANCE_KEYS}, "
+            f"got {type(checkpoint_provenance).__name__}"
+        )
+    missing = [k for k in _REQUIRED_CHECKPOINT_PROVENANCE_KEYS if k not in checkpoint_provenance]
+    if missing:
+        raise ValueError(f"checkpoint_provenance is missing required key(s): {missing}")
+    empty = [k for k in _REQUIRED_CHECKPOINT_PROVENANCE_KEYS if not str(checkpoint_provenance[k]).strip()]
+    if empty:
+        raise ValueError(f"checkpoint_provenance has empty/whitespace value(s) for required key(s): {empty}")
+    canonical = {k: str(checkpoint_provenance[k]) for k in _REQUIRED_CHECKPOINT_PROVENANCE_KEYS}
+    return json.dumps(canonical, sort_keys=True)
 
 
 @dataclass(frozen=True)
@@ -127,6 +197,49 @@ class NovaeContextInputs:
     node_barcodes: np.ndarray          # [n_context] str, sorted
     node_composite_ids: np.ndarray     # [n_context] str, composite_spot_id(sample_id, barcode)
     context_adata: object              # "ad.AnnData" -- physically excludes every query row
+
+
+def _build_sanitized_context_adata(
+    adata: "ad.AnnData", node_barcodes: np.ndarray, node_pos: list[int],
+) -> "ad.AnnData":
+    """Build a genuinely NEW, EXPLICITLY-constructed context-only AnnData
+    (13th Codex re-audit finding #1) -- never `adata[node_pos].copy()`,
+    which blanket-inherits every `.obsm`/`.obsp`/`.layers`/`.uns`/`.raw`
+    entry from the original object. Array-shaped obs-indexed fields ARE
+    correctly row-subset by that blanket copy, but arbitrary
+    non-obs-indexed `.uns` entries have no subsetting semantics at all
+    and would carry forward unchanged -- a real leakage surface for a
+    full-slide summary statistic stashed in `.uns`.
+
+    Only three things are carried forward, all explicitly row/identity
+    subset: `X` (expression), `var` (gene identities Novae needs to
+    match its own vocabulary by name -- not slide-derived, this is
+    panel/vocabulary metadata), and `obsm['spatial']` (coordinates, the
+    only spatial input real `novae.spatial_neighbors` reads). `.uns` is
+    populated ONLY from `_ALLOWED_CONTEXT_UNS_KEYS` -- exactly the keys
+    `_adata_feature_signature` itself reads, so the cache fingerprint
+    still reflects real preprocessing state. `.obsp`, `.layers`, `.raw`,
+    and every other `.uns` key are never copied -- if a real
+    `novae_feature_fn` adapter needs something beyond this, that is a
+    disclosed, real integration gap (`build_novae_preflight_report`'s
+    `not_provable_from_this_module_alone`), not something silently
+    assumed safe to smuggle through."""
+    X = adata.X[node_pos]
+    X = X.copy() if hasattr(X, "copy") else np.array(X, copy=True)
+    obs_index_name = adata.obs.index.name if hasattr(adata.obs, "index") else None
+    context_adata = ad.AnnData(
+        X=X,
+        obs=pd.DataFrame(index=pd.Index(node_barcodes, name=obs_index_name)),
+        var=adata.var.copy(),
+    )
+    if "spatial" not in adata.obsm:
+        raise ValueError("adata.obsm['spatial'] is required to build a context-only Novae input")
+    context_adata.obsm["spatial"] = np.asarray(adata.obsm["spatial"])[node_pos].copy()
+    source_uns = getattr(adata, "uns", {})
+    for key in _ALLOWED_CONTEXT_UNS_KEYS:
+        if key in source_uns:
+            context_adata.uns[key] = source_uns[key]
+    return context_adata
 
 
 def build_context_only_novae_input(
@@ -159,10 +272,7 @@ def build_context_only_novae_input(
 
     node_barcodes = np.asarray(sorted(str(b) for b in context_barcodes), dtype=str)
     node_pos = [barcode_to_pos[b] for b in node_barcodes]
-    # A genuinely NEW object, never a view over the full adata -- the
-    # injected novae_feature_fn physically cannot reach query rows
-    # through this, regardless of what it does internally.
-    context_adata = adata[node_pos].copy()
+    context_adata = _build_sanitized_context_adata(adata, node_barcodes, node_pos)
     node_composite_ids = np.asarray(
         [composite_spot_id(sample_id, b) for b in node_barcodes], dtype=str,
     )
@@ -252,17 +362,21 @@ def compute_novae_embeddings(inputs: NovaeContextInputs, novae_feature_fn: Novae
 
 def ensure_cached_novae_embeddings(
     cache_dir: str | Path, inputs: NovaeContextInputs, novae_feature_fn: NovaeFeatureFn,
-    query_barcodes: Iterable[str], *, expected_dim: int | None = None, checkpoint_signature: str = "",
+    query_barcodes: Iterable[str], *, expected_dim: int | None = None, checkpoint_provenance: dict,
 ) -> tuple[np.ndarray, Path]:
     """Load-or-compute-and-cache the Novae embeddings for this
     context-only input, atomically. The cache key is
     `_adata_feature_signature(context_adata, novae_feature_fn,
     extra_signature=...)` -- a COMPREHENSIVE fingerprint over real
     expression bytes, obs/var names, spatial coordinates, preprocessing
-    state, the feature function's identity, `checkpoint_signature` (a
-    caller-supplied real checkpoint identity string, e.g. `f"{repo}:
-    {revision}"`), and this module's own cache-schema version -- never
-    just context-node identities alone (12th Codex re-audit finding #2).
+    state, the feature function's identity, `checkpoint_provenance` (a
+    REQUIRED structured dict -- `checkpoint_repo`, `checkpoint_revision`,
+    `novae_package_version`, `adapter_version`, `spatial_neighbors_settings`,
+    validated by `_validate_checkpoint_provenance`; 13th Codex re-audit
+    finding #7, CONFIRMED: an optional default-empty-string signature let
+    a caller silently omit real checkpoint identity and still get a
+    cache hit), and this module's own cache-schema version -- never just
+    context-node identities alone (12th Codex re-audit finding #2).
 
     Before ever returning a CACHED result, this function validates: the
     cache file has every required key; its recorded `cache_key` matches
@@ -275,6 +389,7 @@ def ensure_cached_novae_embeddings(
     cache, not a silent fallback to treating it as a miss."""
     verify_novae_context_excludes_query_identities(inputs, query_barcodes)  # fail closed before touching the cache
     query_composite_ids = {composite_spot_id(inputs.sample_id, b) for b in query_barcodes}
+    checkpoint_signature = _validate_checkpoint_provenance(checkpoint_provenance)
 
     cache_key = _adata_feature_signature(
         inputs.context_adata, novae_feature_fn,
@@ -352,7 +467,7 @@ def ensure_cached_novae_embeddings(
 def build_novae_preflight_report(
     adata: "ad.AnnData",  # noqa: F821
     context_barcodes: list[str], query_barcodes: list[str], novae_feature_fn: NovaeFeatureFn, *,
-    sample_id: str, cache_dir: str | Path, expected_dim: int | None = None, checkpoint_signature: str = "",
+    sample_id: str, cache_dir: str | Path, checkpoint_provenance: dict, expected_dim: int | None = None,
 ) -> dict:
     """Build the context-only Novae input, compute (or reuse cached)
     embeddings, pool them, and record what was ACTUALLY verified versus
@@ -360,14 +475,15 @@ def build_novae_preflight_report(
     finding #4: a prior version's "checks" dict asserted `True` for
     claims -- like "an arbitrary injected function didn't leak external
     data" -- that no amount of checking the INPUT/OUTPUT shape here can
-    actually establish). This is the artifact Step 8's preflight gate
-    is meant to require before a real training run touches Novae
-    features."""
+    actually establish). `checkpoint_provenance` is REQUIRED (13th Codex
+    re-audit finding #7) -- see `_validate_checkpoint_provenance` for its
+    schema. This is the artifact Step 8's preflight gate is meant to
+    require before a real training run touches Novae features."""
     inputs = build_context_only_novae_input(adata, context_barcodes, query_barcodes, sample_id=sample_id)
     context_check = verify_novae_context_excludes_query_identities(inputs, query_barcodes)
     embeddings, cache_path = ensure_cached_novae_embeddings(
         cache_dir, inputs, novae_feature_fn, query_barcodes,
-        expected_dim=expected_dim, checkpoint_signature=checkpoint_signature,
+        expected_dim=expected_dim, checkpoint_provenance=checkpoint_provenance,
     )
     pooled = pool_novae_embeddings(embeddings)
 
@@ -375,6 +491,7 @@ def build_novae_preflight_report(
         "version": _REPORT_VERSION,
         "sample_id": sample_id,
         "cache_path": str(cache_path),
+        "checkpoint_provenance": {k: str(checkpoint_provenance[k]) for k in _REQUIRED_CHECKPOINT_PROVENANCE_KEYS},
         "n_context": context_check["n_context"],
         "n_query_checked": context_check["n_query_checked"],
         "pooled_embedding_dim": int(pooled.shape[0]),
@@ -383,6 +500,10 @@ def build_novae_preflight_report(
             "(checked directly against the AnnData object actually passed to novae_feature_fn)",
             "context_adata.obs_names, node_barcodes, and node_composite_ids are mutually consistent",
             "the returned embeddings are row-aligned 1:1 with context_adata (shape checked)",
+            "context_adata was built EXPLICITLY field-by-field (X/var/obsm['spatial']/whitelisted "
+            "uns keys only), not by blanket-copying the full adata's .obsm/.obsp/.layers/.uns/.raw",
+            "checkpoint_provenance has every required key (checkpoint_repo, checkpoint_revision, "
+            "novae_package_version, adapter_version, spatial_neighbors_settings) non-empty",
             "if reused from cache: the cache's recorded cache_key, node identity/order, required "
             "keys, shape, dtype, and finiteness were all validated before trusting it",
         ],
@@ -390,7 +511,7 @@ def build_novae_preflight_report(
             "that an arbitrary injected novae_feature_fn did not internally read data beyond the "
             "context_adata object it was given (this module cannot inspect the function's body)",
             "that cached or freshly-computed embeddings came from the exact real Novae checkpoint "
-            "claimed, beyond whatever identity string the caller supplied via checkpoint_signature",
+            "claimed, beyond whatever identity strings the caller supplied via checkpoint_provenance",
         ],
         "passed": True,
     }

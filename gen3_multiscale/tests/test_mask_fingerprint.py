@@ -6,12 +6,13 @@ import pytest
 from gen3_multiscale.data import mask_bank
 from gen3_multiscale.data.dataset_manifest import composite_spot_id
 from gen3_multiscale.data.mask_fingerprint import (
-    build_collision_free_training_schedule, build_held_out_sample_mask_report,
+    EmptyMaskRealizationError, build_collision_free_training_schedule, build_held_out_sample_mask_report,
     build_training_sample_mask_report, load_collision_free_training_schedule, load_mask_fingerprint_report,
     realize_seed_and_fingerprint, realized_query_composite_ids, save_collision_free_training_schedule,
     save_mask_fingerprint_report, sorted_composite_query_fingerprint,
-    validate_realized_barcodes_against_manifest, verify_no_cross_split_query_leakage,
-    verify_no_duplicate_masks_within_split, verify_realized_pool_uniqueness, verify_realized_seed_uniqueness,
+    validate_collision_free_training_schedule, validate_realized_barcodes_against_manifest,
+    verify_no_cross_split_query_leakage, verify_no_duplicate_masks_within_split, verify_realized_pool_uniqueness,
+    verify_realized_seed_uniqueness,
 )
 from gen3_multiscale.data.mask_schedule import build_stratified_mask_bank, stratum_to_masking_cfg
 
@@ -291,7 +292,7 @@ def test_build_training_sample_mask_report_end_to_end_and_persists(tmp_path):
     disk -- the artifact Step 8's preflight gate will require before
     training starts."""
     coords3d, slice_ids, obs_names = _synthetic_slide()
-    manifest = {"samples": {"S0": {"barcodes": list(obs_names)}}}
+    manifest = {"samples": {"S0": {"barcodes": list(obs_names), "split": "train"}}}
     mask_bank_bank = build_stratified_mask_bank(
         coords3d, slice_ids, obs_names, _REPORT_STRATA, split_counts={"validation": 1, "test": 1},
     )
@@ -329,7 +330,7 @@ def test_build_training_sample_mask_report_includes_a_clearly_labeled_same_sampl
     test verifies -- the labeling/separation of the diagnostic section
     itself)."""
     coords3d, slice_ids, obs_names = _synthetic_slide()
-    manifest = {"samples": {"S0": {"barcodes": list(obs_names)}}}
+    manifest = {"samples": {"S0": {"barcodes": list(obs_names), "split": "train"}}}
     mask_bank_bank = build_stratified_mask_bank(
         coords3d, slice_ids, obs_names, _REPORT_STRATA, split_counts={"validation": 1, "test": 0},
     )
@@ -348,22 +349,58 @@ def test_build_training_sample_mask_report_includes_a_clearly_labeled_same_sampl
     assert "SECONDARY diagnostic" in diagnostic["note"]
 
 
-def test_build_training_sample_mask_report_raises_on_a_sample_id_mismatch():
+def test_build_training_sample_mask_report_raises_on_an_unknown_sample():
     coords3d, slice_ids, obs_names = _synthetic_slide()
-    manifest = {"samples": {"S0": {"barcodes": list(obs_names)}}}
+    manifest = {"samples": {"S0": {"barcodes": list(obs_names), "split": "train"}}}
+    schedule = build_collision_free_training_schedule(
+        coords3d, slice_ids, obs_names, "S0", _REPORT_STRATA, n_items=4, base_seed=0,
+        reserved_query_composite_ids=set(),
+    )
+    with pytest.raises(ValueError, match="is not a sample the dataset manifest declares"):
+        build_training_sample_mask_report(
+            manifest, "WRONG_SAMPLE", coords3d, slice_ids, obs_names, _REPORT_STRATA, schedule,
+        )
+
+
+def test_build_training_sample_mask_report_raises_on_a_schedule_sample_id_mismatch():
+    coords3d, slice_ids, obs_names = _synthetic_slide()
+    manifest = {
+        "samples": {
+            "S0": {"barcodes": list(obs_names), "split": "train"},
+            "S1": {"barcodes": list(obs_names), "split": "train"},
+        },
+    }
     schedule = build_collision_free_training_schedule(
         coords3d, slice_ids, obs_names, "S0", _REPORT_STRATA, n_items=4, base_seed=0,
         reserved_query_composite_ids=set(),
     )
     with pytest.raises(ValueError, match="was built for sample"):
         build_training_sample_mask_report(
-            manifest, "WRONG_SAMPLE", coords3d, slice_ids, obs_names, _REPORT_STRATA, schedule,
+            manifest, "S1", coords3d, slice_ids, obs_names, _REPORT_STRATA, schedule,
+        )
+
+
+def test_build_training_sample_mask_report_raises_when_manifest_does_not_assign_train_role():
+    """13th Codex re-audit of commit 65611c7, finding #4 (CONFIRMED): a
+    prior version accepted any sample_id the training_schedule itself
+    claimed, never cross-checking it against the manifest's own role
+    assignment -- e.g. building a "training" report for a sample the
+    manifest actually reserved for validation."""
+    coords3d, slice_ids, obs_names = _synthetic_slide()
+    manifest = {"samples": {"S0": {"barcodes": list(obs_names), "split": "validation"}}}
+    schedule = build_collision_free_training_schedule(
+        coords3d, slice_ids, obs_names, "S0", _REPORT_STRATA, n_items=4, base_seed=0,
+        reserved_query_composite_ids=set(),
+    )
+    with pytest.raises(ValueError, match="not 'train'"):
+        build_training_sample_mask_report(
+            manifest, "S0", coords3d, slice_ids, obs_names, _REPORT_STRATA, schedule,
         )
 
 
 def test_build_held_out_sample_mask_report_end_to_end():
     coords3d, slice_ids, obs_names = _synthetic_slide()
-    manifest = {"samples": {"S0": {"barcodes": list(obs_names)}}}
+    manifest = {"samples": {"S0": {"barcodes": list(obs_names), "split": "validation"}}}
     mask_bank_bank = build_stratified_mask_bank(
         coords3d, slice_ids, obs_names, _REPORT_STRATA, split_counts={"validation": 3, "test": 0},
     )
@@ -374,6 +411,7 @@ def test_build_held_out_sample_mask_report_end_to_end():
     assert report["role"] == "validation"
     assert report["primary"]["n_records"] == 6  # 3 per stratum * 2 strata
     assert report["primary"]["n_unique_masks"] == 6
+    assert "mask_bank_content_fingerprint" in report
 
 
 def test_build_held_out_sample_mask_report_raises_when_bank_contains_a_different_split():
@@ -381,7 +419,7 @@ def test_build_held_out_sample_mask_report_raises_when_bank_contains_a_different
     carry masks from a different split -- e.g. a validation sample's
     mask bank must not also contain test-labeled records."""
     coords3d, slice_ids, obs_names = _synthetic_slide()
-    manifest = {"samples": {"S0": {"barcodes": list(obs_names)}}}
+    manifest = {"samples": {"S0": {"barcodes": list(obs_names), "split": "validation"}}}
     mask_bank_bank = build_stratified_mask_bank(
         coords3d, slice_ids, obs_names, _REPORT_STRATA, split_counts={"validation": 1, "test": 1},
     )
@@ -393,7 +431,7 @@ def test_build_held_out_sample_mask_report_raises_when_bank_contains_a_different
 
 def test_build_held_out_sample_mask_report_raises_on_duplicate_masks_within_the_split():
     coords3d, slice_ids, obs_names = _synthetic_slide()
-    manifest = {"samples": {"S0": {"barcodes": list(obs_names)}}}
+    manifest = {"samples": {"S0": {"barcodes": list(obs_names), "split": "validation"}}}
     mask_bank_bank = build_stratified_mask_bank(
         coords3d, slice_ids, obs_names, _REPORT_STRATA, split_counts={"validation": 2, "test": 0},
     )
@@ -408,12 +446,89 @@ def test_build_held_out_sample_mask_report_raises_on_duplicate_masks_within_the_
         )
 
 
+def test_build_held_out_sample_mask_report_raises_when_manifest_does_not_assign_requested_split():
+    """13th Codex re-audit finding #4 (CONFIRMED): a prior version
+    accepted any sample_id/split pair the caller claimed, never
+    cross-checking against the manifest's own role assignment -- e.g.
+    building a "validation" report for a sample the manifest actually
+    assigned to "test"."""
+    coords3d, slice_ids, obs_names = _synthetic_slide()
+    manifest = {"samples": {"S0": {"barcodes": list(obs_names), "split": "test"}}}
+    mask_bank_bank = build_stratified_mask_bank(
+        coords3d, slice_ids, obs_names, _REPORT_STRATA, split_counts={"validation": 1, "test": 0},
+    )
+    with pytest.raises(ValueError, match="not the requested"):
+        build_held_out_sample_mask_report(
+            manifest, "S0", coords3d, slice_ids, obs_names, _REPORT_STRATA, "validation", mask_bank_bank,
+        )
+
+
+def test_build_held_out_sample_mask_report_rejects_an_empty_mask_bank_for_the_split():
+    """13th Codex re-audit finding #4 (CONFIRMED): a prior version let a
+    held-out mask bank with zero records for the requested split
+    silently "pass" with n_records=0 -- an empty held-out mask bank must
+    never look like a valid evaluation report."""
+    coords3d, slice_ids, obs_names = _synthetic_slide()
+    manifest = {"samples": {"S0": {"barcodes": list(obs_names), "split": "validation"}}}
+    mask_bank_bank = build_stratified_mask_bank(
+        coords3d, slice_ids, obs_names, _REPORT_STRATA, split_counts={"validation": 0, "test": 0},
+    )
+    with pytest.raises(ValueError, match="empty held-out mask bank"):
+        build_held_out_sample_mask_report(
+            manifest, "S0", coords3d, slice_ids, obs_names, _REPORT_STRATA, "validation", mask_bank_bank,
+        )
+
+
+def test_build_held_out_sample_mask_report_rejects_a_stale_dataset_fingerprint():
+    """13th Codex re-audit finding #5 (CONFIRMED): a prior version never
+    validated the SUPPLIED stratified_mask_bank's own recorded
+    dataset_fingerprint/spatial_fingerprint/strata_fingerprint/
+    mask_generation_version against the live inputs -- it trusted the
+    bank's records without ever confirming the bank was built from the
+    same underlying data."""
+    coords3d, slice_ids, obs_names = _synthetic_slide()
+    manifest = {"samples": {"S0": {"barcodes": list(obs_names), "split": "validation"}}}
+    mask_bank_bank = build_stratified_mask_bank(
+        coords3d, slice_ids, obs_names, _REPORT_STRATA, split_counts={"validation": 1, "test": 0},
+    )
+    stale_bank = dict(mask_bank_bank)
+    stale_bank["dataset_fingerprint"] = "not-the-real-fingerprint"
+    with pytest.raises(ValueError, match="dataset_fingerprint does not match"):
+        build_held_out_sample_mask_report(
+            manifest, "S0", coords3d, slice_ids, obs_names, _REPORT_STRATA, "validation", stale_bank,
+        )
+
+
+def test_build_held_out_sample_mask_report_rejects_an_unexpected_record_count():
+    """13th Codex re-audit finding #5: expected per-split, per-stratum
+    record counts (from the bank's own split_counts) are now checked --
+    a bank silently missing records for this split/stratum must fail
+    loudly rather than quietly reporting a smaller-than-requested
+    evaluation set as if it were the full one."""
+    coords3d, slice_ids, obs_names = _synthetic_slide()
+    manifest = {"samples": {"S0": {"barcodes": list(obs_names), "split": "validation"}}}
+    mask_bank_bank = build_stratified_mask_bank(
+        coords3d, slice_ids, obs_names, _REPORT_STRATA, split_counts={"validation": 2, "test": 0},
+    )
+    truncated_bank = dict(mask_bank_bank)
+    truncated_bank["records"] = [
+        r for r in mask_bank_bank["records"] if not (r["split"] == "validation" and r["index"] == 1)
+    ]
+    with pytest.raises(ValueError, match="expected"):
+        build_held_out_sample_mask_report(
+            manifest, "S0", coords3d, slice_ids, obs_names, _REPORT_STRATA, "validation", truncated_bank,
+        )
+
+
 def test_report_input_fingerprints_change_when_the_manifest_changes():
     """12th Codex re-audit finding #6: reports must be bound to the
     exact inputs they were built from."""
     coords3d, slice_ids, obs_names = _synthetic_slide()
-    manifest_a = {"samples": {"S0": {"barcodes": list(obs_names)}}}
-    manifest_b = {"samples": {"S0": {"barcodes": list(obs_names)}, "extra_key": "changes the fingerprint"}}
+    manifest_a = {"samples": {"S0": {"barcodes": list(obs_names), "split": "validation"}}}
+    manifest_b = {
+        "samples": {"S0": {"barcodes": list(obs_names), "split": "validation"}},
+        "extra_key": "changes the fingerprint",
+    }
     mask_bank_bank = build_stratified_mask_bank(
         coords3d, slice_ids, obs_names, _REPORT_STRATA, split_counts={"validation": 1, "test": 0},
     )
@@ -424,3 +539,130 @@ def test_report_input_fingerprints_change_when_the_manifest_changes():
         manifest_b, "S0", coords3d, slice_ids, obs_names, _REPORT_STRATA, "validation", mask_bank_bank,
     )
     assert report_a["input_fingerprints"]["manifest_fingerprint"] != report_b["input_fingerprints"]["manifest_fingerprint"]
+
+
+def test_report_input_fingerprints_include_observation_order():
+    """13th Codex re-audit finding #2 (CONFIRMED): a prior report bound
+    only manifest/spatial/strata fingerprints, never the ORDERED
+    observation identity sequence realization itself depends on."""
+    coords3d, slice_ids, obs_names = _synthetic_slide()
+    manifest = {"samples": {"S0": {"barcodes": list(obs_names), "split": "validation"}}}
+    mask_bank_bank = build_stratified_mask_bank(
+        coords3d, slice_ids, obs_names, _REPORT_STRATA, split_counts={"validation": 1, "test": 0},
+    )
+    report_a = build_held_out_sample_mask_report(
+        manifest, "S0", coords3d, slice_ids, obs_names, _REPORT_STRATA, "validation", mask_bank_bank,
+    )
+    reordered = list(reversed(list(obs_names)))
+    assert (
+        report_a["input_fingerprints"]["observation_order_fingerprint"]
+        != _observation_order_fingerprint_for_test(reordered)
+    )
+
+
+def _observation_order_fingerprint_for_test(obs_names):
+    from gen3_multiscale.data.mask_fingerprint import _observation_order_fingerprint
+    return _observation_order_fingerprint(obs_names)
+
+
+def test_validate_collision_free_training_schedule_passes_for_a_freshly_built_schedule():
+    coords3d, slice_ids, obs_names = _synthetic_slide()
+    reserved_ids = {composite_spot_id("S0", obs_names[0])}
+    schedule = build_collision_free_training_schedule(
+        coords3d, slice_ids, obs_names, "S0", _REPORT_STRATA, n_items=4, base_seed=0,
+        reserved_query_composite_ids=reserved_ids,
+    )
+    result = validate_collision_free_training_schedule(
+        schedule, coords3d, slice_ids, obs_names, "S0", _REPORT_STRATA, reserved_ids,
+    )
+    assert result == {"n_items": 4, "passed": True}
+
+
+def test_validate_collision_free_training_schedule_detects_a_tampered_fingerprint():
+    """13th Codex re-audit finding #3 (CONFIRMED): no function existed to
+    re-verify a persisted schedule still matched the generation it
+    accompanies -- this proves a tampered/stale realized_query_composite_
+    fingerprints entry is actually caught by re-realization, not just
+    trusted from the file."""
+    coords3d, slice_ids, obs_names = _synthetic_slide()
+    reserved_ids: set[str] = set()
+    schedule = build_collision_free_training_schedule(
+        coords3d, slice_ids, obs_names, "S0", _REPORT_STRATA, n_items=4, base_seed=0,
+        reserved_query_composite_ids=reserved_ids,
+    )
+    tampered = dict(schedule)
+    tampered["realized_query_composite_fingerprints"] = list(schedule["realized_query_composite_fingerprints"])
+    tampered["realized_query_composite_fingerprints"][0] = "not-the-real-fingerprint"
+    with pytest.raises(ValueError, match="no longer matches"):
+        validate_collision_free_training_schedule(
+            tampered, coords3d, slice_ids, obs_names, "S0", _REPORT_STRATA, reserved_ids,
+        )
+
+
+def test_validate_collision_free_training_schedule_detects_a_changed_same_sized_reserved_set():
+    """13th Codex re-audit finding #3, the reserved-set half: a prior
+    schedule recorded only len(reserved_query_composite_ids), so a
+    DIFFERENT reserved set of the SAME SIZE would look identical. The
+    fingerprint (not the count) must catch this."""
+    coords3d, slice_ids, obs_names = _synthetic_slide()
+    reserved_a = {composite_spot_id("S0", obs_names[0])}
+    reserved_b = {composite_spot_id("S0", obs_names[1])}  # same size, different content
+    schedule = build_collision_free_training_schedule(
+        coords3d, slice_ids, obs_names, "S0", _REPORT_STRATA, n_items=4, base_seed=0,
+        reserved_query_composite_ids=reserved_a,
+    )
+    assert schedule["n_reserved_composite_ids"] == 1
+    with pytest.raises(ValueError, match="reserved_composite_ids_fingerprint does not match"):
+        validate_collision_free_training_schedule(
+            schedule, coords3d, slice_ids, obs_names, "S0", _REPORT_STRATA, reserved_b,
+        )
+
+
+def test_build_collision_free_training_schedule_stores_a_reserved_set_fingerprint_not_just_a_count():
+    coords3d, slice_ids, obs_names = _synthetic_slide()
+    reserved_ids = {composite_spot_id("S0", obs_names[0])}
+    schedule = build_collision_free_training_schedule(
+        coords3d, slice_ids, obs_names, "S0", _REPORT_STRATA, n_items=4, base_seed=0,
+        reserved_query_composite_ids=reserved_ids,
+    )
+    assert "reserved_composite_ids_fingerprint" in schedule
+    assert isinstance(schedule["reserved_composite_ids_fingerprint"], str) and schedule["reserved_composite_ids_fingerprint"]
+
+
+def test_build_collision_free_training_schedule_does_not_retry_a_structural_error():
+    """13th Codex re-audit finding #8 (CONFIRMED): a bare
+    `except ValueError: continue` in the seed-retry loop also swallowed
+    STRUCTURAL errors (e.g. a manifest mismatch), retrying up to
+    max_attempts_per_item times on an error no seed could ever fix,
+    instead of failing immediately. Engineered via a manifest that
+    declares only a tiny fraction of the real barcodes for S0 -- every
+    realized mask will reference undeclared barcodes, raising a plain
+    ValueError (via validate_realized_barcodes_against_manifest) that is
+    NOT an EmptyMaskRealizationError. The narrowed except must let this
+    propagate on the FIRST attempt, so the error message is the
+    manifest-validation message, never the retry-budget-exhausted
+    message a swallow-everything catch would eventually produce."""
+    coords3d, slice_ids, obs_names = _synthetic_slide()
+    broken_manifest = {"samples": {"S0": {"barcodes": list(obs_names)[:2], "split": "train"}}}
+    with pytest.raises(ValueError, match="never declared"):
+        build_collision_free_training_schedule(
+            coords3d, slice_ids, obs_names, "S0", _REPORT_STRATA, n_items=2, base_seed=0,
+            reserved_query_composite_ids=set(), manifest=broken_manifest, max_attempts_per_item=3,
+        )
+
+
+def test_realize_seed_and_fingerprint_raises_empty_mask_realization_error_for_a_genuinely_empty_draw():
+    """realize_seed_and_fingerprint's empty-context/query case must raise
+    the narrow EmptyMaskRealizationError (a ValueError subclass), the
+    ONLY exception build_collision_free_training_schedule's retry loop
+    may swallow."""
+    n = 3
+    xs, ys = np.meshgrid(np.arange(n), np.arange(n))
+    coords3d = np.stack([xs.ravel(), ys.ravel(), np.zeros(n * n)], axis=1).astype(np.float64)
+    slice_ids = np.array(["slide_a"] * (n * n))
+    obs_names = [f"spot_{i}" for i in range(n * n)]
+    masking_cfg = {"strategy": "random_dropout_patches", "params": {
+        "n_patches": 1, "radius_range": [1000.0, 1001.0], "radius_unit": "coordinate", "shape": "circle",
+    }}
+    with pytest.raises(EmptyMaskRealizationError):
+        realize_seed_and_fingerprint(coords3d, slice_ids, obs_names, "S0", masking_cfg, 0)

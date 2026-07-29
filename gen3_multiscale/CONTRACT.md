@@ -3308,7 +3308,204 @@ availability.
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 38. Response to the thirteenth external Codex re-audit (of commit 65611c7)
+
+Codex confirmed the 12th round's fixes (real Novae adapter interface,
+deterministic collision-free scheduling, sample-role-aware reports) as
+genuine improvements, then found 8 further launch-blocking gaps across
+Step 4's context-only AnnData sanitization and Step 3's schedule/report
+binding and validation depth -- all 8 individually re-confirmed against
+the real code before any fix, exactly as every prior round.
+
+**Finding #1 (CONFIRMED): the context-only AnnData was not actually
+sanitized, only row-subset.** `build_context_only_novae_input` built
+`context_adata = adata[node_pos].copy()` -- AnnData's own slicing
+correctly row-subsets every array-shaped obs-indexed field (`X`,
+`obsm`, `obsp`, `layers`), but it also blanket-COPIES `.uns` and `.raw`
+verbatim, and `.uns` entries have no obs-indexed subsetting semantics
+at all -- a full-slide summary statistic stashed in `.uns` would carry
+forward into the "context-only" object completely unchanged. Fixed:
+new `_build_sanitized_context_adata` constructs the object EXPLICITLY
+field-by-field -- `X` (row-subset), `var` (gene identities, needed to
+match Novae's own vocabulary by name), `obsm['spatial']` (row-subset),
+and `.uns` populated ONLY from `_ALLOWED_CONTEXT_UNS_KEYS`
+(`_scilifestdl_expression_state`, `expression_preprocessing` -- exactly
+the two keys `_adata_feature_signature` itself reads, so the cache
+fingerprint still reflects real preprocessing state). `.obsp`,
+`.layers`, and `.raw` are never copied. The module docstring's prior
+claim that `novae_feature_fn` could never reach the full adata "even
+via a closure" was also corrected -- no callee can police what a
+caller's own Python closure captures; that specific claim was already,
+correctly, listed under `not_provable_from_this_module_alone` and now
+the docstring says so instead of overclaiming. Verified:
+`test_build_context_only_novae_input_excludes_unwhitelisted_uns_and_obsp_layers_raw`
+stashes a full-slide statistic under a non-whitelisted `.uns` key plus
+extra `.layers`/`.obsp` entries and confirms none of them appear on
+`context_adata`, while the whitelisted key does.
+
+**Finding #2 (CONFIRMED): reports were not bound to the schedule/bank
+content or the ordered observation sequence, only to manifest/spatial/
+strata summary fingerprints.** `_mask_bank_records_fingerprint` existed
+but was DEAD CODE -- defined, never called. Fixed: `_input_fingerprints`
+gained `observation_order_fingerprint` (SHA256 of the obs_names
+sequence IN ORDER -- `realize_seed_and_fingerprint` indexes by
+position, so a report is only meaningful for the exact ordered sequence
+it was computed against). `build_training_sample_mask_report` now
+records `training_schedule_content_fingerprint` (over the schedule's
+own `items`) and `realized_query_composite_fingerprints_fingerprint`
+(over the accepted fingerprints set), plus a `content_fingerprint_by_split`
+entry inside the same-sample diagnostic section when present.
+`build_held_out_sample_mask_report` now records
+`mask_bank_content_fingerprint` (over the actual filtered `records`
+used) via the now-wired-in `_mask_bank_records_fingerprint`. Verified:
+`test_report_input_fingerprints_include_observation_order`.
+
+**Finding #3 (CONFIRMED): a persisted collision-free training schedule
+could never be re-verified against live data, and its reserved-set
+binding was a COUNT, not a fingerprint.** No `validate_*` function
+existed for `build_collision_free_training_schedule`'s output, and its
+`n_reserved_composite_ids` field is a size, not an identity -- a
+DIFFERENT reserved set of the same size would look identical. Fixed:
+the schedule now also records `reserved_composite_ids_fingerprint`
+(SHA256 of the sorted reserved-set contents). New
+`validate_collision_free_training_schedule(schedule, coords3d,
+slice_ids, obs_names, sample_id, strata, reserved_query_composite_ids,
+*, manifest=None)` checks schema version/kind, sample_id, strata
+identity and fingerprint, the reserved-set fingerprint, internal
+item-count consistency, and -- the strongest check -- RE-REALIZES
+every stored `(stratum, seed)` item from scratch and confirms its fresh
+query composite fingerprint matches the one on record, with no reserved
+collisions and no internal duplicates. `_SCHEDULE_VERSION` bumped
+2 (schema changed: new required field). Verified: a happy-path pass, a
+tampered-fingerprint detection test, and a same-SIZE-different-CONTENT
+reserved-set detection test (proving the fingerprint, not the count, is
+what's actually checked).
+
+**Finding #4 (CONFIRMED): neither report builder enforced the
+manifest's own sample-role assignment, and an empty held-out mask bank
+silently "passed."** `build_training_sample_mask_report` accepted any
+`sample_id` the `training_schedule` itself claimed, never checking
+`manifest["samples"][sample_id]["split"] == "train"`;
+`build_held_out_sample_mask_report` never checked
+`manifest["samples"][sample_id]["split"] == split`; and if the
+requested split's `records` list came back empty,
+`verify_no_duplicate_masks_within_split` happily returned
+`{"n_records": 0, ...}` with no rejection. Fixed: both functions now
+require `sample_id` to exist in the manifest and require its recorded
+`split` to match the role being reported (train / the requested
+validation-or-test split) -- raising immediately otherwise.
+`build_held_out_sample_mask_report` now also rejects an empty `records`
+list outright. Verified by 4 new tests covering each direction (unknown
+sample, wrong role for training, wrong role for held-out, empty bank).
+
+**Finding #5 (CONFIRMED): `build_held_out_sample_mask_report` trusted
+the supplied `stratified_mask_bank`'s records without ever validating
+the BANK ITSELF against live data, or checking expected record
+counts.** Fixed: the function now validates the bank's own
+`dataset_fingerprint`/`spatial_fingerprint`/`strata_fingerprint`/
+`mask_generation_version` against live `obs_names`/`coords3d`/
+`slice_ids`/`strata` (mirroring `mask_schedule.load_stratified_mask_bank`'s
+own staleness checks, applied here to an in-memory bank rather than one
+re-read from disk), confirms the expected per-split record count from
+the bank's own `split_counts` (`split_counts[split] * len(strata)`),
+confirms every declared stratum has at least one record for this split,
+and confirms every record's context/query sets are individually
+non-empty and disjoint. Verified by 2 new tests (a stale
+`dataset_fingerprint`, and a bank missing one expected record).
+
+**Finding #6 (CONFIRMED): the per-organ held-out quota re-validation in
+`dataset_manifest.build_dataset_manifest` only ran when THIS function's
+own final-exact-panel filter happened to drop something.**
+`resolve_sample_selection`'s OWN internal filtering (its coarse
+compatibility pre-filter, and its cross-organ patient conflict
+resolution) can also leave an organ short of its requested
+validation/test patient quota, without this function's own
+`dropped_for_final_panel` ever becoming non-empty -- silently skipping
+the quota check entirely. Fixed: the per-organ quota loop now runs
+UNCONDITIONALLY after sample-selection/held-out-panel filtering, not
+gated behind `if dropped_for_final_panel:` (the informational "excluded
+N held-out sample(s)" print stays conditional; only the quota
+enforcement itself is now unconditional). Verified:
+`test_quota_check_fires_even_when_this_functions_own_final_panel_filter_drops_nothing`
+monkeypatches `resolve_sample_selection` to return a split where an
+organ already has zero validation patients but every returned sample's
+panel is fully compatible (so this function's own filter drops
+nothing) -- confirms the manifest build now still fails closed.
+
+**Finding #7 (CONFIRMED): `checkpoint_signature` was an OPTIONAL,
+default-empty-string parameter.** A caller could silently omit real
+Novae checkpoint identity entirely and still get a cache hit or a
+"passed" preflight report. Fixed: `ensure_cached_novae_embeddings` and
+`build_novae_preflight_report` now take a REQUIRED `checkpoint_provenance:
+dict`, validated by new `_validate_checkpoint_provenance` against 5
+required, non-empty keys -- `checkpoint_repo`, `checkpoint_revision`
+(a real repo revision OR a local checkpoint file's own SHA256),
+`novae_package_version`, `adapter_version`, `spatial_neighbors_settings`
+(since Novae's own `spatial_neighbors(adata)` graph-construction
+settings also affect the embeddings, not just the model checkpoint).
+The preflight report now echoes `checkpoint_provenance` and lists the
+provenance check under `"verified"`. Verified:
+`test_validate_checkpoint_provenance_rejects_missing_and_empty_fields`,
+`test_ensure_cached_novae_embeddings_requires_checkpoint_provenance`,
+`test_build_novae_preflight_report_requires_checkpoint_provenance`.
+
+**Finding #8 (CONFIRMED): the schedule-builder's seed-retry loop caught
+bare `ValueError`, swallowing structural errors as if they were
+retriable.** `build_collision_free_training_schedule`'s `except
+ValueError: continue` treated a genuinely empty context/query
+realization THE SAME as a manifest-validation failure or a malformed
+`masking_cfg` -- retrying up to `max_attempts_per_item` times on an
+error no different seed could ever fix, before eventually surfacing a
+misleading "could not find a collision-free training mask" error
+instead of the real cause. Fixed: new `EmptyMaskRealizationError(ValueError)`
+is raised ONLY by `realize_seed_and_fingerprint`'s genuine
+empty-context/query case; the schedule builder's retry loop now catches
+only that narrow type, so any other `ValueError` propagates immediately
+with its real, specific message. Verified:
+`test_build_collision_free_training_schedule_does_not_retry_a_structural_error`
+uses a manifest declaring only 2 of many real barcodes for the sample,
+so every realized mask trips the manifest-validation check -- confirms
+the real "never declared" error surfaces immediately, not a
+retry-budget-exhausted message.
+
+`_REPORT_VERSION` bumped 2 -> 3 (schema changed: new fingerprint
+fields on every report). `_SCHEDULE_VERSION` bumped 1 -> 2 (schema
+changed: `reserved_composite_ids_fingerprint` is now a required field).
+
+**What the audit confirmed as correct, no fix needed:** the real
+AnnData-based Novae interface itself (finding #1 from the 12th round);
+comprehensive Novae cache fingerprinting via `_adata_feature_signature`;
+cached-embedding validation on load; honest preflight
+verified-vs-not-provable claims; the collision-free scheduling
+algorithm's core guarantee (never queries a reserved identity, never
+repeats an accepted mask); duplicate-mask-within-split detection.
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 440 passed (45 reused-infra + 12 example-schema +
+  11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 23 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 17 dataset-manifest + 16 example-builder +
+  40 mask-fingerprint + 21 novae-graph)
+gen2_architectures + gen3_multiscale: 613 passed, 1 skipped
+```
+
+Note: a full monorepo run (`pytest -q` from the repo root, everything
+including the top-level `tests/` directory) still shows the same one
+pre-existing failure noted since §26,
+`tests/test_multi_sample.py::test_inject_multi_sample_n_genes`,
+unrelated to `gen2_architectures/` or `gen3_multiscale/`; unchanged and
+still out of scope for this pass.
+
+The block immediately below (pre-13th-audit-response test counts) is
+kept for historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 422 passed (45 reused-infra + 12 example-schema +
