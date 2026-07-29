@@ -49,20 +49,24 @@ def _synthetic_inputs(n_genes=6, gex_dim=4, image_dim=8, seed=0):
 _MODEL_KWARGS = dict(hidden_dim=32, n_heads=4, n_blocks=2, dense_threshold=100)
 
 
+_STUB_CHECKPOINT_SHA256 = "deadbeef" * 8
+
+
 def _with_synthetic_wsi_context(inputs, image_dim, n_tiles=12, grid_bound=10.0, seed=1):
     """Attach a hand-built, in-bounds WSI context to an existing
-    SpatialFieldInputs -- native coords deliberately far outside
-    [-1, 1] (real GigaPath level-0 pixel coordinates are large) while
+    SpatialFieldInputs -- LongNet coords deliberately far outside
+    [-1, 1] (real GigaPath target-MPP coordinates are large) while
     regional coords stay inside grid_bound, matching how
     example_builder.py produces two genuinely different-scale frames
-    from the same tiles."""
+    from the same tiles (17th Codex re-audit, Step 5 Part 2 launch
+    blocker #1: the two frames must never be interchangeable)."""
     rng = np.random.default_rng(seed)
-    native_coords = rng.uniform(10_000.0, 20_000.0, size=(n_tiles, 2)).astype(np.float32)
+    longnet_coords = rng.uniform(10_000.0, 20_000.0, size=(n_tiles, 2)).astype(np.float32)
     regional_coords = rng.uniform(-grid_bound + 0.5, grid_bound - 0.5, size=(n_tiles, 2)).astype(np.float32)
     features = rng.normal(size=(n_tiles, image_dim)).astype(np.float32)
     return dataclasses.replace(
         inputs,
-        wsi_tile_native_coords=native_coords,
+        wsi_tile_longnet_coords=longnet_coords,
         wsi_tile_regional_coords=regional_coords,
         wsi_tile_features=features,
         full_slide_coord_bounds=(-grid_bound, grid_bound, -grid_bound, grid_bound),
@@ -74,11 +78,18 @@ class _StubSlideEncoder(torch.nn.Module):
     """Duck-typed stand-in for FrozenGigaPathSlideEncoder -- same
     forward(tile_features, tile_coords, cache_namespace) -> [output_dim]
     contract, no real checkpoint needed, matching every other pluggable-
-    component test stub in this codebase."""
+    component test stub in this codebase. Exposes checkpoint_sha256
+    (17th Codex re-audit, Step 5 Part 2, "Important before Step 6/7") so
+    _SharedFieldArchitecture's real cross-verification against a
+    caller-supplied gigapath_checkpoint_sha256 has something real to
+    check -- defaults to the SAME value every test's
+    gigapath_checkpoint_sha256= call sites use, so construction succeeds
+    unless a test deliberately passes a mismatched value."""
 
-    def __init__(self, tile_feature_dim: int, output_dim: int):
+    def __init__(self, tile_feature_dim: int, output_dim: int, checkpoint_sha256: str = _STUB_CHECKPOINT_SHA256):
         super().__init__()
         self.proj = torch.nn.Linear(tile_feature_dim, output_dim)
+        self.checkpoint_sha256 = checkpoint_sha256
         self.calls = []
 
     def forward(self, tile_features, tile_coords, cache_namespace):
@@ -156,6 +167,77 @@ def test_architecture_3_use_global_slide_requires_a_real_slide_encoder_and_check
         )
 
 
+def test_architecture_3_use_global_slide_rejects_a_slide_encoder_with_no_checkpoint_sha256_attribute():
+    """17th Codex re-audit (Step 5 Part 2, "Important before Step 6/7"),
+    CONFIRMED real: a slide_encoder that doesn't expose checkpoint_sha256
+    at all (e.g. an incorrectly-typed object) must be rejected explicitly
+    -- there is nothing to verify a caller's gigapath_checkpoint_sha256
+    claim against otherwise."""
+    n_genes, gex_dim, image_dim = 6, 4, 8
+
+    class _NoChecksumEncoder(torch.nn.Module):
+        def forward(self, tile_features, tile_coords, cache_namespace):
+            return tile_features.mean(dim=0)
+
+    with pytest.raises(ValueError, match="requires slide_encoder to expose checkpoint_sha256"):
+        Architecture3(
+            n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+            use_global_slide=True, slide_encoder=_NoChecksumEncoder(),
+            gigapath_checkpoint_sha256=_STUB_CHECKPOINT_SHA256, **_MODEL_KWARGS,
+        )
+
+
+def test_architecture_3_use_global_slide_rejects_a_gigapath_checkpoint_sha256_that_does_not_match_the_real_checkpoint():
+    """17th Codex re-audit (Step 5 Part 2, "Important before Step 6/7"),
+    CONFIRMED real: gigapath_checkpoint_sha256 used to be a caller-
+    supplied string trusted blindly -- a caller could pass ANY unrelated
+    string and it would silently poison the LongNet cache namespace with
+    a false checkpoint identity. FrozenGigaPathSlideEncoder now exposes
+    its own real checkpoint_sha256 (computed from the actual file bytes
+    at construction); construction must fail closed when the caller's
+    claim disagrees with it."""
+    n_genes, gex_dim, image_dim = 6, 4, 8
+    mismatched_encoder = _StubSlideEncoder(image_dim, 8, checkpoint_sha256="totally-unrelated-string")
+    with pytest.raises(ValueError, match="does not match"):
+        Architecture3(
+            n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+            use_global_slide=True, slide_encoder=mismatched_encoder,
+            gigapath_checkpoint_sha256=_STUB_CHECKPOINT_SHA256, **_MODEL_KWARGS,
+        )
+
+
+def test_forward_device_selection_ignores_an_independently_relocated_slide_encoder():
+    """17th Codex re-audit (Step 5 Part 2, "Important before Step 6/7"),
+    CONFIRMED real: `next(self.parameters()).device` picks whatever
+    parameter is registered FIRST -- self.slide_encoder is registered
+    before self.gene_encoder/spot_token/backbone/transport_head, and the
+    real FrozenGigaPathSlideEncoder.forward() independently moves ITS
+    OWN frozen submodule onto CUDA lazily, per call. A CPU-resident
+    learned model could then silently pick a stale/independently-moved
+    device on the NEXT forward() call. Verified here without needing
+    real CUDA: registers a stray module holding a `meta`-device
+    parameter FIRST (reproducing the exact registration-order scenario,
+    via a plain slide_encoder kwarg -- use_global_slide stays False, so
+    _global_slide_vector is never actually called), and confirms
+    forward() still resolves the real (cpu) device rather than picking
+    up `meta` from naive next(self.parameters())."""
+    inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    torch.manual_seed(0)
+    stray_encoder = torch.nn.Module()
+    stray_encoder.weight = torch.nn.Parameter(torch.zeros(2, device="meta"))
+    model = Architecture1(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        slide_encoder=stray_encoder, **_MODEL_KWARGS,
+    )
+    # Sanity: confirms the premise -- naive next(model.parameters()) really
+    # would pick up the stray encoder's meta-device parameter first.
+    assert next(model.parameters()).device.type == "meta"
+
+    out = model(inputs)  # must not crash, must resolve the real cpu device
+    assert out["expression"].device.type == "cpu"
+    assert torch.isfinite(out["expression"]).all()
+
+
 def test_architecture_3_regional_he_and_global_slide_forward_end_to_end_with_synthetic_wsi_context():
     """Real end-to-end forward pass with both branches wired to genuine
     (synthetic) WSI data -- proves the whole chain (pool_regional_tokens
@@ -187,39 +269,39 @@ def test_architecture_3_regional_he_and_global_slide_forward_end_to_end_with_syn
     assert model.model_architecture_version in slide_encoder.calls[0]
 
 
-def test_architecture_3_regional_he_uses_native_vs_regional_coordinate_frames_correctly():
-    """16th Codex re-audit (Step 5 Part 2): regional attention must use
-    wsi_tile_regional_coords (the same centered/normalized frame as
-    query_coords), never wsi_tile_native_coords (real, large-magnitude
-    GigaPath pixel coordinates) -- feeding native coordinates into
-    compute_relative_geometry against normalized query_coords would
-    produce huge, meaningless relative-geometry values. Verified
-    directly: the LongNet stub call always receives the NATIVE
-    coordinates (large magnitude), confirming the two frames are never
-    swapped."""
+def test_architecture_3_regional_he_uses_longnet_vs_regional_coordinate_frames_correctly():
+    """16th/17th Codex re-audits (Step 5 Part 2): regional attention must
+    use wsi_tile_regional_coords (the same centered/normalized frame as
+    query_coords), never wsi_tile_longnet_coords (real, large-magnitude
+    GigaPath LongNet target-MPP coordinates) -- feeding LongNet
+    coordinates into compute_relative_geometry against normalized
+    query_coords would produce huge, meaningless relative-geometry
+    values. Verified directly: the LongNet stub call always receives the
+    LongNet-frame coordinates (large magnitude), confirming the two
+    frames are never swapped."""
     inputs, _targets, n_genes, gex_dim, image_dim = _synthetic_inputs(image_dim=8)
     inputs = _with_synthetic_wsi_context(inputs, image_dim)
     torch.manual_seed(0)
     slide_encoder = _StubSlideEncoder(image_dim, 8)
-    captured_native_coords = {}
+    captured_longnet_coords = {}
     real_forward = slide_encoder.forward
 
     def _patched(tile_features, tile_coords, cache_namespace):
-        captured_native_coords["coords"] = tile_coords.clone()
+        captured_longnet_coords["coords"] = tile_coords.clone()
         return real_forward(tile_features, tile_coords, cache_namespace)
 
     slide_encoder.forward = _patched
     model = Architecture3(
         n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
         use_regional_he=True, use_global_slide=True, global_slide_dim=8,
-        slide_encoder=slide_encoder, gigapath_checkpoint_sha256="cafef00d",
+        slide_encoder=slide_encoder, gigapath_checkpoint_sha256=_STUB_CHECKPOINT_SHA256,
         regional_grid_size=2, **_MODEL_KWARGS,
     )
     model(inputs)
-    # wsi_tile_native_coords was sampled from [10_000, 20_000); regional
+    # wsi_tile_longnet_coords was sampled from [10_000, 20_000); regional
     # coords from roughly [-10, 10). If the frames were ever swapped, the
     # LongNet stub would see small-magnitude values instead.
-    assert captured_native_coords["coords"].abs().min() > 1000.0
+    assert captured_longnet_coords["coords"].abs().min() > 1000.0
 
 
 def test_architecture_3_regional_and_global_he_never_enter_the_gex_value_candidate_pool():
@@ -255,7 +337,7 @@ def test_architecture_3_regional_and_global_he_never_enter_the_gex_value_candida
     baseline_expr_shape, baseline_hidden_shape = _captured_shared_expression_shape()
     wsi_expr_shape, wsi_hidden_shape = _captured_shared_expression_shape(
         use_regional_he=True, use_global_slide=True, global_slide_dim=8,
-        slide_encoder=_StubSlideEncoder(image_dim, 8), gigapath_checkpoint_sha256="deadbeef",
+        slide_encoder=_StubSlideEncoder(image_dim, 8), gigapath_checkpoint_sha256=_STUB_CHECKPOINT_SHA256,
         regional_grid_size=2,
     )
     assert wsi_expr_shape == baseline_expr_shape
@@ -487,7 +569,7 @@ def test_architecture_4_threads_regional_he_and_global_slide_into_its_conditione
         n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
         gene_basis=gene_basis, gene_names=gene_names,
         use_regional_he=True, use_global_slide=True, global_slide_dim=8,
-        slide_encoder=_StubSlideEncoder(image_dim, 8), gigapath_checkpoint_sha256="deadbeef",
+        slide_encoder=_StubSlideEncoder(image_dim, 8), gigapath_checkpoint_sha256=_STUB_CHECKPOINT_SHA256,
         regional_grid_size=2, **_MODEL_KWARGS,
     )
     assert model.conditioner.use_regional_he is True

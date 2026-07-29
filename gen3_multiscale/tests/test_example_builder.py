@@ -374,69 +374,95 @@ def test_build_spatial_field_example_normalizes_coordinates_not_raw_pixels():
     assert 0.5 < np.median(dist[:, 1]) < 2.0
 
 
-def _wsi_slide_context(tile_xys: list[tuple[float, float]], tile_size: float = 20.0) -> dict:
+def _wsi_slide_context(
+    level0_xys: list[tuple[float, float]], tile_size: float = 20.0,
+    longnet_scale: float = 2.0, longnet_offset: tuple[float, float] = (5000.0, 5000.0),
+) -> dict:
     """A minimal, hand-built slide_context.load_slide_context()-shaped
-    dict -- real level-0 WSI tile coordinates/features, independent of
-    the GEX spot coordinate frame (as real dense_wsi_cache tiles are)."""
-    coords = np.asarray(tile_xys, dtype=np.float32)
-    features = np.stack([np.full(8, float(i + 1), dtype=np.float32) for i in range(len(tile_xys))])
+    dict with TWO GENUINELY DIFFERENT coordinate frames, matching a real
+    dense_wsi_cache whose source MPP differs from GigaPath's target MPP:
+    `mask_coords` (level-0/HEST-aligned, the SAME physical frame
+    spot_coords/adata.obsm['spatial'] use) and `coords` (GigaPath
+    LongNet's own target-MPP frame -- here a different scale AND a large
+    coordinate-origin offset, simulating a real level-0-pixel-vs-target-
+    MPP mismatch) -- so a test using this fixture would FAIL if
+    example_builder.py ever mixed the two frames up again (17th Codex
+    re-audit, Step 5 Part 2 launch blocker #1)."""
+    level0 = np.asarray(level0_xys, dtype=np.float32)
+    longnet = level0 * longnet_scale + np.asarray(longnet_offset, dtype=np.float32)
+    features = np.stack([np.full(8, float(i + 1), dtype=np.float32) for i in range(len(level0_xys))])
     return {
-        "features": features, "coords": coords, "mask_coords": coords,
+        "features": features, "coords": longnet, "mask_coords": level0,
         "tile_size": tile_size, "mask_tile_size": tile_size, "coords_are_centers": True,
         "context_id": "wsi-unit-test", "source": "dense_wsi_cache",
     }
 
 
+# Three level-0 tile centers; y-values differ so full_slide_coord_bounds is
+# non-degenerate. The x=20 tile's footprint overlaps a query hole at
+# (20, 20) with patch_size_fullres=15.0 (limit=17.5); x=0/x=40 do not
+# (see test_slide_context.py's identical overlap-threshold arithmetic).
+_WSI_LEVEL0_TILES = [(0.0, 10.0), (20.0, 20.0), (40.0, 30.0)]
+
+
 def test_build_spatial_field_example_wires_wsi_context_with_separate_coordinate_frames():
-    """16th Codex re-audit (Step 5 Part 2), CONFIRMED: wsi_tile_native_coords
-    must stay the raw level-0 pixel frame real GigaPath/LongNet expects,
-    while wsi_tile_regional_coords is the same centered/spot-spacing-
-    normalized frame as observed_coords/query_coords -- both derived from
-    the identical (raw - reference) / scale transform. full_slide_coord_bounds
-    comes from the COMPLETE (pre-hole) tile set, and slide_cache_namespace
-    is real (non-empty, bound to the visible tile set)."""
+    """17th Codex re-audit (Step 5 Part 2 launch blocker #1), CONFIRMED:
+    wsi_tile_longnet_coords must stay GigaPath LongNet's own frame
+    (visible_slide_context's `coords`, UNCHANGED -- never recentered/
+    rescaled), while wsi_tile_regional_coords must be derived from the
+    level-0/HEST-aligned frame (`level0_coords`) via the documented
+    (level0 - reference) / scale transform -- the SAME physical frame
+    observed_coords/query_coords already use. This fixture's `coords`
+    and `mask_coords` are deliberately on different scales/origins (as a
+    real non-0.5-MPP dense_wsi_cache would be), so the two must never be
+    interchangeable in either direction."""
     adata = _square_grid_adata(n_side=6, spacing=10.0)
     patches = _matching_patches(adata)
     barcodes = list(adata.obs_names)
     query_barcode = barcodes[14]  # coords (20, 20) -- see _square_grid_adata's x*spacing,y*spacing layout
     context = [b for b in barcodes if b != query_barcode]
-
-    # Tiles at x=0,20,40 (y=20, tile_size=20): the x=20 tile's footprint
-    # overlaps the query hole; x=0/x=40 do not (see test_slide_context.py's
-    # identical overlap-threshold arithmetic).
-    slide_context = _wsi_slide_context([(0.0, 10.0), (20.0, 20.0), (40.0, 30.0)])
+    slide_context = _wsi_slide_context(_WSI_LEVEL0_TILES)
 
     inputs, _ = build_spatial_field_example(
         adata, patches, context, [query_barcode], _stub_image_feature_fn,
         sample_id="S0", patient_id="P0", patch_size_fullres=15.0,
-        require_full_sample_coords=False, slide_context=slide_context,
+        full_sample_coords=adata.obsm["spatial"], slide_context=slide_context,
     )
 
     assert inputs.slide_cache_namespace and inputs.slide_cache_namespace.strip()
-    assert inputs.wsi_tile_native_coords.shape == (2, 2)
+    assert inputs.wsi_tile_longnet_coords.shape == (2, 2)
     assert inputs.wsi_tile_regional_coords.shape == (2, 2)
     assert inputs.wsi_tile_features.shape == (2, 8)
-    # Native coords are the RAW level-0 pixels -- untouched by centering/scaling.
-    assert set(inputs.wsi_tile_native_coords[:, 0].tolist()) == {0.0, 40.0}
-    # Regional coords are NOT the raw pixels -- they went through the same
-    # (raw - reference) / scale transform as observed_coords/query_coords.
-    assert not np.array_equal(inputs.wsi_tile_regional_coords, inputs.wsi_tile_native_coords)
-    # The regional frame must be the SAME transform as observed_coords'
-    # own centering/scaling: reconstruct it directly from provenance's
-    # recorded scale and the sample-wide centroid the builder itself used
-    # (observed_coords+query_coords union mean), and compare exactly.
+
+    # reference/scale are now derived from the COMPLETE sample lattice
+    # (17th Codex re-audit launch blocker #2) -- for this uniform 6x6,
+    # spacing=10 grid, that's exactly (25, 25) and 10.0, deterministically,
+    # regardless of which mask was realized.
     scale = inputs.provenance["spot_spacing_scale"]
-    centroid = np.concatenate(
-        [adata.obsm["spatial"][[barcodes.index(b) for b in context]], adata.obsm["spatial"][[14]]], axis=0,
-    ).mean(axis=0)
-    expected_regional = (inputs.wsi_tile_native_coords - centroid) / scale
+    reference = np.asarray(inputs.provenance["coordinate_reference"])
+    assert np.allclose(reference, [25.0, 25.0])
+    assert np.isclose(scale, 10.0)
+
+    # wsi_tile_longnet_coords is EXACTLY visible_slide_context's `coords`
+    # (the LongNet frame) -- large-magnitude, UNTOUCHED by centering/scaling.
+    expected_longnet = np.asarray([(0.0, 10.0), (40.0, 30.0)], dtype=np.float32) * 2.0 + np.asarray([5000.0, 5000.0])
+    assert np.allclose(inputs.wsi_tile_longnet_coords, expected_longnet)
+
+    # wsi_tile_regional_coords is derived from level0_coords -- NOT from
+    # wsi_tile_longnet_coords. Reconstructing regional coords from the
+    # (wrong) longnet frame would give a completely different, large-
+    # magnitude result -- explicitly asserted absent here.
+    expected_regional = (np.asarray([(0.0, 10.0), (40.0, 30.0)], dtype=np.float32) - reference) / scale
     assert np.allclose(inputs.wsi_tile_regional_coords, expected_regional, atol=1e-4)
-    # full_slide_coord_bounds spans the COMPLETE (3-tile) slide, not just
-    # the 2 tiles that survived hole-filtering: the removed tile (x=20)
-    # lies strictly inside the bounds even though it's absent from
+    wrong_regional_from_longnet_frame = (inputs.wsi_tile_longnet_coords - reference) / scale
+    assert not np.allclose(inputs.wsi_tile_regional_coords, wrong_regional_from_longnet_frame)
+
+    # full_slide_coord_bounds comes from the COMPLETE (3-tile) level-0
+    # tile-center set, in the same normalized frame -- the removed tile
+    # (x=20) lies strictly inside the bounds even though it's absent from
     # wsi_tile_regional_coords itself.
     xmin, xmax, ymin, ymax = inputs.full_slide_coord_bounds
-    removed_tile_regional_x = (20.0 - centroid[0]) / scale
+    removed_tile_regional_x = (20.0 - reference[0]) / scale
     assert xmin <= removed_tile_regional_x <= xmax
     assert removed_tile_regional_x not in inputs.wsi_tile_regional_coords[:, 0].tolist()
     assert inputs.provenance["wsi_context_available"] is True
@@ -453,13 +479,13 @@ def test_build_spatial_field_example_excludes_hole_overlapping_wsi_tiles_but_kee
     context = [b for b in barcodes if b != query_barcode]
 
     def _build(hole_tile_value: float, visible_tile_value: float):
-        slide_context = _wsi_slide_context([(0.0, 10.0), (20.0, 20.0), (40.0, 30.0)])
+        slide_context = _wsi_slide_context(_WSI_LEVEL0_TILES)
         slide_context["features"][1, :] = hole_tile_value  # x=20 -- overlaps the hole
         slide_context["features"][0, :] = visible_tile_value  # x=0 -- visible
         inputs, _ = build_spatial_field_example(
             adata, patches, context, [query_barcode], _stub_image_feature_fn,
             sample_id="S0", patient_id="P0", patch_size_fullres=15.0,
-            require_full_sample_coords=False, slide_context=slide_context,
+            full_sample_coords=adata.obsm["spatial"], slide_context=slide_context,
         )
         return inputs
 
@@ -469,6 +495,96 @@ def test_build_spatial_field_example_excludes_hole_overlapping_wsi_tiles_but_kee
 
     assert np.array_equal(baseline.wsi_tile_features, changed_hole_only.wsi_tile_features)
     assert not np.array_equal(baseline.wsi_tile_features, changed_visible.wsi_tile_features)
+
+
+def test_build_spatial_field_example_wsi_regional_coordinates_are_stable_across_different_masks():
+    """17th Codex re-audit (Step 5 Part 2 launch blocker #2), CONFIRMED:
+    a prior version derived `reference` from ONLY this example's own
+    observed+query subset -- the SAME physical WSI tile would land at a
+    DIFFERENT regional coordinate depending purely on which mask
+    happened to be realized on the identical sample, contradicting the
+    slide-stable regional-grid contract. Two DIFFERENT single-spot
+    queries on the SAME sample/slide_context must agree exactly on the
+    regional coordinate of a tile visible under both, and on
+    full_slide_coord_bounds and the recorded coordinate_reference."""
+    adata = _square_grid_adata(n_side=6, spacing=10.0)
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    full_coords = adata.obsm["spatial"]
+
+    def _build(query_idx: int):
+        query_barcode = barcodes[query_idx]
+        context = [b for b in barcodes if b != query_barcode]
+        slide_context = _wsi_slide_context(_WSI_LEVEL0_TILES)
+        inputs, _ = build_spatial_field_example(
+            adata, patches, context, [query_barcode], _stub_image_feature_fn,
+            sample_id="S0", patient_id="P0", patch_size_fullres=15.0,
+            full_sample_coords=full_coords, slide_context=slide_context,
+        )
+        return inputs
+
+    # index 14 -> (20, 20); index 20 -> (30, 20) (_square_grid_adata's
+    # index = x*n_side+y, spacing=10.0). Both holes leave the level-0
+    # tile at (0, 10) visible (verified by hand against the same
+    # overlap-threshold arithmetic _wsi_slide_context's docstring uses),
+    # while removing different OTHER tiles -- a real, different mask.
+    inputs_a = _build(14)
+    inputs_b = _build(20)
+    assert inputs_a.provenance["coordinate_reference"] == inputs_b.provenance["coordinate_reference"]
+    assert inputs_a.provenance["spot_spacing_scale"] == inputs_b.provenance["spot_spacing_scale"]
+    assert inputs_a.full_slide_coord_bounds == inputs_b.full_slide_coord_bounds
+
+    common_tile_regional_a = inputs_a.wsi_tile_regional_coords[0]  # tile (0, 10) is row 0 in both
+    common_tile_regional_b = inputs_b.wsi_tile_regional_coords[0]
+    assert np.allclose(common_tile_regional_a, common_tile_regional_b)
+    assert np.allclose(common_tile_regional_a, [-2.5, -1.5])  # (0-25)/10, (10-25)/10
+
+
+def test_build_spatial_field_example_slide_context_requires_full_sample_coords():
+    """17th Codex re-audit (Step 5 Part 2 launch blocker #2): WSI
+    regional-grid stability across masks fundamentally depends on a
+    coordinate reference derived from the COMPLETE sample lattice --
+    combining slide_context with the require_full_sample_coords=False
+    escape hatch must fail closed, not silently produce a mask-dependent
+    (and therefore unstable) regional frame."""
+    adata = _square_grid_adata(n_side=6, spacing=10.0)
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query_barcode = barcodes[14]
+    context = [b for b in barcodes if b != query_barcode]
+    slide_context = _wsi_slide_context(_WSI_LEVEL0_TILES)
+
+    with pytest.raises(ValueError, match="slide_context requires full_sample_coords"):
+        build_spatial_field_example(
+            adata, patches, context, [query_barcode], _stub_image_feature_fn,
+            sample_id="S0", patient_id="P0", patch_size_fullres=15.0,
+            require_full_sample_coords=False, slide_context=slide_context,
+        )
+
+
+def test_build_spatial_field_example_rejects_unsupported_image_modes():
+    """17th Codex re-audit (Step 5 Part 2 launch blocker #4): image
+    intervention semantics ("all_zero" removes WSI context but leaves
+    spot H&E features populated; "shuffled" does not actually shuffle
+    WSI features; "full" still removes spot patches overlapping the
+    hole) are not implemented consistently yet -- the real builder must
+    fail closed on anything but "target_zero" rather than silently
+    producing an inconsistent example."""
+    adata = _square_grid_adata(n_side=6, spacing=10.0)
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query_barcode = barcodes[14]
+    context = [b for b in barcodes if b != query_barcode]
+    slide_context = _wsi_slide_context(_WSI_LEVEL0_TILES)
+
+    for unsupported in ("all_zero", "full", "shuffled"):
+        with pytest.raises(ValueError, match="not yet implemented consistently"):
+            build_spatial_field_example(
+                adata, patches, context, [query_barcode], _stub_image_feature_fn,
+                sample_id="S0", patient_id="P0", patch_size_fullres=15.0,
+                full_sample_coords=adata.obsm["spatial"], slide_context=slide_context,
+                image_mode=unsupported,
+            )
 
 
 def test_build_spatial_field_example_no_slide_context_leaves_wsi_fields_unset():

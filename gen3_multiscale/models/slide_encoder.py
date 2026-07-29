@@ -34,6 +34,14 @@ import torch
 import torch.nn as nn
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 class FrozenGigaPathSlideEncoder(nn.Module):
     """Frozen official Prov-GigaPath slide encoder with a small output cache.
 
@@ -89,21 +97,44 @@ class FrozenGigaPathSlideEncoder(nn.Module):
                     "flash-attn==2.5.8 --no-build-isolation`, then start a new Python process."
                 )
 
+        # 17th Codex re-audit (Step 5 Part 2 launch blocker #3), CONFIRMED
+        # real: the checkpoint's own SHA256 is the model-identity half of
+        # the complete LongNet cache-namespace requirement (tile-cache
+        # content hash + visible-tile identity + checkpoint SHA256 +
+        # architecture/version) -- computed here, from the ACTUAL bytes
+        # this instance loaded, so a caller-supplied
+        # gigapath_checkpoint_sha256 elsewhere can be verified against
+        # reality rather than trusted blindly (a caller could otherwise
+        # pass any unrelated string).
+        self.checkpoint_sha256 = _sha256_file(path)
+
         self.model = slide_encoder.create_model(
             str(path), model_arch, int(tile_feature_dim)
         )
-        self.model.eval()
         for parameter in self.model.parameters():
             parameter.requires_grad_(False)
         self.tile_feature_dim = int(tile_feature_dim)
         self.output_dim = int(output_dim)
         self.cache_entries = int(cache_entries)
         self._cache: dict[str, torch.Tensor] = {}
+        # 17th Codex re-audit, CONFIRMED real: self.model.eval() alone left
+        # the WRAPPER's own `self.training` at nn.Module's default (True)
+        # -- eval() here (via the overridden train() below) forces both
+        # the wrapper and the frozen child model into eval mode together.
+        self.eval()
 
     def train(self, mode: bool = True):
-        # Lightning recursively calls train() on every child module.  Keep the
-        # frozen LongNet deterministic (its upstream default has dropout).
-        super().train(mode)
+        # Lightning recursively calls train() on every child module.
+        # 17th Codex re-audit, CONFIRMED real: a prior version passed
+        # `mode` straight to super().train(mode), so the WRAPPER's own
+        # `self.training` flag became True whenever a caller (or
+        # Lightning) called .train(True), even though self.model was
+        # immediately forced back to eval() on the next line -- the two
+        # flags could disagree. This frozen encoder must stay in eval
+        # mode unconditionally, wrapper included, regardless of what mode
+        # is requested; its upstream default has dropout, and its own
+        # per-call forward() logic depends on model.eval() semantics.
+        super().train(False)
         self.model.eval()
         return self
 

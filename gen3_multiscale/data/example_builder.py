@@ -57,7 +57,20 @@ from scipy.spatial import cKDTree
 from gen3_multiscale.data import loaders
 from gen3_multiscale.data.boundary_graph import extract_boundary_and_local_context
 from gen3_multiscale.data.example import SpatialFieldInputs, SpatialFieldTargets, validate_spatial_field_example
-from gen3_multiscale.data.slide_context import nonoverlapping_context_patch_mask, visible_slide_context
+from gen3_multiscale.data.slide_context import (
+    nonoverlapping_context_patch_mask, tile_centers, visible_slide_context,
+)
+
+# 17th Codex re-audit (Step 5 Part 2 launch blocker #4): image intervention
+# semantics are only implemented consistently for "target_zero" today --
+# "all_zero" removes WSI context but leaves spot H&E features populated
+# (a real inconsistency: use_regional_he/use_global_slide would then fail
+# on the resulting example instead of cleanly degrading), "shuffled" does
+# not actually shuffle WSI features (a silent no-op alias of "full"), and
+# "full" still removes spot patches overlapping the hole even though
+# nothing else about the item was damaged. Until those modes are made
+# consistent, the real builder accepts only "target_zero".
+_SUPPORTED_IMAGE_MODES = frozenset({"target_zero"})
 
 
 def load_sample_for_examples(
@@ -194,27 +207,64 @@ def build_spatial_field_example(
     re-audit, Step 5 Part 2: "Every WSI tile physically overlapping the
     hole is excluded"), so architectures.py's regional-token pooling and
     LongNet global-vector computation only ever see tiles that could
-    still exist after the same physical damage query spots model. Two
-    coordinate frames are derived from the surviving tiles, from the
-    SAME `(raw - reference) / scale` transform already used for
-    observed_coords/query_coords: `wsi_tile_native_coords` keeps the raw
-    level-0 pixel coordinates real GigaPath/LongNet positional encoding
-    expects; `wsi_tile_regional_coords` is the centered/spot-spacing-
-    normalized frame regional spatial attention shares with every other
-    coordinate in this example. `full_slide_coord_bounds` is computed
-    from the COMPLETE (pre-hole-filtering) tile set in that same
-    normalized frame, so a regional grid cell's spatial meaning stays
-    stable across different holes on the same slide (16th Codex
-    re-audit: "Regional-grid bounds come from the complete slide before
-    masking"). `slide_cache_namespace` is `visible_slide_context`'s own
-    `context_id` -- already bound to real tile-cache content, the visible
-    tile set, and this example's hole (15th/16th Codex re-audits).
+    still exist after the same physical damage query spots model.
+
+    Two GENUINELY DIFFERENT physical coordinate frames come out of
+    `visible_slide_context`, never mixed (17th Codex re-audit, Step 5
+    Part 2 launch blocker #1, CONFIRMED real: an earlier version derived
+    regional coordinates from `visible["coords"]` -- GigaPath's own
+    target-MPP LongNet frame -- minus the ST-level-0 reference/scale,
+    which is physically invalid whenever the cache's source MPP differs
+    from GigaPath's target MPP): `wsi_tile_longnet_coords` keeps
+    `visible["coords"]` UNCHANGED, fed to real GigaPath/LongNet inference
+    as-is; `wsi_tile_regional_coords` is derived from
+    `visible["level0_coords"]` (the level-0/HEST-aligned tile CENTER
+    coordinates -- the SAME physical frame observed_coords/query_coords
+    are already expressed in) via the documented `(level0_coords -
+    reference) / scale` transform, so regional spatial attention shares
+    an honest, physically consistent frame with every other coordinate
+    in this example. `full_slide_coord_bounds` is computed from the
+    COMPLETE (pre-hole-filtering) level-0 tile-center set
+    (`slide_context.tile_centers`), in that same transform, so a
+    regional grid cell's spatial meaning stays stable across different
+    holes on the same slide (16th Codex re-audit: "Regional-grid bounds
+    come from the complete slide before masking"). `slide_cache_namespace`
+    is `visible_slide_context`'s own `context_id` -- already bound to
+    real tile-cache content, the visible tile set, and this example's
+    hole (15th/16th Codex re-audits).
+
+    `image_mode` (17th Codex re-audit, Step 5 Part 2 launch blocker #4)
+    accepts only `"target_zero"` today -- `all_zero`/`shuffled`/`full`
+    are not yet implemented consistently across the WSI-context and
+    spot-H&E-availability paths (e.g. `all_zero` currently removes WSI
+    context while leaving spot H&E features populated); any other value
+    raises rather than silently producing an inconsistent example.
     """
     if full_sample_coords is None and require_full_sample_coords:
         raise ValueError(
             f"{sample_id}: full_sample_coords is required (the complete aligned sample "
             "lattice, for a stable mask-independent spot-spacing unit) -- pass it explicitly, "
             "or require_full_sample_coords=False for small/synthetic tests only"
+        )
+    if slide_context is not None and full_sample_coords is None:
+        # 17th Codex re-audit, Step 5 Part 2 launch blocker #2, CONFIRMED
+        # real: regional-grid stability across masks fundamentally
+        # requires a coordinate reference derived from the COMPLETE
+        # sample lattice, never a per-example subset -- see the
+        # reference/scale computation below. Without full_sample_coords
+        # there is no complete lattice to derive it from, so WSI context
+        # cannot be safely combined with the require_full_sample_coords=False
+        # escape hatch.
+        raise ValueError(
+            f"{sample_id}: slide_context requires full_sample_coords (regional-grid stability "
+            "across masks depends on a coordinate reference derived from the complete sample "
+            "lattice, not a per-example subset) -- pass full_sample_coords explicitly"
+        )
+    if slide_context is not None and image_mode not in _SUPPORTED_IMAGE_MODES:
+        raise ValueError(
+            f"{sample_id}: image_mode={image_mode!r} is not yet implemented consistently -- "
+            f"only {sorted(_SUPPORTED_IMAGE_MODES)} is supported until all_zero/shuffled/full are "
+            "made consistent across the WSI-context and spot-H&E-availability paths"
         )
 
     obs_names = np.asarray(adata.obs_names, dtype=str)
@@ -308,14 +358,34 @@ def build_spatial_field_example(
                 f"{n_missing} of the sample's own coordinates are absent from it"
             )
         spacing_source = full_coords_arr
+        # 17th Codex re-audit, Step 5 Part 2 launch blocker #2, CONFIRMED
+        # real: a prior version derived `reference` from ONLY this
+        # example's own observed+query subset -- if context is capped,
+        # reserved, filtered, or otherwise incomplete, the coordinate
+        # ORIGIN itself shifts between masks on the identical sample,
+        # so the SAME physical WSI tile would land at different
+        # regional coordinates (and potentially a different regional
+        # grid cell) depending purely on which mask happened to be
+        # realized -- contradicting the slide-stable regional-grid
+        # contract "Regional-grid bounds come from the complete slide
+        # before masking, so regions remain spatially stable across
+        # holes." Deriving BOTH reference and scale from the SAME
+        # complete, validated sample lattice makes the whole coordinate
+        # system (observed_coords/query_coords AND the WSI regional
+        # frame) mask-independent, not just the scale unit -- and is a
+        # more literal reading of the original 6th Codex re-audit
+        # recommendation ("coordinates relative to the hole OR SLIDE
+        # CENTRE") than a per-example subset centroid ever was.
+        reference_source = full_coords_arr
     else:
         spacing_source = np.concatenate([context_coords_all_raw, query_coords_raw], axis=0)
+        reference_source = spacing_source
     scale = max(_median_nearest_neighbor_spacing(spacing_source), 1e-6)
-    reference = np.concatenate([observed_coords_raw, query_coords_raw], axis=0).mean(axis=0)
+    reference = reference_source.mean(axis=0)
     observed_coords = ((observed_coords_raw - reference) / scale).astype(np.float32)
     query_coords = ((query_coords_raw - reference) / scale).astype(np.float32)
 
-    wsi_tile_native_coords = None
+    wsi_tile_longnet_coords = None
     wsi_tile_regional_coords = None
     wsi_tile_features = None
     full_slide_coord_bounds = None
@@ -323,15 +393,22 @@ def build_spatial_field_example(
     if slide_context is not None:
         visible = visible_slide_context(slide_context, query_coords_raw, image_mode, patch_size_fullres)
         if visible["available"]:
-            wsi_tile_native_coords = np.asarray(visible["coords"], dtype=np.float32)
-            wsi_tile_regional_coords = ((wsi_tile_native_coords - reference) / scale).astype(np.float32)
+            # GigaPath's own target-MPP frame -- fed to LongNet UNCHANGED,
+            # never combined with the level-0/HEST-aligned reference/scale.
+            wsi_tile_longnet_coords = np.asarray(visible["coords"], dtype=np.float32)
+            # The level-0/HEST-aligned tile CENTER coordinates -- the
+            # SAME physical frame observed_coords/query_coords/
+            # spacing_source are already expressed in, so this transform
+            # is physically valid regardless of the cache's source MPP.
+            level0_visible = np.asarray(visible["level0_coords"], dtype=np.float32)
+            wsi_tile_regional_coords = ((level0_visible - reference) / scale).astype(np.float32)
             wsi_tile_features = np.asarray(visible["features"], dtype=np.float32)
-            # Bounds come from the COMPLETE (unmasked) tile set, in the
-            # same normalized frame, so a regional grid cell keeps the
-            # same spatial meaning regardless of which hole this
-            # particular example carries (16th Codex re-audit).
-            full_slide_native = np.asarray(slide_context["coords"], dtype=np.float32)
-            full_slide_regional = (full_slide_native - reference) / scale
+            # Bounds come from the COMPLETE (unmasked) level-0 tile-center
+            # set, in the same normalized frame, so a regional grid cell
+            # keeps the same spatial meaning regardless of which hole
+            # this particular example carries (16th Codex re-audit).
+            full_slide_level0 = tile_centers(slide_context).astype(np.float32)
+            full_slide_regional = (full_slide_level0 - reference) / scale
             full_slide_coord_bounds = (
                 float(full_slide_regional[:, 0].min()), float(full_slide_regional[:, 0].max()),
                 float(full_slide_regional[:, 1].min()), float(full_slide_regional[:, 1].max()),
@@ -399,7 +476,7 @@ def build_spatial_field_example(
         boundary_idx=boundary.boundary_idx,
         boundary_ring=boundary.boundary_ring,
         query_depth_to_boundary=boundary.query_depth_to_boundary,
-        wsi_tile_native_coords=wsi_tile_native_coords,
+        wsi_tile_longnet_coords=wsi_tile_longnet_coords,
         wsi_tile_regional_coords=wsi_tile_regional_coords,
         wsi_tile_features=wsi_tile_features,
         full_slide_coord_bounds=full_slide_coord_bounds,
@@ -408,6 +485,11 @@ def build_spatial_field_example(
             "n_context_requested": len(context_barcodes),
             "n_context_image_unavailable_for_physical_he_overlap": n_image_unavailable,
             "spot_spacing_scale": scale,
+            # 17th Codex re-audit, Step 5 Part 2 launch blocker #2: the
+            # coordinate reference is now recorded explicitly (previously
+            # implicit and mask-dependent) so a caller/test can verify
+            # two examples on the same sample share the identical origin.
+            "coordinate_reference": reference.tolist(),
             "wsi_context_available": wsi_tile_features is not None,
             **boundary.diagnostic,
         },

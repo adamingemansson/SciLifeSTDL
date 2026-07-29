@@ -36,14 +36,21 @@ def _gene_basis(n_genes=6, rank=4, seed=0):
     return fit_gene_residual_basis(rng.normal(size=(20, n_genes)), gene_names, rank=rank), gene_names
 
 
+_STUB_CHECKPOINT_SHA256 = "deadbeef" * 8
+
+
 class _StubSlideEncoder(torch.nn.Module):
     """Duck-typed stand-in for FrozenGigaPathSlideEncoder -- no real
     checkpoint needed, same forward(tile_features, tile_coords,
-    cache_namespace) -> [output_dim] contract."""
+    cache_namespace) -> [output_dim] contract. Exposes checkpoint_sha256
+    (17th Codex re-audit, Step 5 Part 2, "Important before Step 6/7") so
+    _SharedFieldArchitecture's real cross-verification against
+    gigapath_checkpoint_sha256 has something real to check against."""
 
-    def __init__(self, tile_feature_dim: int = 1536, output_dim: int = 768):
+    def __init__(self, tile_feature_dim: int = 1536, output_dim: int = 768, checkpoint_sha256: str = _STUB_CHECKPOINT_SHA256):
         super().__init__()
         self.proj = torch.nn.Linear(tile_feature_dim, output_dim)
+        self.checkpoint_sha256 = checkpoint_sha256
 
     def forward(self, tile_features, tile_coords, cache_namespace):
         return self.proj(tile_features.mean(dim=0))
@@ -59,7 +66,7 @@ def _wsi_kwargs_for(name: str) -> dict:
     plays the role the real trainer (Step 6, not yet built) will
     eventually play when constructing these architectures for real."""
     if name in ("architecture3", "architecture4"):
-        return {"slide_encoder": _StubSlideEncoder(), "gigapath_checkpoint_sha256": "deadbeef" * 8}
+        return {"slide_encoder": _StubSlideEncoder(), "gigapath_checkpoint_sha256": _STUB_CHECKPOINT_SHA256}
     return {}
 
 

@@ -42,8 +42,9 @@ attended, matching this codebase's established index-selection pattern
 for excluded content elsewhere -- boundary_idx/local_idx are index sets,
 never masks). use_global_slide runs the injected, frozen
 FrozenGigaPathSlideEncoder once per item over the item's visible tiles
-in their REAL, unnormalized GigaPath-native coordinates (never the
-normalized regional-attention coordinates -- see SpatialFieldInputs'
+in their REAL, unnormalized GigaPath LongNet target-MPP coordinates
+(never the normalized regional-attention coordinates, nor the level-0/
+HEST-aligned frame those are derived from -- see SpatialFieldInputs'
 own docstring for why two separate coordinate fields exist) and FiLM-
 modulates the query field with the resulting global vector. Both
 branches read ONLY from SpatialFieldInputs' WSI fields and ONLY feed
@@ -137,6 +138,29 @@ class _SharedFieldArchitecture(nn.Module):
                 raise ValueError("use_global_slide=True requires a real slide_encoder (FrozenGigaPathSlideEncoder)")
             if not gigapath_checkpoint_sha256 or not str(gigapath_checkpoint_sha256).strip():
                 raise ValueError("use_global_slide=True requires a non-empty gigapath_checkpoint_sha256")
+            # 17th Codex re-audit (Step 5 Part 2, "Important before Step
+            # 6/7"), CONFIRMED real: gigapath_checkpoint_sha256 was only
+            # ever a caller-supplied string, trusted blindly -- nothing
+            # verified it actually matched the checkpoint slide_encoder
+            # loaded, so a caller could pass any unrelated string and
+            # silently poison the cache namespace with a false identity.
+            # FrozenGigaPathSlideEncoder now exposes checkpoint_sha256,
+            # computed from the real file bytes at construction; verify
+            # the caller's claim against it, fail closed on mismatch or
+            # on a slide_encoder that doesn't expose it at all (a
+            # correctly-typed real encoder always does).
+            if not hasattr(slide_encoder, "checkpoint_sha256"):
+                raise ValueError(
+                    "use_global_slide=True requires slide_encoder to expose checkpoint_sha256 (the "
+                    "real checkpoint's own SHA256, computed by FrozenGigaPathSlideEncoder at "
+                    "construction) so gigapath_checkpoint_sha256 can be verified against it"
+                )
+            if str(slide_encoder.checkpoint_sha256) != str(gigapath_checkpoint_sha256):
+                raise ValueError(
+                    f"gigapath_checkpoint_sha256 {gigapath_checkpoint_sha256!r} does not match "
+                    f"slide_encoder's actual loaded checkpoint SHA256 "
+                    f"{slide_encoder.checkpoint_sha256!r} -- a caller cannot supply an unrelated string"
+                )
         self.slide_encoder = slide_encoder
         self.gigapath_checkpoint_sha256 = gigapath_checkpoint_sha256
 
@@ -262,7 +286,7 @@ class _SharedFieldArchitecture(nn.Module):
     def _require_wsi_context(self, inputs: SpatialFieldInputs, requiring_flag: str) -> None:
         if inputs.wsi_tile_features is None:
             raise ValueError(
-                f"{requiring_flag}=True requires wsi_tile_features/wsi_tile_native_coords/"
+                f"{requiring_flag}=True requires wsi_tile_features/wsi_tile_longnet_coords/"
                 "wsi_tile_regional_coords/full_slide_coord_bounds/slide_cache_namespace on "
                 "SpatialFieldInputs -- build the example with a real slide_context "
                 "(gen3_multiscale.data.slide_context.load_slide_context) passed to "
@@ -306,27 +330,42 @@ class _SharedFieldArchitecture(nn.Module):
     def _global_slide_vector(self, inputs: SpatialFieldInputs, device: torch.device) -> torch.Tensor:
         """Runs the injected, frozen FrozenGigaPathSlideEncoder ONCE over
         this item's visible WSI tiles in their REAL, unnormalized
-        GigaPath-native coordinates (wsi_tile_native_coords -- NEVER
-        wsi_tile_regional_coords, which would silently corrupt LongNet's
-        real positional encoding, see SpatialFieldInputs' own docstring).
-        The cache namespace combines the data layer's own real cache
-        material (content hash + visible-tile-set identity, already
-        bound into inputs.slide_cache_namespace) with THIS model's
-        checkpoint SHA256 and architecture/version -- properties of
-        which model is running, supplied at construction, never assumed
-        by the data layer (16th Codex re-audit's complete cache-key
-        requirement)."""
+        GigaPath LongNet target-MPP coordinates (wsi_tile_longnet_coords
+        -- NEVER wsi_tile_regional_coords, which would silently corrupt
+        LongNet's real positional encoding, see SpatialFieldInputs' own
+        docstring). The cache namespace combines the data layer's own
+        real cache material (content hash + visible-tile-set identity,
+        already bound into inputs.slide_cache_namespace) with THIS
+        model's checkpoint SHA256 and architecture/version -- properties
+        of which model is running, supplied at construction, never
+        assumed by the data layer (16th Codex re-audit's complete
+        cache-key requirement)."""
         self._require_wsi_context(inputs, "use_global_slide")
         cache_namespace = (
             f"{inputs.slide_cache_namespace}:checkpoint={self.gigapath_checkpoint_sha256}:"
             f"model={self.model_architecture_version}"
         )
         tile_features = torch.as_tensor(inputs.wsi_tile_features, dtype=torch.float32, device=device)
-        native_coords = torch.as_tensor(inputs.wsi_tile_native_coords, dtype=torch.float32, device=device)
-        return self.slide_encoder(tile_features, native_coords, cache_namespace)
+        longnet_coords = torch.as_tensor(inputs.wsi_tile_longnet_coords, dtype=torch.float32, device=device)
+        return self.slide_encoder(tile_features, longnet_coords, cache_namespace)
 
     def forward(self, inputs: SpatialFieldInputs) -> dict:
-        device = next(self.parameters()).device
+        # 17th Codex re-audit (Step 5 Part 2 launch blocker, "Important
+        # before Step 6/7"), CONFIRMED real: `next(self.parameters())`
+        # picks whatever parameter happens to be registered FIRST --
+        # self.slide_encoder (when given) is registered before
+        # self.gene_encoder/spot_token/backbone/transport_head, AND
+        # FrozenGigaPathSlideEncoder.forward() independently moves ITS
+        # OWN frozen submodule onto CUDA lazily, per call, regardless of
+        # where the rest of this model lives. A CPU-resident learned
+        # model (e.g. during CPU-only evaluation) that had already run
+        # one use_global_slide forward pass would then silently pick
+        # CUDA as `device` on the NEXT item, while its actually-trainable
+        # layers remained on CPU -- a device mismatch. self.gene_encoder
+        # always exists, is always genuinely trainable, and is never
+        # independently relocated by any other code path, so it is the
+        # correct, stable device source.
+        device = next(self.gene_encoder.parameters()).device
         query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32, device=device)
         depth = torch.as_tensor(inputs.query_depth_to_boundary, dtype=torch.long, device=device)
         hole_geometry = compute_hole_geometry(query_coords)
@@ -602,7 +641,15 @@ class Architecture4(nn.Module):
         return target_expression
 
     def compute_flow_matching_loss(self, inputs: SpatialFieldInputs, target_expression: torch.Tensor | np.ndarray) -> torch.Tensor:
-        device = next(self.parameters()).device
+        # 17th Codex re-audit (Step 5 Part 2 launch blocker, "Important
+        # before Step 6/7"): same device-selection bug as
+        # _SharedFieldArchitecture.forward() -- self.conditioner's own
+        # slide_encoder (when given) can independently move itself to
+        # CUDA per call, and next(self.parameters()) would pick it up
+        # first (registered before self.velocity_network). velocity_network
+        # always exists, is always genuinely trainable, and is never
+        # independently relocated by any other code path.
+        device = next(self.velocity_network.parameters()).device
         conditioner_out = self.conditioner(inputs)
         query_hidden = conditioner_out["query_hidden"].detach()
         deterministic_mean = conditioner_out["expression"].detach()
@@ -626,7 +673,15 @@ class Architecture4(nn.Module):
         compute_flow_matching_loss() are kept unchanged for callers that
         only need one or the other and for the existing tests exercising
         them independently."""
-        device = next(self.parameters()).device
+        # 17th Codex re-audit (Step 5 Part 2 launch blocker, "Important
+        # before Step 6/7"): same device-selection bug as
+        # _SharedFieldArchitecture.forward() -- self.conditioner's own
+        # slide_encoder (when given) can independently move itself to
+        # CUDA per call, and next(self.parameters()) would pick it up
+        # first (registered before self.velocity_network). velocity_network
+        # always exists, is always genuinely trainable, and is never
+        # independently relocated by any other code path.
+        device = next(self.velocity_network.parameters()).device
         conditioner_out = self.conditioner(inputs)
         query_hidden = conditioner_out["query_hidden"].detach()
         deterministic_mean = conditioner_out["expression"].detach()
@@ -649,7 +704,15 @@ class Architecture4(nn.Module):
         conditioner-only forward()'s output for anything that only reads
         "expression"). Also reports predictive_std (uncertainty) and the
         raw per-sample field for diversity diagnostics (Phase 7)."""
-        device = next(self.parameters()).device
+        # 17th Codex re-audit (Step 5 Part 2 launch blocker, "Important
+        # before Step 6/7"): same device-selection bug as
+        # _SharedFieldArchitecture.forward() -- self.conditioner's own
+        # slide_encoder (when given) can independently move itself to
+        # CUDA per call, and next(self.parameters()) would pick it up
+        # first (registered before self.velocity_network). velocity_network
+        # always exists, is always genuinely trainable, and is never
+        # independently relocated by any other code path.
+        device = next(self.velocity_network.parameters()).device
         conditioner_out = self.conditioner(inputs)
         query_hidden = conditioner_out["query_hidden"]
         deterministic_mean = conditioner_out["expression"]

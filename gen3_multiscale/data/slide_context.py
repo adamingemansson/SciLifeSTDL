@@ -223,6 +223,28 @@ def _overlaps_query_hole(
     return overlap
 
 
+def tile_centers(slide_context: dict) -> np.ndarray:
+    """Real level-0/HEST-aligned tile CENTER coordinates for the
+    COMPLETE (unmasked) tile set -- the same physical frame `spot_coords`
+    (ST spot coordinates) are already expressed in, and the ONLY frame
+    `example_builder.py` may validly derive regional-attention geometry
+    from (17th Codex re-audit, Step 5 Part 2 launch blocker #1).
+
+    `slide_context["coords"]` is a DIFFERENT frame: GigaPath LongNet's
+    own target-MPP tile coordinates, used for real LongNet inference
+    only. For a dense_wsi_cache with a genuinely different source MPP
+    (i.e. `coords != mask_coords`), the two frames are not
+    interchangeable -- computing regional coordinates from `coords`
+    against a level-0 reference/scale would be physically invalid.
+    `mask_coords`/`mask_tile_size` are always the level-0/HEST-aligned
+    fields (see load_slide_context's own field documentation)."""
+    mask_coords = slide_context["mask_coords"]
+    mask_tile_size = float(slide_context["mask_tile_size"])
+    if bool(slide_context["coords_are_centers"]):
+        return mask_coords
+    return mask_coords + mask_tile_size / 2.0
+
+
 def visible_slide_context(
     slide_context: dict | None,
     query_coords: np.ndarray,
@@ -234,13 +256,8 @@ def visible_slide_context(
         return {"available": False}
     features = slide_context["features"]
     coords = slide_context["coords"]
-    mask_coords = slide_context["mask_coords"]
-    tile_size = float(slide_context["tile_size"])
     mask_tile_size = float(slide_context["mask_tile_size"])
-    if bool(slide_context["coords_are_centers"]):
-        mask_centers = mask_coords
-    else:
-        mask_centers = mask_coords + mask_tile_size / 2.0
+    mask_centers = tile_centers(slide_context)
 
     visible = np.ones(features.shape[0], dtype=bool)
     if image_mode == "target_zero":
@@ -265,9 +282,16 @@ def visible_slide_context(
     return {
         "available": True,
         "features": features[visible],
-        # GigaPath expects level-0 tile coordinates. Preserve the cached
-        # convention (top-left for dense WSI, centers for spot fallback).
+        # GigaPath LongNet's own target-MPP tile coordinates -- fed to
+        # FrozenGigaPathSlideEncoder unchanged, never mixed with the
+        # level-0/HEST-aligned frame below.
         "coords": visible_coords,
+        # Real level-0/HEST-aligned tile CENTER coordinates for the same
+        # visible tiles, in the SAME physical frame as spot_coords -- the
+        # only frame example_builder.py may validly derive
+        # wsi_tile_regional_coords from (17th Codex re-audit, Step 5
+        # Part 2 launch blocker #1).
+        "level0_coords": mask_centers[visible],
         "context_id": f"{slide_context['context_id']}:{image_mode}:{visible_digest}",
         "n_total": int(features.shape[0]),
         "n_visible": int(visible.sum()),

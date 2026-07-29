@@ -160,7 +160,7 @@ def test_accepts_a_zeroed_image_feature_for_an_unavailable_spot():
 
 _VALID_WSI_KWARGS = dict(
     wsi_tile_features=np.zeros((2, 1536), dtype=np.float32),
-    wsi_tile_native_coords=np.asarray([[9000.0, 9000.0], [9100.0, 9100.0]], dtype=np.float32),
+    wsi_tile_longnet_coords=np.asarray([[9000.0, 9000.0], [9100.0, 9100.0]], dtype=np.float32),
     wsi_tile_regional_coords=np.asarray([[-1.0, -1.0], [1.0, 1.0]], dtype=np.float32),
     full_slide_coord_bounds=(-5.0, 5.0, -5.0, 5.0),
     slide_cache_namespace="content-hash:visible-set:checkpoint-sha256",
@@ -217,7 +217,7 @@ def test_rejects_a_visible_tile_outside_the_full_slide_bounds():
     inputs, targets = _valid_example()
     kwargs = dict(_VALID_WSI_KWARGS)
     kwargs["wsi_tile_features"] = np.zeros((1, 1536), dtype=np.float32)
-    kwargs["wsi_tile_native_coords"] = np.asarray([[9000.0, 9000.0]], dtype=np.float32)
+    kwargs["wsi_tile_longnet_coords"] = np.asarray([[9000.0, 9000.0]], dtype=np.float32)
     kwargs["wsi_tile_regional_coords"] = np.asarray([[100.0, 100.0]], dtype=np.float32)  # well outside bounds
     bad_inputs = _replace(inputs, **kwargs)
     with pytest.raises(ValueError, match="outside full_slide_coord_bounds"):
@@ -241,9 +241,59 @@ def test_native_and_regional_wsi_coords_are_independently_scaled():
     inputs, targets = _valid_example()
     good_inputs = _replace(inputs, **_VALID_WSI_KWARGS)
     assert not np.allclose(
-        good_inputs.wsi_tile_native_coords[:, 0], good_inputs.wsi_tile_regional_coords[:, 0],
+        good_inputs.wsi_tile_longnet_coords[:, 0], good_inputs.wsi_tile_regional_coords[:, 0],
     )
     validate_spatial_field_example(good_inputs, targets)  # must not raise
+
+
+def test_rejects_a_wsi_coordinate_array_with_the_wrong_column_count():
+    """17th Codex re-audit (Step 5 Part 2 launch blocker, "Important
+    before Step 6/7"), CONFIRMED: a prior version only checked ROW
+    counts against wsi_tile_features -- a [N, 3] or [N] coordinate array
+    with a matching row count would have silently passed."""
+    inputs, targets = _valid_example()
+    kwargs = dict(_VALID_WSI_KWARGS)
+    kwargs["wsi_tile_longnet_coords"] = np.asarray([[9000.0, 9000.0, 0.0], [9100.0, 9100.0, 0.0]], dtype=np.float32)
+    bad_inputs = _replace(inputs, **kwargs)
+    with pytest.raises(ValueError, match=r"wsi_tile_longnet_coords must be \[2, 2\]"):
+        validate_spatial_field_example(bad_inputs, targets)
+
+    kwargs2 = dict(_VALID_WSI_KWARGS)
+    kwargs2["wsi_tile_regional_coords"] = np.asarray([-1.0, 1.0], dtype=np.float32)
+    bad_inputs2 = _replace(inputs, **kwargs2)
+    with pytest.raises(ValueError, match=r"wsi_tile_regional_coords must be \[2, 2\]"):
+        validate_spatial_field_example(bad_inputs2, targets)
+
+
+def test_rejects_duplicate_wsi_tile_coordinates_in_either_frame():
+    """17th Codex re-audit (Step 5 Part 2 launch blocker, "Important
+    before Step 6/7"), CONFIRMED: no check existed for duplicate
+    coordinates in EITHER WSI frame independently -- a corrupted or
+    mismatched dense_wsi_cache (coords/mask_coords sourced separately)
+    could produce duplicate visible tiles in one frame without the other,
+    double-counting that region's contribution to regional pooling or
+    the LongNet global vector."""
+    inputs, targets = _valid_example()
+    kwargs = dict(_VALID_WSI_KWARGS)
+    kwargs["wsi_tile_longnet_coords"] = np.asarray([[9000.0, 9000.0], [9000.0, 9000.0]], dtype=np.float32)
+    bad_inputs = _replace(inputs, **kwargs)
+    with pytest.raises(ValueError, match="wsi_tile_longnet_coords contains duplicate"):
+        validate_spatial_field_example(bad_inputs, targets)
+
+    kwargs2 = dict(_VALID_WSI_KWARGS)
+    kwargs2["wsi_tile_regional_coords"] = np.asarray([[-1.0, -1.0], [-1.0, -1.0]], dtype=np.float32)
+    bad_inputs2 = _replace(inputs, **kwargs2)
+    with pytest.raises(ValueError, match="wsi_tile_regional_coords contains duplicate"):
+        validate_spatial_field_example(bad_inputs2, targets)
+
+
+def test_rejects_a_non_string_slide_cache_namespace():
+    inputs, targets = _valid_example()
+    kwargs = dict(_VALID_WSI_KWARGS)
+    kwargs["slide_cache_namespace"] = 12345
+    bad_inputs = _replace(inputs, **kwargs)
+    with pytest.raises(ValueError, match="non-empty string"):
+        validate_spatial_field_example(bad_inputs, targets)
 
 
 def test_targets_are_a_distinct_type_from_inputs():

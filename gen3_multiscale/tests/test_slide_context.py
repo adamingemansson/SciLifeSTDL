@@ -9,7 +9,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from gen3_multiscale.data.slide_context import (
-    load_slide_context, nonoverlapping_context_patch_mask, visible_slide_context,
+    load_slide_context, nonoverlapping_context_patch_mask, tile_centers, visible_slide_context,
 )
 
 
@@ -37,6 +37,58 @@ def test_target_zero_removes_every_wsi_tile_intersecting_the_hole():
     assert visible["n_total"] == 3
     assert visible["n_visible"] == 2
     assert np.array_equal(visible["coords"][:, 0], np.asarray([0, 512]))
+
+
+def _slide_context_with_differing_mpp():
+    """17th Codex re-audit (Step 5 Part 2 launch blocker #1): a real
+    dense_wsi_cache can have `coords` (GigaPath's target-MPP frame) on a
+    genuinely different scale/origin than `mask_coords` (level-0/HEST-
+    aligned) whenever the source slide's MPP differs from 0.5 um/px.
+    `coords == mask_coords` (as `_slide_context()` above uses) would
+    never catch a caller that accidentally mixed the two frames up."""
+    level0 = np.asarray([[0, 0], [256, 0], [512, 0]], dtype=np.float32)
+    longnet = level0 * 1.7 + np.asarray([9000.0, 9000.0], dtype=np.float32)  # different MPP scale + origin
+    return {
+        "features": np.ones((3, 1536), dtype=np.float32),
+        "coords": longnet,
+        "mask_coords": level0,
+        "tile_size": 256.0,
+        "mask_tile_size": 256.0,
+        "coords_are_centers": False,
+        "context_id": "unit-test-differing-mpp",
+        "source": "dense_wsi_cache",
+    }
+
+
+def test_visible_slide_context_returns_level0_coords_independent_of_the_longnet_frame():
+    """17th Codex re-audit (Step 5 Part 2 launch blocker #1), CONFIRMED:
+    a prior version of visible_slide_context returned ONLY `coords`
+    (the LongNet frame) -- callers had no way to derive regional
+    coordinates in the level-0/HEST-aligned frame without incorrectly
+    reusing the LongNet one. `level0_coords` must be the real tile
+    CENTERS in the mask_coords frame (here, non-centers with tile_size
+    256 -- center = corner + 128), independent of `coords`'s own scale."""
+    ctx = _slide_context_with_differing_mpp()
+    visible = visible_slide_context(
+        ctx, np.asarray([[384 * 1.0, 128, 0]], dtype=np.float32),  # level-0-frame hole coordinates
+        image_mode="target_zero", query_patch_size=224.0,
+    )
+    # The hole overlap test itself runs in the level-0/mask frame -- same
+    # result as test_target_zero_removes_every_wsi_tile_intersecting_the_hole.
+    assert visible["n_visible"] == 2
+    expected_level0_centers = np.asarray([[128.0, 128.0], [640.0, 128.0]], dtype=np.float32)  # corner + tile_size/2
+    assert np.allclose(visible["level0_coords"], expected_level0_centers)
+    # coords stays the untouched LongNet frame -- large-magnitude, on a
+    # completely different scale from level0_coords.
+    expected_longnet = np.asarray([[0.0, 0.0], [512.0, 0.0]], dtype=np.float32) * 1.7 + np.asarray([9000.0, 9000.0])
+    assert np.allclose(visible["coords"], expected_longnet)
+    assert not np.allclose(visible["coords"], visible["level0_coords"])
+
+
+def test_tile_centers_computes_the_complete_unmasked_level0_center_set():
+    ctx = _slide_context_with_differing_mpp()
+    centers = tile_centers(ctx)
+    assert np.allclose(centers, np.asarray([[128.0, 128.0], [384.0, 128.0], [640.0, 128.0]], dtype=np.float32))
 
 
 def test_all_zero_removes_the_complete_slide_context():

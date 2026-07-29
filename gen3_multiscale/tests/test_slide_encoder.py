@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from gen3_multiscale.models.slide_encoder import FrozenGigaPathSlideEncoder, pool_regional_tokens
+from gen3_multiscale.models.slide_encoder import FrozenGigaPathSlideEncoder, _sha256_file, pool_regional_tokens
 
 
 def test_frozen_gigapath_slide_encoder_fails_closed_on_a_missing_checkpoint(tmp_path):
@@ -15,6 +15,40 @@ def test_frozen_gigapath_slide_encoder_fails_closed_on_a_missing_checkpoint(tmp_
     missing = tmp_path / "does_not_exist.pth"
     with pytest.raises(FileNotFoundError, match="GigaPath slide checkpoint not found"):
         FrozenGigaPathSlideEncoder(checkpoint_path=str(missing))
+
+
+def test_sha256_file_is_real_content_bound(tmp_path):
+    a = tmp_path / "a.bin"
+    b = tmp_path / "b.bin"
+    a.write_bytes(b"content-one")
+    b.write_bytes(b"content-two")
+    assert _sha256_file(a) == _sha256_file(a)  # stable/deterministic
+    assert _sha256_file(a) != _sha256_file(b)  # real content-sensitivity
+
+
+def test_train_forces_the_whole_wrapper_and_child_model_to_stay_in_eval_mode():
+    """17th Codex re-audit (Step 5 Part 2 launch blocker #3), CONFIRMED:
+    a prior version's train() passed `mode` straight through to
+    super().train(mode), so the WRAPPER's own `.training` flag became
+    True whenever Lightning (or any caller) called .train(True) -- even
+    though self.model was immediately forced back to eval() on the very
+    next line, leaving the two flags disagreeing. Also, self.model.eval()
+    alone never touched the wrapper's own default (True) training flag,
+    so encoder.training was True immediately after construction too.
+    Constructs a minimal instance bypassing the real __init__ (which
+    needs a real checkpoint file plus the optional `gigapath` package,
+    neither available here) to test the overridden train()/eval() logic
+    directly, in isolation from those unavailable dependencies."""
+    encoder = FrozenGigaPathSlideEncoder.__new__(FrozenGigaPathSlideEncoder)
+    torch.nn.Module.__init__(encoder)
+    encoder.model = torch.nn.Dropout(p=0.5)  # a real submodule with meaningful train/eval-mode behavior
+    encoder.eval()  # what __init__ now calls at the end of real construction
+    assert not encoder.training
+    assert not encoder.model.training
+
+    encoder.train(True)  # Lightning recursively calls train(True) on every child module
+    assert not encoder.training, "wrapper must stay in eval mode regardless of the requested mode"
+    assert not encoder.model.training, "frozen child model must stay in eval mode regardless of the requested mode"
 
 
 def test_pool_regional_tokens_assigns_tiles_to_the_correct_grid_cell():

@@ -143,7 +143,7 @@ class SpatialFieldInputs:
     # 16th Codex re-audit (Step 5 Part 2 acceptance criteria), CONFIRMED
     # real: a prior version had exactly ONE wsi_tile_coords field, used
     # for BOTH real GigaPath LongNet inference (which needs its own
-    # native level-0 tile coordinates for positional encoding -- see
+    # native target-MPP tile coordinates for positional encoding -- see
     # models.slide_encoder.FrozenGigaPathSlideEncoder.forward) AND
     # regional-token spatial pooling / relative-geometry-to-query
     # (which needs the SAME centered, spot-spacing-normalized frame as
@@ -153,15 +153,28 @@ class SpatialFieldInputs:
     # silently corrupt its real positional encoding (LongNet was
     # pretrained on true physical tile positions, not a value that
     # rescales and re-centers per example); feeding the regional pooler
-    # raw native pixel coordinates would make relative geometry to
-    # query_coords meaningless. Two separate fields now exist, BOTH
-    # derived from the exact same documented transformation
-    # (`(raw_native - reference) / scale`, the SAME reference/scale
-    # example_builder.py already computes for observed_coords/
-    # query_coords) so a caller can never accidentally mix them up by
-    # only having one array to reach for.
-    wsi_tile_native_coords: np.ndarray | None = None  # [n_visible_tiles, 2], real level-0 GigaPath/LongNet coords, UNNORMALIZED
-    wsi_tile_regional_coords: np.ndarray | None = None  # [n_visible_tiles, 2], same centered/normalized frame as observed_coords
+    # raw LongNet-frame coordinates would make relative geometry to
+    # query_coords meaningless.
+    #
+    # 17th Codex re-audit (Step 5 Part 2 launch blocker #1), CONFIRMED
+    # real: a prior version derived wsi_tile_regional_coords from THIS
+    # SAME LongNet-frame array (`visible["coords"]`) minus the ST-level-0
+    # reference/scale -- physically invalid whenever the cache's source
+    # MPP differs from GigaPath's target MPP (0.5 um/px), since `coords`
+    # and `mask_coords`/spot_coords are then genuinely different
+    # physical frames, not just different units of the same one.
+    # wsi_tile_longnet_coords MUST stay slide_context.visible_slide_context's
+    # `coords` (GigaPath's own frame, UNNORMALIZED, fed to LongNet
+    # unchanged); wsi_tile_regional_coords MUST be derived from that same
+    # function's `level0_coords` (the level-0/HEST-aligned tile CENTER
+    # coordinates, the SAME physical frame observed_coords/query_coords
+    # are already expressed in) via the documented
+    # `(level0_coords - reference) / scale` transform -- the two source
+    # arrays are never interchangeable, hence the deliberately
+    # unambiguous field name (renamed from wsi_tile_native_coords, which
+    # did not make clear which of the two real physical frames it was).
+    wsi_tile_longnet_coords: np.ndarray | None = None  # [n_visible_tiles, 2], GigaPath LongNet's own target-MPP coords, UNNORMALIZED
+    wsi_tile_regional_coords: np.ndarray | None = None  # [n_visible_tiles, 2], level-0/HEST-aligned frame, same centered/normalized transform as observed_coords
     wsi_tile_features: np.ndarray | None = None  # [n_visible_tiles, 1536]
     # (xmin, xmax, ymin, ymax) computed from the COMPLETE tile set BEFORE
     # hole filtering, in the SAME normalized frame as
@@ -282,28 +295,48 @@ def validate_spatial_field_example(inputs: SpatialFieldInputs, targets: SpatialF
         raise ValueError("query_depth_to_boundary must be non-negative (BFS hop count)")
 
     wsi_fields_set = (
-        inputs.wsi_tile_native_coords is not None, inputs.wsi_tile_regional_coords is not None,
+        inputs.wsi_tile_longnet_coords is not None, inputs.wsi_tile_regional_coords is not None,
         inputs.wsi_tile_features is not None, inputs.full_slide_coord_bounds is not None,
         inputs.slide_cache_namespace is not None,
     )
     if any(wsi_fields_set) and not all(wsi_fields_set):
         raise ValueError(
-            "wsi_tile_native_coords, wsi_tile_regional_coords, wsi_tile_features, "
+            "wsi_tile_longnet_coords, wsi_tile_regional_coords, wsi_tile_features, "
             "full_slide_coord_bounds, and slide_cache_namespace must be set together (all five or "
             "none) -- regional/global GigaPath context requires all of them"
         )
     if inputs.wsi_tile_features is not None:
-        if inputs.wsi_tile_features.shape[0] != inputs.wsi_tile_native_coords.shape[0]:
-            raise ValueError("wsi_tile_features and wsi_tile_native_coords must have the same row count")
-        if inputs.wsi_tile_features.shape[0] != inputs.wsi_tile_regional_coords.shape[0]:
-            raise ValueError("wsi_tile_features and wsi_tile_regional_coords must have the same row count")
-        if inputs.wsi_tile_features.shape[0] == 0:
+        n_visible_tiles = inputs.wsi_tile_features.shape[0]
+        if inputs.wsi_tile_features.ndim != 2:
+            raise ValueError(f"wsi_tile_features must be [N, F], got shape {inputs.wsi_tile_features.shape}")
+        # 17th Codex re-audit (Step 5 Part 2), CONFIRMED: a prior version
+        # only checked ROW counts against wsi_tile_features -- never that
+        # the coordinate arrays were actually [N, 2] (a [N, 3] or [N]
+        # array with a matching row count would have silently passed).
+        for coord_name, coord_arr in (
+            ("wsi_tile_longnet_coords", inputs.wsi_tile_longnet_coords),
+            ("wsi_tile_regional_coords", inputs.wsi_tile_regional_coords),
+        ):
+            if coord_arr.shape != (n_visible_tiles, 2):
+                raise ValueError(
+                    f"{coord_name} must be [{n_visible_tiles}, 2] aligned with wsi_tile_features, "
+                    f"got shape {coord_arr.shape}"
+                )
+            # 17th Codex re-audit, CONFIRMED: no check existed for
+            # duplicate coordinates in EITHER WSI frame independently --
+            # load_slide_context only rejects duplicates in the
+            # UNFILTERED cache's `coords` field, never `mask_coords`
+            # (the two are independently sourced fields in a real cache
+            # and could disagree), and never after mask-filtering either.
+            if np.unique(coord_arr, axis=0).shape[0] != n_visible_tiles:
+                raise ValueError(f"{coord_name} contains duplicate tile coordinates")
+        if n_visible_tiles == 0:
             raise ValueError("wsi_tile_features is set but has zero rows -- pass None instead of an empty array")
         if not np.all(np.isfinite(inputs.wsi_tile_features)):
             raise ValueError("wsi_tile_features contains non-finite values")
-        if not np.all(np.isfinite(inputs.wsi_tile_native_coords)) or not np.all(np.isfinite(inputs.wsi_tile_regional_coords)):
-            raise ValueError("wsi_tile_native_coords/wsi_tile_regional_coords contain non-finite values")
-        if not str(inputs.slide_cache_namespace).strip():
+        if not np.all(np.isfinite(inputs.wsi_tile_longnet_coords)) or not np.all(np.isfinite(inputs.wsi_tile_regional_coords)):
+            raise ValueError("wsi_tile_longnet_coords/wsi_tile_regional_coords contain non-finite values")
+        if not isinstance(inputs.slide_cache_namespace, str) or not inputs.slide_cache_namespace.strip():
             raise ValueError("slide_cache_namespace must be a non-empty string when WSI context is set")
         xmin, xmax, ymin, ymax = inputs.full_slide_coord_bounds
         if not (xmax > xmin and ymax > ymin):

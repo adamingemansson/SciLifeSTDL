@@ -3882,7 +3882,193 @@ other than a script for Adam to run himself, per this session's standing
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 42. Response to the seventeenth external Codex re-audit (of Step 5 Part 2) -- 3 launch blockers plus "Important before Step 6/7"
+
+Adam's verdict on Part 2: "keep going, but have Claude fix the three
+launch blockers before beginning Step 6." All 3 launch blockers plus
+every item under "Important before Step 6/7" were re-confirmed against
+the actual code before any fix, then fixed. Step 5 is still not being
+declared complete by this section alone -- see the remaining open items
+at the end.
+
+**Launch blocker #1 (CONFIRMED real): dense-cache coordinates were
+mixed up.** `example_builder.py` derived `wsi_tile_regional_coords`
+from `visible["coords"]` -- GigaPath LongNet's own target-MPP frame --
+minus the ST-level-0 `reference`/`scale`. Physically invalid whenever a
+cache's source MPP differs from GigaPath's target MPP (0.5 um/px); the
+prior synthetic tests never caught this because they set
+`coords == mask_coords`. Fixed:
+- `slide_context.visible_slide_context` now returns BOTH `coords`
+  (unchanged, GigaPath's own frame) AND a new `level0_coords` (the
+  real level-0/HEST-aligned tile CENTER coordinates -- the SAME
+  physical frame `spot_coords`/`observed_coords`/`query_coords` use),
+  computed by a new shared `slide_context.tile_centers` helper (also
+  used to compute the COMPLETE, pre-mask tile-center set for
+  `full_slide_coord_bounds`, replacing the prior incorrect use of
+  `slide_context["coords"]` there too).
+- `example_builder.py`'s `SpatialFieldInputs.wsi_tile_native_coords`
+  was renamed `wsi_tile_longnet_coords` (an unambiguous name -- the
+  prior name did not say WHICH of the two real physical frames it
+  held) and now stays `visible["coords"]` UNCHANGED, fed to LongNet
+  as-is; `wsi_tile_regional_coords` is now derived from
+  `visible["level0_coords"]`.
+- New regression tests (`test_slide_context.py`,
+  `test_example_builder.py`) use a fixture where `coords != mask_coords`
+  on a DIFFERENT scale AND origin (simulating a real non-0.5-MPP slide),
+  proving the two frames are never interchangeable in either direction.
+
+**Launch blocker #2 (CONFIRMED real): the "stable" coordinate origin
+was mask-dependent.** `scale` was already derived from
+`full_sample_coords` (the complete, validated sample lattice), but
+`reference` was derived from ONLY this example's own observed+query
+subset -- if context is capped, reserved, filtered, or otherwise
+incomplete, the coordinate ORIGIN itself shifts between masks on the
+identical sample, so the SAME physical WSI tile could land at a
+different regional coordinate (and potentially a different regional
+grid cell) purely depending on which mask happened to be realized,
+contradicting the slide-stable regional-grid contract. Fixed: `reference`
+is now derived from the SAME complete sample lattice as `scale`
+whenever `full_sample_coords` is given -- making the WHOLE coordinate
+system (observed_coords/query_coords AND the WSI regional frame)
+mask-independent, not just the scale unit (also a more literal reading
+of the original 6th Codex re-audit's "coordinates relative to the hole
+OR SLIDE CENTRE" than a per-example subset centroid ever was).
+`slide_context` now REQUIRES `full_sample_coords` (raises otherwise --
+regional-grid stability across masks fundamentally depends on it), and
+`reference`/`scale` are both recorded explicitly in provenance
+(`coordinate_reference`/`spot_spacing_scale`) so a caller/test can
+verify two examples on the same sample share the identical origin.
+Verified by a new test building two examples with different single-spot
+queries (genuinely different masks) on the same sample/slide_context and
+confirming a tile visible under both gets the IDENTICAL regional
+coordinate, and that `full_slide_coord_bounds`/`coordinate_reference`
+match exactly between them.
+
+**Launch blocker #3 (CONFIRMED real): the A100 smoke test would have
+failed immediately, and its cache-hit check proved nothing.**
+`FrozenGigaPathSlideEncoder.__init__` called `self.model.eval()` but
+never `self.eval()` -- the WRAPPER's own `self.training` stayed at
+`nn.Module`'s default (`True`) immediately after construction, and
+`train(mode)` passed `mode` straight to `super().train(mode)` before
+forcing `self.model` back to eval, so the wrapper's own flag would
+become `True` again on any Lightning-style `.train(True)` call even
+though `self.model` was immediately forced back to eval -- the two
+flags could disagree. Separately, the smoke test's cache-hit check
+compared two outputs for equality, which proves nothing on its own
+since LongNet inference is deterministic -- identical outputs could
+simply mean the SAME real (expensive) forward pass ran twice, not that
+the cache was actually hit. Fixed:
+- `FrozenGigaPathSlideEncoder.__init__` now calls `self.eval()` at the
+  end of construction (forcing both the wrapper and the frozen child
+  model into eval mode via the overridden `train()` below); `train()`
+  now passes `super().train(False)` UNCONDITIONALLY (never the caller's
+  requested `mode`), so both the wrapper's own `.training` and
+  `self.model.training` stay `False` regardless of what any caller
+  (Lightning included) asks for.
+- The smoke test now monkeypatches `encoder.model.forward` to RAISE on
+  any call after the first real one, then makes a second call with the
+  identical `cache_namespace`/coordinates -- proving the cache was
+  genuinely hit (no exception) rather than merely coincidentally
+  producing the same deterministic output.
+- Added a real end-to-end Architecture3/Architecture4 forward-pass
+  smoke test (`run_architecture_smoke_test`), not only the isolated
+  LongNet call -- builds a small synthetic `SpatialFieldInputs` with a
+  real WSI context, constructs both architectures with
+  `use_regional_he=True`/`use_global_slide=True` and the REAL
+  `FrozenGigaPathSlideEncoder`, and checks finite output plus bounded
+  peak CUDA memory for each.
+- Two new tests in `test_slide_encoder.py` exercise the overridden
+  `train()`/`eval()` logic directly (bypassing the real `__init__`,
+  which needs a real checkpoint and the optional `gigapath` package,
+  neither available in this environment) via a minimal instance with a
+  real `nn.Dropout` child module, whose train/eval-mode behavior is
+  itself meaningful and observable.
+
+**"Important before Step 6/7" (all addressed in this pass, not
+deferred):**
+
+- *Device selection could silently pick a stale/relocated device.*
+  `_SharedFieldArchitecture.forward()` and all three of Architecture4's
+  device-resolving methods (`compute_flow_matching_loss`,
+  `compute_losses`, `sample_predictive_distribution`) used
+  `next(self.parameters()).device` -- `self.slide_encoder` (when given)
+  is registered before every genuinely-trainable module, AND
+  `FrozenGigaPathSlideEncoder.forward()` independently moves ITS OWN
+  frozen submodule onto CUDA lazily, per call, regardless of where the
+  rest of the model lives. A CPU-resident learned model that had
+  already run one `use_global_slide` forward pass could then silently
+  resolve CUDA as `device` on the NEXT item, while its actually-
+  trainable layers remained on CPU. Fixed: `_SharedFieldArchitecture`
+  now reads `next(self.gene_encoder.parameters()).device` (always
+  exists, always genuinely trainable, never independently relocated);
+  Architecture4's three methods read
+  `next(self.velocity_network.parameters()).device` for the same
+  reason. Verified by a new CPU-only-compatible regression test: a
+  stray module holding a `meta`-device parameter is registered as
+  `slide_encoder` FIRST (reproducing the exact registration-order
+  scenario), and `forward()` is confirmed to still resolve the real
+  `cpu` device rather than the misleading `meta` one `next(self.parameters())`
+  would have picked.
+- *WSI tensor shape/duplicate validation was incomplete.*
+  `validate_spatial_field_example` previously only checked ROW counts
+  for `wsi_tile_longnet_coords`/`wsi_tile_regional_coords` against
+  `wsi_tile_features` -- a `[N, 3]` or `[N]` array with a matching row
+  count would have silently passed. Fixed: both are now checked as
+  exactly `[N, 2]`, and each is independently checked for duplicate
+  rows (a corrupted or mismatched cache could produce duplicates in one
+  frame without the other, since `coords`/`mask_coords` are
+  independently sourced fields). `slide_cache_namespace` is now also
+  checked with `isinstance(..., str)`, not just `str(...).strip()`
+  (which would have accepted e.g. an int).
+- *`gigapath_checkpoint_sha256` was a caller-supplied string trusted
+  blindly.* A caller could pass any unrelated string, silently
+  poisoning the LongNet cache namespace with a false checkpoint
+  identity. Fixed: `FrozenGigaPathSlideEncoder` now computes and
+  exposes `self.checkpoint_sha256` (real SHA256 of the actual checkpoint
+  file bytes, at construction). `_SharedFieldArchitecture.__init__`
+  now requires `slide_encoder` to expose `checkpoint_sha256` (raises if
+  it doesn't) and verifies the caller's `gigapath_checkpoint_sha256`
+  claim matches it exactly (raises on mismatch) whenever
+  `use_global_slide=True`.
+- *Image intervention semantics were inconsistent.* `all_zero` removed
+  WSI context while leaving spot H&E features populated (so a
+  `use_regional_he`/`use_global_slide` model would then fail on the
+  resulting example rather than cleanly degrading); `shuffled` never
+  actually shuffled WSI features (a silent no-op alias of `full`);
+  `full` still removed spot patches overlapping the hole even though
+  nothing else about the item was damaged. Rather than attempt a full
+  redesign now (out of scope for this pass, deferred to before Step 7
+  as Adam specified), `build_spatial_field_example` fails closed:
+  `image_mode` is accepted ONLY as `"target_zero"` whenever
+  `slide_context` is given; any other value raises immediately.
+
+**Explicitly still open:** the real trainer (Step 6) that would
+construct a genuine `FrozenGigaPathSlideEncoder` from a real checkpoint
+path and pass it (plus its real, now-verifiable `checkpoint_sha256`)
+into `model_factory.build_architecture`; someone with real A100 access
+running `scripts/smoke_test_gigapath_slide_encoder.py`; and the
+consistent redesign of `all_zero`/`shuffled`/`full` image intervention
+semantics, deferred to before Step 7 per Adam's own framing.
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 485 passed (45 reused-infra + 26 example-schema +
+  11 boundary-graph + 12 slide-context + 9 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 31 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 17 dataset-manifest + 23 example-builder +
+  46 mask-fingerprint + 22 novae-graph)
+gen2_architectures + gen3_multiscale: 658 passed, 1 skipped
+```
+
+The block immediately below (pre-Step-5-part-2-fixes test counts) is
+kept for historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 472 passed (45 reused-infra + 23 example-schema +
