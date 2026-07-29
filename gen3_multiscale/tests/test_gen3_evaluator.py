@@ -213,11 +213,25 @@ def test_evaluate_gen3_checkpoint_reports_configured_named_gene_panels(tmp_path,
 
     assert report["gene_panel_metadata"]["two_gene_panel"]["evaluated_count"] == 2
     assert report["gene_panel_metadata"]["two_gene_panel"]["missing_genes"] == ["not_a_real_gene"]
-    panel_metrics = report["per_panel_patient_aggregated_metrics"]["two_gene_panel"]
-    assert "pcc" in panel_metrics and "rmse" in panel_metrics
-    assert panel_metrics["pcc"]["n_items"] == report["n_items"]
+    # Secondary fix #3: named-panel metrics for EVERY arm (model AND every
+    # baseline), keyed [panel][arm], plus per-panel paired deltas. Only
+    # "model" is asserted to cover every item's pcc as a finite value --
+    # "mean" broadcasts one constant vector to every query spot, which
+    # makes its per-gene pcc structurally undefined (zero prediction
+    # variance) whenever a query has more than one spot, a pre-existing
+    # property of that baseline, not something this round changes.
+    panel_by_arm = report["per_panel_patient_aggregated_metrics"]["two_gene_panel"]
+    for arm_name in ("model", "mean", "nearest_neighbor", "harmonic"):
+        assert arm_name in panel_by_arm
+        assert "pcc" in panel_by_arm[arm_name] and "rmse" in panel_by_arm[arm_name]
+    assert panel_by_arm["model"]["pcc"]["n_items"] == report["n_items"]
+    panel_deltas = report["per_panel_paired_delta_vs_model"]["two_gene_panel"]
+    for baseline_name in ("mean", "nearest_neighbor", "harmonic"):
+        assert baseline_name in panel_deltas
+        assert "pcc_delta" in panel_deltas[baseline_name]
     assert "gene_panels" in report["per_item_records"][0]
     assert "two_gene_panel" in report["per_item_records"][0]["gene_panels"]
+    assert "two_gene_panel" in report["per_item_records"][0]["baseline_gene_panels"]["mean"]
 
 
 def test_evaluate_gen3_checkpoint_reports_per_stratum_results(tmp_path, monkeypatch):

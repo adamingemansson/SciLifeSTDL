@@ -343,8 +343,38 @@ def _train_a_real_checkpoint_with_best(tmp_path, cfg, manifest, manifest_path, s
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
     summary = train_module.run_training(str(config_path), smoke=False)
     assert summary["ok"] is True
-    assert (checkpoint_dir / "best" / "best_info.json").is_file()
+    # best/ is a real checkpoint.py transactional bundle now (Codex
+    # re-audit of commit f7bb8a1, launch blocker #3).
+    assert (checkpoint_dir / "best" / "latest_bundle.json").is_file()
+    assert (checkpoint_dir / "best" / "run_manifest.json").is_file()
     return config_path, checkpoint_dir
+
+
+def _resign_bundle_file(bundle_dir, filename: str, new_content: bytes) -> None:
+    """Test helper: overwrite one file INSIDE a resolved checkpoint
+    bundle with new content and re-sign the bundle's own manifest.json
+    (and its pointer's manifest_sha256) to match -- simulates "this
+    field's value was WRONG when the checkpoint was originally saved"
+    (e.g. a hypothetical bug in build_run_manifest), which is a
+    DIFFERENT adversarial scenario than bytes altered after writing
+    (already covered by test_checkpoint_load_refuses_a_bundle_file_
+    corrupted_after_writing) -- that scenario is deliberately NOT
+    re-signed and is correctly refused by the hash check alone."""
+    import hashlib as _hashlib
+    import json as _json
+
+    bundle_dir = Path(bundle_dir)
+    (bundle_dir / filename).write_bytes(new_content)
+    manifest_path = bundle_dir / "manifest.json"
+    manifest = _json.loads(manifest_path.read_text())
+    manifest["files"][filename] = _hashlib.sha256(new_content).hexdigest()
+    manifest_path.write_text(_json.dumps(manifest, indent=2, sort_keys=True))
+    new_manifest_sha256 = _hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    checkpoint_dir = bundle_dir.parent.parent  # bundle_dir == checkpoint_dir/history/<bundle_name>
+    pointer_path = checkpoint_dir / "latest_bundle.json"
+    pointer = _json.loads(pointer_path.read_text())
+    pointer["manifest_sha256"] = new_manifest_sha256
+    pointer_path.write_text(_json.dumps(pointer, indent=2))
 
 
 def test_evaluate_gen3_checkpoint_refuses_a_best_bundle_whose_weights_were_altered_after_writing(tmp_path, monkeypatch):
@@ -359,12 +389,20 @@ def test_evaluate_gen3_checkpoint_refuses_a_best_bundle_whose_weights_were_alter
 
     # Now mutate best/'s weights file AFTER it was written -- exactly
     # audit #4's "altered cache/checkpoint contents" adversarial scenario,
-    # applied to the checkpoint bundle itself.
-    weights_path = checkpoint_dir / "best" / "trainable_weights.pt"
+    # applied to the checkpoint bundle itself. Must corrupt the RESOLVED
+    # bundle's own copy, not checkpoint_dir/best's root mirror -- the
+    # root mirror is a disposable convenience copy (real, independent
+    # bytes since the hardlink fix) that no real loader ever trusts.
+    bundle_dir = checkpoint_module.resolve_checkpoint_identity(checkpoint_dir / "best").resolved_dir
+    weights_path = bundle_dir / "trainable_weights.pt"
     original = weights_path.read_bytes()
     weights_path.write_bytes(original + b"\x00")
 
-    with pytest.raises(ValueError, match="does not match the sha256"):
+    # RuntimeError, not ValueError: this now fails inside checkpoint.py's
+    # own resolve_checkpoint_identity (exact-weights verification),
+    # BEFORE verify_full_checkpoint_identity ever reaches its own
+    # identity-field comparisons -- an earlier, more fundamental check.
+    with pytest.raises(RuntimeError, match="does not match the sha256"):
         evaluate_gen3_checkpoint(str(config_path), checkpoint_dir, split="validation", n_masks_per_sample=2)
 
 
@@ -379,10 +417,11 @@ def test_evaluate_gen3_checkpoint_refuses_a_best_bundle_selected_under_a_differe
     config_path, checkpoint_dir = _train_a_real_checkpoint_with_best(tmp_path, cfg, manifest, manifest_path, sync_dir)
 
     import json
-    info_path = checkpoint_dir / "best" / "best_info.json"
-    info = json.loads(info_path.read_text())
-    info["dataset_manifest_fingerprint"] = "deadbeef" * 8
-    info_path.write_text(json.dumps(info, indent=2, sort_keys=True))
+
+    bundle_dir = checkpoint_module.resolve_checkpoint_identity(checkpoint_dir / "best").resolved_dir
+    run_manifest = json.loads((bundle_dir / "run_manifest.json").read_text())
+    run_manifest["dataset_manifest_fingerprint"] = "deadbeef" * 8
+    _resign_bundle_file(bundle_dir, "run_manifest.json", json.dumps(run_manifest, indent=2, sort_keys=True).encode())
 
     with pytest.raises(ValueError, match="dataset_manifest_fingerprint"):
         evaluate_gen3_checkpoint(str(config_path), checkpoint_dir, split="validation", n_masks_per_sample=2)
@@ -426,6 +465,93 @@ def test_evaluate_gen3_checkpoint_reports_real_architecture4_calibration(tmp_pat
     # happens to be well-calibrated.
     assert calibration["coverage_68"] <= calibration["coverage_90"] <= calibration["coverage_95"]
     assert "predictive_std_mean" in report["per_arm_patient_aggregated_metrics"]["model"]
+    # Codex re-audit of commit f7bb8a1, secondary fix #4: the Gaussian
+    # summary is now explicitly labeled an approximation, and no
+    # empirical-quantile summary is computed unless calibration_n_samples
+    # was actually requested.
+    assert calibration["method"] == "gaussian_std_approximation"
+    assert report["architecture4_empirical_calibration"] == {"n_values": 0}
+
+
+# ---------------------------------------------------------------------------
+# Codex re-audit of commit f7bb8a1, launch blocker #7 + secondary fix #4:
+# stable-identity evaluation seeding (never raw item index) and a
+# higher-fidelity empirical-quantile calibration alternative to the
+# Gaussian-std approximation, with a caller-configurable sample count.
+# ---------------------------------------------------------------------------
+
+def test_evaluate_gen3_checkpoint_is_reproducible_and_seed_dependent(tmp_path, monkeypatch):
+    """Two evaluations of the SAME checkpoint with the SAME evaluation_seed
+    must reproduce bit-identical per-item Architecture 4 predictions
+    (stable-key seeding, not wall-clock/process-order-dependent); a
+    DIFFERENT evaluation_seed must change at least one item's prediction
+    (proof the seed is actually threaded through, not silently ignored)."""
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
+
+    arch3_config_path, arch3_checkpoint_dir = _train_a_real_architecture3_checkpoint(
+        tmp_path, cfg, manifest, manifest_path, sync_dir, name="arch3_for_seed_stability", seed=0,
+    )
+    basis_path = tmp_path / "seed_stability_gene_residual_basis.pt"
+    fit_and_save_architecture4_basis(
+        str(arch3_config_path), str(arch3_checkpoint_dir), str(basis_path), n_masks_per_sample=2, rank=4,
+    )
+    checkpoint_dir = tmp_path / "arch4_for_seed_stability"
+    config_path = _write_architecture4_config(
+        tmp_path, cfg, manifest_path, name="arch4_for_seed_stability", checkpoint_dir=checkpoint_dir,
+        sync_dir=sync_dir, basis_path=basis_path, arch3_checkpoint_dir=arch3_checkpoint_dir,
+    )
+    summary = train_module.run_training(str(config_path), smoke=False)
+    assert summary["ok"] is True
+
+    def _predictions(evaluation_seed: int) -> list[float]:
+        report = evaluate_gen3_checkpoint(
+            str(config_path), checkpoint_dir, split="validation", n_masks_per_sample=2, use_best=False,
+            evaluation_seed=evaluation_seed,
+        )
+        return [record["model"]["rmse"] for record in report["per_item_records"]]
+
+    seed0_first = _predictions(0)
+    seed0_second = _predictions(0)
+    assert seed0_first == seed0_second
+
+    seed1 = _predictions(1)
+    assert seed1 != seed0_first
+
+
+def test_evaluate_gen3_checkpoint_empirical_calibration_respects_configured_sample_count(tmp_path, monkeypatch):
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
+
+    arch3_config_path, arch3_checkpoint_dir = _train_a_real_architecture3_checkpoint(
+        tmp_path, cfg, manifest, manifest_path, sync_dir, name="arch3_for_empirical_calibration", seed=0,
+    )
+    basis_path = tmp_path / "empirical_calibration_gene_residual_basis.pt"
+    fit_and_save_architecture4_basis(
+        str(arch3_config_path), str(arch3_checkpoint_dir), str(basis_path), n_masks_per_sample=2, rank=4,
+    )
+    checkpoint_dir = tmp_path / "arch4_for_empirical_calibration"
+    config_path = _write_architecture4_config(
+        tmp_path, cfg, manifest_path, name="arch4_for_empirical_calibration", checkpoint_dir=checkpoint_dir,
+        sync_dir=sync_dir, basis_path=basis_path, arch3_checkpoint_dir=arch3_checkpoint_dir,
+    )
+    summary = train_module.run_training(str(config_path), smoke=False)
+    assert summary["ok"] is True
+
+    report = evaluate_gen3_checkpoint(
+        str(config_path), checkpoint_dir, split="validation", n_masks_per_sample=2, use_best=False,
+        calibration_n_samples=50,
+    )
+    empirical = report["architecture4_empirical_calibration"]
+    assert empirical["method"] == "empirical_quantiles"
+    assert empirical["n_samples_per_item"] == 50
+    assert empirical["n_values"] > 0
+    assert empirical["coverage_68"] <= empirical["coverage_90"] <= empirical["coverage_95"]
+    # A real (never Gaussian-assumed) empirical fraction must lie in [0, 1].
+    for key in ("coverage_68", "coverage_90", "coverage_95"):
+        assert 0.0 <= empirical[key] <= 1.0
+    # The Gaussian approximation is still reported alongside it, labeled.
+    assert report["architecture4_calibration"]["method"] == "gaussian_std_approximation"
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +589,81 @@ def test_maybe_load_gene_basis_refuses_a_provenance_sidecar_missing_a_required_f
     config["training"]["total_steps"] = 1
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
     with pytest.raises(ValueError, match="missing required field 'architecture3_config_fingerprint'"):
+        train_module.run_training(str(config_path), smoke=False)
+
+
+def test_maybe_load_gene_basis_refuses_a_basis_whose_recorded_checkpoint_step_does_not_match(tmp_path, monkeypatch):
+    """Codex re-audit of commit f7bb8a1, launch blocker #5: "Bind the
+    basis sidecar to canonical bundle identity/step... Validate all of
+    those when Architecture 4 loads the basis." A basis whose recorded
+    `architecture3_checkpoint_trainable_weights_sha256` happens to still
+    match (a real, if contrived, scenario: an operator points
+    `required_fingerprints.architecture3_conditioner_checkpoint` at a
+    checkpoint_dir that has since moved on to a LATER step with the SAME
+    weights hash recorded under a stale/rolled-back `latest_bundle.json`)
+    must still be refused once its recorded STEP disagrees."""
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
+    arch3_config_path, arch3_checkpoint_dir = _train_a_real_architecture3_checkpoint(
+        tmp_path, cfg, manifest, manifest_path, sync_dir, name="arch3_step_mismatch", seed=0,
+    )
+    basis_path = tmp_path / "gene_residual_basis_step_mismatch.pt"
+    fit_and_save_architecture4_basis(
+        str(arch3_config_path), str(arch3_checkpoint_dir), str(basis_path), n_masks_per_sample=2, rank=4,
+    )
+    provenance_path = tmp_path / "gene_residual_basis_step_mismatch.pt.provenance.json"
+    import json
+    provenance = json.loads(provenance_path.read_text())
+    real_step = provenance["architecture3_checkpoint_step"]
+    assert real_step is not None
+    provenance["architecture3_checkpoint_step"] = int(real_step) + 1000  # a step that never happened
+    provenance_path.write_text(json.dumps(provenance, indent=2, sort_keys=True))
+
+    checkpoint_dir = tmp_path / "arch4_step_mismatch"
+    config_path = _write_architecture4_config(
+        tmp_path, cfg, manifest_path, name="arch4_step_mismatch", checkpoint_dir=checkpoint_dir,
+        sync_dir=sync_dir, basis_path=basis_path, arch3_checkpoint_dir=arch3_checkpoint_dir,
+    )
+    config = yaml.safe_load(config_path.read_text())
+    config["training"]["total_steps"] = 1
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    with pytest.raises(ValueError, match="different training step of the conditioner"):
+        train_module.run_training(str(config_path), smoke=False)
+
+
+def test_maybe_load_gene_basis_refuses_a_basis_fit_against_different_cache_content(tmp_path, monkeypatch):
+    """Launch blocker #5's other new binding: per-sample cache content.
+    A basis whose recorded `cache_content_by_sample` disagrees with the
+    CURRENT run's own cache content for a sample both runs share must be
+    refused -- proof the basis is not silently trusted against a
+    regenerated/stale cache."""
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
+    arch3_config_path, arch3_checkpoint_dir = _train_a_real_architecture3_checkpoint(
+        tmp_path, cfg, manifest, manifest_path, sync_dir, name="arch3_cache_mismatch", seed=0,
+    )
+    basis_path = tmp_path / "gene_residual_basis_cache_mismatch.pt"
+    fit_and_save_architecture4_basis(
+        str(arch3_config_path), str(arch3_checkpoint_dir), str(basis_path), n_masks_per_sample=2, rank=4,
+    )
+    provenance_path = tmp_path / "gene_residual_basis_cache_mismatch.pt.provenance.json"
+    import json
+    provenance = json.loads(provenance_path.read_text())
+    recorded_cache = provenance["cache_content_by_sample"]
+    assert recorded_cache
+    a_sample_id = next(iter(recorded_cache))
+    recorded_cache[a_sample_id] = {**recorded_cache[a_sample_id], "spot_features_content_sha256": "deadbeef" * 8}
+    provenance_path.write_text(json.dumps(provenance, indent=2, sort_keys=True))
+
+    checkpoint_dir = tmp_path / "arch4_cache_mismatch"
+    config_path = _write_architecture4_config(
+        tmp_path, cfg, manifest_path, name="arch4_cache_mismatch", checkpoint_dir=checkpoint_dir,
+        sync_dir=sync_dir, basis_path=basis_path, arch3_checkpoint_dir=arch3_checkpoint_dir,
+    )
+    config = yaml.safe_load(config_path.read_text())
+    config["training"]["total_steps"] = 1
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    with pytest.raises(ValueError, match="cache content"):
         train_module.run_training(str(config_path), smoke=False)
 
 
@@ -543,19 +744,30 @@ def test_resume_refuses_a_regenerated_spot_feature_cache_with_different_content_
 
 
 def test_common_random_validation_seed_is_independent_of_training_step():
-    """Codex re-audit of commit 90f853e, launch blocker #6: the SAME
-    held-out item must get the SAME sampled noise regardless of which
-    training step is currently being validated -- direct unit proof for
-    the extracted `common_random_validation_seed` helper (previously
-    inline)."""
-    seed_at_early_step_context = train_module.common_random_validation_seed(seed=42, item_index=3)
-    seed_at_late_step_context = train_module.common_random_validation_seed(seed=42, item_index=3)
+    """Codex re-audit of commit 90f853e, launch blocker #6, refined by
+    the re-audit of commit f7bb8a1's secondary fix #1: the SAME held-out
+    item must get the SAME sampled noise regardless of which training
+    step is currently being validated, OR of the item's storage/
+    enumeration position -- direct unit proof for the extracted
+    `common_random_validation_seed` helper (previously inline, and
+    previously keyed on item_index rather than a stable content key)."""
+    key_a = "S0:small:deadbeef"
+    seed_at_early_step_context = train_module.common_random_validation_seed(seed=42, stable_key=key_a)
+    seed_at_late_step_context = train_module.common_random_validation_seed(seed=42, stable_key=key_a)
     assert seed_at_early_step_context == seed_at_late_step_context  # no step argument at all -- structurally step-independent
     # Different items get different seeds (not a constant function).
-    assert train_module.common_random_validation_seed(42, 3) != train_module.common_random_validation_seed(42, 4)
+    key_b = "S0:small:cafef00d"
+    assert train_module.common_random_validation_seed(42, key_a) != train_module.common_random_validation_seed(42, key_b)
     # Different runs (different training.seed) get different seeds for
     # the SAME item too.
-    assert train_module.common_random_validation_seed(42, 3) != train_module.common_random_validation_seed(43, 3)
+    assert train_module.common_random_validation_seed(42, key_a) != train_module.common_random_validation_seed(43, key_a)
+    # The key is the item's CONTENT identity, not its storage/enumeration
+    # position -- reordering two items (swapping which index each lives
+    # at) must not reassign their noise draws to each other.
+    assert (
+        train_module.common_random_validation_seed(42, "S0:small:aaa")
+        != train_module.common_random_validation_seed(42, "S1:small:bbb")
+    )
 
 
 def test_staged_architecture4_smoke_loads_the_real_canonical_architecture3_bundle(tmp_path, monkeypatch):

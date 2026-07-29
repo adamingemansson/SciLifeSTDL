@@ -32,6 +32,7 @@ been run once against a real, trained Architecture 3 checkpoint.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -46,8 +47,8 @@ from gen3_multiscale.training import checkpoint as checkpoint_module
 from gen3_multiscale.training.gen3_dataset import Gen3SpatialFieldDataset, build_gen3_mask_schedule
 from gen3_multiscale.training.gen3_preflight import load_and_preflight_samples
 from gen3_multiscale.training.train import (
-    build_model_for_inference, config_fingerprint, dataset_manifest_fingerprint,
-    expected_tile_encoder_provenance, resolved_config,
+    build_model_for_inference, config_fingerprint, config_identity_fingerprint, dataset_manifest_fingerprint,
+    expected_tile_encoder_provenance, resolved_config, verify_full_checkpoint_identity,
 )
 
 
@@ -121,7 +122,20 @@ def fit_and_save_architecture4_basis(
     the fitted basis to the exact config, dataset manifest, gene panel,
     Architecture 3 checkpoint, and mask schedule it was produced from --
     Adam's "fit and persist the basis with dataset/gene/checkpoint/mask
-    provenance"."""
+    provenance".
+
+    Codex re-audit of commit f7bb8a1, launch blocker #5: "Before residual
+    fitting, verify Architecture 3 through the same complete best/latest
+    identity pipeline used by evaluation." Before this round,
+    `architecture3_checkpoint_dir` was only ever checked for EXACT-WEIGHTS
+    integrity (`resolve_checkpoint_identity`, via `build_model_for_inference`)
+    -- a checkpoint whose weights hash was internally self-consistent but
+    was produced under a DIFFERENT config/dataset/gene-panel/synchronized-
+    init/gigapath-checkpoint than what THIS basis-fitting run is currently
+    using would still pass. `verify_full_checkpoint_identity` (the same
+    function `evaluate_gen3_checkpoint` uses for `best`/latest) now runs
+    FIRST, before any residual computation, failing closed on exactly
+    that mismatch."""
     config = resolved_config(architecture3_config_path)
     architecture_id = str(config["model"]["architecture"])
     if architecture_id != "3":
@@ -138,10 +152,19 @@ def fit_and_save_architecture4_basis(
     train_ids = list(dataset_manifest["train_sample_ids"])
     if not train_ids:
         raise ValueError("dataset manifest has zero train_sample_ids -- nothing to fit a residual basis on")
+    gene_names = list(dataset_manifest["gene_panel"])
 
     cfg_om = OmegaConf.create(config)
     expected_provenance = expected_tile_encoder_provenance(config)
-    samples, _preflight_report = load_and_preflight_samples(cfg_om, dataset_manifest, train_ids, expected_provenance)
+    samples, preflight_report = load_and_preflight_samples(cfg_om, dataset_manifest, train_ids, expected_provenance)
+
+    # Launch blocker #5: fail closed BEFORE any residual computation --
+    # never spend the (potentially expensive) residual pass against a
+    # checkpoint that turns out not to describe the current run.
+    verify_full_checkpoint_identity(
+        architecture3_checkpoint_dir, config=config, dataset_manifest=dataset_manifest, gene_names=gene_names,
+        cache_content_by_sample=preflight_report.get("cache_content_by_sample"),
+    )
 
     strata = config["masking"]["strata"]
     train_schedule = build_gen3_mask_schedule(
@@ -149,7 +172,6 @@ def fit_and_save_architecture4_basis(
     )
     train_dataset = Gen3SpatialFieldDataset(dataset_manifest, samples, train_schedule, strata)
 
-    gene_names = list(dataset_manifest["gene_panel"])
     device = torch.device(device_str)
 
     # Audit #2 of commit a32051b: the ONE shared model-reconstruction
@@ -161,7 +183,7 @@ def fit_and_save_architecture4_basis(
     # inline duplicate.
     architecture3_model, _info = build_model_for_inference(
         config, gene_names=gene_names, device=device, checkpoint_dir=architecture3_checkpoint_dir, smoke=False,
-        dataset_manifest=dataset_manifest,
+        dataset_manifest=dataset_manifest, cache_content_by_sample=preflight_report.get("cache_content_by_sample"),
     )
 
     # Launch blocker #11: a real, disk-backed memmap file, not a Python
@@ -184,14 +206,25 @@ def fit_and_save_architecture4_basis(
     # above just loaded weights from -- never hash `architecture3_checkpoint_dir`'s
     # root convenience-mirror file directly, which could disagree with
     # the real bundle after a crash between the two.
-    checkpoint_sha256 = checkpoint_module.resolve_checkpoint_identity(architecture3_checkpoint_dir).weights_sha256
+    resolved_identity = checkpoint_module.resolve_checkpoint_identity(architecture3_checkpoint_dir)
+    # Launch blocker #5: a real, deterministic fingerprint over the
+    # complete REALIZED training-mask schedule this basis was fit
+    # against -- bound (recorded), though (per `maybe_load_gene_basis`'s
+    # own docstring) deliberately not equality-checked at load time,
+    # since a legitimately re-diversified training schedule must not
+    # invalidate an otherwise-valid basis.
+    training_mask_schedule_fingerprint = hashlib.sha256(
+        json.dumps(train_schedule.reports, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
     provenance = {
-        "version": 1,
+        "version": 2,
         "kind": "gen3_architecture4_residual_basis_provenance",
         "architecture3_config_path": str(architecture3_config_path),
         "architecture3_config_fingerprint": config_fingerprint(config),
+        "architecture3_config_identity_fingerprint": config_identity_fingerprint(config),
         "architecture3_checkpoint_dir": str(architecture3_checkpoint_dir),
-        "architecture3_checkpoint_trainable_weights_sha256": checkpoint_sha256,
+        "architecture3_checkpoint_trainable_weights_sha256": resolved_identity.weights_sha256,
+        "architecture3_checkpoint_step": resolved_identity.step,
         "dataset_manifest_fingerprint": dataset_manifest_fingerprint(dataset_manifest),
         "gene_panel_hash": gene_panel_hash(gene_names),
         "n_genes": len(gene_names),
@@ -200,6 +233,8 @@ def fit_and_save_architecture4_basis(
         "n_residual_rows": n_residual_rows,
         "rank": basis.rank,
         "mask_schedule_reports": train_schedule.reports,
+        "training_mask_schedule_fingerprint": training_mask_schedule_fingerprint,
+        "cache_content_by_sample": preflight_report.get("cache_content_by_sample"),
         "output_basis_path": str(saved_basis_path),
     }
     provenance_path = Path(f"{saved_basis_path}.provenance.json")

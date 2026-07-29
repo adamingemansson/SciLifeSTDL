@@ -366,6 +366,111 @@ def test_run_training_refuses_resume_when_code_state_drifted_unless_explicitly_a
     assert resumed_manifest["code_drift_acknowledged"] is True
 
 
+def test_run_training_refuses_resume_when_code_identity_is_unknown_unless_explicitly_allowed(tmp_path, monkeypatch):
+    """Codex re-audit of commit f7bb8a1, launch blocker #8: "fail closed
+    when code identity is unknown unless an explicit recorded override is
+    supplied." The PRIOR behavior SKIPPED the code-drift check entirely
+    when the old manifest recorded no commit at all (simulating a
+    checkpoint from outside a git checkout, or predating this field) --
+    this must now be refused exactly like a confirmed change, not
+    silently treated as nothing to verify."""
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
+    config_path = tmp_path / "config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_unknown_code_identity"
+    _write_config(
+        cfg, manifest_path, config_path, architecture="1", checkpoint_dir=checkpoint_dir,
+        synchronized_init_dir=str(sync_dir),
+    )
+    config = yaml.safe_load(config_path.read_text())
+    config["training"]["total_steps"] = 1
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    train_module.run_training(str(config_path), smoke=False)
+
+    manifest_path_on_disk = checkpoint_dir / "run_manifest.json"
+    persisted = json.loads(manifest_path_on_disk.read_text())
+    assert persisted["code_commit_hash"] is not None  # this repo IS a real git checkout
+    persisted["code_commit_hash"] = None  # simulate a checkpoint from outside git / predating this field
+    manifest_path_on_disk.write_text(json.dumps(persisted, indent=2, sort_keys=True, default=str))
+
+    config["training"]["total_steps"] = 2
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    with pytest.raises(ValueError, match="code identity is unknown"):
+        train_module.run_training(str(config_path), smoke=False)
+
+    summary = train_module.run_training(str(config_path), smoke=False, allow_code_drift=True)
+    assert summary["ok"] is True
+    resumed_manifest = json.loads(manifest_path_on_disk.read_text())
+    assert resumed_manifest["code_drift_acknowledged"] is True
+
+
+def test_worktree_diff_hash_hashes_untracked_content_and_ignores_generated_directories(tmp_path):
+    """Codex re-audit of commit f7bb8a1, launch blocker #8: "hash tracked
+    diffs plus contents of relevant untracked source/config files; ignore
+    generated caches/results." Exercises `_worktree_diff_hash` directly
+    against THIS real repo checkout -- the only way to prove it reads
+    file CONTENT (not merely names) and ignores generated-directory
+    paths, both real behavioral properties `git status --porcelain`'s
+    raw text alone cannot demonstrate. Creates and always removes real,
+    uniquely-named throwaway files under `gen3_multiscale/` (never
+    touching anything tracked)."""
+    import os
+    import uuid
+
+    from gen3_multiscale.training.train import _code_commit_hash, _worktree_diff_hash
+
+    if _code_commit_hash() is None:
+        pytest.skip("not a real git checkout in this environment")
+
+    package_dir = Path(__file__).resolve().parent.parent  # gen3_multiscale/
+    marker = uuid.uuid4().hex[:12]
+    source_probe = package_dir / f"_codestate_probe_{marker}.py"
+    # "cache" must be the EXACT directory name -- `_worktree_diff_hash`
+    # matches whole path PARTS against `_CODE_STATE_IGNORED_PATH_PARTS`,
+    # not a substring/prefix, so a marker-suffixed name like
+    # "cache_<marker>" would NOT be recognized as ignored. The marker
+    # lives one level deeper instead, so this probe never collides with a
+    # real "gen3_multiscale/cache" directory's own contents.
+    cache_dir_preexisting = (package_dir / "cache").is_dir()
+    cache_probe_dir = package_dir / "cache" / marker
+    cache_probe = cache_probe_dir / "probe.py"
+    try:
+        baseline = _worktree_diff_hash()
+        assert baseline is not None
+
+        source_probe.write_text("x = 1\n")
+        after_add = _worktree_diff_hash()
+        assert after_add != baseline  # a new untracked source file's PRESENCE changes the hash
+
+        source_probe.write_text("x = 2\n")
+        after_edit = _worktree_diff_hash()
+        assert after_edit != after_add  # editing an untracked file's CONTENT also changes the hash
+        assert after_edit != baseline
+
+        source_probe.unlink()
+        back_to_baseline = _worktree_diff_hash()
+        assert back_to_baseline == baseline
+
+        cache_probe_dir.mkdir(parents=True)
+        cache_probe.write_text("x = 1\n")
+        with_ignored_cache_file = _worktree_diff_hash()
+        # An untracked file inside a generated-directory-named path (here
+        # "cache", an exact `_CODE_STATE_IGNORED_PATH_PARTS` entry) must
+        # never affect the hash -- neither its presence nor its content.
+        assert with_ignored_cache_file == baseline
+        cache_probe.write_text("x = 2\n")
+        assert _worktree_diff_hash() == baseline
+    finally:
+        if source_probe.exists():
+            source_probe.unlink()
+        if cache_probe.exists():
+            cache_probe.unlink()
+        if cache_probe_dir.exists():
+            os.rmdir(cache_probe_dir)
+        if not cache_dir_preexisting and (package_dir / "cache").is_dir():
+            os.rmdir(package_dir / "cache")
+
+
 def test_run_training_validation_selection_metric_is_deterministic_across_repeated_calls(tmp_path, monkeypatch):
     """Regression test for requirement #8: Architecture 4's validation
     used to mix a RANDOMLY-sampled flow loss into the very metric used
@@ -426,8 +531,17 @@ def test_run_training_saves_a_best_checkpoint_and_validation_history(tmp_path, m
     history = json.loads((checkpoint_dir / "validation_history.json").read_text())
     assert len(history) == 2
     assert [entry["step"] for entry in history] == [1, 2]
+    # best/ is now a real checkpoint.py transactional bundle (Codex
+    # re-audit of commit f7bb8a1, launch blocker #3) -- root-mirror
+    # trainable_weights.pt plus a real latest_bundle.json pointer and
+    # run_manifest.json, not a bespoke best_info.json.
+    from gen3_multiscale.training import checkpoint as checkpoint_module
+
     assert (checkpoint_dir / "best" / "trainable_weights.pt").is_file()
-    assert (checkpoint_dir / "best" / "best_info.json").is_file()
+    assert (checkpoint_dir / "best" / "latest_bundle.json").is_file()
+    assert (checkpoint_dir / "best" / "run_manifest.json").is_file()
+    best_identity = checkpoint_module.resolve_checkpoint_identity(checkpoint_dir / "best")
+    assert best_identity.step in (1, 2)
 
 
 def test_run_training_does_not_duplicate_save_when_total_steps_coincides_with_checkpoint_interval(tmp_path, monkeypatch):

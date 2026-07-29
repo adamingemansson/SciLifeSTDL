@@ -98,6 +98,7 @@ def maybe_build_slide_encoder(config: dict):
 
 def maybe_load_gene_basis(
     config: dict, gene_names: list[str], dataset_manifest: dict | None = None, *, smoke: bool = False,
+    cache_content_by_sample: dict[str, dict] | None = None,
 ):
     """Architecture 4 only: `required_fingerprints.gene_basis` must point
     at an already-fit, saved `GeneResidualBasis`
@@ -147,7 +148,26 @@ def maybe_load_gene_basis(
     matches the same reasoning documented for `train.py`'s own
     `_RESUME_CONSISTENCY_FIELDS`, which also excludes mask-schedule
     fingerprints from its own identity comparisons for scheduling
-    fields."""
+    fields. `training_mask_schedule_fingerprint` is still REQUIRED to be
+    present (bound, per Codex's re-audit of commit f7bb8a1's launch
+    blocker #5), just not equality-checked, for the same reason.
+
+    Codex re-audit of commit f7bb8a1, launch blocker #5: "Bind the basis
+    sidecar to canonical bundle identity/step... and cache content.
+    Validate all of those when Architecture 4 loads the basis." Two
+    fields added since the prior round: `architecture3_checkpoint_step`
+    (the resolved bundle's own step, cross-checked for EXACT equality
+    against the currently configured conditioner checkpoint's resolved
+    step -- weights_sha256 alone already implies the same step in
+    practice, but a caller relying on this function to catch a
+    swapped/rolled-back checkpoint should not have to reason about that
+    implication); and `cache_content_by_sample`, compared PER-SAMPLE
+    (never the single combined preflight fingerprint -- see
+    `verify_full_checkpoint_identity`'s own docstring for why a combined
+    hash cannot be validly compared across two calls that may cover
+    different sample sets) against `cache_content_by_sample`, when the
+    caller supplies one, for every sample_id present in BOTH sides;
+    samples the basis-fitting run never touched are skipped, not failed."""
     architecture_id = str((config.get("model") or {}).get("architecture", ""))
     if architecture_id != "4":
         return None, None
@@ -213,7 +233,9 @@ def maybe_load_gene_basis(
         )
 
     _require_field("architecture3_config_fingerprint")
+    _require_field("architecture3_config_identity_fingerprint")
     _require_field("mask_schedule_reports")
+    _require_field("training_mask_schedule_fingerprint")
 
     conditioner_checkpoint_dir = (config.get("required_fingerprints") or {}).get(
         "architecture3_conditioner_checkpoint",
@@ -226,6 +248,7 @@ def maybe_load_gene_basis(
             "against the SAME conditioner this run is about to load"
         )
     recorded_checkpoint_sha256 = _require_field("architecture3_checkpoint_trainable_weights_sha256")
+    recorded_checkpoint_step = _require_field("architecture3_checkpoint_step")
     actual_identity = checkpoint_module.resolve_checkpoint_identity(conditioner_checkpoint_dir)
     if actual_identity.weights_sha256 != recorded_checkpoint_sha256:
         raise ValueError(
@@ -234,6 +257,34 @@ def maybe_load_gene_basis(
             f"this run (sha256 {actual_identity.weights_sha256!r} at {conditioner_checkpoint_dir}) -- "
             "refusing to use a basis fit against a different conditioner's residuals"
         )
+    if int(actual_identity.step) != int(recorded_checkpoint_step):
+        raise ValueError(
+            f"gene residual basis at {path} was fit against Architecture 3 checkpoint step "
+            f"{recorded_checkpoint_step!r}, but the checkpoint configured for this run is at step "
+            f"{actual_identity.step!r} -- refusing to use a basis fit against a different training step "
+            "of the conditioner, even though its weights hash matches (Codex re-audit of commit "
+            "f7bb8a1, launch blocker #5: bind the basis sidecar to canonical bundle identity/step)"
+        )
+
+    # Launch blocker #5: per-sample cache-content binding -- never the
+    # single combined preflight fingerprint, which this Architecture 4
+    # run's own sample set need not exactly match the Architecture 3
+    # basis-fitting run's (see `verify_full_checkpoint_identity`'s
+    # docstring for the identical reasoning). Only samples present on
+    # BOTH sides are compared; a basis-fitting run that never touched a
+    # sample this run happens to also load says nothing about that
+    # sample's cache content.
+    recorded_cache_content_by_sample = provenance.get("cache_content_by_sample")
+    if cache_content_by_sample and recorded_cache_content_by_sample:
+        for sample_id, current_content in cache_content_by_sample.items():
+            recorded_content = recorded_cache_content_by_sample.get(sample_id)
+            if recorded_content is not None and recorded_content != current_content:
+                raise ValueError(
+                    f"gene residual basis at {path} was fit using cache content for sample {sample_id!r} "
+                    f"that does not match this run's currently loaded cache content for that sample -- "
+                    "refusing to use a basis fit against a stale or regenerated cache (Codex re-audit of "
+                    "commit f7bb8a1, launch blocker #5)"
+                )
     return basis, gene_names
 
 
@@ -322,7 +373,7 @@ def maybe_load_pretrained_conditioner_for_architecture4(
 def build_model_for_inference(
     config: dict, *, gene_names: list[str], device: torch.device,
     checkpoint_dir: str | Path | None = None, smoke: bool = False, staged_smoke: bool = False,
-    dataset_manifest: dict | None = None,
+    dataset_manifest: dict | None = None, cache_content_by_sample: dict[str, dict] | None = None,
 ) -> tuple[torch.nn.Module, dict]:
     """The ONE real model-reconstruction pipeline -- construct the
     architecture (with a real `FrozenGigaPathSlideEncoder` when
@@ -364,6 +415,7 @@ def build_model_for_inference(
     # bypass that validation the way a construction-only smoke may.
     gene_basis, resolved_gene_names = maybe_load_gene_basis(
         config, gene_names, dataset_manifest=dataset_manifest, smoke=smoke and not staged_smoke,
+        cache_content_by_sample=cache_content_by_sample,
     )
 
     torch.manual_seed(seed)  # re-seed immediately before construction -- shared init discipline
@@ -410,7 +462,7 @@ def build_model_for_inference(
 
 
 def predict_for_metrics(
-    architecture_id: str, model, inputs, *, generator: torch.Generator | None = None,
+    architecture_id: str, model, inputs, *, generator: torch.Generator | None = None, n_samples: int | None = None,
 ) -> dict:
     """The metric-basis prediction for `inputs` -- Adam's Step 6 audit #1
     of commit a32051b: "Architecture 4 validation/evaluation/overfit must
@@ -424,17 +476,26 @@ def predict_for_metrics(
     Returns `{"expression": <the metric-basis prediction>}` for every
     architecture, plus (Architecture 4 only) `"conditioner_only_expression"`
     (the frozen conditioner's own, secondary, mean -- never the reported
-    headline metric) and `"predictive_std"` (per-query sampled-residual
-    uncertainty). `generator`, when given, makes Architecture 4's
-    stochastic sampling reproducible -- required for exact resume/
-    evaluation consistency (same audit item)."""
+    headline metric), `"predictive_std"` (per-query sampled-residual
+    uncertainty) and `"predictive_samples"` (the raw per-draw field,
+    `[n_samples, n_query, n_genes]`, for empirical-quantile calibration).
+    `generator`, when given, makes Architecture 4's stochastic sampling
+    reproducible -- required for exact resume/evaluation consistency
+    (same audit item). `n_samples`, when given, overrides the model's own
+    configured `n_flow_samples` -- Codex re-audit of commit f7bb8a1,
+    secondary fix #4: "Treat Gaussian coverage from 8 flow samples as
+    approximate; preferably use empirical quantiles with a larger
+    configurable sample count." A caller that wants a more reliable
+    calibration estimate than the training-time default can ask for more
+    draws here without changing `n_flow_samples` itself."""
     if architecture_id == "4":
         conditioner_out = model(inputs)
-        predictive = model.sample_predictive_distribution(inputs, generator=generator)
+        predictive = model.sample_predictive_distribution(inputs, n_samples=n_samples, generator=generator)
         return {
             "expression": predictive["predictive_mean"],
             "conditioner_only_expression": conditioner_out["expression"],
             "predictive_std": predictive["predictive_std"],
+            "predictive_samples": predictive["predictive_samples"],
         }
     out = model(inputs)
     return {"expression": out["expression"]}
@@ -518,20 +579,27 @@ def load_gene_scale(path: str | Path) -> np.ndarray:
     return np.load(path)
 
 
-def common_random_validation_seed(seed: int, item_index: int) -> int:
-    """Codex re-audit of commit 90f853e, launch blocker #6: "Use common
-    random numbers for Architecture 4 validation: seed by fixed
-    evaluation seed plus stable mask identity, independent of training
-    step and evaluation order." Extracted into its own named function
-    (previously inline inside `_run_validation`'s closure) specifically
-    so this determinism/step-independence property is directly unit-
-    testable, not just observable end-to-end. `item_index` is `val_
-    loader`'s own enumeration index -- stable because `val_loader` is
-    always built with `shuffle=False` -- never the current training
-    step, which is the property this function exists to guarantee: two
-    calls with the SAME `(seed, item_index)` return the SAME value
-    regardless of when (which training step) they are called."""
-    return (int(seed) * 7_919 + int(item_index)) % (2**63)
+def common_random_validation_seed(seed: int, stable_key: str) -> int:
+    """Codex re-audit of commit 90f853e, launch blocker #6 (refined by
+    the re-audit of commit f7bb8a1's secondary fix #1): "Seed
+    Architecture 4 validation/evaluation from a stable identity:
+    evaluation seed + sample_id + stratum + query_fingerprint, never
+    item index." `item_index` (the prior version's key) is `val_loader`'s
+    own enumeration position -- stable only as long as the validation
+    mask BANK's on-disk record ordering never changes; a mask bank
+    self-heal/regeneration that reorders (without changing) the same
+    logical set of realized masks would silently reassign every item's
+    noise draw to a DIFFERENT held-out mask. `stable_key` is the
+    caller's own `f"{sample_id}:{stratum}:{query_fingerprint}"` (see
+    `Gen3SpatialFieldDataset.item_identity`) -- a content-derived
+    identity for the EXACT realized mask itself, invariant to
+    reordering. Extracted into its own named function so this
+    determinism/stability property is directly unit-testable, not just
+    observable end-to-end: two calls with the SAME `(seed, stable_key)`
+    return the SAME value regardless of training step, evaluation
+    order, or mask-bank record order."""
+    digest = hashlib.sha256(f"gen3-common-random-validation:{int(seed)}:{stable_key}".encode("utf-8")).hexdigest()
+    return int(digest[:16], 16) % (2**63)
 
 
 def deterministic_train_index_for_step(step: int, dataset_len: int, seed: int) -> int:
@@ -678,19 +746,32 @@ _RESUME_EXCLUDED_TRAINING_FIELDS = frozenset({
 
 def config_identity_fingerprint(config: dict) -> str:
     """Same content as `config_fingerprint`, minus
-    `_RESUME_EXCLUDED_TRAINING_FIELDS` -- the fingerprint
-    `verify_resume_consistency` actually compares. Adam's Step 6 audit #5:
-    "Verify the existing run manifest/config/dataset/cache/LongNet/init/
-    basis fingerprints before loading anything. Refuse changed configs
-    or artifacts" -- but a resumed run legitimately needs to be able to
-    ask for MORE steps, a different checkpoint cadence, or a raised
-    wall-clock budget without that being treated as "a changed config"
-    in the sense this check is meant to catch."""
+    `_RESUME_EXCLUDED_TRAINING_FIELDS` and the entire `evaluation` section
+    -- the fingerprint `verify_resume_consistency`/
+    `verify_full_checkpoint_identity` actually compare. Adam's Step 6
+    audit #5: "Verify the existing run manifest/config/dataset/cache/
+    LongNet/init/basis fingerprints before loading anything. Refuse
+    changed configs or artifacts" -- but a resumed run legitimately needs
+    to be able to ask for MORE steps, a different checkpoint cadence, or
+    a raised wall-clock budget without that being treated as "a changed
+    config" in the sense this check is meant to catch.
+
+    The `evaluation` section (Codex re-audit of commit f7bb8a1, confirmed
+    real gap surfaced while wiring `verify_full_checkpoint_identity` into
+    BOTH best/ and latest-checkpoint evaluation): named gene panels,
+    `n_masks_per_sample`, `compute_st_fid_mmd`, and similar
+    evaluation-only settings never affect what was actually TRAINED --
+    only how an already-trained checkpoint is LATER measured. Binding
+    them into the checkpoint's scientific identity would mean adding a
+    new named evaluation gene panel, or raising an evaluation sample
+    count, retroactively "invalidates" every already-trained checkpoint
+    for evaluation purposes, which is not a real identity change."""
     identity_config = json.loads(json.dumps(config, default=str))  # deep copy, same serialization the hash itself uses
     training_section = dict(identity_config.get("training") or {})
     for field in _RESUME_EXCLUDED_TRAINING_FIELDS:
         training_section.pop(field, None)
     identity_config["training"] = training_section
+    identity_config.pop("evaluation", None)
     return hashlib.sha256(json.dumps(identity_config, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
@@ -721,28 +802,78 @@ def _environment_versions() -> dict:
     }
 
 
+_CODE_STATE_IGNORED_PATH_PARTS = frozenset({
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".git",
+    "cache", "caches", "checkpoint", "checkpoints", "results", "result",
+    "output", "outputs", "logs", "log", "wandb", "hest1k_cache", "hest1k",
+    "evaluation_masks", "runs", "tmp",
+})
+_CODE_STATE_RELEVANT_SUFFIXES = frozenset({
+    ".py", ".yaml", ".yml", ".json", ".toml", ".cfg", ".ini", ".sh", ".md", ".txt",
+})
+
+
 def _worktree_diff_hash() -> str | None:
     """Best-effort sha256 over `git diff HEAD` (every tracked-file
-    change, staged or not, relative to the current commit) plus `git
-    status --porcelain` (so a new UNTRACKED file also changes the hash)
-    -- Codex re-audit of commit 90f853e, launch blocker #10: "Bind code
-    state on resume: exact commit plus clean-worktree status/diff hash."
-    None (not an error) outside a git checkout or if git itself is
-    unavailable, exactly like `_code_commit_hash`; an all-clean worktree
-    still returns a real, stable hash (of two empty strings), never
-    None, so "clean" is distinguishable from "unknown"."""
+    change, staged or not, relative to the current commit) plus the
+    CONTENTS of relevant untracked source/config files -- Codex re-audit
+    of commit 90f853e, launch blocker #10: "Bind code state on resume:
+    exact commit plus clean-worktree status/diff hash." None (not an
+    error) outside a git checkout or if git itself is unavailable,
+    exactly like `_code_commit_hash`; an all-clean worktree still returns
+    a real, stable hash, never None, so "clean" is distinguishable from
+    "unknown".
+
+    Codex re-audit of commit f7bb8a1, launch blocker #8: "Make code-state
+    binding operational: hash tracked diffs plus contents of relevant
+    untracked source/config files; ignore generated caches/results." The
+    PRIOR version hashed `git status --porcelain`'s raw text -- which
+    lists every untracked path's NAME but never its CONTENT, so editing
+    an already-untracked file (a real, confirmed gap: a new source file
+    added but not yet `git add`-ed, then edited again, changes nothing
+    about `git status`'s own output) left this hash unchanged; and it
+    included every untracked path repo-wide, so an unrelated generated
+    data/cache/results/checkpoint directory appearing (nothing to do with
+    CODE identity at all) could spuriously flag "code drift" and block a
+    legitimate resume. Fixed: any path with an ignored directory name
+    anywhere in it (`_CODE_STATE_IGNORED_PATH_PARTS`) is excluded
+    entirely -- its presence, absence, or content never affects this
+    hash. Every SURVIVING untracked path with a source/config-like
+    extension (`_CODE_STATE_RELEVANT_SUFFIXES`) has its actual file
+    CONTENT read and hashed, not merely its name; surviving paths that
+    don't match (binary/data files that happen to sit outside an ignored
+    directory) still contribute their NAME (so their appearance is not
+    silently invisible), just not their content."""
+    repo_root = Path(__file__).resolve().parents[2]
     try:
         diff = subprocess.run(
-            ["git", "diff", "HEAD"], cwd=Path(__file__).resolve().parent,
-            capture_output=True, text=True, timeout=10,
+            ["git", "diff", "HEAD"], cwd=repo_root, capture_output=True, text=True, timeout=10,
         )
         status = subprocess.run(
-            ["git", "status", "--porcelain"], cwd=Path(__file__).resolve().parent,
-            capture_output=True, text=True, timeout=10,
+            ["git", "status", "--porcelain"], cwd=repo_root, capture_output=True, text=True, timeout=10,
         )
         if diff.returncode != 0 or status.returncode != 0:
             return None
-        return hashlib.sha256(f"{diff.stdout}\x00{status.stdout}".encode("utf-8")).hexdigest()
+        hasher = hashlib.sha256()
+        hasher.update(diff.stdout.encode("utf-8"))
+        hasher.update(b"\x00")
+        relevant_lines = []
+        for line in status.stdout.splitlines():
+            if len(line) < 4:
+                continue
+            code, relpath = line[:2], line[3:].strip().strip('"')
+            if any(part in _CODE_STATE_IGNORED_PATH_PARTS for part in Path(relpath).parts):
+                continue  # a generated cache/results/output/checkpoint path -- never part of code identity
+            relevant_lines.append(line)
+            if code == "??":
+                full_path = repo_root / relpath
+                if full_path.is_file() and full_path.suffix in _CODE_STATE_RELEVANT_SUFFIXES:
+                    try:
+                        hasher.update(full_path.read_bytes())
+                    except OSError:
+                        pass
+        hasher.update("\n".join(sorted(relevant_lines)).encode("utf-8"))
+        return hasher.hexdigest()
     except Exception:
         return None
 
@@ -900,15 +1031,28 @@ def verify_resume_consistency(
     a resumed run whose code changed (a different commit, or a dirty
     worktree with different uncommitted edits) may have produced
     different losses/gradients/masking behavior than the run being
-    resumed, for reasons none of the other fields here can see. Skipped
-    when the OLD manifest recorded no commit at all (a checkpoint from
-    outside a git checkout, or predating this field -- nothing to bind
-    against). `allow_code_drift=True` (threaded from
-    `run_training(..., allow_code_drift=True)` / `--allow-code-drift`)
-    is the explicit override: it does not silence the check, it is
-    RECORDED by the caller into the new run manifest's
-    `code_drift_acknowledged` field so the override is scientifically
-    visible in the artifact itself, never a silent bypass."""
+    resumed, for reasons none of the other fields here can see.
+    `allow_code_drift=True` (threaded from `run_training(...,
+    allow_code_drift=True)` / `--allow-code-drift`) is the explicit
+    override: it does not silence the check, it is RECORDED by the
+    caller into the new run manifest's `code_drift_acknowledged` field so
+    the override is scientifically visible in the artifact itself, never
+    a silent bypass.
+
+    Codex re-audit of commit f7bb8a1, launch blocker #8: "fail closed
+    when code identity is unknown unless an explicit recorded override is
+    supplied." The PRIOR version SKIPPED this entire check whenever the
+    OLD manifest recorded no commit at all (`old_commit is not None and
+    ...`) -- a checkpoint from outside a git checkout, or one predating
+    this field, was silently treated as "nothing to verify," which meant
+    a resume against such a checkpoint could run under ARBITRARY code
+    changes with no check at all, not even the override requirement.
+    Fixed: an unknown commit on EITHER side now counts as drift itself
+    (there is nothing to positively confirm code identity matched), so it
+    requires the same explicit `allow_code_drift=True` override as a
+    confirmed change -- this trainer would rather force an operator in a
+    non-git or git-unavailable environment to pass the override on every
+    resume than silently trust an unverifiable one."""
     for field in _RESUME_CONSISTENCY_FIELDS:
         old_value = old_run_manifest.get(field)
         new_value = new_run_manifest.get(field)
@@ -924,14 +1068,17 @@ def verify_resume_consistency(
     new_commit = new_run_manifest.get("code_commit_hash")
     old_diff_hash = old_run_manifest.get("code_worktree_diff_hash")
     new_diff_hash = new_run_manifest.get("code_worktree_diff_hash")
-    code_drifted = old_commit is not None and (old_commit != new_commit or old_diff_hash != new_diff_hash)
+    code_identity_unknown = old_commit is None or new_commit is None
+    code_drifted = code_identity_unknown or old_commit != new_commit or old_diff_hash != new_diff_hash
     if code_drifted and not allow_code_drift:
+        reason = "code identity is unknown on at least one side" if code_identity_unknown else "code state changed"
         raise ValueError(
-            f"resume refused: code state changed since the last checkpoint at "
+            f"resume refused: {reason} since the last checkpoint at "
             f"{old_run_manifest.get('checkpoint_dir')} (commit {old_commit!r} -> {new_commit!r}, "
             f"worktree_diff_hash {old_diff_hash!r} -> {new_diff_hash!r}) -- pass allow_code_drift=True "
-            "(run_training(..., allow_code_drift=True) / --allow-code-drift) if resuming under different "
-            "code is genuinely intended; the override is recorded in the new run_manifest.json, never silent"
+            "(run_training(..., allow_code_drift=True) / --allow-code-drift) if resuming under different or "
+            "unverifiable code is genuinely intended; the override is recorded in the new run_manifest.json, "
+            "never silent"
         )
 
 
@@ -949,203 +1096,177 @@ def save_run_manifest(run_manifest: dict, path: str | Path) -> Path:
 
 
 def save_best_checkpoint_bundle(
-    model, gene_names: list[str], best_dir: str | Path, *, step: int, val_loss: float, run_manifest: dict,
+    model, config: dict, gene_names: list[str], best_dir: str | Path, *, step: int, val_loss: float,
+    run_manifest: dict,
 ) -> Path:
-    """Atomically (re)write `best/` as a COMPLETE, independently
-    verifiable inference bundle -- Adam's Step 6 audit #3 of commit
-    a32051b: "Make best/ a complete, verifiable inference bundle... or an
-    immutable pointer to one... including gene names, config/run-manifest
-    identity, external artifact hashes, selected step, and weights."
-    Before this function existed, `best/` held only `trainable_weights.pt`
-    plus a 2-field `best_info.json` -- not independently loadable/
-    verifiable as a standalone artifact separate from the live
-    `checkpoint_dir` state.
+    """`best/` as a real transactional `checkpoint.py` bundle -- Codex
+    re-audit of commit f7bb8a1, launch blocker #3: "Replace mutable
+    best/ with immutable uniquely named inference bundles plus an atomic
+    best pointer." The prior version staged a temp directory, then did
+    `shutil.rmtree(best_dir)` FOLLOWED BY `os.replace(tmp_dir, best_dir)`
+    -- two separate operations, not one atomic one (`os.replace` cannot
+    atomically swap in a directory over a non-empty existing one on
+    POSIX). A crash in the window between the rmtree and the replace left
+    NO best checkpoint at all, confirmed real by this re-audit.
 
-    Staged in a temp directory and swapped in with a single `os.replace`
-    so `best/` is always either the complete PREVIOUS bundle or the
-    complete NEW one, never a partially-written mix of the two (mirrors
-    `checkpoint.py`'s existing atomic-write discipline, extended here to
-    the whole directory rather than one file at a time)."""
-    best_dir = Path(best_dir)
-    tmp_dir = best_dir.parent / f".{best_dir.name}.tmp{os.getpid()}"
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    checkpoint_module.save_trainable_state(model, tmp_dir)
-    (tmp_dir / "gene_names.json").write_text(json.dumps(list(gene_names), indent=2))
-
-    file_hashes = {
-        name: file_sha256(tmp_dir / name)
-        for name in ("trainable_weights.pt", "gene_names.json") if (tmp_dir / name).is_file()
-    }
-    bundle_info = {
-        "step": int(step), "total": float(val_loss), "files": file_hashes,
-        "config_path": run_manifest.get("config_path"),
-        "config_identity_fingerprint": run_manifest.get("config_identity_fingerprint"),
-        "dataset_manifest_fingerprint": run_manifest.get("dataset_manifest_fingerprint"),
-        "gene_panel_hash": run_manifest.get("gene_panel_hash"),
-        "model_architecture": run_manifest.get("model_architecture"),
-        "synchronized_init_manifest_sha256": run_manifest.get("synchronized_init_manifest_sha256"),
-        "gigapath_checkpoint_sha256": run_manifest.get("gigapath_checkpoint_sha256"),
-        "gene_residual_basis_gene_names_hash": run_manifest.get("gene_residual_basis_gene_names_hash"),
-        "gene_residual_basis_sha256": run_manifest.get("gene_residual_basis_sha256"),
-        "gene_scale_sha256": run_manifest.get("gene_scale_sha256"),
-        "architecture3_conditioner_checkpoint_sha256": run_manifest.get("architecture3_conditioner_checkpoint_sha256"),
-        "architecture3_conditioner_checkpoint_step": run_manifest.get("architecture3_conditioner_checkpoint_step"),
-        "code_commit_hash": run_manifest.get("code_commit_hash"),
-    }
-    # Written LAST -- a reader can treat best_info.json's presence (and
-    # its own per-file hashes matching) as proof the bundle is complete.
-    (tmp_dir / "best_info.json").write_text(json.dumps(bundle_info, indent=2, sort_keys=True, default=str))
-
-    if best_dir.exists():
-        shutil.rmtree(best_dir)
-    os.replace(tmp_dir, best_dir)
-    return best_dir
+    Reusing `checkpoint_module.save_checkpoint` directly gives `best/`
+    every crash-safety property already built and hardened there for
+    free: a uniquely-named, never-deleted-in-place bundle; an atomic
+    pointer written and fsync'd BEFORE pruning; and (via
+    `run_manifest=run_manifest`) the run's COMPLETE identity -- config,
+    dataset, gene panel, cache content, synchronized init, LongNet
+    checkpoint, Architecture 3 conditioner bundle/step, residual basis,
+    and code state -- bound INSIDE the bundle and hash-verified on every
+    read, not merely recorded in a bespoke, separately-verified
+    `best_info.json`. `model_config` is the real resolved training
+    config (mirrors every other `save_checkpoint` call site in this
+    module), so `best/` is independently reconstructable without needing
+    the original YAML on hand. `keep_last=2` keeps one prior best bundle
+    around defensively; `optimizer=None` since `best/` is an inference
+    artifact, never meant to resume TRAINING from."""
+    checkpoint_module.save_checkpoint(
+        model, config, gene_names, best_dir, step=step,
+        extra_metadata={"total": float(val_loss)}, keep_last=2, run_manifest=run_manifest,
+    )
+    return Path(best_dir)
 
 
-def verify_checkpoint_bundle_identity(
-    bundle_dir: str | Path, *, dataset_manifest: dict, gene_names: list[str], architecture_id: str | None = None,
-) -> dict:
-    """Fail-closed pre-load check for a `save_best_checkpoint_bundle`
-    bundle -- Adam's Step 6 audit #7: "Verify the checkpoint run manifest
-    against evaluation inputs before loading." Confirms every per-file
-    hash the bundle's own `best_info.json` recorded still matches the
-    file on disk right now (catches altered/corrupted bundle contents --
-    audit #4's adversarial scenario) and that the bundle's
-    `dataset_manifest_fingerprint`/`gene_panel_hash`/`model_architecture`
-    agree with what the CALLER is about to evaluate against, before any
-    weights are loaded. Returns the bundle's own info dict on success.
-
-    Codex re-audit of commit 90f853e, launch blocker #4: "Missing
-    dataset/gene metadata is accepted as valid." The prior version
-    treated a MISSING recorded field (`info.get(...) is None`) as
-    passing -- a bundle whose `best_info.json` never actually recorded
-    its own dataset/gene-panel identity (e.g. a hand-assembled or
-    corrupted `best_info.json`) passed this check by simply omitting the
-    field it would have failed on. Every identity field checked here is
-    now REQUIRED to be present; a missing field now fails exactly like a
-    mismatched one."""
-    bundle_dir = Path(bundle_dir)
-    info_path = bundle_dir / "best_info.json"
-    if not info_path.is_file():
-        raise ValueError(f"{bundle_dir} has no best_info.json -- not a complete, verifiable inference bundle")
-    info = json.loads(info_path.read_text())
-    for name, expected_hash in (info.get("files") or {}).items():
-        file_path = bundle_dir / name
-        if not file_path.is_file():
-            raise ValueError(f"{bundle_dir}: best_info.json references {name} but it is missing")
-        if file_sha256(file_path) != expected_hash:
-            raise ValueError(
-                f"{bundle_dir}: {name} does not match the sha256 recorded in best_info.json -- "
-                "the bundle's contents were altered after being written, refusing to load"
-            )
-    expected_dataset_fp = dataset_manifest_fingerprint(dataset_manifest)
-    recorded_dataset_fp = info.get("dataset_manifest_fingerprint")
-    if recorded_dataset_fp is None or recorded_dataset_fp != expected_dataset_fp:
-        raise ValueError(
-            f"{bundle_dir}: was selected under dataset_manifest_fingerprint={recorded_dataset_fp!r} but "
-            f"this evaluation's dataset manifest fingerprints to {expected_dataset_fp!r} -- refusing to "
-            "evaluate a checkpoint against different (or unrecorded) data than it was trained/selected on"
-        )
-    expected_gene_hash = gene_panel_hash(gene_names)
-    recorded_gene_hash = info.get("gene_panel_hash")
-    if recorded_gene_hash is None or recorded_gene_hash != expected_gene_hash:
-        raise ValueError(
-            f"{bundle_dir}: was selected under gene_panel_hash={recorded_gene_hash!r} but this "
-            f"evaluation's gene panel hashes to {expected_gene_hash!r} -- refusing to load"
-        )
-    if architecture_id is not None:
-        recorded_architecture = info.get("model_architecture")
-        if recorded_architecture is None or str(recorded_architecture) != str(architecture_id):
-            raise ValueError(
-                f"{bundle_dir}: was selected under model_architecture={recorded_architecture!r} but this "
-                f"evaluation is loading architecture {architecture_id!r} -- refusing to load"
-            )
-    return info
+# Codex re-audit of commit f7bb8a1, launch blocker #3: every identity
+# field that must agree between the CURRENT run/evaluation and a
+# checkpoint's own recorded identity before its weights are trusted --
+# "verify exact config, dataset, cache-content mapping, gene panel, sync
+# init, LongNet checkpoint, conditioner bundle/step, residual basis and
+# code state." Shared by `verify_full_checkpoint_identity` below for
+# BOTH `best/` and a live checkpoint_dir's latest state -- one complete
+# check, not two partial ones.
+_FULL_CHECKPOINT_IDENTITY_FIELDS = (
+    "model_architecture", "config_identity_fingerprint", "dataset_manifest_fingerprint", "gene_panel_hash",
+    "synchronized_init_manifest_sha256", "gigapath_checkpoint_sha256",
+    "gene_residual_basis_gene_names_hash", "gene_residual_basis_sha256", "gene_scale_sha256",
+    "architecture3_conditioner_checkpoint_sha256", "architecture3_conditioner_checkpoint_step",
+)
 
 
-def verify_checkpoint_run_manifest_against_evaluation(
+def verify_full_checkpoint_identity(
     checkpoint_dir: str | Path, *, config: dict, dataset_manifest: dict, gene_names: list[str],
+    cache_content_by_sample: dict[str, dict] | None = None,
 ) -> dict:
-    """Fail-closed pre-load check for evaluating a checkpoint_dir's
-    LATEST state directly (not a `best/` bundle, which is verified
-    separately by `verify_checkpoint_bundle_identity`). Codex re-audit of
-    commit 90f853e, launch blocker #4: "Latest-checkpoint evaluation does
-    not compare the checkpoint's run manifest with the evaluation
-    dataset ... must require complete metadata and verify configuration,
-    architecture, dataset, gene panel, basis, conditioner, LongNet,
-    synchronized initialization ... and exact weights before loading."
-    ("Exact weights" is covered separately -- `checkpoint.py`'s own
-    transactional `_resolve_checkpoint_source` already fail-closed
-    verifies every file's hash before `load_trainable_state` uses it.)
+    """The ONE shared, complete identity verifier for both `best/` and a
+    live checkpoint_dir's latest state -- Codex re-audit of commit
+    f7bb8a1, launch blockers #3/#4/#6: replaces the previous
+    `verify_checkpoint_bundle_identity` (best/-only, best_info.json-
+    based, only checked dataset/genes/architecture) and
+    `verify_checkpoint_run_manifest_against_evaluation` (latest-only,
+    missing cache-content/gene-scale/basis-gene-names-hash/conditioner-
+    step) with one function that checks EVERY field in
+    `_FULL_CHECKPOINT_IDENTITY_FIELDS` against BOTH sources of the
+    checkpoint's recorded identity.
 
-    Compares `checkpoint_dir/run_manifest.json`'s own recorded identity
-    fields against values freshly computed from THIS evaluation's
-    config/dataset/gene-panel -- every field checked is REQUIRED to be
-    present in the checkpoint's manifest; a missing field fails exactly
-    like a mismatched one."""
+    Resolves through `checkpoint_module.resolve_checkpoint_identity`
+    first (exact-weights verification, already fail-closed and hardened
+    there) then reads the run manifest bound INSIDE that exact resolved
+    bundle via `checkpoint_module.load_checkpoint_run_manifest` -- never
+    a loose, unbound root-level file. Every field is REQUIRED to be
+    present in the checkpoint's recorded identity; a missing field fails
+    exactly like a mismatched one.
+
+    `cache_content_by_sample` (launch blocker #2/#6: "Bind evaluation to
+    cache content used by training. Compare the checkpoint's per-sample
+    cache identities against the currently loaded evaluation samples
+    before loading weights") is a PER-SAMPLE comparison, deliberately
+    NOT the single combined `cache_content_fingerprint` resume-
+    consistency uses: training's own preflight covers `train_ids +
+    validation_ids`, while an evaluation call may cover a DIFFERENT
+    (e.g. validation-only, or test-only) sample set, so the two combined
+    fingerprints are never expected to match even when every individual
+    sample's cache content genuinely agrees. Instead, every sample_id in
+    the caller's `cache_content_by_sample` that the checkpoint's own
+    recorded `cache_preflight_report.cache_content_by_sample` ALSO
+    covers must match exactly -- a sample the checkpoint's training run
+    never touched (e.g. a held-out test sample) has nothing to compare
+    against and is skipped, never silently treated as a pass OR a
+    failure for a sample outside the checkpoint's own training scope."""
     checkpoint_dir = Path(checkpoint_dir)
-    manifest_path = checkpoint_dir / "run_manifest.json"
-    if not manifest_path.is_file():
+    identity = checkpoint_module.resolve_checkpoint_identity(checkpoint_dir)
+    if identity.weights_sha256 is None and identity.resolved_dir == checkpoint_dir and identity.step is None:
+        raise ValueError(f"{checkpoint_dir}: no checkpoint bundle found -- nothing to verify or load")
+    checkpoint_run_manifest = checkpoint_module.load_checkpoint_run_manifest(checkpoint_dir)
+    if checkpoint_run_manifest is None:
         raise ValueError(
-            f"{checkpoint_dir} has no run_manifest.json -- cannot verify this checkpoint's config/"
-            "dataset/gene-panel/architecture/synchronized-init/conditioner/basis identity against the "
-            "evaluation inputs before loading. Refusing to evaluate an unverifiable checkpoint (a "
-            "best/ bundle, verified independently, is the alternative self-verifying path)"
+            f"{checkpoint_dir} (resolved bundle {identity.resolved_dir}) has no run_manifest.json bound "
+            "inside it -- cannot verify this checkpoint's config/dataset/gene-panel/architecture/cache/"
+            "synchronized-init/conditioner/basis identity before loading. Refusing to load an "
+            "unverifiable checkpoint"
         )
-    checkpoint_run_manifest = json.loads(manifest_path.read_text())
-
-    def _require_match(field: str, expected) -> None:
-        recorded = checkpoint_run_manifest.get(field)
-        if recorded is None or recorded != expected:
-            raise ValueError(
-                f"{checkpoint_dir}: run_manifest.json field {field}={recorded!r} does not match this "
-                f"evaluation's own {field}={expected!r} -- refusing to load a checkpoint whose recorded "
-                "identity does not match (or never recorded) what is being evaluated against"
-            )
 
     architecture_id = str((config.get("model") or {}).get("architecture", ""))
-    _require_match("model_architecture", architecture_id)
-    _require_match("dataset_manifest_fingerprint", dataset_manifest_fingerprint(dataset_manifest))
-    _require_match("gene_panel_hash", gene_panel_hash(gene_names))
-    _require_match("config_identity_fingerprint", config_identity_fingerprint(config))
+    expected_values = {
+        "model_architecture": architecture_id,
+        "config_identity_fingerprint": config_identity_fingerprint(config),
+        "dataset_manifest_fingerprint": dataset_manifest_fingerprint(dataset_manifest),
+        "gene_panel_hash": gene_panel_hash(gene_names),
+    }
 
     training_cfg = config.get("training") or {}
     synchronized_init_dir = training_cfg.get("synchronized_init_dir")
     if synchronized_init_dir:
         sync_manifest_path = Path(synchronized_init_dir) / "initialization_manifest.json"
-        expected_sync_sha256 = file_sha256(sync_manifest_path) if sync_manifest_path.is_file() else None
-        _require_match("synchronized_init_manifest_sha256", expected_sync_sha256)
+        expected_values["synchronized_init_manifest_sha256"] = (
+            file_sha256(sync_manifest_path) if sync_manifest_path.is_file() else None
+        )
 
     model_params = (config.get("model") or {}).get("params") or {}
     required_fingerprints = config.get("required_fingerprints") or {}
     if model_params.get("use_global_slide"):
         gigapath_checkpoint_path = required_fingerprints.get("gigapath_checkpoint")
-        expected_gigapath_sha256 = (
+        expected_values["gigapath_checkpoint_sha256"] = (
             file_sha256(gigapath_checkpoint_path)
             if gigapath_checkpoint_path and Path(gigapath_checkpoint_path).is_file() else None
         )
-        _require_match("gigapath_checkpoint_sha256", expected_gigapath_sha256)
 
     if architecture_id == "4":
-        conditioner_checkpoint_dir = required_fingerprints.get("architecture3_conditioner_checkpoint")
-        if conditioner_checkpoint_dir:
-            expected_conditioner_sha256 = checkpoint_module.resolve_checkpoint_identity(
-                conditioner_checkpoint_dir,
-            ).weights_sha256
-            _require_match("architecture3_conditioner_checkpoint_sha256", expected_conditioner_sha256)
-        basis_path = required_fingerprints.get("gene_residual_basis")
-        if basis_path:
+        gene_residual_basis_path = required_fingerprints.get("gene_residual_basis")
+        if gene_residual_basis_path:
             from gen3_multiscale.models.gene_basis import load_gene_residual_basis
 
-            basis = load_gene_residual_basis(basis_path)
-            expected_basis_sha256 = hashlib.sha256(
+            basis = load_gene_residual_basis(gene_residual_basis_path)
+            expected_values["gene_residual_basis_gene_names_hash"] = basis.gene_names_hash
+            expected_values["gene_residual_basis_sha256"] = hashlib.sha256(
                 np.ascontiguousarray(basis.basis.detach().cpu().numpy()).tobytes()
             ).hexdigest()
-            _require_match("gene_residual_basis_sha256", expected_basis_sha256)
+        conditioner_checkpoint_dir = required_fingerprints.get("architecture3_conditioner_checkpoint")
+        if conditioner_checkpoint_dir:
+            conditioner_identity = checkpoint_module.resolve_checkpoint_identity(conditioner_checkpoint_dir)
+            expected_values["architecture3_conditioner_checkpoint_sha256"] = conditioner_identity.weights_sha256
+            expected_values["architecture3_conditioner_checkpoint_step"] = conditioner_identity.step
 
+    for field in _FULL_CHECKPOINT_IDENTITY_FIELDS:
+        if field not in expected_values:
+            continue  # not applicable to this architecture/config (e.g. gigapath fields when use_global_slide=false)
+        expected = expected_values[field]
+        recorded = checkpoint_run_manifest.get(field)
+        if recorded is None or recorded != expected:
+            raise ValueError(
+                f"{checkpoint_dir} (resolved bundle {identity.resolved_dir}): recorded {field}={recorded!r} "
+                f"does not match this run's own {field}={expected!r} -- refusing to load a checkpoint whose "
+                "recorded identity does not match (or never recorded) what is being trained/evaluated against"
+            )
+
+    if cache_content_by_sample:
+        recorded_cache_by_sample = (
+            (checkpoint_run_manifest.get("cache_preflight_report") or {}).get("cache_content_by_sample") or {}
+        )
+        for sample_id, current_identity in cache_content_by_sample.items():
+            recorded_identity = recorded_cache_by_sample.get(sample_id)
+            if recorded_identity is None:
+                continue  # this checkpoint's own training run never touched this sample -- nothing to compare
+            if recorded_identity != current_identity:
+                raise ValueError(
+                    f"{checkpoint_dir} (resolved bundle {identity.resolved_dir}): sample {sample_id!r}'s cache "
+                    f"content identity recorded at training time ({recorded_identity!r}) does not match its "
+                    f"currently-loaded cache content ({current_identity!r}) -- the cache was regenerated with "
+                    "different content since this checkpoint was trained; refusing to load"
+                )
     return checkpoint_run_manifest
 
 
@@ -1206,7 +1327,17 @@ def run_training(
     samples, preflight_report = load_and_preflight_samples(
         cfg_om, dataset_manifest, train_ids + validation_ids, expected_provenance,
     )
-    save_gen3_preflight_report(preflight_report, checkpoint_dir / "preflight_report.json")
+    # Codex re-audit of commit f7bb8a1, launch blocker #6: "Perform all
+    # resume verification before writing preflight reports, mask banks,
+    # gene scale, validation history or other checkpoint-directory
+    # artifacts." Confirmed real: `save_gen3_preflight_report` used to
+    # write here, unconditionally, BEFORE `verify_resume_consistency` --
+    # a resume that gets refused must never have already overwritten the
+    # PRIOR run's own preflight_report.json on its way to being refused
+    # (exactly the same concern `gene_scale.npy` was already fixed for).
+    # The disk WRITE is deferred to right after resume verification
+    # passes, below; only the in-memory `preflight_report` (needed to
+    # build the run manifest being verified) is computed here.
 
     strata = config["masking"]["strata"]
     train_samples = {sid: s for sid, s in samples.items() if sid in train_ids}
@@ -1221,10 +1352,18 @@ def run_training(
     val_schedule = None
     val_loader = None
     if val_samples:
+        # Same launch-blocker-#6 deferral: `mask_bank_dir` deliberately
+        # OMITTED here (never write validation mask banks to
+        # checkpoint_dir before resume verification passes) --
+        # `build_gen3_mask_schedule` is a pure, deterministic function of
+        # (dataset_manifest, val_samples, strata, split_counts,
+        # split_seeds) when given no `mask_bank_dir`, so the SAME
+        # schedule/reports this run_manifest gets built from are
+        # recomputed (cheaply) and PERSISTED to disk in a second call
+        # further below, once verification has actually passed.
         val_schedule = build_gen3_mask_schedule(
             dataset_manifest, val_samples, strata, role="validation",
             split_counts={"validation": n_validation_masks}, split_seeds={"validation": 700_000},
-            mask_bank_dir=str(checkpoint_dir),
         )
 
     novae_enabled = bool((data_cfg.get("novae") or {}).get("enabled", False))
@@ -1264,6 +1403,7 @@ def run_training(
     model, model_info = build_model_for_inference(
         config, gene_names=gene_names, device=device, checkpoint_dir=None,
         smoke=smoke, staged_smoke=staged_smoke, dataset_manifest=dataset_manifest,
+        cache_content_by_sample=preflight_report.get("cache_content_by_sample"),
     )
     gene_basis = model_info["gene_basis"]
     gigapath_checkpoint_sha256 = model_info["gigapath_checkpoint_sha256"]
@@ -1315,18 +1455,43 @@ def run_training(
         architecture3_conditioner_info=architecture3_conditioner_info,
     )
     existing_run_manifest_path = checkpoint_dir / "run_manifest.json"
+    # Codex re-audit of commit f7bb8a1, launch blocker #6: "Enforce
+    # run-manifest/checkpoint-pointer consistency in both directions."
+    # Real history bundles with no root-level run_manifest.json at all
+    # can only mean it was deleted/lost after a real run, or this
+    # checkpoint_dir predates the code version that started writing one
+    # -- either way, this trainer cannot honestly verify what that prior
+    # run's identity was, so refusing here is safer than silently
+    # treating it as "nothing to resume from." (The converse -- a
+    # run_manifest.json with no checkpoint pointer yet -- is a normal,
+    # safe state for a run that crashed before its FIRST checkpoint ever
+    # saved; `checkpoint_module.load_training_state`'s own hardening
+    # already guarantees a pointer exists whenever `step > 0` is ever
+    # reported, so there is no silent-mismatch case left to reject there.)
+    if checkpoint_module.list_checkpoint_bundles(checkpoint_dir) and not existing_run_manifest_path.is_file():
+        raise ValueError(
+            f"{checkpoint_dir} has real checkpoint history bundles but no run_manifest.json -- cannot "
+            "verify this checkpoint's identity before resuming. Either it was deleted after a real run, "
+            "or this checkpoint_dir predates run_manifest.json being written; refusing to silently treat "
+            "unverifiable history as safe to build on"
+        )
     code_drift_acknowledged = False
     if existing_run_manifest_path.is_file():
         old_run_manifest = json.loads(existing_run_manifest_path.read_text())
         verify_resume_consistency(old_run_manifest, run_manifest, allow_code_drift=allow_code_drift)
-        # Launch blocker #10: record whether the override was actually
-        # NEEDED (not merely passed) -- a caller passing
-        # allow_code_drift=True against a checkpoint whose code state
-        # did NOT drift leaves this False, so the manifest only ever
-        # claims an override happened when one genuinely did.
+        # Launch blocker #10 (refined by the re-audit of commit f7bb8a1's
+        # launch blocker #8, matching `verify_resume_consistency`'s own
+        # fail-closed-on-unknown definition of drift): record whether the
+        # override was actually NEEDED (not merely passed) -- a caller
+        # passing allow_code_drift=True against a checkpoint whose code
+        # state did NOT drift (and whose identity was fully known on both
+        # sides) leaves this False, so the manifest only ever claims an
+        # override happened when one genuinely did.
         old_commit = old_run_manifest.get("code_commit_hash")
-        code_drift_acknowledged = allow_code_drift and old_commit is not None and (
-            old_commit != run_manifest.get("code_commit_hash")
+        new_commit = run_manifest.get("code_commit_hash")
+        code_identity_unknown = old_commit is None or new_commit is None
+        code_drift_acknowledged = allow_code_drift and (
+            code_identity_unknown or old_commit != new_commit
             or old_run_manifest.get("code_worktree_diff_hash") != run_manifest.get("code_worktree_diff_hash")
         )
     run_manifest["code_drift_acknowledged"] = code_drift_acknowledged
@@ -1335,6 +1500,21 @@ def run_training(
     # being no prior run to verify against), is it safe to overwrite this
     # checkpoint_dir's gene_scale.npy -- audit #4.
     gene_scale_path = save_gene_scale(gene_scale, checkpoint_dir / "gene_scale.npy")
+    # Launch blocker #6: preflight report and validation mask banks are
+    # ALSO deferred here, for the identical reason -- see the comment at
+    # this function's earlier (in-memory-only) preflight/mask-schedule
+    # construction. Persisting the validation mask bank a SECOND time
+    # (identical content, since `build_gen3_mask_schedule` is a pure
+    # function of its non-mask_bank_dir arguments) is the cheap, correct
+    # way to keep the disk write itself deferred without recomputing
+    # `val_schedule`/`run_manifest`'s own reports differently.
+    save_gen3_preflight_report(preflight_report, checkpoint_dir / "preflight_report.json")
+    if val_samples:
+        build_gen3_mask_schedule(
+            dataset_manifest, val_samples, strata, role="validation",
+            split_counts={"validation": n_validation_masks}, split_seeds={"validation": 700_000},
+            mask_bank_dir=str(checkpoint_dir),
+        )
 
     resume_step = 0
     optimizer_cfg = training_cfg.get("optimizer") or {}
@@ -1404,27 +1584,36 @@ def run_training(
             val_conditioner_only_totals: list[float] = []
             val_flow_losses: list[float] = []
             for item_index, (val_inputs, val_targets) in enumerate(val_loader):
-                # Codex re-audit of commit 90f853e, launch blocker #6:
-                # "Use common random numbers for Architecture 4
+                # Codex re-audit of commit 90f853e, launch blocker #6,
+                # refined by the re-audit of commit f7bb8a1's secondary
+                # fix #1: "Use common random numbers for Architecture 4
                 # validation: seed by fixed evaluation seed plus stable
-                # mask identity, independent of training step and
-                # evaluation order." The PRIOR generator was reseeded
-                # from (seed, current_step) -- every checkpoint therefore
-                # sampled Architecture 4's flow apparatus with DIFFERENT
-                # noise on the SAME held-out item, so best-checkpoint
-                # selection could partly reflect Monte Carlo luck in the
-                # noise draw rather than a genuine difference between
-                # checkpoints. Reseeding per FIXED `item_index` instead
-                # (`val_loader` is `shuffle=False`, so this index names
-                # the SAME held-out item at every call, regardless of
-                # `current_step`) gives every checkpoint the IDENTICAL
-                # noise draw on the IDENTICAL item -- a real common-
-                # random-numbers comparison across checkpoints. Still
-                # exactly reproducible across a resume, since it depends
-                # only on the run's own fixed `seed` and the item's fixed
-                # position in the deterministic validation dataset.
+                # mask identity [sample_id + stratum + query_fingerprint],
+                # independent of training step and evaluation order [and
+                # dataset/mask-bank record index]." The PRIOR generator
+                # was reseeded from (seed, current_step) -- every
+                # checkpoint therefore sampled Architecture 4's flow
+                # apparatus with DIFFERENT noise on the SAME held-out
+                # item, so best-checkpoint selection could partly reflect
+                # Monte Carlo luck in the noise draw rather than a
+                # genuine difference between checkpoints. A LATER fix
+                # reseeded per `item_index` instead, confirmed still
+                # real by this re-audit: `item_index` is only stable as
+                # long as the on-disk mask bank's record ORDER never
+                # changes -- a self-heal/regeneration that reorders the
+                # identical logical set of realized masks would silently
+                # reassign noise draws across items. Reseeding from the
+                # item's own CONTENT identity (`sample_id`/`stratum`/
+                # `query_fingerprint`, stable regardless of storage
+                # order) closes that gap while keeping every other
+                # property (identical noise on the identical item across
+                # checkpoints/resumes, common-random-numbers comparison).
+                item_identity = val_dataset.item_identity(item_index)
+                stable_key = (
+                    f"{item_identity['sample_id']}:{item_identity['stratum']}:{item_identity['query_fingerprint']}"
+                )
                 predictive_val_generator = torch.Generator(device=device).manual_seed(
-                    common_random_validation_seed(seed, item_index)
+                    common_random_validation_seed(seed, stable_key)
                 )
                 val_target_expression = torch.as_tensor(val_targets.query_expression, dtype=torch.float32, device=device)
                 val_query_coords = torch.as_tensor(val_inputs.query_coords, dtype=torch.float32, device=device)
@@ -1582,7 +1771,7 @@ def run_training(
                     best_val_loss = entry["total"]
                     if not smoke:
                         save_best_checkpoint_bundle(
-                            model, gene_names, checkpoint_dir / "best",
+                            model, config, gene_names, checkpoint_dir / "best",
                             step=completed_steps, val_loss=entry["total"], run_manifest=run_manifest,
                         )
 
@@ -1601,7 +1790,7 @@ def run_training(
             checkpoint_module.save_checkpoint(
                 model, config, gene_names, checkpoint_dir, completed_steps,
                 extra_metadata={"n_skipped_nonfinite": n_skipped_nonfinite, "completion_reason": "in_progress"},
-                keep_last=checkpoint_keep_last, optimizer=optimizer, rng=sample_rng,
+                keep_last=checkpoint_keep_last, optimizer=optimizer, rng=sample_rng, run_manifest=run_manifest,
             )
         step = completed_steps
 
@@ -1609,7 +1798,7 @@ def run_training(
         checkpoint_module.save_checkpoint(
             model, config, gene_names, checkpoint_dir, step,
             extra_metadata={"n_skipped_nonfinite": n_skipped_nonfinite, "completion_reason": completion_reason},
-            keep_last=checkpoint_keep_last, optimizer=optimizer, rng=sample_rng,
+            keep_last=checkpoint_keep_last, optimizer=optimizer, rng=sample_rng, run_manifest=run_manifest,
         )
 
     elapsed = time.time() - start_time

@@ -76,10 +76,75 @@ def test_fit_and_save_architecture4_basis_produces_a_real_basis_with_provenance(
     assert loaded_provenance["n_residual_rows"] > 0
     assert loaded_provenance["train_sample_ids"] == sorted(manifest["train_sample_ids"])
     assert loaded_provenance["architecture3_checkpoint_trainable_weights_sha256"] is not None
+    # Codex re-audit of commit f7bb8a1, launch blocker #5: "Bind the basis
+    # sidecar to canonical bundle identity/step, config identity, ...
+    # cache content and the complete realized training-mask schedule."
+    assert loaded_provenance["architecture3_checkpoint_step"] is not None
+    assert loaded_provenance["architecture3_config_identity_fingerprint"]
+    assert loaded_provenance["training_mask_schedule_fingerprint"]
+    assert loaded_provenance["cache_content_by_sample"]
+    assert set(loaded_provenance["cache_content_by_sample"]) == set(manifest["train_sample_ids"])
 
     from gen3_multiscale.models.gene_basis import load_gene_residual_basis
     basis = load_gene_residual_basis(output_basis_path)
     assert basis.n_genes == len(manifest["gene_panel"])
+
+
+# ---------------------------------------------------------------------------
+# Codex re-audit of commit f7bb8a1, launch blocker #5: "Before residual
+# fitting, verify Architecture 3 through the same complete best/latest
+# identity pipeline used by evaluation."
+# ---------------------------------------------------------------------------
+
+def test_fit_and_save_architecture4_basis_refuses_a_checkpoint_trained_under_a_different_config(tmp_path, monkeypatch):
+    """`verify_full_checkpoint_identity` must run BEFORE any residual
+    computation -- a checkpoint whose weights hash is internally
+    self-consistent but was trained under a DIFFERENT config (here: a
+    different masking stratum set than the one this basis-fitting call
+    is using) must be refused, not silently accepted."""
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    arch3_config_path, arch3_checkpoint_dir = _train_a_real_architecture3_checkpoint(tmp_path, cfg, manifest, manifest_path)
+
+    config = yaml.safe_load(arch3_config_path.read_text())
+    config["masking"]["strata"] = [
+        {**stratum, "hole_fraction": min(0.95, float(stratum.get("hole_fraction", 0.3)) + 0.1)}
+        for stratum in config["masking"]["strata"]
+    ]
+    mismatched_config_path = tmp_path / "architecture3_config_mismatched.yaml"
+    mismatched_config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+
+    output_basis_path = tmp_path / "gene_residual_basis_mismatched.pt"
+    with pytest.raises(ValueError, match="config_identity_fingerprint"):
+        fit_and_save_architecture4_basis(
+            str(mismatched_config_path), str(arch3_checkpoint_dir), str(output_basis_path),
+            n_masks_per_sample=2, rank=4,
+        )
+    # The fail-closed check runs BEFORE the (expensive) residual pass --
+    # no basis or memmap should have been produced at all.
+    assert not output_basis_path.is_file()
+    assert list(tmp_path.glob("*.residuals.tmp.*")) == []
+
+
+def test_fit_and_save_architecture4_basis_refuses_a_checkpoint_trained_under_a_different_dataset(tmp_path, monkeypatch):
+    """Overwrites the SAME manifest path (config, and therefore
+    `config_identity_fingerprint`, is left untouched) with mutated
+    content, isolating the `dataset_manifest_fingerprint` check from the
+    `config_identity_fingerprint` one exercised above."""
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    arch3_config_path, arch3_checkpoint_dir = _train_a_real_architecture3_checkpoint(tmp_path, cfg, manifest, manifest_path)
+
+    from gen3_multiscale.data.dataset_manifest import load_dataset_manifest, save_dataset_manifest
+
+    mutated_manifest = dict(load_dataset_manifest(manifest_path))
+    mutated_manifest["gene_panel"] = list(mutated_manifest["gene_panel"])[::-1]
+    save_dataset_manifest(mutated_manifest, manifest_path)
+
+    output_basis_path = tmp_path / "gene_residual_basis_mutated_manifest.pt"
+    with pytest.raises(ValueError, match="dataset_manifest_fingerprint"):
+        fit_and_save_architecture4_basis(
+            str(arch3_config_path), str(arch3_checkpoint_dir), str(output_basis_path),
+            n_masks_per_sample=2, rank=4,
+        )
 
 
 def test_fit_and_save_architecture4_basis_leaves_no_residual_memmap_file_behind(tmp_path, monkeypatch):

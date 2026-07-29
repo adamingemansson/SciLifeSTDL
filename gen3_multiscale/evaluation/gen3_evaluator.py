@@ -47,8 +47,8 @@ from gen3_multiscale.models.harmonic import harmonic_interpolation
 from gen3_multiscale.training.gen3_dataset import Gen3SpatialFieldDataset, build_gen3_mask_schedule
 from gen3_multiscale.training.gen3_preflight import load_and_preflight_samples
 from gen3_multiscale.training.train import (
-    build_model_for_inference, expected_tile_encoder_provenance, predict_for_metrics, resolved_config,
-    verify_checkpoint_bundle_identity, verify_checkpoint_run_manifest_against_evaluation,
+    build_model_for_inference, common_random_validation_seed, expected_tile_encoder_provenance, predict_for_metrics,
+    resolved_config, verify_full_checkpoint_identity,
 )
 
 
@@ -155,13 +155,26 @@ def architecture4_calibration_summary(standardized_residuals: list[float]) -> di
     (|z| <= 1.0 / 1.645 / 1.96) should then match those nominal
     fractions. Systematically low coverage means the model is
     OVERCONFIDENT (intervals too narrow); systematically high coverage
-    means it is UNDERCONFIDENT (intervals too wide)."""
+    means it is UNDERCONFIDENT (intervals too wide).
+
+    Codex re-audit of commit f7bb8a1, secondary fix #4: "Treat Gaussian
+    coverage from 8 flow samples as approximate." `predictive_std` is
+    itself estimated from only `n_flow_samples` (8 by default) draws, so
+    ASSUMING those standardized residuals are exactly standard-normal
+    (rather than checking the actual sample distribution) is itself an
+    approximation on top of an approximation. `"method"` is recorded
+    explicitly as `"gaussian_std_approximation"` so a caller cannot
+    mistake this for a calibrated empirical measurement --
+    `architecture4_empirical_calibration_summary` below is the
+    higher-fidelity alternative, computed directly from the flow's own
+    empirical quantiles rather than a Gaussian assumption."""
     z = np.asarray(standardized_residuals, dtype=np.float64)
     z = z[np.isfinite(z)]
     if z.size == 0:
         return {"n_values": 0}
     abs_z = np.abs(z)
     return {
+        "method": "gaussian_std_approximation",
         "n_values": int(z.size),
         "z_mean": float(z.mean()),
         "z_std": float(z.std()),
@@ -171,9 +184,46 @@ def architecture4_calibration_summary(standardized_residuals: list[float]) -> di
     }
 
 
+_EMPIRICAL_COVERAGE_LEVELS = {"coverage_68": 0.68, "coverage_90": 0.90, "coverage_95": 0.95}
+
+
+class _EmpiricalCoverageAccumulator:
+    """Codex re-audit of commit f7bb8a1, secondary fix #4: "preferably
+    use empirical quantiles with a larger configurable sample count."
+    Accumulates running in-interval counts across items rather than
+    storing per-element booleans/values, so memory stays bounded
+    regardless of how many items or genes are evaluated -- the same
+    bounded-memory discipline as `compute_training_residuals`'s memmap
+    (Codex re-audit of commit 90f853e, launch blocker #11)."""
+
+    def __init__(self) -> None:
+        self.n_values = 0
+        self.in_interval = {name: 0 for name in _EMPIRICAL_COVERAGE_LEVELS}
+
+    def add_item(self, predictive_samples: np.ndarray, true_expression: np.ndarray) -> None:
+        true64 = np.asarray(true_expression, dtype=np.float64)
+        self.n_values += true64.size
+        for name, level in _EMPIRICAL_COVERAGE_LEVELS.items():
+            lower_q = (1.0 - level) / 2.0 * 100.0
+            upper_q = 100.0 - lower_q
+            lo = np.percentile(predictive_samples, lower_q, axis=0)
+            hi = np.percentile(predictive_samples, upper_q, axis=0)
+            self.in_interval[name] += int(np.sum((true64 >= lo) & (true64 <= hi)))
+
+    def summary(self, n_samples_per_item: int) -> dict:
+        if self.n_values == 0:
+            return {"n_values": 0}
+        return {
+            "method": "empirical_quantiles",
+            "n_samples_per_item": int(n_samples_per_item),
+            "n_values": int(self.n_values),
+            **{name: count / self.n_values for name, count in self.in_interval.items()},
+        }
+
+
 def _load_model_for_evaluation(
     config: dict, checkpoint_dir: str | Path, gene_names: list[str], device: torch.device,
-    dataset_manifest: dict | None = None,
+    dataset_manifest: dict | None = None, cache_content_by_sample: dict[str, dict] | None = None,
 ):
     """Construct the real architecture and load a real, already-trained
     checkpoint's trainable weights onto it -- never a random/untrained
@@ -188,7 +238,7 @@ def _load_model_for_evaluation(
     Architecture 3 checkpoint the way training did."""
     model, _info = build_model_for_inference(
         config, gene_names=gene_names, device=device, checkpoint_dir=checkpoint_dir, smoke=False,
-        dataset_manifest=dataset_manifest,
+        dataset_manifest=dataset_manifest, cache_content_by_sample=cache_content_by_sample,
     )
     model.eval()
     return model
@@ -197,7 +247,8 @@ def _load_model_for_evaluation(
 def evaluate_gen3_checkpoint(
     config_path: str, checkpoint_dir: str | Path, *, split: str = "validation",
     n_masks_per_sample: int = 8, use_best: bool = True, compute_st_fid_mmd: bool = False,
-    allow_test: bool = False, device_str: str = "cpu",
+    allow_test: bool = False, device_str: str = "cpu", evaluation_seed: int = 0,
+    calibration_n_samples: int | None = None,
 ) -> dict:
     """The real Step 7 evaluation entrypoint. Runs a REAL, already-trained
     checkpoint over the FIXED, deterministic held-out mask schedule for
@@ -222,7 +273,23 @@ def evaluate_gen3_checkpoint(
     `per_arm_patient_aggregated_metrics["model"]` when available); and a
     fail-closed check of the checkpoint's own bundle identity against
     THIS evaluation's dataset/gene-panel before any weights are loaded
-    (audit #4's altered-cache/swapped-checkpoint adversarial scenario)."""
+    (audit #4's altered-cache/swapped-checkpoint adversarial scenario).
+
+    Codex re-audit of commit f7bb8a1, launch blocker #7: `evaluation_seed`
+    (default 0) combines with each item's own content-derived
+    `stable_key` (`common_random_validation_seed`) to seed Architecture
+    4's stochastic sampling -- never the loop's raw `idx`, which is only
+    stable as long as the mask bank's on-disk record order never changes
+    (see `common_random_validation_seed`'s own docstring). Two calls with
+    the same `(evaluation_seed, checkpoint)` are exactly reproducible
+    regardless of mask-bank regeneration order.
+
+    Secondary fix #4: `calibration_n_samples`, when given, overrides
+    Architecture 4's configured `n_flow_samples` for every item's flow
+    draw and additionally reports `architecture4_empirical_calibration`
+    -- empirical-quantile interval coverage computed directly from those
+    draws, a higher-fidelity alternative to `architecture4_calibration`'s
+    Gaussian-std approximation (see both functions' docstrings)."""
     if split == "test" and not allow_test:
         raise ValueError(
             "evaluate_gen3_checkpoint refuses split='test' unless allow_test=True is passed "
@@ -263,34 +330,35 @@ def evaluate_gen3_checkpoint(
     gene_names = list(dataset_manifest["gene_panel"])
     device = torch.device(device_str)
     checkpoint_dir = Path(checkpoint_dir)
-    # Codex re-audit of commit 90f853e, launch blocker #4: "use_best=True
+    # Codex re-audit of commit 90f853e, launch blocker #4 (and re-audit of
+    # commit f7bb8a1, launch blockers #2/#3/#4/#6): "use_best=True
     # silently falls back to latest if best/ is missing... Latest-
     # checkpoint evaluation does not compare the checkpoint's run
-    # manifest with the evaluation dataset." Both are now fail-closed:
-    # use_best=True with no real best/ bundle RAISES rather than quietly
-    # evaluating a different (unselected, unverified-for-this-purpose)
-    # checkpoint state; evaluating the latest checkpoint directly now
-    # requires and verifies its own run_manifest.json against this
-    # evaluation's config/dataset/gene-panel/architecture/synchronized-
-    # init/conditioner/basis identity before any weights are loaded.
-    if use_best:
-        weights_dir = checkpoint_dir / "best"
-        if not weights_dir.is_dir():
-            raise ValueError(
-                f"evaluate_gen3_checkpoint: use_best=True but no best/ bundle exists at {checkpoint_dir} "
-                "-- refusing to silently fall back to evaluating the latest checkpoint instead. Pass "
-                "use_best=False explicitly if evaluating the latest (not best-selected) checkpoint is "
-                "genuinely intended."
-            )
-        verify_checkpoint_bundle_identity(
-            weights_dir, dataset_manifest=dataset_manifest, gene_names=gene_names, architecture_id=architecture_id,
+    # manifest with the evaluation dataset... bind evaluation to cache
+    # content used by training." Both use_best=True and use_best=False
+    # now go through the SAME complete verifier
+    # (`verify_full_checkpoint_identity`) -- best/ is no longer a
+    # separately-verified, partially-checked bespoke bundle: it is a
+    # real transactional checkpoint.py bundle, verified identically to
+    # the live checkpoint_dir's own latest state, including per-sample
+    # cache content identity against what THIS evaluation actually
+    # loaded.
+    weights_dir = checkpoint_dir / "best" if use_best else checkpoint_dir
+    if use_best and not weights_dir.is_dir():
+        raise ValueError(
+            f"evaluate_gen3_checkpoint: use_best=True but no best/ bundle exists at {checkpoint_dir} "
+            "-- refusing to silently fall back to evaluating the latest checkpoint instead. Pass "
+            "use_best=False explicitly if evaluating the latest (not best-selected) checkpoint is "
+            "genuinely intended."
         )
-    else:
-        weights_dir = checkpoint_dir
-        verify_checkpoint_run_manifest_against_evaluation(
-            weights_dir, config=config, dataset_manifest=dataset_manifest, gene_names=gene_names,
-        )
-    model = _load_model_for_evaluation(config, weights_dir, gene_names, device, dataset_manifest=dataset_manifest)
+    verify_full_checkpoint_identity(
+        weights_dir, config=config, dataset_manifest=dataset_manifest, gene_names=gene_names,
+        cache_content_by_sample=preflight_report.get("cache_content_by_sample"),
+    )
+    model = _load_model_for_evaluation(
+        config, weights_dir, gene_names, device, dataset_manifest=dataset_manifest,
+        cache_content_by_sample=preflight_report.get("cache_content_by_sample"),
+    )
 
     gene_panels = load_configured_gene_panels(config)
     _panel_indices, panel_metadata = resolve_gene_panels(gene_names, gene_panels) if gene_panels else ({}, {})
@@ -298,29 +366,48 @@ def evaluate_gen3_checkpoint(
     per_item_by_arm: dict[str, list[dict]] = {"model": []}
     for name in _BASELINE_PREDICTORS:
         per_item_by_arm[name] = []
-    per_panel_items: dict[str, list[dict]] = {panel: [] for panel in gene_panels}
+    arm_names = ["model", *_BASELINE_PREDICTORS]
+    # Secondary fix #3: named-panel metrics for EVERY arm (model AND every
+    # baseline), not just the model -- otherwise a caller can never tell
+    # whether the model actually beats a trivial baseline ON a clinically
+    # relevant panel specifically, only on the full gene set.
+    per_panel_items_by_arm: dict[str, dict[str, list[dict]]] = {
+        arm: {panel: [] for panel in gene_panels} for arm in arm_names
+    }
     per_stratum_model_items: dict[str, list[dict]] = {}
     per_stratum_patient_ids: dict[str, list[str]] = {}
     patient_ids: list[str] = []
     per_item_records: list[dict] = []
     predictive_stds: list[float] = []
     architecture4_standardized_residuals: list[float] = []
+    empirical_coverage = _EmpiricalCoverageAccumulator()
     real_expression_for_embedding: list[np.ndarray] = []
     model_expression_for_embedding: list[np.ndarray] = []
 
-    # Audit #1: Architecture 4's reported prediction comes from
-    # `sample_predictive_distribution`'s predictive mean, reseeded per
-    # item from (a fixed evaluation seed, idx) so repeated evaluation
-    # runs against the same checkpoint are exactly reproducible.
+    # Audit #1 of commit a32051b, refined by the re-audit of commit
+    # f7bb8a1's launch blocker #7: Architecture 4's reported prediction
+    # comes from `sample_predictive_distribution`'s predictive mean,
+    # reseeded per item from a STABLE content-derived identity
+    # (`evaluation_seed` + sample_id + stratum + query_fingerprint via
+    # `common_random_validation_seed`), never the loop's raw `idx` --
+    # see `common_random_validation_seed`'s own docstring for why `idx`
+    # is not stable across a mask-bank regeneration.
     with torch.no_grad():
         for idx in range(len(dataset)):
             inputs, targets = dataset[idx]
             true_expression = np.asarray(targets.query_expression, dtype=np.float32)
             patient_ids.append(str(inputs.patient_id))
             item_identity = dataset.item_identity(idx)
+            stable_key = (
+                f"{item_identity['sample_id']}:{item_identity['stratum']}:{item_identity['query_fingerprint']}"
+            )
 
-            item_generator = torch.Generator(device=device).manual_seed((idx * 104_729 + 1) % (2**63))
-            prediction = predict_for_metrics(architecture_id, model, inputs, generator=item_generator)
+            item_generator = torch.Generator(device=device).manual_seed(
+                common_random_validation_seed(evaluation_seed, stable_key)
+            )
+            prediction = predict_for_metrics(
+                architecture_id, model, inputs, generator=item_generator, n_samples=calibration_n_samples,
+            )
             model_pred = np.asarray(prediction["expression"].detach().cpu().numpy(), dtype=np.float32)
             model_item_metrics = per_item_reconstruction_metrics(model_pred, true_expression)
             if "predictive_std" in prediction:
@@ -334,6 +421,15 @@ def evaluate_gen3_checkpoint(
                 safe_std = np.where(predictive_std_arr > 1e-8, predictive_std_arr, np.nan)
                 z = (true_expression.astype(np.float64) - model_pred.astype(np.float64)) / safe_std
                 architecture4_standardized_residuals.extend(z.flatten().tolist())
+                # Secondary fix #4: empirical-quantile coverage computed
+                # directly from this item's raw flow draws, only when the
+                # caller actually asked for a (larger) calibration sample
+                # count -- never silently swaps in the training-time
+                # n_flow_samples=8 draws for this purpose, since that
+                # count was never chosen for calibration reliability.
+                if calibration_n_samples is not None and "predictive_samples" in prediction:
+                    samples_arr = prediction["predictive_samples"].detach().cpu().numpy().astype(np.float64)
+                    empirical_coverage.add_item(samples_arr, true_expression)
             per_item_by_arm["model"].append(model_item_metrics)
 
             stratum = item_identity["stratum"]
@@ -346,17 +442,30 @@ def evaluate_gen3_checkpoint(
                 per_stratum_model_items.setdefault(str(stratum), []).append(model_item_metrics)
                 per_stratum_patient_ids.setdefault(str(stratum), []).append(str(inputs.patient_id))
 
+            if gene_panels:
+                model_panel_item_metrics = gene_panel_metrics(model_pred, true_expression, gene_names, gene_panels)
+                record["gene_panels"] = model_panel_item_metrics
+                for panel_name, panel_metrics in model_panel_item_metrics.items():
+                    per_panel_items_by_arm["model"][panel_name].append(panel_metrics)
+
             for name, predictor in _BASELINE_PREDICTORS.items():
                 baseline_pred = predictor(inputs)
+                # `baseline_item_metrics` is appended AS-IS into
+                # `per_item_by_arm[name]`, which `aggregate_patient_metrics`
+                # later iterates key-by-key expecting every value to be a
+                # plain float -- panel metrics must be attached to a
+                # SEPARATE dict (`record`), never mutated into this one,
+                # or aggregation would try to float()-cast a nested dict.
                 baseline_item_metrics = per_item_reconstruction_metrics(baseline_pred, true_expression)
                 per_item_by_arm[name].append(baseline_item_metrics)
                 record[name] = baseline_item_metrics
-
-            if gene_panels:
-                panel_item_metrics = gene_panel_metrics(model_pred, true_expression, gene_names, gene_panels)
-                record["gene_panels"] = panel_item_metrics
-                for panel_name, panel_metrics in panel_item_metrics.items():
-                    per_panel_items[panel_name].append(panel_metrics)
+                if gene_panels:
+                    baseline_panel_item_metrics = gene_panel_metrics(
+                        baseline_pred, true_expression, gene_names, gene_panels,
+                    )
+                    record.setdefault("baseline_gene_panels", {})[name] = baseline_panel_item_metrics
+                    for panel_name, panel_metrics in baseline_panel_item_metrics.items():
+                        per_panel_items_by_arm[name][panel_name].append(panel_metrics)
 
             per_item_records.append(record)
 
@@ -380,17 +489,24 @@ def evaluate_gen3_checkpoint(
         for stratum, items in per_stratum_model_items.items()
     }
 
-    # Launch blocker #9: "configured named panels" -- real per-panel
-    # patient-safe aggregation, not just per-item numbers buried in
-    # per_item_records.
+    # Launch blocker #9 + secondary fix #3: "configured named panels" for
+    # EVERY arm, keyed `[panel][arm]` -- real per-panel patient-safe
+    # aggregation for the model AND every baseline, not just per-item
+    # numbers buried in per_item_records.
     per_panel_patient_aggregated_metrics = {
-        panel: aggregate_patient_metrics(items, patient_ids) for panel, items in per_panel_items.items()
+        panel: {
+            arm: aggregate_patient_metrics(per_panel_items_by_arm[arm][panel], patient_ids) for arm in arm_names
+        }
+        for panel in gene_panels
     }
 
     # Launch blocker #9: "Architecture 4 interval coverage/calibration" --
     # empty ({"n_values": 0}, not omitted) for Architectures 1-3, which
-    # report no predictive_std at all.
+    # report no predictive_std at all. Gaussian approximation only.
     architecture4_calibration = architecture4_calibration_summary(architecture4_standardized_residuals)
+    # Secondary fix #4: higher-fidelity empirical-quantile alternative,
+    # only populated when calibration_n_samples was actually requested.
+    architecture4_empirical_calibration = empirical_coverage.summary(calibration_n_samples or 0)
 
     # Audit #7: PAIRED model-vs-baseline deltas -- computed ITEM BY ITEM
     # (same mask, same sample) rather than by differencing two
@@ -398,19 +514,33 @@ def evaluate_gen3_checkpoint(
     # `aggregate_patient_metrics` patient-level-CI machinery used for the
     # raw metrics. Positive pcc_delta / positive rmse_delta both mean
     # "the model beat this baseline" on that item.
-    paired_deltas = {}
-    for name in _BASELINE_PREDICTORS:
+    def _paired_deltas(model_items: list[dict], baseline_items: list[dict]) -> dict:
         deltas = [
             {
                 "pcc_delta": model_item["pcc"] - baseline_item["pcc"],
                 "rmse_delta": baseline_item["rmse"] - model_item["rmse"],
             }
-            for model_item, baseline_item in zip(per_item_by_arm["model"], per_item_by_arm[name])
+            for model_item, baseline_item in zip(model_items, baseline_items)
         ]
-        paired_deltas[name] = aggregate_patient_metrics(deltas, patient_ids)
+        return aggregate_patient_metrics(deltas, patient_ids)
+
+    paired_deltas = {
+        name: _paired_deltas(per_item_by_arm["model"], per_item_by_arm[name]) for name in _BASELINE_PREDICTORS
+    }
+    # Secondary fix #3: "paired deltas for every baseline too" -- restricted
+    # to a named panel, using the SAME patient_ids ordering (one entry per
+    # item, regardless of panel), since every item contributes to every
+    # configured panel.
+    per_panel_paired_delta_vs_model = {
+        panel: {
+            name: _paired_deltas(per_panel_items_by_arm["model"][panel], per_panel_items_by_arm[name][panel])
+            for name in _BASELINE_PREDICTORS
+        }
+        for panel in gene_panels
+    }
 
     report = {
-        "version": 3,
+        "version": 4,
         "kind": "gen3_step7_evaluation_report",
         "config_path": str(config_path),
         "checkpoint_dir": str(checkpoint_dir),
@@ -418,6 +548,7 @@ def evaluate_gen3_checkpoint(
         "split": split,
         "n_samples": len(split_ids),
         "n_items": len(dataset),
+        "evaluation_seed": int(evaluation_seed),
         "cache_preflight_report": preflight_report,
         "per_arm_patient_aggregated_metrics": aggregated,
         "per_arm_paired_delta_vs_model": paired_deltas,
@@ -426,7 +557,9 @@ def evaluate_gen3_checkpoint(
         "per_stratum_patient_aggregated_metrics": per_stratum_aggregated_metrics,
         "gene_panel_metadata": panel_metadata,
         "per_panel_patient_aggregated_metrics": per_panel_patient_aggregated_metrics,
+        "per_panel_paired_delta_vs_model": per_panel_paired_delta_vs_model,
         "architecture4_calibration": architecture4_calibration,
+        "architecture4_empirical_calibration": architecture4_empirical_calibration,
     }
 
     if compute_st_fid_mmd and len(real_expression_for_embedding) >= 2:
