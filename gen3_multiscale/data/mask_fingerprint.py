@@ -87,7 +87,7 @@ from gen3_multiscale.data.mask_schedule import (
     _MASK_GENERATION_VERSION, _STRATUM_SEED_STRIDE, strata_fingerprint, stratum_to_masking_cfg,
 )
 
-_REPORT_VERSION = 3
+_REPORT_VERSION = 4
 _SCHEDULE_VERSION = 2
 
 
@@ -560,7 +560,8 @@ def validate_collision_free_training_schedule(
 
 def build_training_sample_mask_report(
     manifest: dict, sample_id: str, coords3d: np.ndarray, slice_ids: np.ndarray, obs_names: Iterable[str],
-    strata: list[dict], training_schedule: dict, *, same_sample_diagnostic_mask_bank: dict | None = None,
+    strata: list[dict], training_schedule: dict, reserved_query_composite_ids: set[str], *,
+    same_sample_diagnostic_mask_bank: dict | None = None,
 ) -> dict:
     """The primary mask-fingerprint report for a TRAINING sample
     (`dataset_manifest.py`'s `train_sample_ids`). 12th Codex re-audit of
@@ -575,9 +576,24 @@ def build_training_sample_mask_report(
     all three split types as normally coexisting on one sample.
 
     `training_schedule`: `build_collision_free_training_schedule`'s
-    output for this sample -- re-verified for pool uniqueness here
-    (never merely trusted), since a caller could hand-construct or load
-    a stale one.
+    output for this sample.
+    `reserved_query_composite_ids`: the LIVE reserved (validation/test)
+    composite identity set for this sample -- required (14th Codex
+    re-audit of commit 8d4e276, finding #2, CONFIRMED: this function
+    used to re-realize masks only to prove POOL uniqueness among
+    themselves; it never had a reserved set to check against at all, so
+    it could not detect a training schedule that collides with the
+    CURRENT reserved set, only with itself). Passed straight through to
+    `validate_collision_free_training_schedule`, which is now called
+    BEFORE this function can return -- re-realizing every stored
+    `(stratum, seed)` item from scratch and confirming: its fresh query
+    composite fingerprint matches the one on record; the schedule's own
+    `reserved_composite_ids_fingerprint` matches
+    `reserved_query_composite_ids`'s live fingerprint (not merely a
+    stale count); and no two items collide. A caller can no longer get
+    `passed: true` out of this function while handing it a schedule that
+    is stale, tampered, or built against a reserved set that has since
+    changed.
     `same_sample_diagnostic_mask_bank` (optional): a
     `mask_schedule.build_stratified_mask_bank`'s validation/test
     records realized on THIS SAME sample -- reported under a clearly
@@ -603,14 +619,16 @@ def build_training_sample_mask_report(
         raise ValueError(
             f"training_schedule was built for sample {training_schedule['sample_id']!r}, not {sample_id!r}"
         )
-    masking_cfg_by_stratum = {s["name"]: stratum_to_masking_cfg(s) for s in strata}
-    train_items = [
-        {"label": f"{it['stratum']}:{it['seed']}", "masking_cfg": masking_cfg_by_stratum[it["stratum"]], "seed": it["seed"]}
-        for it in training_schedule["items"]
-    ]
-    pool_result = verify_realized_pool_uniqueness(
-        coords3d, slice_ids, obs_names, sample_id, train_items, manifest=manifest,
+
+    # Re-realizes every stored item, confirms it matches live data AND
+    # the LIVE reserved set (not just internal pool uniqueness), and
+    # confirms no duplicates -- raises (fail-closed) on any mismatch.
+    validate_collision_free_training_schedule(
+        training_schedule, coords3d, slice_ids, obs_names, sample_id, strata, reserved_query_composite_ids,
+        manifest=manifest,
     )
+
+    masking_cfg_by_stratum = {s["name"]: stratum_to_masking_cfg(s) for s in strata}
     train_query_ids: set[str] = set()
     for it in training_schedule["items"]:
         record = realize_seed_and_fingerprint(
@@ -629,9 +647,13 @@ def build_training_sample_mask_report(
         "realized_query_composite_fingerprints_fingerprint": _composite_id_set_fingerprint(
             training_schedule["realized_query_composite_fingerprints"]
         ),
+        "reserved_composite_ids_fingerprint": _composite_id_set_fingerprint(reserved_query_composite_ids),
+        "schedule_validated_against_live_data_and_reserved_set": True,
         "primary": {
             "n_items": len(training_schedule["items"]),
-            "n_unique_masks": pool_result["n_unique_realized_masks"],
+            # Guaranteed == n_items: validate_collision_free_training_schedule above
+            # already raised if any two items realized the same fingerprint.
+            "n_unique_masks": len(training_schedule["items"]),
         },
     }
 
@@ -669,7 +691,8 @@ def build_training_sample_mask_report(
 
 def build_held_out_sample_mask_report(
     manifest: dict, sample_id: str, coords3d: np.ndarray, slice_ids: np.ndarray, obs_names: Iterable[str],
-    strata: list[dict], split: str, stratified_mask_bank: dict,
+    strata: list[dict], split: str, stratified_mask_bank: dict, *,
+    expected_split_counts: dict[str, int], expected_split_seeds: dict[str, int],
 ) -> dict:
     """The primary mask-fingerprint report for a VALIDATION or TEST
     sample (`dataset_manifest.py`'s `validation_sample_ids`/
@@ -682,6 +705,19 @@ def build_held_out_sample_mask_report(
     training-labeled masks, and a validation sample must never carry
     test-labeled masks or vice versa (12th Codex re-audit finding #7/#8).
 
+    `expected_split_counts`/`expected_split_seeds`: the RESOLVED
+    EXPERIMENT CONFIGURATION's own `{"validation": n, "test": m}`-shaped
+    dicts (e.g. `evaluation.n_validation_masks`/`n_test_masks` and
+    `validation_seed`/`test_seed` from a real config, matching
+    `mask_schedule.build_stratified_mask_bank`'s own `split_counts`/
+    `split_seeds` parameters) -- REQUIRED, and never read off the
+    supplied `stratified_mask_bank` itself (14th Codex re-audit of
+    commit 8d4e276, finding #3, CONFIRMED: a prior version compared the
+    bank's `strata_fingerprint` against a fingerprint computed FROM the
+    bank's own recorded `split_counts`/`split_seeds` -- self-referential,
+    and could never catch a bank built with the WRONG counts/seeds for
+    this experiment in the first place).
+
     13th Codex re-audit of commit 65611c7 (CONFIRMED):
     - finding #4: now REQUIRES `manifest["samples"][sample_id]["split"]
       == split` -- a prior version accepted any sample_id/split pair the
@@ -690,16 +726,36 @@ def build_held_out_sample_mask_report(
       version let a held-out mask bank with zero records for this split
       silently "pass" with `n_records=0`).
     - finding #5: `stratified_mask_bank`'s own recorded
-      `dataset_fingerprint`/`spatial_fingerprint`/`strata_fingerprint`/
-      `mask_generation_version` are now validated against the LIVE
-      obs_names/coords3d/slice_ids/strata (mirroring
-      `mask_schedule.load_stratified_mask_bank`'s own staleness checks,
-      but for an in-memory bank a caller already has rather than one
-      re-read from disk) -- a prior version trusted the bank's records
-      without ever confirming the bank itself was built from the same
-      underlying data. Expected per-split, per-stratum record counts
-      (from the bank's own `split_counts`) are checked, and every
-      record's context/query sets are confirmed non-empty and disjoint."""
+      `dataset_fingerprint`/`spatial_fingerprint`/`mask_generation_version`
+      are validated against the LIVE obs_names/coords3d/slice_ids
+      (mirroring `mask_schedule.load_stratified_mask_bank`'s own
+      staleness checks, but for an in-memory bank a caller already has
+      rather than one re-read from disk) -- a prior version trusted the
+      bank's records without ever confirming the bank itself was built
+      from the same underlying data.
+
+    14th Codex re-audit of commit 8d4e276, finding #3 (CONFIRMED): the
+    prior per-stratum check only required AT LEAST ONE record per
+    stratum, and the total-count check alone could not detect a
+    misdistributed bank (e.g. 3 records in stratum A + 1 in stratum B
+    passing a "4 total, 2 expected per stratum" check). Fixed:
+    - every stratum must have EXACTLY `expected_split_counts[split]`
+      records for this split -- checked independently per stratum, not
+      only in aggregate.
+    - each stratum's record `index` values must be EXACTLY
+      `{0, ..., expected_split_counts[split] - 1}` -- no gaps, no
+      duplicates, no out-of-range indices.
+    - each record's `seed` must match the EXACT deterministic seed
+      `mask_schedule.build_stratified_mask_bank`/`mask_bank.build_mask_bank`
+      would have assigned it: `expected_split_seeds[split] +
+      stratum_index * _STRATUM_SEED_STRIDE + record_index`.
+    - every record is RE-REALIZED from live coordinates (via
+      `realize_seed_and_fingerprint` at its own expected seed) and its
+      fresh `context_obs_names`/`query_obs_names` are compared for EXACT
+      list equality against what's stored -- not merely re-deriving a
+      fingerprint from the STORED barcodes (which would trivially always
+      match itself), but proving the stored barcodes are what live data
+      actually produces."""
     if split not in ("validation", "test"):
         raise ValueError(f"split must be 'validation' or 'test', got {split!r}")
     if sample_id not in manifest["samples"]:
@@ -710,6 +766,12 @@ def build_held_out_sample_mask_report(
             f"{sample_id}: dataset manifest assigns split {manifest_split!r}, not the requested "
             f"{split!r} -- refusing to build a held-out report under the wrong sample role"
         )
+    if split not in expected_split_counts:
+        raise ValueError(f"expected_split_counts is missing an entry for split {split!r}")
+    if split not in expected_split_seeds:
+        raise ValueError(f"expected_split_seeds is missing an entry for split {split!r}")
+    if not strata:
+        raise ValueError("strata must be a non-empty list")
 
     obs_names_list = [str(b) for b in obs_names]
     expected_dataset_fp = mask_bank.dataset_fingerprint(np.asarray(obs_names_list))
@@ -724,13 +786,24 @@ def build_held_out_sample_mask_report(
             f"{sample_id}: stratified_mask_bank's spatial_fingerprint does not match the live "
             "coordinates/slice IDs -- this mask bank was built for different spatial data"
         )
-    expected_strata_fp = strata_fingerprint(
-        strata, stratified_mask_bank.get("split_counts"), stratified_mask_bank.get("split_seeds"),
-    )
+
+    bank_split_counts = stratified_mask_bank.get("split_counts")
+    if bank_split_counts != dict(expected_split_counts):
+        raise ValueError(
+            f"{sample_id}: stratified_mask_bank's split_counts {bank_split_counts!r} does not match "
+            f"the resolved experiment's expected_split_counts {dict(expected_split_counts)!r}"
+        )
+    bank_split_seeds = stratified_mask_bank.get("split_seeds")
+    if bank_split_seeds != dict(expected_split_seeds):
+        raise ValueError(
+            f"{sample_id}: stratified_mask_bank's split_seeds {bank_split_seeds!r} does not match "
+            f"the resolved experiment's expected_split_seeds {dict(expected_split_seeds)!r}"
+        )
+    expected_strata_fp = strata_fingerprint(strata, expected_split_counts, expected_split_seeds)
     if stratified_mask_bank.get("strata_fingerprint") != expected_strata_fp:
         raise ValueError(
             f"{sample_id}: stratified_mask_bank's strata_fingerprint does not match the live strata "
-            "(or this bank's own recorded split_counts/split_seeds)"
+            "under the resolved experiment's expected split_counts/split_seeds"
         )
     if stratified_mask_bank.get("mask_generation_version") != _MASK_GENERATION_VERSION:
         raise ValueError(
@@ -752,30 +825,69 @@ def build_held_out_sample_mask_report(
             f"{sample_id}: no {split!r} record(s) found in stratified_mask_bank -- an empty held-out "
             "mask bank must never silently pass as a valid evaluation report"
         )
-    split_counts = stratified_mask_bank.get("split_counts") or {}
-    expected_count = int(split_counts.get(split, 0)) * len(strata)
-    if expected_count and len(records) != expected_count:
-        raise ValueError(
-            f"{sample_id}: expected {expected_count} {split!r} record(s) "
-            f"({split_counts.get(split)} per stratum x {len(strata)} strata), found {len(records)}"
-        )
-    for stratum in strata:
+
+    expected_count_per_stratum = int(expected_split_counts[split])
+    if expected_count_per_stratum <= 0:
+        raise ValueError(f"expected_split_counts[{split!r}] must be positive, got {expected_count_per_stratum}")
+    base_seed = int(expected_split_seeds[split])
+    masking_cfg_by_stratum = {s["name"]: stratum_to_masking_cfg(s) for s in strata}
+
+    for stratum_index, stratum in enumerate(strata):
         stratum_name = stratum.get("name")
-        if not any(r.get("stratum") == stratum_name for r in records):
-            raise ValueError(f"{sample_id}: stratum {stratum_name!r} has zero {split!r} record(s)")
-    for record in records:
-        validate_realized_barcodes_against_manifest(manifest, sample_id, record["context_obs_names"])
-        validate_realized_barcodes_against_manifest(manifest, sample_id, record["query_obs_names"])
-        context_set = set(record["context_obs_names"])
-        query_set = set(record["query_obs_names"])
-        if not context_set:
-            raise ValueError(f"{sample_id}: {split} record index {record.get('index')} has an empty context set")
-        if not query_set:
-            raise ValueError(f"{sample_id}: {split} record index {record.get('index')} has an empty query set")
-        if context_set & query_set:
+        stratum_records = [r for r in records if r.get("stratum") == stratum_name]
+        if len(stratum_records) != expected_count_per_stratum:
             raise ValueError(
-                f"{sample_id}: {split} record index {record.get('index')} has overlapping context/query barcodes"
+                f"{sample_id}: stratum {stratum_name!r} has {len(stratum_records)} {split!r} "
+                f"record(s), expected EXACTLY {expected_count_per_stratum}"
             )
+        indices = sorted(int(r["index"]) for r in stratum_records)
+        expected_indices = list(range(expected_count_per_stratum))
+        if indices != expected_indices:
+            raise ValueError(
+                f"{sample_id}: stratum {stratum_name!r} {split!r} records have index set {indices}, "
+                f"expected exactly {expected_indices}"
+            )
+        stratum_base_seed = base_seed + stratum_index * _STRATUM_SEED_STRIDE
+        record_by_index = {int(r["index"]): r for r in stratum_records}
+        for i in range(expected_count_per_stratum):
+            record = record_by_index[i]
+            expected_seed = stratum_base_seed + i
+            if int(record["seed"]) != expected_seed:
+                raise ValueError(
+                    f"{sample_id}: stratum {stratum_name!r} {split!r} record index {i} has seed "
+                    f"{record['seed']}, expected {expected_seed} (base_seed={base_seed}, "
+                    f"stratum_index={stratum_index}, _STRATUM_SEED_STRIDE={_STRATUM_SEED_STRIDE})"
+                )
+            validate_realized_barcodes_against_manifest(manifest, sample_id, record["context_obs_names"])
+            validate_realized_barcodes_against_manifest(manifest, sample_id, record["query_obs_names"])
+            context_set = set(record["context_obs_names"])
+            query_set = set(record["query_obs_names"])
+            if not context_set:
+                raise ValueError(f"{sample_id}: {split} record index {i} (stratum {stratum_name!r}) has an empty context set")
+            if not query_set:
+                raise ValueError(f"{sample_id}: {split} record index {i} (stratum {stratum_name!r}) has an empty query set")
+            if context_set & query_set:
+                raise ValueError(
+                    f"{sample_id}: {split} record index {i} (stratum {stratum_name!r}) has overlapping "
+                    "context/query barcodes"
+                )
+            fresh = realize_seed_and_fingerprint(
+                coords3d, slice_ids, obs_names, sample_id, masking_cfg_by_stratum[stratum_name], expected_seed,
+                manifest=manifest,
+            )
+            if fresh["context_obs_names"] != list(record["context_obs_names"]):
+                raise ValueError(
+                    f"{sample_id}: stratum {stratum_name!r} {split!r} record index {i} (seed "
+                    f"{expected_seed}) re-realizes to a DIFFERENT context set than stored -- the stored "
+                    "record no longer matches what live coordinates/masking would produce"
+                )
+            if fresh["query_obs_names"] != list(record["query_obs_names"]):
+                raise ValueError(
+                    f"{sample_id}: stratum {stratum_name!r} {split!r} record index {i} (seed "
+                    f"{expected_seed}) re-realizes to a DIFFERENT query set than stored -- the stored "
+                    "record no longer matches what live coordinates/masking would produce"
+                )
+
     dedup_result = verify_no_duplicate_masks_within_split(sample_id, records)
 
     return {
@@ -785,6 +897,8 @@ def build_held_out_sample_mask_report(
         "role": split,
         "input_fingerprints": _input_fingerprints(manifest, coords3d, slice_ids, strata, obs_names_list),
         "mask_bank_content_fingerprint": _mask_bank_records_fingerprint(records),
+        "expected_split_counts": dict(expected_split_counts),
+        "expected_split_seeds": dict(expected_split_seeds),
         "primary": {
             "n_records": dedup_result["n_records"],
             "n_unique_masks": dedup_result["n_unique_masks"],

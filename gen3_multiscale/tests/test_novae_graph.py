@@ -107,6 +107,28 @@ def test_build_context_only_novae_input_excludes_unwhitelisted_uns_and_obsp_laye
     assert not hasattr(inputs.context_adata, "raw") or inputs.context_adata.raw is None
 
 
+def test_build_context_only_novae_input_var_is_index_only_not_full_slide_gene_stats():
+    """14th Codex re-audit of commit 8d4e276, finding #1 (CONFIRMED): a
+    prior version copied `adata.var` wholesale (`adata.var.copy()`) --
+    Scanpy/AnnData conventionally stores full-slide-derived per-gene
+    statistics there (detection counts, means, dispersion/variability),
+    computed over EVERY spot including query spots. Only gene IDENTITY
+    (var_names) may survive into the context-only object."""
+    adata = _square_grid_adata()
+    adata.var["mean_counts_full_slide"] = np.arange(adata.n_vars, dtype=np.float64) * 1000.0
+    adata.var["n_cells_by_counts"] = np.arange(adata.n_vars) + 1
+
+    barcodes = list(adata.obs_names)
+    query = barcodes[:1]
+    context = barcodes[1:]
+    inputs = build_context_only_novae_input(adata, context, query, sample_id="S0")
+
+    assert list(inputs.context_adata.var_names) == list(adata.var_names)
+    assert list(inputs.context_adata.var.columns) == []
+    assert "mean_counts_full_slide" not in inputs.context_adata.var.columns
+    assert "n_cells_by_counts" not in inputs.context_adata.var.columns
+
+
 def test_build_context_only_novae_input_includes_all_gex_available_context_spots_even_with_he_overlap():
     """The core requirement Step 4 exists to satisfy: unlike
     build_spatial_field_example (which excludes context spots whose H&E

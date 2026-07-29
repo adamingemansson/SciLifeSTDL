@@ -212,25 +212,36 @@ def _build_sanitized_context_adata(
     full-slide summary statistic stashed in `.uns`.
 
     Only three things are carried forward, all explicitly row/identity
-    subset: `X` (expression), `var` (gene identities Novae needs to
-    match its own vocabulary by name -- not slide-derived, this is
-    panel/vocabulary metadata), and `obsm['spatial']` (coordinates, the
-    only spatial input real `novae.spatial_neighbors` reads). `.uns` is
-    populated ONLY from `_ALLOWED_CONTEXT_UNS_KEYS` -- exactly the keys
+    subset: `X` (expression), `var` (gene IDENTITY ONLY -- see below),
+    and `obsm['spatial']` (coordinates, the only spatial input real
+    `novae.spatial_neighbors` reads). `.uns` is populated ONLY from
+    `_ALLOWED_CONTEXT_UNS_KEYS` -- exactly the keys
     `_adata_feature_signature` itself reads, so the cache fingerprint
     still reflects real preprocessing state. `.obsp`, `.layers`, `.raw`,
     and every other `.uns` key are never copied -- if a real
     `novae_feature_fn` adapter needs something beyond this, that is a
     disclosed, real integration gap (`build_novae_preflight_report`'s
     `not_provable_from_this_module_alone`), not something silently
-    assumed safe to smuggle through."""
+    assumed safe to smuggle through.
+
+    14th Codex re-audit of commit 8d4e276, finding #1 (CONFIRMED): `var`
+    used to be `adata.var.copy()` -- copying every column, not just gene
+    identity. Scanpy/AnnData conventionally stores full-slide-derived
+    per-gene statistics in `.var` (detection counts, means, dispersion/
+    variability), computed over EVERY spot including query spots -- a
+    real leakage surface identical in kind to the `.uns` one above, just
+    on the gene axis instead of the observation axis. Fixed: `var` is
+    now an INDEX-ONLY DataFrame built straight from `adata.var_names`
+    (gene identity strings, the only thing Novae needs to match its own
+    vocabulary by name), never `adata.var`'s other columns."""
     X = adata.X[node_pos]
     X = X.copy() if hasattr(X, "copy") else np.array(X, copy=True)
     obs_index_name = adata.obs.index.name if hasattr(adata.obs, "index") else None
+    var_index_name = adata.var.index.name if hasattr(adata.var, "index") else None
     context_adata = ad.AnnData(
         X=X,
         obs=pd.DataFrame(index=pd.Index(node_barcodes, name=obs_index_name)),
-        var=adata.var.copy(),
+        var=pd.DataFrame(index=pd.Index(np.asarray(adata.var_names, dtype=str), name=var_index_name)),
     )
     if "spatial" not in adata.obsm:
         raise ValueError("adata.obsm['spatial'] is required to build a context-only Novae input")

@@ -3482,7 +3482,124 @@ repeats an accepted mask); duplicate-mask-within-split detection.
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 39. Response to the fourteenth external Codex re-audit (of commit 8d4e276)
+
+The 13th round's audit-response was judged "mostly solid" but genuinely
+incomplete -- Codex found 3 further, narrower gaps in Step 3/4 before
+agreeing Step 5 was safe to start. All 3 re-confirmed against the real
+code before any fix.
+
+**Finding #1 (CONFIRMED): `_build_sanitized_context_adata` still copied
+`adata.var` wholesale.** The 13th round's fix explicitly built `X`/
+`obsm['spatial']`/whitelisted `.uns` keys field-by-field, but left
+`var=adata.var.copy()` -- copying every column, not just gene identity.
+Scanpy/AnnData conventionally stores full-slide-derived per-gene
+statistics in `.var` (detection counts, means, dispersion/variability),
+computed over EVERY spot including query spots -- the exact same class
+of leak as the `.uns` gap the 13th round fixed, just on the gene axis.
+Fixed: `var` is now an INDEX-ONLY `pd.DataFrame` built straight from
+`adata.var_names` -- gene identity strings, the only thing real Novae
+needs to match its own vocabulary by name. Verified:
+`test_build_context_only_novae_input_var_is_index_only_not_full_slide_gene_stats`
+stashes `mean_counts_full_slide`/`n_cells_by_counts` columns on
+`adata.var` and confirms `context_adata.var` has zero columns while
+`var_names` is preserved exactly.
+
+**Finding #2 (CONFIRMED): `build_training_sample_mask_report` never
+called `validate_collision_free_training_schedule`.** The 13th round
+built that validator but never wired it into the report builder -- the
+report's own re-realization loop only proved POOL uniqueness among the
+schedule's own items; it had no reserved set to check against at all,
+so a report could be built successfully from a schedule that (a) no
+longer avoids the CURRENT reserved set, or (b) has a tampered/stale
+`realized_query_composite_fingerprints` entry that happens to still be
+internally self-consistent. Fixed: `build_training_sample_mask_report`
+now REQUIRES a `reserved_query_composite_ids` parameter and calls
+`validate_collision_free_training_schedule` before doing anything else
+-- re-realizing every stored item, confirming it matches BOTH the
+recorded fingerprint AND the live reserved set's fingerprint, and
+confirming no duplicates -- fail-closed on any mismatch. The report's
+own subsequent re-realization loop (still needed to build
+`train_query_ids` for the same-sample diagnostic leakage check) no
+longer needs its own separate pool-uniqueness check, since a passing
+`validate_collision_free_training_schedule` call already guarantees it;
+`report["n_unique_masks"]` is now simply `len(training_schedule["items"])`,
+correct by construction. The report also now records
+`reserved_composite_ids_fingerprint` and
+`schedule_validated_against_live_data_and_reserved_set: True`. Verified
+by 2 new tests: a reserved set that's the same SIZE but different
+CONTENT than what the schedule was built against (proving the
+fingerprint, not a stale count, is checked), and a schedule with one
+tampered `realized_query_composite_fingerprints` entry.
+
+**Finding #3 (CONFIRMED): `build_held_out_sample_mask_report`'s
+provenance/count checking was self-referential and coarse.** Three
+distinct real gaps, all in the same function:
+- The strata-fingerprint check compared the bank's OWN recorded
+  `strata_fingerprint` against a fingerprint computed FROM the bank's
+  own recorded `split_counts`/`split_seeds` -- self-referential, and
+  could never catch a bank built with the WRONG counts/seeds for the
+  experiment actually being run, only an INTERNALLY inconsistent bank.
+- The per-stratum check only required AT LEAST ONE record per stratum,
+  and the total-count check alone could not detect a MISDISTRIBUTED
+  bank (e.g. 3 records in stratum A + 1 in stratum B totalling the same
+  "4" as a correctly-distributed 2+2).
+- Records were trusted as truth: the function fingerprinted the STORED
+  `context_obs_names`/`query_obs_names` directly, never re-deriving
+  them from live coordinates -- a tampered record with internally
+  well-formed (non-empty, disjoint) but WRONG barcodes would pass.
+
+Fixed: `build_held_out_sample_mask_report` now REQUIRES
+`expected_split_counts`/`expected_split_seeds` from the RESOLVED
+EXPERIMENT CONFIGURATION (never read off the supplied bank) and:
+explicitly compares the bank's own `split_counts`/`split_seeds` against
+these expected values before any fingerprint check; requires EXACTLY
+`expected_split_counts[split]` records per stratum (checked
+independently per stratum); requires each stratum's record `index`
+values to be exactly `{0, ..., count-1}`; requires each record's `seed`
+to equal the exact deterministic value
+`expected_split_seeds[split] + stratum_index * _STRATUM_SEED_STRIDE +
+record_index`; and RE-REALIZES every record via
+`realize_seed_and_fingerprint` at its expected seed, comparing fresh
+`context_obs_names`/`query_obs_names` against the stored ones for exact
+list equality. Verified by 6 new tests: the audit's own "3+1 vs 2+2"
+misdistribution example (relabels one record's `stratum` field,
+confirms the per-stratum check catches it while the aggregate total
+stays unchanged); a tampered record's barcodes caught by re-realization;
+a tampered `seed` field; a bank whose `split_counts` don't match the
+resolved config; and a bank whose `split_seeds` don't match.
+
+`_REPORT_VERSION` bumped 3 -> 4 (schema changed: training reports gain
+`reserved_composite_ids_fingerprint`/
+`schedule_validated_against_live_data_and_reserved_set`; held-out
+reports gain `expected_split_counts`/`expected_split_seeds`).
+
+**What the audit confirmed as correct, no fix needed:** the sanitized
+`X`/`obsm['spatial']`/whitelisted-`.uns` construction itself; the
+checkpoint-provenance requirement; the manifest sample-role enforcement;
+the empty-held-out-bank rejection; the schedule's reserved-set
+fingerprint mechanism itself (only its wiring into the report builder
+was missing); `EmptyMaskRealizationError`'s narrow retry scoping.
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 447 passed (45 reused-infra + 12 example-schema +
+  11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 23 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 17 dataset-manifest + 16 example-builder +
+  46 mask-fingerprint + 22 novae-graph)
+gen2_architectures + gen3_multiscale: 620 passed, 1 skipped
+```
+
+The block immediately below (pre-14th-audit-response test counts) is
+kept for historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 440 passed (45 reused-infra + 12 example-schema +
