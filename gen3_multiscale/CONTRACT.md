@@ -4209,7 +4209,155 @@ here for the record.
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 44. Response to the nineteenth external Codex re-audit -- 1 remaining launch blocker (unpinned tile-encoder revision), plus a note on Step 6's real spot-embedding requirement
+
+Adam confirmed the 18th round's core leakage fixes (GEX-valid spots
+retained, `observed_image_available` correctly combining missing-source
+and hole-overlap availability, unavailable patches never reaching the
+image encoder, hole-overlapping WSI tiles excluded before pooling/
+LongNet, query expression target-only, LongNet call-independence)
+are all real and correct, but found the tile-encoder pinning fix from
+the 18th round was incomplete: the identity was RECORDED but never
+actually ENFORCED to be immutable, or fully bound into the cache
+identity. All 6 items re-confirmed against the actual code before any
+fix.
+
+**Remaining launch blocker (CONFIRMED real): `--tile-encoder-revision`
+defaulted to `None`, explicitly permitting an unpinned tile encoder, and
+`gigapath_tile_encoder_provenance` queried the Hub for "main" AFTER the
+encoder had already been loaded -- a genuine TOCTOU gap.** Combines what
+were 4 separate items in Adam's report:
+1. `--tile-encoder-revision` is now `required=True` in
+   `scripts/precompute_gigapath_wsi_tiles.py` -- no more silent
+   unpinned default. Validated immediately after arg parsing, before
+   any expensive work (WSI opening, GPU allocation).
+2. `_validate_immutable_hf_revision` (`src/models/conditioning.py`)
+   requires a full 40-character lowercase hex Hugging Face commit SHA
+   -- rejects branch/tag names like `"main"`, short/abbreviated SHAs,
+   and uppercase hex. `gigapath_tile_encoder_provenance`'s `revision`
+   parameter is now MANDATORY (previously `str | None = None`); its
+   entire "if revision is None, query `huggingface_hub.HfApi()` for
+   whatever main currently is" fallback is DELETED -- that query ran
+   AFTER `_load_gigapath_tile_encoder` had already loaded the model,
+   so the repository could move in between the two calls, silently
+   recording a revision different from what was actually loaded. Since
+   the caller must now already supply a resolved, immutable SHA, both
+   the load and the provenance record use the identical value by
+   construction -- nothing left to race.
+3. `load_slide_context` (`gen3_multiscale/data/slide_context.py`) now
+   validates EVERY tile-encoder provenance field for a `dense_wsi_cache`,
+   not just a nonblank `state_dict_sha256`: `hf_repo_id` must equal
+   `"prov-gigapath/prov-gigapath"`; `hf_revision` must match the same
+   40-hex-lowercase commit-SHA pattern; `timm_version` must be nonblank
+   and not the string `"None"`; `preprocessing_spec` must exactly equal
+   the current real `_GIGAPATH_PREPROCESS_VERSION` value (kept as a
+   synchronized local copy, `_EXPECTED_GIGAPATH_PREPROCESSING_SPEC`,
+   consistent with `loaders.py`'s established "gen3_multiscale never
+   imports from src/" copy-not-import convention);
+   `state_dict_sha256` must be a well-formed 64-character lowercase hex
+   digest; `schema_version` must be in a supported set (`{1}`).
+4. `content_digest` (drives `context_id`) previously hashed only
+   `tile_encoder_provenance["state_dict_sha256"]`, despite its own
+   comment claiming "the real tile-encoder identity" was bound -- now
+   hashes `json.dumps(tile_encoder_provenance, sort_keys=True)`, the
+   COMPLETE canonical provenance object, so a cache differing in ANY
+   field (not just the weights hash) gets a different `context_id`.
+5. `scripts/precompute_hierarchical_slide_4gpu.sh` (the actual
+   multi-GPU launcher that invokes `precompute_gigapath_wsi_tiles.py`)
+   now requires and validates `GIGAPATH_TILE_ENCODER_REVISION`
+   (40-hex-lowercase, checked in bash before any Python runs), mirroring
+   the existing `GIGAPATH_SLIDE_CHECKPOINT` requirement, and forwards it
+   via `--tile-encoder-revision` to every invocation (including the
+   `--probe-only` call, since the flag is now unconditionally required
+   by argparse even though probing never loads the tile encoder).
+6. `loaders.align_patches_to_adata` built `barcode_to_idx = {b: i for
+   i, b in enumerate(barcodes)}` directly from the raw barcodes array --
+   a duplicated barcode silently kept only its LAST occurrence, with no
+   signal a patch had been misattributed, and there was no check that
+   `len(barcodes) == patches.shape[0]`. Both are now rejected explicitly,
+   before the dict is ever built.
+
+**Adversarial test coverage added** (`tests/test_conditioning.py`,
+`gen3_multiscale/tests/test_slide_context.py`,
+`gen3_multiscale/tests/test_loaders.py` -- new file): malformed/blank/
+unpinned/wrong-case/wrong-length revisions at both the
+`gigapath_tile_encoder_provenance` layer and the `load_slide_context`
+cache-loading layer; a wrong `hf_repo_id`; a blank/`"None"`
+`timm_version`; a stale `preprocessing_spec`; a malformed
+`state_dict_sha256` (wrong length, non-hex, wrong case); an unsupported
+`schema_version`; a `context_id` that changes when ONLY a non-`
+state_dict_sha256` provenance field changes (proving the full-object
+hash, not just the one field); duplicate patch barcodes; and a
+barcodes/patches row-count mismatch.
+
+**Existing fixtures updated:** `gen3_multiscale/tests/test_slide_context.py`'s
+`_TILE_ENCODER_PROVENANCE_KWARGS` and
+`gen3_multiscale/scripts/smoke_test_gigapath_slide_encoder.py`'s
+synthetic dense-cache builder both used non-conforming placeholder
+strings (`"unit-test-revision"`, `"smoke-test"`) for fields now
+strictly validated -- updated to well-formed values (a real 40-hex
+SHA, the exact real preprocessing spec string) so existing/positive-path
+tests keep exercising real behavior rather than merely avoiding the new
+checks. Re-ran the smoke script's real data-pipeline half
+(`_build_real_inputs_through_the_data_pipeline`, data-layer only, no GPU
+needed) standalone in this sandbox to confirm it still produces a valid
+`SpatialFieldInputs` (`wsi_tile_features` shape `(323, 1536)`) under the
+tightened validation.
+
+**Not a code change this round -- Adam's own explicit requirement for
+Step 6, recorded here for the record:** `image_feature_fn` must NOT
+invoke the frozen GigaPath tile encoder per training example -- that
+would re-encode nearly-identical context patches on every step and make
+training unnecessarily slow. Step 6 must instead load barcode-aligned,
+precomputed spot embeddings (same strict provenance discipline as the
+dense WSI cache) and select/zero rows according to each realized hole,
+exactly the same "precompute once, slice per draw" pattern
+`precompute_gigapath_features` already uses elsewhere in this
+repository.
+
+**Adam's stated safe sequence, also recorded here, not yet executed
+beyond step 1:** (1) fix provenance and loader validation -- DONE this
+round; (2) rebuild one real sample's dense cache using a pinned
+tile-encoder revision; (3) validate and load that real cache; (4) run
+the existing A100 LongNet/Architecture 3/4 smoke; (5) build Step 6
+around cached spot embeddings; (6) only then prepare the trainer and a
+longer run. Steps 2-6 require real GPU/HuggingFace/checkpoint access
+this sandbox does not have.
+
+**Explicitly still open:** the real trainer (Step 6, now additionally
+scoped to require precomputed spot embeddings rather than per-example
+tile-encoder calls, per above); someone with real A100 access running
+steps 2-4 of the safe sequence above; the consistent redesign of
+`all_zero`/`shuffled`/`full` image intervention semantics (deferred to
+before Step 7); and Novae's status as documented, unconsumed
+infrastructure -- unchanged this round, still not started, still noted
+here for the record.
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 517 passed (45 reused-infra + 27 example-schema +
+  11 boundary-graph + 36 slide-context + 9 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 31 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 17 dataset-manifest + 26 example-builder +
+  46 mask-fingerprint + 22 novae-graph + 4 loaders [new file])
+gen2_architectures + gen3_multiscale: 690 passed, 1 skipped
+(repo-root tests/test_conditioning.py: 16 passed, including 3 new tests
+for gigapath_tile_encoder_provenance's mandatory-revision validation --
+outside this document's own gen2_architectures/gen3_multiscale count,
+noted here since the fix it covers lives in src/models/conditioning.py,
+shared infrastructure this document does not otherwise track test
+counts for)
+```
+
+The block immediately below (pre-19th-re-audit test counts) is kept for
+historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 495 passed (45 reused-infra + 27 example-schema +

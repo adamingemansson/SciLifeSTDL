@@ -217,10 +217,18 @@ def _build_real_inputs_through_the_data_pipeline(
         features=tile_features, coords=tile_xy.copy(), level0_coords=tile_xy.copy(),
         tile_size=np.asarray(tile_step, dtype=np.float32), level0_tile_size=np.asarray(tile_step, dtype=np.float32),
         coords_are_centers=np.asarray(True),
+        # 19th Codex re-audit (Step 5 Part 2, remaining launch blocker
+        # #3): load_slide_context now validates every one of these
+        # fields against the real expected values (repo id, a real
+        # 40-hex commit SHA shape, the exact current preprocessing
+        # spec, a supported schema version) -- placeholder strings like
+        # "smoke-test" would now be rejected, so these are deliberately
+        # well-formed even though this is still synthetic smoke-test
+        # data, not a real GigaPath run.
         tile_encoder_hf_repo_id=np.asarray("prov-gigapath/prov-gigapath"),
-        tile_encoder_hf_revision=np.asarray("smoke-test"),
+        tile_encoder_hf_revision=np.asarray("f" * 40),
         tile_encoder_timm_version=np.asarray("smoke-test"),
-        tile_encoder_preprocessing_spec=np.asarray("smoke-test"),
+        tile_encoder_preprocessing_spec=np.asarray("centercrop224_no_resize_v2_2026-07-24"),
         tile_encoder_state_dict_sha256=np.asarray("f" * 64),
         tile_encoder_schema_version=np.asarray(1),
     )

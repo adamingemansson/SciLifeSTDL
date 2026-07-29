@@ -15,9 +15,24 @@ deliberate reason.
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 from pathlib import Path
 
 import numpy as np
+
+# Must match src.models.conditioning's real GigaPath tile-encoder identity
+# constants exactly. gen3_multiscale deliberately never imports from src/
+# (see loaders.py's own copy-provenance note in this package) -- kept as a
+# synchronized copy instead of a cross-package import. If either drifts,
+# every real dense_wsi_cache built with the current tile encoder starts
+# failing this validation, which is the intended fail-closed behavior, not
+# a bug to silently work around.
+_EXPECTED_GIGAPATH_HF_REPO_ID = "prov-gigapath/prov-gigapath"
+_EXPECTED_GIGAPATH_PREPROCESSING_SPEC = "centercrop224_no_resize_v2_2026-07-24"
+_SUPPORTED_TILE_ENCODER_SCHEMA_VERSIONS = {1}
+_HF_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _cache_path(cfg, sample_id: str) -> Path:
@@ -108,8 +123,47 @@ def load_slide_context(
             "state_dict_sha256": str(cached["tile_encoder_state_dict_sha256"]),
             "schema_version": int(np.asarray(cached["tile_encoder_schema_version"]).item()),
         }
-        if not tile_encoder_provenance["state_dict_sha256"].strip():
-            raise ValueError(f"slide cache {path} has a blank tile_encoder_state_dict_sha256")
+        # 19th Codex re-audit (Step 5 Part 2, remaining launch blocker
+        # #3), CONFIRMED real: only a nonblank state_dict_sha256 was
+        # meaningfully checked -- hf_repo_id/hf_revision/timm_version/
+        # preprocessing_spec/schema_version were read but never validated,
+        # so a cache built against the wrong repo, an unpinned/malformed
+        # revision, a blank library version, stale preprocessing, or an
+        # unrecognized schema could all silently pass. Every field is now
+        # validated explicitly, fail-closed.
+        if tile_encoder_provenance["hf_repo_id"] != _EXPECTED_GIGAPATH_HF_REPO_ID:
+            raise ValueError(
+                f"slide cache {path} tile_encoder_hf_repo_id="
+                f"{tile_encoder_provenance['hf_repo_id']!r}, expected "
+                f"{_EXPECTED_GIGAPATH_HF_REPO_ID!r}"
+            )
+        if not _HF_COMMIT_SHA_RE.match(tile_encoder_provenance["hf_revision"]):
+            raise ValueError(
+                f"slide cache {path} tile_encoder_hf_revision="
+                f"{tile_encoder_provenance['hf_revision']!r} is not a full 40-character "
+                "lowercase hex Hugging Face commit SHA -- rebuild with a pinned, "
+                "immutable --tile-encoder-revision"
+            )
+        if not tile_encoder_provenance["timm_version"].strip() or tile_encoder_provenance["timm_version"] == "None":
+            raise ValueError(f"slide cache {path} has a blank/missing tile_encoder_timm_version")
+        if tile_encoder_provenance["preprocessing_spec"] != _EXPECTED_GIGAPATH_PREPROCESSING_SPEC:
+            raise ValueError(
+                f"slide cache {path} tile_encoder_preprocessing_spec="
+                f"{tile_encoder_provenance['preprocessing_spec']!r}, expected "
+                f"{_EXPECTED_GIGAPATH_PREPROCESSING_SPEC!r} -- rebuild it with the current "
+                "scripts/precompute_gigapath_wsi_tiles.py"
+            )
+        if not _SHA256_HEX_RE.match(tile_encoder_provenance["state_dict_sha256"]):
+            raise ValueError(
+                f"slide cache {path} tile_encoder_state_dict_sha256 is not a well-formed "
+                "64-character lowercase hex SHA256 digest"
+            )
+        if tile_encoder_provenance["schema_version"] not in _SUPPORTED_TILE_ENCODER_SCHEMA_VERSIONS:
+            raise ValueError(
+                f"slide cache {path} tile_encoder_schema_version="
+                f"{tile_encoder_provenance['schema_version']} is not supported "
+                f"(supported: {sorted(_SUPPORTED_TILE_ENCODER_SCHEMA_VERSIONS)})"
+            )
         features = np.asarray(cached["features"], dtype=np.float32)
         coords = np.asarray(cached["coords"], dtype=np.float32)
         tile_size = float(np.asarray(cached["tile_size"]).item())
@@ -157,15 +211,19 @@ def load_slide_context(
         content_digest.update(str(tile_size).encode())
         content_digest.update(str(mask_tile_size).encode())
         content_digest.update(str(coords_are_centers).encode())
-        # 18th Codex re-audit (Step 5 Part 2 launch blocker #2): bind the
-        # real tile-encoder identity into the SAME content digest that
-        # already drives context_id -- a cache regenerated with a
-        # DIFFERENT tile encoder (or a fixed preprocessing bug) now
-        # produces a different identity even if its features/coords
-        # happened to match by coincidence, extending the same
-        # content-hash discipline the 16th/17th re-audits already
-        # established for the masking-relevant fields.
-        content_digest.update(tile_encoder_provenance["state_dict_sha256"].encode())
+        # 18th Codex re-audit (Step 5 Part 2 launch blocker #2), EXTENDED
+        # by the 19th re-audit (remaining launch blocker #4), CONFIRMED
+        # real: the 18th-round fix only hashed state_dict_sha256, despite
+        # its own comment claiming "the real tile-encoder identity" was
+        # bound -- hf_repo_id/hf_revision/timm_version/preprocessing_spec/
+        # schema_version were validated (above) but NOT folded into
+        # content_digest, so a cache with identical weights but a
+        # different (still-valid-looking) recorded revision/repo/
+        # preprocessing string would silently collide on context_id. Hash
+        # the COMPLETE canonical provenance object (json.dumps with
+        # sort_keys=True is deterministic regardless of dict insertion
+        # order) so ANY provenance field changing changes context_id.
+        content_digest.update(json.dumps(tile_encoder_provenance, sort_keys=True).encode())
         identity = f"{sample_id}:dense:{content_digest.hexdigest()}"
         # 16th Codex re-audit (Step 5 Part 2), CONFIRMED: no check existed
         # for duplicate tile coordinates -- a corrupted or badly-generated

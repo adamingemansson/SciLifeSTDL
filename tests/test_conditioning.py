@@ -12,6 +12,8 @@ importable — same convention as src/training/train.py)
 import torch
 import torch.nn as nn
 
+import pytest
+
 from src.models.conditioning import SpatialContextEncoder, gigapath_tile_encoder_provenance
 
 
@@ -148,6 +150,9 @@ def _run_edge_cases():
     print("[edge: single query point] OK")
 
 
+_REAL_LOOKING_SHA = "d072f48609bec7ec4d2c43889262b3029bb1279f"  # 40 lowercase hex chars
+
+
 def test_gigapath_tile_encoder_provenance_is_real_and_content_sensitive():
     """18th Codex re-audit (Step 5 Part 2, "the dense WSI cache... stores
     no resolved Hugging Face revision, model identifier, preprocessing
@@ -163,17 +168,50 @@ def test_gigapath_tile_encoder_provenance_is_real_and_content_sensitive():
         encoder_a.weight.fill_(1.0)
         encoder_b.weight.fill_(2.0)  # genuinely different real weights
 
-    prov_a = gigapath_tile_encoder_provenance(encoder_a, revision="deadbeef")
-    prov_a_again = gigapath_tile_encoder_provenance(encoder_a, revision="deadbeef")
-    prov_b = gigapath_tile_encoder_provenance(encoder_b, revision="deadbeef")
+    prov_a = gigapath_tile_encoder_provenance(encoder_a, revision=_REAL_LOOKING_SHA)
+    prov_a_again = gigapath_tile_encoder_provenance(encoder_a, revision=_REAL_LOOKING_SHA)
+    prov_b = gigapath_tile_encoder_provenance(encoder_b, revision=_REAL_LOOKING_SHA)
 
     assert prov_a["state_dict_sha256"] == prov_a_again["state_dict_sha256"]  # stable/deterministic
     assert prov_a["state_dict_sha256"] != prov_b["state_dict_sha256"]  # real content-sensitivity
-    assert prov_a["hf_revision"] == "deadbeef"  # explicit revision passed through, never overridden
+    assert prov_a["hf_revision"] == _REAL_LOOKING_SHA  # explicit revision passed through, never overridden
     assert prov_a["hf_repo_id"] == "prov-gigapath/prov-gigapath"
     assert "timm_version" in prov_a  # None here (timm not installed in this sandbox) is the documented best-effort fallback
     assert prov_a["preprocessing_spec"]
     assert prov_a["schema_version"] == 1
+
+
+@pytest.mark.parametrize("bad_revision", [
+    None, "", "main", "latest", "HEAD",
+    "deadbeef",  # too short -- a real abbreviated SHA, not the full 40 chars required
+    "a" * 39,  # one character short of a real SHA-1 hex digest
+    "a" * 41,  # one character too long
+    "A" * 40,  # uppercase hex -- git/HF commit SHAs are always lowercase
+    "g" * 40,  # not valid hex at all
+    "a1b2c3d4e5f60718293a4b5c6d7e8f9012345 7",  # embedded whitespace
+])
+def test_gigapath_tile_encoder_provenance_rejects_unpinned_or_malformed_revisions(bad_revision):
+    """19th Codex re-audit (Step 5 Part 2, remaining launch blockers #1-2):
+    `revision` is now MANDATORY and must already be a resolved, immutable
+    Hugging Face commit SHA -- the previous version silently accepted
+    `revision=None` (or any string) and, for None, queried the Hub for
+    whatever "main" currently resolved to AFTER the tile encoder had
+    already been loaded elsewhere -- a real race between what was loaded
+    and what got recorded. Every non-conforming input must now be
+    refused outright, never silently coerced or best-effort resolved."""
+    encoder = nn.Linear(4, 4)
+    with pytest.raises(ValueError):
+        gigapath_tile_encoder_provenance(encoder, revision=bad_revision)
+
+
+def test_gigapath_tile_encoder_provenance_accepts_a_real_looking_full_commit_sha():
+    """The positive case for the same fix: a genuine 40-character
+    lowercase hex commit SHA must be accepted and recorded verbatim, with
+    no additional network call needed to "resolve" it further (it is
+    already the immutable, final identifier)."""
+    encoder = nn.Linear(4, 4)
+    prov = gigapath_tile_encoder_provenance(encoder, revision=_REAL_LOOKING_SHA)
+    assert prov["hf_revision"] == _REAL_LOOKING_SHA
 
 
 if __name__ == "__main__":

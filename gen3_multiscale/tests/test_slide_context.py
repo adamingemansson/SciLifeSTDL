@@ -155,9 +155,17 @@ def test_visible_slide_context_id_is_stable_for_the_same_hole():
     assert a["context_id"] == b["context_id"]
 
 
+# 19th Codex re-audit (Step 5 Part 2, remaining launch blocker #3):
+# load_slide_context now validates every provenance field, not just a
+# nonblank state_dict_sha256 -- these defaults must therefore be
+# well-formed (a real 40-hex-char commit SHA, the exact expected repo id
+# and preprocessing spec, a supported schema version) for every existing
+# test that doesn't deliberately corrupt one field.
+_VALID_HF_REVISION = "d072f48609bec7ec4d2c43889262b3029bb1279f"  # 40 lowercase hex chars
+
 _TILE_ENCODER_PROVENANCE_KWARGS = dict(
     tile_encoder_hf_repo_id=np.asarray("prov-gigapath/prov-gigapath"),
-    tile_encoder_hf_revision=np.asarray("unit-test-revision"),
+    tile_encoder_hf_revision=np.asarray(_VALID_HF_REVISION),
     tile_encoder_timm_version=np.asarray("1.0.3"),
     tile_encoder_preprocessing_spec=np.asarray("centercrop224_no_resize_v2_2026-07-24"),
     tile_encoder_state_dict_sha256=np.asarray("a" * 64),
@@ -332,7 +340,7 @@ def test_load_slide_context_exposes_real_tile_encoder_provenance_for_dense_cache
     ctx = load_slide_context(cfg, "S0", None, spot_coords)
     provenance = ctx["tile_encoder_provenance"]
     assert provenance["hf_repo_id"] == "prov-gigapath/prov-gigapath"
-    assert provenance["hf_revision"] == "unit-test-revision"
+    assert provenance["hf_revision"] == _VALID_HF_REVISION
     assert provenance["state_dict_sha256"] == "a" * 64
     assert provenance["schema_version"] == 1
 
@@ -346,7 +354,7 @@ def test_load_slide_context_rejects_a_blank_tile_encoder_state_dict_sha256(tmp_p
     cfg = OmegaConf.create({"data": {"slide_context_source": "dense_wsi_cache", "hest_data_dir": str(tmp_path / "hest1k")}})
     spot_coords = np.asarray([[10, 10]], dtype=np.float32)
 
-    with pytest.raises(ValueError, match="blank tile_encoder_state_dict_sha256"):
+    with pytest.raises(ValueError, match="tile_encoder_state_dict_sha256"):
         load_slide_context(cfg, "S0", None, spot_coords)
 
 
@@ -359,3 +367,149 @@ def test_load_slide_context_spot_aligned_has_no_tile_encoder_provenance():
     spot_coords = np.asarray([[10, 10], [20, 20]], dtype=np.float32)
     ctx = load_slide_context(cfg, "S0", spot_features, spot_coords)
     assert ctx["tile_encoder_provenance"] is None
+
+
+def test_load_slide_context_rejects_an_unexpected_tile_encoder_hf_repo_id(tmp_path):
+    """19th Codex re-audit (Step 5 Part 2, remaining launch blocker #3):
+    a cache claiming a DIFFERENT source repository must be refused, not
+    silently trusted -- there is nothing else tying the cached features
+    to prov-gigapath/prov-gigapath specifically."""
+    cache_dir = tmp_path / "hest1k" / "gigapath_slide_cache"
+    cache_dir.mkdir(parents=True)
+    coords = np.asarray([[0, 0], [256, 0]], dtype=np.float32)
+    features = np.ones((2, 1536), dtype=np.float32)
+    _write_dense_wsi_cache(
+        cache_dir / "S0.npz", features, coords,
+        tile_encoder_hf_repo_id=np.asarray("some-other-org/some-other-model"),
+    )
+    cfg = OmegaConf.create({"data": {"slide_context_source": "dense_wsi_cache", "hest_data_dir": str(tmp_path / "hest1k")}})
+    spot_coords = np.asarray([[10, 10]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="tile_encoder_hf_repo_id"):
+        load_slide_context(cfg, "S0", None, spot_coords)
+
+
+@pytest.mark.parametrize("bad_revision", [
+    "main", "latest", "unpinned", "deadbeef", "a" * 39, "A" * 40, "g" * 40,
+])
+def test_load_slide_context_rejects_a_non_immutable_tile_encoder_hf_revision(tmp_path, bad_revision):
+    """19th Codex re-audit (Step 5 Part 2, remaining launch blockers
+    #1-3): a cache recording a moving ref (or malformed string) instead
+    of a real, resolved, immutable 40-character lowercase hex commit SHA
+    must be rejected -- this is the same discipline
+    scripts/precompute_gigapath_wsi_tiles.py now enforces at build time,
+    re-checked here so an old/hand-edited cache can't bypass it."""
+    cache_dir = tmp_path / "hest1k" / "gigapath_slide_cache"
+    cache_dir.mkdir(parents=True)
+    coords = np.asarray([[0, 0], [256, 0]], dtype=np.float32)
+    features = np.ones((2, 1536), dtype=np.float32)
+    _write_dense_wsi_cache(
+        cache_dir / "S0.npz", features, coords,
+        tile_encoder_hf_revision=np.asarray(bad_revision),
+    )
+    cfg = OmegaConf.create({"data": {"slide_context_source": "dense_wsi_cache", "hest_data_dir": str(tmp_path / "hest1k")}})
+    spot_coords = np.asarray([[10, 10]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="tile_encoder_hf_revision"):
+        load_slide_context(cfg, "S0", None, spot_coords)
+
+
+def test_load_slide_context_rejects_a_blank_tile_encoder_timm_version(tmp_path):
+    cache_dir = tmp_path / "hest1k" / "gigapath_slide_cache"
+    cache_dir.mkdir(parents=True)
+    coords = np.asarray([[0, 0], [256, 0]], dtype=np.float32)
+    features = np.ones((2, 1536), dtype=np.float32)
+    _write_dense_wsi_cache(
+        cache_dir / "S0.npz", features, coords,
+        tile_encoder_timm_version=np.asarray("None"),  # str(None) -- best-effort load-time fallback
+    )
+    cfg = OmegaConf.create({"data": {"slide_context_source": "dense_wsi_cache", "hest_data_dir": str(tmp_path / "hest1k")}})
+    spot_coords = np.asarray([[10, 10]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="tile_encoder_timm_version"):
+        load_slide_context(cfg, "S0", None, spot_coords)
+
+
+def test_load_slide_context_rejects_an_unexpected_tile_encoder_preprocessing_spec(tmp_path):
+    """A cache whose recorded preprocessing string doesn't match the
+    current real pipeline (src.models.conditioning._GIGAPATH_PREPROCESS_
+    VERSION) must be refused -- it was built with different (possibly
+    stale) pixel-processing logic and would silently produce features
+    that mean something different from a freshly-built cache."""
+    cache_dir = tmp_path / "hest1k" / "gigapath_slide_cache"
+    cache_dir.mkdir(parents=True)
+    coords = np.asarray([[0, 0], [256, 0]], dtype=np.float32)
+    features = np.ones((2, 1536), dtype=np.float32)
+    _write_dense_wsi_cache(
+        cache_dir / "S0.npz", features, coords,
+        tile_encoder_preprocessing_spec=np.asarray("some_stale_preprocessing_v0"),
+    )
+    cfg = OmegaConf.create({"data": {"slide_context_source": "dense_wsi_cache", "hest_data_dir": str(tmp_path / "hest1k")}})
+    spot_coords = np.asarray([[10, 10]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="tile_encoder_preprocessing_spec"):
+        load_slide_context(cfg, "S0", None, spot_coords)
+
+
+@pytest.mark.parametrize("bad_sha", ["", "   ", "a" * 63, "a" * 65, "g" * 64, "A" * 64])
+def test_load_slide_context_rejects_a_malformed_tile_encoder_state_dict_sha256(tmp_path, bad_sha):
+    cache_dir = tmp_path / "hest1k" / "gigapath_slide_cache"
+    cache_dir.mkdir(parents=True)
+    coords = np.asarray([[0, 0], [256, 0]], dtype=np.float32)
+    features = np.ones((2, 1536), dtype=np.float32)
+    _write_dense_wsi_cache(
+        cache_dir / "S0.npz", features, coords,
+        tile_encoder_state_dict_sha256=np.asarray(bad_sha),
+    )
+    cfg = OmegaConf.create({"data": {"slide_context_source": "dense_wsi_cache", "hest_data_dir": str(tmp_path / "hest1k")}})
+    spot_coords = np.asarray([[10, 10]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="tile_encoder_state_dict_sha256"):
+        load_slide_context(cfg, "S0", None, spot_coords)
+
+
+def test_load_slide_context_rejects_an_unsupported_tile_encoder_schema_version(tmp_path):
+    cache_dir = tmp_path / "hest1k" / "gigapath_slide_cache"
+    cache_dir.mkdir(parents=True)
+    coords = np.asarray([[0, 0], [256, 0]], dtype=np.float32)
+    features = np.ones((2, 1536), dtype=np.float32)
+    _write_dense_wsi_cache(
+        cache_dir / "S0.npz", features, coords,
+        tile_encoder_schema_version=np.asarray(999),
+    )
+    cfg = OmegaConf.create({"data": {"slide_context_source": "dense_wsi_cache", "hest_data_dir": str(tmp_path / "hest1k")}})
+    spot_coords = np.asarray([[10, 10]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="tile_encoder_schema_version"):
+        load_slide_context(cfg, "S0", None, spot_coords)
+
+
+def test_load_slide_context_id_changes_when_only_a_non_state_dict_provenance_field_changes(tmp_path):
+    """19th Codex re-audit (Step 5 Part 2, remaining launch blocker #4),
+    CONFIRMED real: content_digest previously only hashed
+    state_dict_sha256 -- hf_revision (and every other provenance field)
+    was validated but NOT bound into context_id. Two caches with
+    IDENTICAL weights (same state_dict_sha256) but a DIFFERENT recorded
+    revision -- e.g. one built at commit A, one at commit B, that happen
+    to produce byte-identical weights -- must still get different
+    context_ids, since the full provenance object is now what's hashed,
+    not just one field of it."""
+    cache_dir = tmp_path / "hest1k" / "gigapath_slide_cache"
+    cache_dir.mkdir(parents=True)
+    coords = np.asarray([[0, 0], [256, 0]], dtype=np.float32)
+    features = np.ones((2, 1536), dtype=np.float32)
+    cfg = OmegaConf.create({"data": {"slide_context_source": "dense_wsi_cache", "hest_data_dir": str(tmp_path / "hest1k")}})
+    spot_coords = np.asarray([[10, 10]], dtype=np.float32)
+
+    _write_dense_wsi_cache(cache_dir / "S0.npz", features, coords)  # hf_revision = _VALID_HF_REVISION
+    ctx_a = load_slide_context(cfg, "S0", None, spot_coords)
+
+    other_revision = "1234567890abcdef1234567890abcdef12345678"
+    _write_dense_wsi_cache(
+        cache_dir / "S0.npz", features, coords,
+        tile_encoder_hf_revision=np.asarray(other_revision),  # changed ONLY this; state_dict_sha256 unchanged
+    )
+    ctx_b = load_slide_context(cfg, "S0", None, spot_coords)
+
+    assert ctx_a["context_id"] != ctx_b["context_id"]
+    assert ctx_a["tile_encoder_provenance"]["state_dict_sha256"] == ctx_b["tile_encoder_provenance"]["state_dict_sha256"]

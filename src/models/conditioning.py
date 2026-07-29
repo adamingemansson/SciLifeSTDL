@@ -30,6 +30,7 @@ registry.py), consistent with keeping the dependency footprint light.
 """
 from __future__ import annotations
 import math
+import re
 
 import torch
 import torch.nn as nn
@@ -355,6 +356,36 @@ class ImagePatchEncoder(nn.Module):
         return self.proj(h)
 
 
+# A full, immutable Hugging Face commit SHA -- always 40 lowercase hex
+# characters (git's SHA-1 object id format). Deliberately rejects branch/tag
+# names like "main" or short/abbreviated SHAs: those can move or be
+# ambiguous, which is exactly the property a pinned revision exists to
+# remove (19th Codex re-audit, "require an immutable Hugging Face commit
+# SHA").
+_HF_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _validate_immutable_hf_revision(revision: str) -> str:
+    """Require `revision` to already be a resolved, immutable Hugging Face
+    commit SHA -- never a moving ref. Callers (e.g.
+    scripts/precompute_gigapath_wsi_tiles.py) must resolve a tag/branch to
+    its real commit SHA THEMSELVES before calling
+    _load_gigapath_tile_encoder / gigapath_tile_encoder_provenance, so both
+    functions always see and record the exact same already-immutable value
+    -- there is no "resolve after loading" step left to race (19th Codex
+    re-audit, remaining Step 5 Part 2 launch blocker: "Resolve the commit
+    before loading, then load that exact revision. Do not query `main`
+    after loading -- it could record a different revision if the
+    repository changes between the two operations.")."""
+    if not isinstance(revision, str) or not _HF_COMMIT_SHA_RE.match(revision):
+        raise ValueError(
+            "tile-encoder revision must already be a resolved, immutable "
+            "Hugging Face commit SHA (40 lowercase hex characters, not a "
+            f"branch/tag like 'main'), got {revision!r}"
+        )
+    return revision
+
+
 def _load_gigapath_tile_encoder(revision: str | None = None):
     """Shared loader for Prov-GigaPath's tile encoder — used by both
     GigapathPatchEncoder below (task #20) and
@@ -399,13 +430,27 @@ def _load_gigapath_tile_encoder(revision: str | None = None):
     return tile_encoder
 
 
-def gigapath_tile_encoder_provenance(tile_encoder, revision: str | None = None) -> dict:
+def gigapath_tile_encoder_provenance(tile_encoder, revision: str) -> dict:
     """Real, verifiable identity of a loaded GigaPath tile encoder --
     18th Codex re-audit (Step 5 Part 2, "the dense WSI cache uses
     timm.create_model(...) but stores no resolved Hugging Face revision,
     model identifier, preprocessing version, library versions, or tile-
     encoder fingerprint... two caches produced with different tile-
     encoder weights/preprocessing can both appear valid").
+
+    `revision` is now MANDATORY and must already be a resolved, immutable
+    Hugging Face commit SHA -- see `_validate_immutable_hf_revision`
+    (19th Codex re-audit, remaining Step 5 Part 2 launch blocker: the
+    previous version silently permitted `revision=None`, in which case it
+    queried the Hub for whatever "main" happened to resolve to AFTER
+    `tile_encoder` had already been loaded -- a genuine TOCTOU gap, since
+    the repository could move between the load and the query, silently
+    recording a revision different from what was actually loaded). The
+    caller (scripts/precompute_gigapath_wsi_tiles.py) is responsible for
+    resolving a moving ref (a tag or "main") to its real commit SHA
+    BEFORE calling `_load_gigapath_tile_encoder`, then passing that exact
+    same SHA here -- both functions then agree by construction, with
+    nothing left to race.
 
     Distinguished from `FrozenGigaPathSlideEncoder.checkpoint_sha256`
     (gen3_multiscale/models/slide_encoder.py): that hashes a LOCAL
@@ -414,9 +459,7 @@ def gigapath_tile_encoder_provenance(tile_encoder, revision: str | None = None) 
     encoder -- a genuinely different model, loaded a genuinely different
     way, with no local file to hash. `state_dict_sha256` is computed
     from the real, in-memory loaded weights (never assumed from the repo
-    id/revision string alone), so it is real even when `hf_revision`
-    could not be resolved (e.g. no network at call time -- best-effort,
-    not required to be present).
+    id/revision string alone).
 
     `preprocessing_spec` is `_GIGAPATH_PREPROCESS_VERSION` -- the SAME
     string `get_gigapath_features`'s cache fingerprint already uses, so
@@ -426,18 +469,12 @@ def gigapath_tile_encoder_provenance(tile_encoder, revision: str | None = None) 
     drift apart."""
     import hashlib
 
+    revision = _validate_immutable_hf_revision(revision)
+
     digest = hashlib.sha256()
     for name, tensor in sorted(tile_encoder.state_dict().items()):
         digest.update(name.encode())
         digest.update(tensor.detach().to(device="cpu").numpy().tobytes())
-
-    resolved_revision = revision
-    if resolved_revision is None:
-        try:
-            import huggingface_hub
-            resolved_revision = huggingface_hub.HfApi().model_info("prov-gigapath/prov-gigapath").sha
-        except Exception:
-            resolved_revision = None  # best-effort only -- never blocks provenance recording
 
     try:
         import timm
@@ -447,7 +484,7 @@ def gigapath_tile_encoder_provenance(tile_encoder, revision: str | None = None) 
 
     return {
         "hf_repo_id": "prov-gigapath/prov-gigapath",
-        "hf_revision": resolved_revision,
+        "hf_revision": revision,
         "timm_version": timm_version,
         "preprocessing_spec": _GIGAPATH_PREPROCESS_VERSION,
         "state_dict_sha256": digest.hexdigest(),

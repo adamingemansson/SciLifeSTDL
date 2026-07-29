@@ -37,6 +37,24 @@ if [[ -z "${GIGAPATH_SLIDE_CHECKPOINT:-}" || ! -f "$GIGAPATH_SLIDE_CHECKPOINT" ]
   echo "ERROR: export GIGAPATH_SLIDE_CHECKPOINT=/absolute/path/to/slide_encoder.pth" >&2
   exit 2
 fi
+# 19th Codex re-audit (Step 5 Part 2, remaining launch blocker #5):
+# scripts/precompute_gigapath_wsi_tiles.py now REQUIRES --tile-encoder-revision
+# (a resolved, immutable Hugging Face commit SHA) -- this launcher must
+# require and forward it, exactly like it already does for
+# GIGAPATH_SLIDE_CHECKPOINT, or every dense WSI cache this script builds
+# would silently use whatever the tile encoder's "main" happens to be.
+if [[ -z "${GIGAPATH_TILE_ENCODER_REVISION:-}" ]]; then
+  echo "ERROR: export GIGAPATH_TILE_ENCODER_REVISION=<immutable-40-hex-commit-sha>" >&2
+  echo "  Resolve prov-gigapath/prov-gigapath's current commit SHA yourself first" >&2
+  echo "  (e.g. via the HuggingFace web UI or huggingface_hub.HfApi().model_info(...).sha)" >&2
+  echo "  -- see scripts/precompute_gigapath_wsi_tiles.py --help." >&2
+  exit 2
+fi
+if ! [[ "$GIGAPATH_TILE_ENCODER_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "ERROR: GIGAPATH_TILE_ENCODER_REVISION must be a full 40-character lowercase" >&2
+  echo "  hex Hugging Face commit SHA, not a branch/tag like 'main'." >&2
+  exit 2
+fi
 if ! "$PYTHON_BIN" -c 'import openslide; print("OpenSlide WSI backend ready")'; then
   echo "ERROR: HEST pyramidal TIFF reading requires OpenSlide." >&2
   echo "Install it in this environment with:" >&2
@@ -44,7 +62,8 @@ if ! "$PYTHON_BIN" -c 'import openslide; print("OpenSlide WSI backend ready")'; 
   exit 2
 fi
 "$PYTHON_BIN" scripts/precompute_gigapath_wsi_tiles.py --config "$CONFIG" \
-  --sample-id "${SAMPLES[0]}" --probe-only
+  --sample-id "${SAMPLES[0]}" --probe-only \
+  --tile-encoder-revision "$GIGAPATH_TILE_ENCODER_REVISION"
 
 echo "===== Dense mask-aware WSI tile caches ====="
 pids=()
@@ -53,7 +72,8 @@ run_wsi_slot() {
   for ((sample_index=slot; sample_index<${#SAMPLES[@]}; sample_index+=${#GPUS[@]})); do
     CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" \
       scripts/precompute_gigapath_wsi_tiles.py --config "$CONFIG" \
-      --sample-id "${SAMPLES[$sample_index]}" --device cuda
+      --sample-id "${SAMPLES[$sample_index]}" --device cuda \
+      --tile-encoder-revision "$GIGAPATH_TILE_ENCODER_REVISION"
   done
 }
 for ((slot=0; slot<${#GPUS[@]}; slot++)); do

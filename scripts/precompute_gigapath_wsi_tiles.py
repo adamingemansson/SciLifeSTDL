@@ -162,12 +162,15 @@ def _tile_grid(slide, source_span: int, output_size: int, min_tissue_fraction: f
                 yield x, y, tile
 
 
-def _encode_batches(records, batch_size: int, device: str, tile_encoder_revision: str | None = None):
+def _encode_batches(records, batch_size: int, device: str, tile_encoder_revision: str):
     from src.models.conditioning import (
         _gigapath_preprocess_and_encode,
         _load_gigapath_tile_encoder,
+        _validate_immutable_hf_revision,
         gigapath_tile_encoder_provenance,
     )
+
+    tile_encoder_revision = _validate_immutable_hf_revision(tile_encoder_revision)
 
     encoder = _load_gigapath_tile_encoder(revision=tile_encoder_revision).to(device).eval()
     # 18th Codex re-audit (Step 5 Part 2 launch blocker #2): record the
@@ -196,7 +199,7 @@ def _encode_batches(records, batch_size: int, device: str, tile_encoder_revision
 
 
 def build_cache(cfg, sample_id: str, batch_size: int, target_mpp: float,
-                min_tissue_fraction: float, device: str, tile_encoder_revision: str | None = None) -> Path:
+                min_tissue_fraction: float, device: str, tile_encoder_revision: str) -> Path:
     root = Path(str(cfg.data.hest_data_dir))
     wsi_path = _resolve_wsi(root, sample_id)
     slide, backend = _open_slide(wsi_path)
@@ -301,14 +304,21 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--probe-only", action="store_true")
     parser.add_argument(
-        "--tile-encoder-revision", default=None,
-        help="Pin an immutable Hugging Face revision (commit SHA or tag) for "
-             "prov-gigapath/prov-gigapath's tile encoder -- see _load_gigapath_tile_encoder's "
-             "docstring. Omit to use the current default (unpinned) revision.",
+        "--tile-encoder-revision", required=True,
+        help="MANDATORY: an already-resolved, immutable Hugging Face commit SHA (40 "
+             "lowercase hex characters) for prov-gigapath/prov-gigapath's tile encoder -- "
+             "resolve a tag/branch (e.g. 'main') to its real commit SHA yourself first "
+             "(e.g. via the HuggingFace web UI or huggingface_hub.HfApi().model_info(...).sha) "
+             "and pass that SHA here. A moving ref is refused: two cache builds using "
+             "'main' at different times could silently use different weights while "
+             "appearing identically pinned. See _load_gigapath_tile_encoder's docstring "
+             "(src/models/conditioning.py).",
     )
     args = parser.parse_args()
     if args.target_mpp <= 0 or not 0 <= args.min_tissue_fraction <= 1:
         raise ValueError("target-mpp must be positive and min-tissue-fraction must be in [0,1]")
+    from src.models.conditioning import _validate_immutable_hf_revision
+    _validate_immutable_hf_revision(args.tile_encoder_revision)
     cfg = OmegaConf.load(args.config)
     ids = list(args.sample_ids or cfg.data.get("sample_ids", []))
     if not ids:

@@ -287,7 +287,29 @@ def align_patches_to_adata(adata: ad.AnnData, patches: np.ndarray, barcodes: np.
     INT1 data: 49/1080 spots had no matching patch, a normal ~4.5% gap
     in HEST-1k's own pipeline, not a data-mismatch bug. Only raises if
     NONE of the spots match at all — that would indicate a genuine
-    version/sample mismatch, not normal partial coverage."""
+    version/sample mismatch, not normal partial coverage.
+
+    19th Codex re-audit (Step 5 Part 2 remaining gap #6), CONFIRMED real:
+    `{b: i for i, b in enumerate(barcodes)}` silently keeps only the
+    LAST occurrence of a duplicated barcode, with no signal that a patch
+    was ever dropped this way — a corrupted/malformed patches .h5 file
+    with a repeated barcode would silently misattribute one spot's
+    patch to another. Reject duplicates and a barcodes/patches row-count
+    mismatch explicitly, before any lookup is built from them."""
+    if len(barcodes) != patches.shape[0]:
+        raise ValueError(
+            f"align_patches_to_adata: len(barcodes)={len(barcodes)} != "
+            f"patches.shape[0]={patches.shape[0]} -- patches and barcodes must be "
+            "row-aligned, exactly as load_hest_patches returns them together"
+        )
+    unique_barcodes, counts = np.unique(np.asarray(barcodes), return_counts=True)
+    duplicated = unique_barcodes[counts > 1]
+    if duplicated.size:
+        raise ValueError(
+            f"align_patches_to_adata: patch barcodes contain {duplicated.size} "
+            f"duplicate value(s) (examples: {duplicated[:5].tolist()}) -- refusing to "
+            "silently keep an arbitrary one of them via dict-overwrite"
+        )
     barcode_to_idx = {b: i for i, b in enumerate(barcodes)}
     image_source_available = np.array([name in barcode_to_idx for name in adata.obs_names], dtype=bool)
     if not image_source_available.any():
