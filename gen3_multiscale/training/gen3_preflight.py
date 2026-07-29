@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 
+from gen3_multiscale.data.dataset_manifest import verify_metadata_csv_provenance
 from gen3_multiscale.data.tile_encoder_preflight import require_consistent_tile_encoder_provenance
 from gen3_multiscale.training.gen3_dataset import Gen3SampleData, load_gen3_sample_data
 
@@ -81,6 +82,14 @@ def load_and_preflight_samples(
     Raises (fail-closed) on any preflight failure -- the caller must not
     proceed to construct a model, optimizer, or DataLoader if this
     raises."""
+    # Real, confirmed gap (Codex audit of commit 27e1232): the shared
+    # metadata CSV's own content provenance was recorded by
+    # dataset_manifest.py but never re-verified before training -- check
+    # it once here (cheap, one shared file) before the per-sample h5ad/
+    # patch checks (load_gen3_sample_data -> verify_content_provenance)
+    # do the same for each sample individually.
+    verify_metadata_csv_provenance(manifest)
+
     samples: dict[str, Gen3SampleData] = {}
     provenance_by_source: dict[str, dict] = {}
     for sample_id in sample_ids:

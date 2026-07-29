@@ -61,7 +61,13 @@ _KNOWN_NON_CONSTRUCTOR_FIELDS = frozenset({"init_seed"})
 # never fits a basis itself -- a caller must supply an already-fit
 # GeneResidualBasis, mirroring Architecture4's own "never fits one
 # itself" discipline), so it is metadata here, not passed through.
-_ARCHITECTURE4_EXTRA_NON_CONSTRUCTOR_FIELDS = frozenset({"gene_basis_rank"})
+# freeze_conditioner_initially is read by train.py::
+# maybe_load_pretrained_conditioner_for_architecture4 (Adam's Step 6
+# audit #11) AFTER construction -- Architecture4.__init__ itself has no
+# such kwarg (the conditioner is always trainable at construction time;
+# freezing is the trainer's own post-construction, post-checkpoint-load
+# decision, not a constructor-time architectural choice).
+_ARCHITECTURE4_EXTRA_NON_CONSTRUCTOR_FIELDS = frozenset({"gene_basis_rank", "freeze_conditioner_initially"})
 
 
 def _constructor_signature(architecture_cls: type) -> inspect.Signature:

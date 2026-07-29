@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 import yaml
@@ -33,6 +34,34 @@ from gen3_multiscale.training import train as train_module
 _prepare = prepare_step6_experiment
 _base_model_params = step6_model_params
 _write_config = write_step6_train_config
+
+
+def _build_synchronized_init_dir(tmp_path: Path, manifest: dict) -> Path:
+    """Real synchronized-initialization manifest for all four
+    architectures (model_factory.persist_four_architecture_initializations
+    requires exactly the four) -- tiny, CPU-only, matching this test
+    file's own small model_param_overrides. Shared by every test below
+    that needs a real (non-smoke) run, which requires this to be set."""
+    from gen3_multiscale.models import model_factory as mf
+
+    gene_names = list(manifest["gene_panel"])
+    n_genes = len(gene_names)
+    residuals = np.random.default_rng(1).normal(size=(10, n_genes)).astype(np.float32)
+    basis = fit_gene_residual_basis(residuals, gene_names, rank=4)
+
+    common = dict(n_genes=n_genes, gex_feature_dim=8, seed=0)
+    models = {
+        "architecture1": mf.build_architecture({"model": {"architecture": "1", "params": _base_model_params("1")}}, **common),
+        "architecture2": mf.build_architecture({"model": {"architecture": "2", "params": _base_model_params("2", use_anchor_blend=True)}}, **common),
+        "architecture3": mf.build_architecture({"model": {"architecture": "3", "params": _base_model_params("3", use_regional_he=True, use_global_gex=True)}}, **common),
+        "architecture4": mf.build_architecture(
+            {"model": {"architecture": "4", "params": _base_model_params("4", use_regional_he=True)}},
+            **common, gene_basis=basis, gene_names=gene_names,
+        ),
+    }
+    sync_dir = tmp_path / "synchronized_init"
+    mf.persist_four_architecture_initializations(models, sync_dir)
+    return sync_dir
 
 
 @pytest.mark.parametrize("architecture", ["1", "2"])
@@ -118,30 +147,7 @@ def test_run_training_non_smoke_loads_verified_synchronized_initialization_and_c
     """Requirement #7 (mandatory synchronized init) + requirement #9
     (checkpointing/resume) exercised together through the real trainer."""
     cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
-
-    # Build a real synchronized-initialization manifest for all four
-    # architectures (model_factory.persist_four_architecture_initializations
-    # requires exactly the four) -- tiny, CPU-only, matching this test's
-    # own small model_param_overrides.
-    from gen3_multiscale.models import model_factory as mf
-    gene_names = list(manifest["gene_panel"])
-    n_genes = len(gene_names)
-    import numpy as np
-    residuals = np.random.default_rng(1).normal(size=(10, n_genes)).astype(np.float32)
-    basis = fit_gene_residual_basis(residuals, gene_names, rank=4)
-
-    common = dict(n_genes=n_genes, gex_feature_dim=8, seed=0)
-    models = {
-        "architecture1": mf.build_architecture({"model": {"architecture": "1", "params": _base_model_params("1")}}, **common),
-        "architecture2": mf.build_architecture({"model": {"architecture": "2", "params": _base_model_params("2", use_anchor_blend=True)}}, **common),
-        "architecture3": mf.build_architecture({"model": {"architecture": "3", "params": _base_model_params("3", use_regional_he=True, use_global_gex=True)}}, **common),
-        "architecture4": mf.build_architecture(
-            {"model": {"architecture": "4", "params": _base_model_params("4", use_regional_he=True)}},
-            **common, gene_basis=basis, gene_names=gene_names,
-        ),
-    }
-    sync_dir = tmp_path / "synchronized_init"
-    mf.persist_four_architecture_initializations(models, sync_dir)
+    sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
 
     config_path = tmp_path / "config.yaml"
     checkpoint_dir = tmp_path / "ckpt_1_resume"
@@ -149,10 +155,9 @@ def test_run_training_non_smoke_loads_verified_synchronized_initialization_and_c
         cfg, manifest_path, config_path, architecture="1", checkpoint_dir=checkpoint_dir,
         synchronized_init_dir=str(sync_dir), checkpoint_every_n_steps=1,
     )
-    # A real, tiny non-smoke run: total_steps is read from training_cfg
-    # normally, but run_training's smoke branch is the only place that
-    # caps it -- so drive a real short run by setting total_steps small
-    # in the config directly.
+    # A real, tiny non-smoke run: total_steps is the run's ABSOLUTE
+    # target step count (requirement #2) -- drive a real short run by
+    # setting it small in the config directly.
     config = yaml.safe_load(config_path.read_text())
     config["training"]["total_steps"] = 2
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
@@ -160,13 +165,234 @@ def test_run_training_non_smoke_loads_verified_synchronized_initialization_and_c
     summary_first = train_module.run_training(str(config_path), smoke=False)
     assert summary_first["ok"] is True
     assert summary_first["final_step"] == 2
+    assert summary_first["completion_reason"] == "completed_total_steps"
     assert (checkpoint_dir / "trainable_weights.pt").is_file()
     assert (checkpoint_dir / "optimizer_rng_state.pt").is_file()
 
-    config["training"]["total_steps"] = 1  # resume for one more step
+    # Requirement #2 regression: total_steps=1 (LESS than the already-
+    # reached resume_step=2) must run ZERO additional steps, never
+    # "resume_step + total_steps" more.
+    config["training"]["total_steps"] = 1
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    summary_noop = train_module.run_training(str(config_path), smoke=False)
+    assert summary_noop["final_step"] == 2
+
+    # An ABSOLUTE total_steps greater than resume_step=2 genuinely
+    # continues training to that absolute target.
+    config["training"]["total_steps"] = 3
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
     summary_second = train_module.run_training(str(config_path), smoke=False)
     assert summary_second["final_step"] == 3
+
+
+def test_run_training_stops_at_the_wall_clock_limit_and_saves_a_checkpoint(tmp_path, monkeypatch):
+    """Regression test for a real, confirmed gap (Codex audit of commit
+    27e1232): training.max_wall_clock_hours was completely unused --
+    total_steps=100_000_000 (the real configs' own hard safety cap) would
+    never stop on a wall-clock budget alone. Fakes time.time() to make the
+    SECOND loop iteration's check exceed the (real, positive) configured
+    limit, after the FIRST step has already run -- confirming the run
+    stops early, records why, and still saves a real checkpoint for the
+    step(s) that did complete."""
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
+    config_path = tmp_path / "config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_wallclock"
+    _write_config(
+        cfg, manifest_path, config_path, architecture="1", checkpoint_dir=checkpoint_dir,
+        synchronized_init_dir=str(sync_dir), checkpoint_every_n_steps=1,
+    )
+    config = yaml.safe_load(config_path.read_text())
+    config["training"]["total_steps"] = 100  # never naturally reached in this test
+    config["training"]["max_wall_clock_hours"] = 1.0
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+
+    # time.time() call order inside run_training: (1) start_time, (2) the
+    # wall-clock check at the top of iteration 0 (must pass), (3) the
+    # check at the top of iteration 1 (must trip the 1.0-hour limit),
+    # (4) the final `elapsed = time.time() - start_time` for the summary.
+    fake_times = iter([0.0, 0.0, 3600.0 * 2, 3600.0 * 2])
+    monkeypatch.setattr(train_module.time, "time", lambda: next(fake_times))
+
+    summary = train_module.run_training(str(config_path), smoke=False)
+    assert summary["completion_reason"] == "wall_clock_limit_reached"
+    assert summary["final_step"] == 1
+    assert (checkpoint_dir / "trainable_weights.pt").is_file()
+
+
+def test_run_training_smoke_learning_gate_fails_on_a_frozen_model(tmp_path, monkeypatch):
+    """Regression test: requirement #4's smoke learning gate must catch a
+    model that is NOT actually learning even when loss/gradients are both
+    perfectly finite -- simulated here by making optimizer.step() a no-op
+    (mirrors a real bug class: e.g. an accidentally-frozen backbone or a
+    disconnected computation graph, where every finite-value check still
+    passes but no trainable parameter ever actually changes)."""
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    config_path = tmp_path / "config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_frozen"
+    _write_config(cfg, manifest_path, config_path, architecture="1", checkpoint_dir=checkpoint_dir)
+    monkeypatch.setattr(torch.optim.AdamW, "step", lambda self, *a, **kw: None)
+    with pytest.raises(RuntimeError, match="zero measurable change"):
+        train_module.run_training(str(config_path), smoke=True)
+
+
+def test_run_training_smoke_learning_gate_fails_on_a_zero_gradient_norm(tmp_path, monkeypatch):
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    config_path = tmp_path / "config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_zero_grad"
+    _write_config(cfg, manifest_path, config_path, architecture="1", checkpoint_dir=checkpoint_dir)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", lambda *a, **kw: torch.as_tensor(0.0))
+    with pytest.raises(RuntimeError, match="not strictly positive"):
+        train_module.run_training(str(config_path), smoke=True)
+
+
+def test_run_training_refuses_to_resume_under_a_changed_architecture(tmp_path, monkeypatch):
+    """Regression test for a real, confirmed gap (Codex audit of commit
+    27e1232): "Refuse changed configs or artifacts." A checkpoint_dir
+    whose run_manifest.json records a DIFFERENT model architecture than
+    the current invocation must raise, not silently proceed."""
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
+    config_path = tmp_path / "config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_arch_switch"
+    _write_config(
+        cfg, manifest_path, config_path, architecture="1", checkpoint_dir=checkpoint_dir,
+        synchronized_init_dir=str(sync_dir),
+    )
+    config = yaml.safe_load(config_path.read_text())
+    config["training"]["total_steps"] = 1
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    train_module.run_training(str(config_path), smoke=False)
+
+    # Same checkpoint_dir, switched to architecture 2 -- a real, plausible
+    # operator mistake (wrong --config path, or a copy-pasted checkpoint_dir).
+    config["model"]["architecture"] = "2"
+    config["model"]["params"]["use_anchor_blend"] = True
+    config["training"]["total_steps"] = 2
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    with pytest.raises(ValueError, match="resume refused"):
+        train_module.run_training(str(config_path), smoke=False)
+
+
+def test_run_training_requires_optimizer_state_to_resume_a_real_checkpoint(tmp_path, monkeypatch):
+    """Regression test: a checkpoint_dir with training_state.json (step >
+    0) but no optimizer_rng_state.pt must refuse to resume rather than
+    silently restarting optimizer momentum/RNG state from scratch."""
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
+    config_path = tmp_path / "config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_no_opt_state"
+    _write_config(
+        cfg, manifest_path, config_path, architecture="1", checkpoint_dir=checkpoint_dir,
+        synchronized_init_dir=str(sync_dir),
+    )
+    config = yaml.safe_load(config_path.read_text())
+    config["training"]["total_steps"] = 1
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    train_module.run_training(str(config_path), smoke=False)
+    assert (checkpoint_dir / "optimizer_rng_state.pt").is_file()
+    (checkpoint_dir / "optimizer_rng_state.pt").unlink()
+
+    config["training"]["total_steps"] = 2
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    with pytest.raises(ValueError, match="optimizer_rng_state"):
+        train_module.run_training(str(config_path), smoke=False)
+
+
+def test_run_training_validation_selection_metric_is_deterministic_across_repeated_calls(tmp_path, monkeypatch):
+    """Regression test for requirement #8: Architecture 4's validation
+    used to mix a RANDOMLY-sampled flow loss into the very metric used
+    for model selection -- calling validation twice on the identical
+    model/data could previously produce two different "total" values.
+    The deterministic reconstruction metric must not."""
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    gene_names = list(manifest["gene_panel"])
+    residuals = np.random.default_rng(3).normal(size=(10, len(gene_names))).astype(np.float32)
+    basis = fit_gene_residual_basis(residuals, gene_names, rank=4)
+    basis_path = tmp_path / "gene_residual_basis.pt"
+    save_gene_residual_basis(basis, basis_path)
+
+    config_path = tmp_path / "config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_val_determinism"
+    _write_config(
+        cfg, manifest_path, config_path, architecture="4", checkpoint_dir=checkpoint_dir,
+        model_param_overrides={"use_regional_he": True}, gene_residual_basis_path=str(basis_path),
+    )
+    summary_a = train_module.run_training(str(config_path), smoke=True)
+    checkpoint_dir_b = tmp_path / "ckpt_val_determinism_b"
+    _write_config(
+        cfg, manifest_path, config_path, architecture="4", checkpoint_dir=checkpoint_dir_b,
+        model_param_overrides={"use_regional_he": True}, gene_residual_basis_path=str(basis_path),
+    )
+    summary_b = train_module.run_training(str(config_path), smoke=True)
+    history_a = json.loads((checkpoint_dir / "validation_history.json").read_text())
+    history_b = json.loads((checkpoint_dir_b / "validation_history.json").read_text())
+    assert summary_a["ok"] is True and summary_b["ok"] is True
+    assert history_a[0]["total"] == history_b[0]["total"]
+
+
+def test_run_training_saves_a_best_checkpoint_and_validation_history(tmp_path, monkeypatch):
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
+    config_path = tmp_path / "config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_best"
+    _write_config(
+        cfg, manifest_path, config_path, architecture="1", checkpoint_dir=checkpoint_dir,
+        synchronized_init_dir=str(sync_dir),
+    )
+    config = yaml.safe_load(config_path.read_text())
+    # eval_every_n_steps is only ever checked for step > resume_step (a
+    # deliberate "don't immediately re-evaluate right after resume"
+    # skip), so total_steps=2 is needed for validation to actually fire
+    # at least once on a fresh (never-resumed) non-smoke run.
+    config["training"]["total_steps"] = 2
+    config["training"]["eval_every_n_steps"] = 1
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    train_module.run_training(str(config_path), smoke=False)
+
+    assert (checkpoint_dir / "validation_history.json").is_file()
+    history = json.loads((checkpoint_dir / "validation_history.json").read_text())
+    assert len(history) == 1
+    assert (checkpoint_dir / "best" / "trainable_weights.pt").is_file()
+    assert (checkpoint_dir / "best" / "best_info.json").is_file()
+
+
+def test_validate_numeric_config_rejects_a_non_positive_learning_rate():
+    with pytest.raises(ValueError, match="training.lr"):
+        train_module._validate_numeric_config({"lr": 0.0}, {})
+
+
+def test_validate_numeric_config_rejects_invalid_betas():
+    with pytest.raises(ValueError, match="betas"):
+        train_module._validate_numeric_config({"lr": 1e-4, "optimizer": {"betas": [1.5, 0.999]}}, {})
+
+
+def test_compute_training_gene_scale_is_a_positive_pure_function_of_training_data(tmp_path, monkeypatch):
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    from gen3_multiscale.training.gen3_dataset import load_gen3_sample_data
+
+    train_samples = {sid: load_gen3_sample_data(cfg, manifest, sid) for sid in manifest["train_sample_ids"]}
+    scale_a = train_module.compute_training_gene_scale(train_samples)
+    scale_b = train_module.compute_training_gene_scale(train_samples)
+    assert scale_a.shape == (len(manifest["gene_panel"]),)
+    assert (scale_a > 0).all()
+    assert np.array_equal(scale_a, scale_b)
+
+
+def test_deterministic_train_index_for_step_is_reproducible_and_covers_the_dataset():
+    seen_epoch0 = {train_module.deterministic_train_index_for_step(i, 5, seed=42) for i in range(5)}
+    assert seen_epoch0 == {0, 1, 2, 3, 4}
+    assert (
+        train_module.deterministic_train_index_for_step(3, 5, seed=42)
+        == train_module.deterministic_train_index_for_step(3, 5, seed=42)
+    )
+    # Different seeds must generally produce different orderings (not
+    # required to differ at every single index, but the whole epoch-0
+    # ordering should not be identical).
+    order_seed_a = [train_module.deterministic_train_index_for_step(i, 5, seed=1) for i in range(5)]
+    order_seed_b = [train_module.deterministic_train_index_for_step(i, 5, seed=2) for i in range(5)]
+    assert order_seed_a != order_seed_b
 
 
 def test_run_training_rejects_incomplete_cache_coverage(tmp_path, monkeypatch):
@@ -233,11 +459,12 @@ def test_run_training_rejects_a_manifest_with_zero_train_samples(tmp_path, monke
         train_module.run_training(str(config_path), smoke=True)
 
 
-def test_run_training_skips_a_nonfinite_loss_step_instead_of_corrupting_the_model(tmp_path, monkeypatch):
-    """Requirement #9's finite-loss safety check, exercised for real: force
-    the loss to be NaN on the one smoke step and confirm the optimizer step
-    is skipped (no exception, and the summary records the skip) rather than
-    silently stepping on a corrupted gradient."""
+def test_run_training_fails_closed_on_a_nonfinite_loss_instead_of_silently_skipping(tmp_path, monkeypatch):
+    """Regression test for a real, confirmed gap (Codex audit of commit
+    27e1232): "NaN/Inf loss or gradients must make smoke/full runs fail,
+    not increment the step and eventually return ok: true." A prior
+    version of this test validated exactly that wrong behavior (skip +
+    ok: true); it must now assert the run RAISES instead."""
     cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
     config_path = tmp_path / "config.yaml"
     checkpoint_dir = tmp_path / "ckpt_nonfinite"
@@ -252,6 +479,22 @@ def test_run_training_skips_a_nonfinite_loss_step_instead_of_corrupting_the_mode
         return losses
 
     monkeypatch.setattr(train_module, "compute_step_losses", _nan_losses)
-    summary = train_module.run_training(str(config_path), smoke=True)
-    assert summary["ok"] is True
-    assert summary["n_skipped_nonfinite"] == 1
+    with pytest.raises(RuntimeError, match="non-finite total loss"):
+        train_module.run_training(str(config_path), smoke=True)
+
+
+def test_run_training_fails_closed_on_a_nonfinite_gradient(tmp_path, monkeypatch):
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    config_path = tmp_path / "config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_nonfinite_grad"
+    _write_config(cfg, manifest_path, config_path, architecture="1", checkpoint_dir=checkpoint_dir)
+
+    real_grad_norm = torch.nn.utils.clip_grad_norm_
+
+    def _nan_grad_norm(*args, **kwargs):
+        real_grad_norm(*args, **kwargs)
+        return torch.as_tensor(float("nan"))
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", _nan_grad_norm)
+    with pytest.raises(RuntimeError, match="non-finite gradient norm"):
+        train_module.run_training(str(config_path), smoke=True)

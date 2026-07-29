@@ -16,6 +16,7 @@ import hashlib
 from gen3_multiscale.data.dataset_manifest import (
     all_composite_spot_ids, build_dataset_manifest, composite_spot_id, ensure_dataset_manifest,
     gene_panel_hash, load_dataset_manifest, load_digest_cache, save_dataset_manifest, save_digest_cache,
+    verify_content_provenance, verify_metadata_csv_provenance,
 )
 
 _SMALL_BUILD_KWARGS = dict(
@@ -471,6 +472,53 @@ def test_content_hash_is_always_freshly_computed_never_trusted_from_the_digest_c
     rebuilt = build_dataset_manifest(**build_kwargs)
     assert rebuilt["samples"]["L0"]["content_provenance"]["h5ad"]["sha256"] == real_hash
     assert rebuilt["samples"]["L0"]["content_provenance"]["h5ad"]["sha256"] != "0" * 64
+
+
+def test_verify_content_provenance_passes_for_an_unmodified_sample(tmp_path):
+    hest_dir, meta_path, _ = _make_synthetic_hest1k(tmp_path, {"Lung": ["L0", "L1", "L2"]})
+    manifest = build_dataset_manifest(
+        hest_dir, str(meta_path), organs="all", min_samples_per_organ=3,
+        n_validation_per_organ=0, n_test_per_organ=0, split_seed=0, **_SMALL_BUILD_KWARGS,
+    )
+    verify_content_provenance(hest_dir, manifest, "L0")  # must not raise
+
+
+def test_verify_content_provenance_rejects_a_changed_h5ad_file(tmp_path):
+    """Regression test for a real, confirmed gap (Codex audit of commit
+    27e1232): 'a changed h5ad with identical genes/barcodes can pass.'"""
+    hest_dir, meta_path, _ = _make_synthetic_hest1k(tmp_path, {"Lung": ["L0", "L1", "L2"]})
+    manifest = build_dataset_manifest(
+        hest_dir, str(meta_path), organs="all", min_samples_per_organ=3,
+        n_validation_per_organ=0, n_test_per_organ=0, split_seed=0, **_SMALL_BUILD_KWARGS,
+    )
+    h5ad_path = hest_dir / "st" / "L0.h5ad"
+    with open(h5ad_path, "ab") as f:
+        f.write(b"\x00extra-bytes-that-change-the-real-content")
+    with pytest.raises(ValueError, match="SHA256"):
+        verify_content_provenance(hest_dir, manifest, "L0")
+
+
+def test_verify_content_provenance_rejects_an_unknown_sample_id(tmp_path):
+    hest_dir, meta_path, _ = _make_synthetic_hest1k(tmp_path, {"Lung": ["L0"]})
+    manifest = build_dataset_manifest(
+        hest_dir, str(meta_path), organs="all", min_samples_per_organ=1,
+        n_validation_per_organ=0, n_test_per_organ=0, split_seed=0, **_SMALL_BUILD_KWARGS,
+    )
+    with pytest.raises(ValueError, match="not a sample"):
+        verify_content_provenance(hest_dir, manifest, "NOT_REAL")
+
+
+def test_verify_metadata_csv_provenance_passes_then_rejects_a_changed_csv(tmp_path):
+    hest_dir, meta_path, _ = _make_synthetic_hest1k(tmp_path, {"Lung": ["L0"]})
+    manifest = build_dataset_manifest(
+        hest_dir, str(meta_path), organs="all", min_samples_per_organ=1,
+        n_validation_per_organ=0, n_test_per_organ=0, split_seed=0, **_SMALL_BUILD_KWARGS,
+    )
+    verify_metadata_csv_provenance(manifest)  # must not raise
+    with open(meta_path, "a") as f:
+        f.write("\n")
+    with pytest.raises(ValueError, match="SHA256"):
+        verify_metadata_csv_provenance(manifest)
 
 
 def test_save_and_load_dataset_manifest_round_trips(tmp_path):

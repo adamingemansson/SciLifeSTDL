@@ -152,6 +152,70 @@ def _sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+def verify_content_provenance(hest_data_dir: str | Path, manifest: dict, sample_id: str) -> None:
+    """Recompute and compare this sample's real, ON-DISK h5ad/patch-h5
+    content hashes against `manifest["samples"][sample_id]
+    ["content_provenance"]` -- fail closed on any mismatch.
+
+    Real, confirmed gap (Codex audit of commit 27e1232): this module
+    already records real SHA256 content provenance for every kept
+    sample's h5ad/patch-h5 files (own docstring above), but nothing in
+    the real trainer (Step 6) ever RE-READ and RE-HASHED those files to
+    confirm they still match what the manifest claims -- a changed
+    h5ad file on disk (same barcodes/gene panel, different expression
+    values, e.g. a corrupted re-download or a since-updated HEST-1k
+    release) would previously pass every check downstream. Called once
+    per sample at trainer preflight time, before any masking or training
+    -- deliberately real, expensive I/O (a full re-read of the file), not
+    a cheap stat-based shortcut, mirroring `_cached_file_content_hash`'s
+    own "never trust size/mtime instead of real bytes" discipline."""
+    record = manifest["samples"].get(sample_id)
+    if record is None:
+        raise ValueError(f"{sample_id!r} is not a sample the dataset manifest declares")
+    expected = record.get("content_provenance")
+    if not expected:
+        raise ValueError(f"{sample_id}: manifest has no content_provenance recorded -- rebuild the manifest")
+
+    h5ad_path = loaders._resolve_hest_sample_file(hest_data_dir, sample_id, ".h5ad")
+    patch_path = loaders._resolve_hest_sample_file(
+        hest_data_dir, sample_id, ".h5", required_path_part="patches",
+    )
+    actual_h5ad_sha256 = _sha256_file(h5ad_path)
+    if actual_h5ad_sha256 != expected["h5ad"]["sha256"]:
+        raise ValueError(
+            f"{sample_id}: h5ad file at {h5ad_path} has SHA256 {actual_h5ad_sha256}, but the "
+            f"dataset manifest declares {expected['h5ad']['sha256']} -- the file on disk has "
+            "changed since the manifest was built; rebuild the manifest or restore the original file"
+        )
+    actual_patch_sha256 = _sha256_file(patch_path)
+    if actual_patch_sha256 != expected["patch_h5"]["sha256"]:
+        raise ValueError(
+            f"{sample_id}: patch h5 file at {patch_path} has SHA256 {actual_patch_sha256}, but the "
+            f"dataset manifest declares {expected['patch_h5']['sha256']} -- the file on disk has "
+            "changed since the manifest was built; rebuild the manifest or restore the original file"
+        )
+
+
+def verify_metadata_csv_provenance(manifest: dict) -> None:
+    """Recompute and compare the manifest's declared metadata CSV content
+    hash against the real, on-disk file -- same discipline as
+    `verify_content_provenance`, but for the ONE shared metadata file
+    (checked once per run, not once per sample)."""
+    provenance = manifest.get("metadata_csv_provenance")
+    if not provenance:
+        raise ValueError("manifest has no metadata_csv_provenance recorded -- rebuild the manifest")
+    path = Path(provenance["path"])
+    if not path.is_file():
+        raise FileNotFoundError(f"metadata CSV not found at {path} -- the manifest cannot be verified")
+    actual_sha256 = _sha256_file(path)
+    if actual_sha256 != provenance["sha256"]:
+        raise ValueError(
+            f"metadata CSV at {path} has SHA256 {actual_sha256}, but the dataset manifest declares "
+            f"{provenance['sha256']} -- the file on disk has changed since the manifest was built; "
+            "rebuild the manifest or restore the original file"
+        )
+
+
 def _cached_file_content_hash(path: Path, digest_cache: dict) -> str:
     """Real SHA256 content hash of `path`, ALWAYS freshly computed by
     reading the file's actual bytes -- never returned from a cached

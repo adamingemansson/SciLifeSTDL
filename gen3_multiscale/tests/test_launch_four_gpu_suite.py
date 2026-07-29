@@ -122,25 +122,58 @@ def test_static_config_audit_still_catches_a_divergence_among_three_configs_when
 # ---------------------------------------------------------------------------
 # check_required_fingerprints
 # ---------------------------------------------------------------------------
-def test_check_required_fingerprints_reports_missing_and_null_paths(tmp_path):
-    present = tmp_path / "exists.json"
-    present.write_text("{}")
-    config = {"required_fingerprints": {"present": str(present), "missing": str(tmp_path / "nope.json"), "unset": None}}
-    missing = check_required_fingerprints(config)
-    assert any("missing" in m for m in missing)
-    assert any("unset" in m for m in missing)
-    assert not any(m.startswith("present:") for m in missing)
-
-
-def test_check_required_fingerprints_empty_when_all_present(tmp_path):
-    present = tmp_path / "exists.json"
-    present.write_text("{}")
-    config = {"required_fingerprints": {"present": str(present)}}
+def test_check_required_fingerprints_ignores_unused_entries_regardless_of_missing_or_null(tmp_path):
+    """Regression test for a real, confirmed gap (Codex audit of commit
+    27e1232): gene_vocabulary/mask-bank paths are not consumed by the
+    real trainer for ANY architecture today -- a config declaring them
+    missing or null must not be blocked on their account."""
+    config = {
+        "model": {"architecture": "1", "params": {"use_global_slide": False}},
+        "required_fingerprints": {
+            "gene_vocabulary": None, "train_mask_bank": str(tmp_path / "nope.json"),
+            "validation_mask_bank": None, "test_mask_bank": None,
+        },
+    }
     assert check_required_fingerprints(config) == []
+
+
+def test_check_required_fingerprints_requires_gigapath_checkpoint_only_when_use_global_slide(tmp_path):
+    base_config = {"required_fingerprints": {"gigapath_checkpoint": None}}
+    assert check_required_fingerprints({
+        **base_config, "model": {"architecture": "1", "params": {"use_global_slide": False}},
+    }) == []
+    missing = check_required_fingerprints({
+        **base_config, "model": {"architecture": "3", "params": {"use_global_slide": True}},
+    })
+    assert any("gigapath_checkpoint" in m for m in missing)
+
+    present = tmp_path / "checkpoint.pth"
+    present.write_text("fake checkpoint bytes")
+    assert check_required_fingerprints({
+        "model": {"architecture": "3", "params": {"use_global_slide": True}},
+        "required_fingerprints": {"gigapath_checkpoint": str(present)},
+    }) == []
+
+
+def test_check_required_fingerprints_requires_gene_residual_basis_only_for_architecture_4(tmp_path):
+    assert check_required_fingerprints({
+        "model": {"architecture": "1", "params": {}}, "required_fingerprints": {"gene_residual_basis": None},
+    }) == []
+    missing = check_required_fingerprints({
+        "model": {"architecture": "4", "params": {}}, "required_fingerprints": {"gene_residual_basis": None},
+    })
+    assert any("gene_residual_basis" in m for m in missing)
+
+    present = tmp_path / "basis.pt"
+    present.write_text("fake basis bytes")
+    assert check_required_fingerprints({
+        "model": {"architecture": "4", "params": {}}, "required_fingerprints": {"gene_residual_basis": str(present)},
+    }) == []
 
 
 def test_check_required_fingerprints_empty_when_no_fingerprints_declared():
     assert check_required_fingerprints({}) == []
+    assert check_required_fingerprints({"model": {"architecture": "4", "params": {}}}) != []
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +431,8 @@ def test_launch_suite_refuses_to_start_any_job_when_the_audit_fails(tmp_path):
 def test_launch_suite_refuses_to_start_when_a_required_fingerprint_is_missing(tmp_path):
     named_configs, config_paths = _minimal_named_configs(n=2)
     for cfg in named_configs.values():
-        cfg["required_fingerprints"] = {"gene_vocabulary": None}
+        cfg["model"] = {"architecture": "3", "params": {"use_global_slide": True}}
+        cfg["required_fingerprints"] = {"gigapath_checkpoint": None}
     with pytest.raises(ValueError, match="missing required fingerprints"):
         launch_suite(named_configs, config_paths, gpu_list=["0", "1"], log_root=tmp_path, command_builder=_stub_command_builder())
     assert list(tmp_path.iterdir()) == []

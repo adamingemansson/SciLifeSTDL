@@ -91,6 +91,69 @@ def test_overfit_test_runs_a_real_short_run_on_one_sample(tmp_path, monkeypatch)
     assert (checkpoint_dir / "trainable_weights.pt").is_file()
 
 
+def _sync_dir_for_overfit(tmp_path, manifest):
+    common = dict(n_genes=len(manifest["gene_panel"]), gex_feature_dim=8, seed=0)
+    gene_names = list(manifest["gene_panel"])
+    residuals = np.random.default_rng(6).normal(size=(10, len(gene_names))).astype(np.float32)
+    basis = fit_gene_residual_basis(residuals, gene_names, rank=4)
+    models = {
+        "architecture1": mf.build_architecture({"model": {"architecture": "1", "params": step6_model_params("1")}}, **common),
+        "architecture2": mf.build_architecture({"model": {"architecture": "2", "params": step6_model_params("2", use_anchor_blend=True)}}, **common),
+        "architecture3": mf.build_architecture({"model": {"architecture": "3", "params": step6_model_params("3", use_regional_he=True, use_global_gex=True)}}, **common),
+        "architecture4": mf.build_architecture(
+            {"model": {"architecture": "4", "params": step6_model_params("4", use_regional_he=True)}},
+            **common, gene_basis=basis, gene_names=gene_names,
+        ),
+    }
+    sync_dir = tmp_path / "sync_overfit"
+    mf.persist_four_architecture_initializations(models, sync_dir)
+    return sync_dir
+
+
+def test_run_overfit_gate_passes_when_the_model_genuinely_learns(tmp_path, monkeypatch):
+    """Regression test for a real, confirmed gap (Codex audit of commit
+    27e1232): "Merely completing 200 steps is not a capacity test." A
+    high learning rate on a single tiny sample should genuinely drive
+    RMSE down on the fixed eval mask within a small number of steps."""
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    sync_dir = _sync_dir_for_overfit(tmp_path, manifest)
+    config_path = tmp_path / "config.yaml"
+    write_step6_train_config(cfg, manifest_path, config_path, architecture="1", checkpoint_dir=tmp_path / "unused")
+    config = yaml.safe_load(config_path.read_text())
+    config["training"]["synchronized_init_dir"] = str(sync_dir)
+    config["training"]["lr"] = 0.05
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+
+    sample_id = manifest["train_sample_ids"][0]
+    checkpoint_dir = tmp_path / "ckpt_overfit_gate"
+    gate_report = step6_overfit_test.run_overfit_gate(
+        str(config_path), sample_id, n_steps=60, checkpoint_dir=str(checkpoint_dir),
+        min_rmse_improvement_fraction=0.05,
+    )
+    assert gate_report["passed"] is True
+    assert gate_report["after"]["rmse"] < gate_report["before"]["rmse"]
+
+
+def test_run_overfit_gate_fails_when_the_model_does_not_learn(tmp_path, monkeypatch):
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    sync_dir = _sync_dir_for_overfit(tmp_path, manifest)
+    config_path = tmp_path / "config.yaml"
+    write_step6_train_config(cfg, manifest_path, config_path, architecture="1", checkpoint_dir=tmp_path / "unused2")
+    config = yaml.safe_load(config_path.read_text())
+    config["training"]["synchronized_init_dir"] = str(sync_dir)
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+
+    import torch
+    monkeypatch.setattr(torch.optim.AdamW, "step", lambda self, *a, **kw: None)
+
+    sample_id = manifest["train_sample_ids"][0]
+    checkpoint_dir = tmp_path / "ckpt_overfit_gate_fail"
+    with pytest.raises(RuntimeError, match="overfit gate FAILED"):
+        step6_overfit_test.run_overfit_gate(
+            str(config_path), sample_id, n_steps=3, checkpoint_dir=str(checkpoint_dir),
+        )
+
+
 def test_run_four_gpu_smoke_diagnostic_calls_launch_suite_with_smoke_only_true(tmp_path, monkeypatch):
     """Wiring test: the diagnostic launcher must call launch_suite with
     smoke_only=True and must NEVER call run_suite_with_smoke_gate (which

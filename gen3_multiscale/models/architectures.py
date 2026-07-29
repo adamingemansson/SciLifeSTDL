@@ -640,7 +640,10 @@ class Architecture4(nn.Module):
             raise ValueError("target_expression contains non-finite (NaN/Inf) values")
         return target_expression
 
-    def compute_flow_matching_loss(self, inputs: SpatialFieldInputs, target_expression: torch.Tensor | np.ndarray) -> torch.Tensor:
+    def compute_flow_matching_loss(
+        self, inputs: SpatialFieldInputs, target_expression: torch.Tensor | np.ndarray,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
         # 17th Codex re-audit (Step 5 Part 2 launch blocker, "Important
         # before Step 6/7"): same device-selection bug as
         # _SharedFieldArchitecture.forward() -- self.conditioner's own
@@ -657,9 +660,12 @@ class Architecture4(nn.Module):
         target_residual = target_expression - deterministic_mean
         target_coefficients = target_residual @ self._gene_basis_matrix.T  # GeneResidualBasis.to_coefficients, device-correct
         query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32, device=device)
-        return flow_matching_loss(self.velocity_network, target_coefficients, query_coords, query_hidden)
+        return flow_matching_loss(self.velocity_network, target_coefficients, query_coords, query_hidden, generator=generator)
 
-    def compute_losses(self, inputs: SpatialFieldInputs, target_expression: torch.Tensor | np.ndarray) -> dict:
+    def compute_losses(
+        self, inputs: SpatialFieldInputs, target_expression: torch.Tensor | np.ndarray,
+        generator: torch.Generator | None = None,
+    ) -> dict:
         """Runs self.conditioner exactly ONCE and derives both the
         deterministic conditioner output and the flow-matching loss from
         that single pass. Calling forward() and compute_flow_matching_loss()
@@ -672,7 +678,17 @@ class Architecture4(nn.Module):
         both losses per step should use; forward() and
         compute_flow_matching_loss() are kept unchanged for callers that
         only need one or the other and for the existing tests exercising
-        them independently."""
+        them independently.
+
+        `generator` (added for Step 6's real trainer, Codex audit of
+        commit 27e1232): flow_matching_loss draws a random t and x0 from
+        the GLOBAL torch RNG when no generator is given, making the flow
+        loss non-deterministic across repeated calls with the same
+        inputs -- fine for training, but wrong for VALIDATION, where a
+        caller computing model-selection metrics needs reproducible
+        numbers. Passing a caller-owned `torch.Generator` here makes the
+        flow loss (and only the flow loss) reproducible without touching
+        the global RNG stream at all."""
         # 17th Codex re-audit (Step 5 Part 2 launch blocker, "Important
         # before Step 6/7"): same device-selection bug as
         # _SharedFieldArchitecture.forward() -- self.conditioner's own
@@ -689,7 +705,7 @@ class Architecture4(nn.Module):
         target_residual = target_expression - deterministic_mean
         target_coefficients = target_residual @ self._gene_basis_matrix.T  # GeneResidualBasis.to_coefficients, device-correct
         query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32, device=device)
-        flow_loss = flow_matching_loss(self.velocity_network, target_coefficients, query_coords, query_hidden)
+        flow_loss = flow_matching_loss(self.velocity_network, target_coefficients, query_coords, query_hidden, generator=generator)
         return {**conditioner_out, "flow_loss": flow_loss}
 
     @torch.no_grad()

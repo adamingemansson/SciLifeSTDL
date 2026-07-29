@@ -150,12 +150,44 @@ def static_config_audit(named_configs: dict[str, dict]) -> dict:
 def check_required_fingerprints(config: dict) -> list[str]:
     """"Refuse to start if any required checkpoint, vocabulary, cache,
     split, or mask-bank fingerprint is absent." A config declares its
-    required paths under `required_fingerprints: {name: path}`; this
-    returns a human-readable description per MISSING one (empty list =
-    every declared fingerprint is present on disk). Fails closed: a path
-    set to null/None is treated as missing, never skipped."""
+    candidate paths under `required_fingerprints: {name: path}`; this
+    returns a human-readable description per MISSING one that this
+    SPECIFIC config actually needs (empty list = every fingerprint this
+    config needs is present on disk). Fails closed: a path set to
+    null/None for a NEEDED fingerprint is treated as missing, never
+    skipped.
+
+    Real, confirmed gap (Codex audit of commit 27e1232): a prior version
+    treated EVERY key under `required_fingerprints` as unconditionally
+    required, regardless of whether the real trainer (training/train.py)
+    actually consumes it for this architecture. `gene_vocabulary` and the
+    three mask-bank paths are not read by train.py at all today (mask
+    banks are generated on the fly by
+    `gen3_dataset.build_gen3_mask_schedule`, keyed off `training.
+    checkpoint_dir`, not off `required_fingerprints`) -- requiring them
+    meant NO config, real or synthetic, could ever launch a real smoke
+    without `--skip-fingerprint-check`, which the launcher's own docs
+    call "only for local dry runs... never for a real launch."
+    `gigapath_checkpoint` is only consumed when `model.params.
+    use_global_slide` is true (`train.py::maybe_build_slide_encoder`);
+    `gene_residual_basis` only for Architecture 4 (`train.py::
+    maybe_load_gene_basis`). Every OTHER declared `required_fingerprints`
+    entry this config doesn't actually need is intentionally never
+    checked here -- a config listing extra, unused paths (e.g. for a
+    future Step 7/8 consumer) must not block launch on their account."""
+    required_fingerprints = config.get("required_fingerprints") or {}
+    model_params = (config.get("model") or {}).get("params") or {}
+    architecture_id = str((config.get("model") or {}).get("architecture", ""))
+
+    needed = set()
+    if model_params.get("use_global_slide"):
+        needed.add("gigapath_checkpoint")
+    if architecture_id == "4":
+        needed.add("gene_residual_basis")
+
     missing = []
-    for name, path in (config.get("required_fingerprints") or {}).items():
+    for name in sorted(needed):
+        path = required_fingerprints.get(name)
         if path is None:
             missing.append(f"{name}: not set in config")
         elif not Path(str(path)).exists():

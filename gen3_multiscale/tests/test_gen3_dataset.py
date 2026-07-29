@@ -3,6 +3,8 @@ manifest-backed dataset. Real, small, end-to-end synthetic data
 (gen3_multiscale/tests/_step6_fixtures.py) exercising every real module
 this dataset wires together: dataset_manifest, example_builder,
 spot_feature_cache, slide_context, mask_fingerprint, mask_schedule."""
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -42,6 +44,54 @@ def test_load_gen3_sample_data_rejects_an_unknown_sample_id(tmp_path, monkeypatc
     cfg, manifest = build_synthetic_gen3_experiment(tmp_path, monkeypatch)
     with pytest.raises(ValueError, match="not a sample"):
         load_gen3_sample_data(cfg, manifest, "NOT_A_REAL_SAMPLE")
+
+
+def test_load_gen3_sample_data_rejects_an_h5ad_file_that_changed_since_the_manifest_was_built(tmp_path, monkeypatch):
+    """Regression test for a real, confirmed gap (Codex audit of commit
+    27e1232): 'a changed h5ad with identical genes/barcodes can pass.'
+    Mutates the real h5ad file on disk (same barcodes/genes, different
+    expression values) after the manifest was built, and confirms the
+    trainer's own load path now catches it via re-hashing."""
+    import anndata as ad
+
+    cfg, manifest = build_synthetic_gen3_experiment(tmp_path, monkeypatch)
+    sample_id = manifest["train_sample_ids"][0]
+    h5ad_path = next(Path(str(cfg.data.hest_data_dir)).glob(f"st/{sample_id}.h5ad"))
+    adata = ad.read_h5ad(h5ad_path)
+    adata.X = adata.X + 1.0  # same shape/barcodes/genes, different real content
+    adata.write_h5ad(h5ad_path)
+
+    with pytest.raises(ValueError, match="SHA256"):
+        load_gen3_sample_data(cfg, manifest, sample_id)
+
+
+def test_gen3_sample_data_rejects_mismatched_precomputed_spot_features_barcodes():
+    """Regression test: a bare row-COUNT check cannot catch a caller-side
+    mix-up between two samples with the SAME n_spots -- barcode identity
+    AND order is the real invariant Gen3SampleData.__post_init__ must
+    enforce."""
+    import anndata as ad
+    import pandas as pd
+
+    barcodes = [f"S0-SPOT{i}-1" for i in range(4)]
+    adata = ad.AnnData(
+        X=np.zeros((4, 2), dtype=np.float32),
+        obs=pd.DataFrame(index=pd.Index(barcodes)), var=pd.DataFrame(index=pd.Index(["G0", "G1"])),
+    )
+    adata.obsm["spatial"] = np.zeros((4, 2), dtype=np.float64)
+    features = np.zeros((4, 1536), dtype=np.float32)
+    wrong_barcodes = np.asarray([f"S1-SPOT{i}-1" for i in range(4)])  # same length, wrong identity
+    import hashlib
+    with pytest.raises(ValueError, match="do not exactly equal"):
+        Gen3SampleData(
+            sample_id="S0", patient_id="P0", split="train", adata=adata,
+            patches=np.zeros((4, 4, 4, 3), dtype=np.uint8), image_source_available=np.ones(4, dtype=bool),
+            precomputed_spot_features=features, precomputed_spot_features_barcodes=wrong_barcodes,
+            precomputed_spot_features_digest=hashlib.sha256(np.ascontiguousarray(features).tobytes()).hexdigest(),
+            full_sample_coords=np.zeros((4, 2), dtype=np.float64), coords3d=np.zeros((4, 3), dtype=np.float64),
+            slice_ids=np.full(4, "S0", dtype=object), slide_context_record=None,
+            tile_encoder_provenance={"dense_wsi": None, "spot_features": None},
+        )
 
 
 def test_build_gen3_mask_schedule_for_train_samples_passes_its_own_report(tmp_path, monkeypatch):
@@ -132,6 +182,47 @@ def test_gen3_dataset_never_calls_the_tile_encoder(tmp_path, monkeypatch):
     monkeypatch.setattr("src.models.conditioning._gigapath_preprocess_and_encode", _fail)
     for i in range(len(dataset)):
         dataset[i]  # must not raise AssertionError
+
+
+def test_build_gen3_mask_schedule_gives_different_samples_different_raw_query_index_schedules(tmp_path, monkeypatch):
+    """Regression test for a real, confirmed gap (Codex audit of commit
+    27e1232): the trainer used to hardcode base_seed=0 for EVERY training
+    sample -- two samples with an IDENTICAL regular lattice (this
+    fixture's own samples all share the exact same n_side x n_side grid
+    and spacing) would then draw their first item's raw query positions
+    from the SAME seed, risking identical realized schedules across
+    DIFFERENT samples. Compares realized query POSITIONS (index within
+    each sample's own obs_names, not the barcode string itself, which
+    trivially differs by sample_id prefix) for the first training item of
+    two different samples."""
+    cfg, manifest = build_synthetic_gen3_experiment(tmp_path, monkeypatch)
+    samples = _load_split_samples(cfg, manifest, "train")
+    sample_ids = sorted(samples)
+    assert len(sample_ids) >= 2
+    schedule = build_gen3_mask_schedule(manifest, samples, _STRATA, role="train", n_training_masks_per_sample=4)
+    dataset = Gen3SpatialFieldDataset(manifest, samples, schedule, _STRATA)
+
+    first_item_idx_by_sample = {}
+    for idx, item in enumerate(schedule.train_items):
+        if item.sample_id not in first_item_idx_by_sample:
+            first_item_idx_by_sample[item.sample_id] = idx
+
+    query_positions_by_sample = {}
+    for sid in sample_ids[:2]:
+        obs_names = np.asarray(samples[sid].adata.obs_names, dtype=str)
+        item = schedule.train_items[first_item_idx_by_sample[sid]]
+        _, query_obs_names = dataset._resolve_barcodes(item)
+        query_positions_by_sample[sid] = sorted(np.flatnonzero(np.isin(obs_names, query_obs_names)).tolist())
+
+    assert query_positions_by_sample[sample_ids[0]] != query_positions_by_sample[sample_ids[1]]
+
+
+def test_sample_seed_namespace_is_stable_and_differs_across_samples_and_salts():
+    from gen3_multiscale.training.gen3_dataset import sample_seed_namespace
+
+    assert sample_seed_namespace("S0", salt="train") == sample_seed_namespace("S0", salt="train")
+    assert sample_seed_namespace("S0", salt="train") != sample_seed_namespace("S1", salt="train")
+    assert sample_seed_namespace("S0", salt="train") != sample_seed_namespace("S0", salt="validation")
 
 
 def test_gen3_identity_collate_requires_batch_size_one():

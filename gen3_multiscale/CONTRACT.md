@@ -4904,20 +4904,331 @@ one `gen3_preflight.py` already implements, and the 24-hour run itself.
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 49. Response to the Codex audit of commit 27e1232 -- 12 fixes to the real trainer before any longer run
+
+Adam verified commit `27e1232` directly: "the manifest split, masked-GEX
+exclusion, overlapping-H&E exclusion, WSI visibility filtering, and
+patient-disjoint validation design look correct. I found no obvious
+target-expression leak." He then gave 12 mandatory fixes ("Do not start
+the 24-hour runs... then stop for another audit") plus three
+deliverables to prepare, never start. All 12 are implemented and tested
+this round; every claim was verified against the real code before being
+fixed, per this project's standing discipline.
+
+**#1/#2 -- wall-clock limit + absolute `total_steps` + `completion_reason`
+(`training/train.py::run_training`).** `training.max_wall_clock_hours`
+was read nowhere; `total_steps` was silently "additional steps after
+every resume" (`while step < resume_step + total_steps`), so a
+checkpoint at 20k with `total_steps=100k` would run to 120k. Fixed: the
+loop now checks `time.time() - start_time` against
+`max_wall_clock_hours` at the top of every iteration and breaks (saving a
+real final checkpoint if any new steps ran); `total_steps` is now the
+run's ABSOLUTE target (`step_target = total_steps` for non-smoke,
+`resume_step + 1` for smoke, which always wants exactly one more step
+regardless of where training already is). Every `run_training` summary
+now carries `completion_reason` (`"completed_total_steps"` /
+`"wall_clock_limit_reached"` / `"completed_smoke_step"`), also persisted
+into `training_state.json`'s `extra_metadata`.
+
+**#3/#4 -- fail closed on non-finite loss/gradients + a real smoke
+learning gate.** A NaN/Inf loss or gradient used to increment
+`n_skipped_nonfinite` and `continue`, so a run that skipped every unstable
+step could still finish and report `ok: true`. Both cases now `raise
+RuntimeError` immediately, failing the whole run -- the prior test that
+validated the wrong (skip-and-continue) behavior was rewritten to assert
+the raise. Smoke additionally gates on REAL learning, not merely finite
+values: it snapshots every trainable parameter before `optimizer.step()`
+and requires (a) a strictly positive gradient norm and (b) at least one
+trainable parameter that actually changed value afterward -- catches a
+disconnected graph or an accidentally-frozen backbone that would
+otherwise "pass" smoke with a finite, zero-effect step.
+
+**#5 -- scientifically exact resume.** Four separate gaps, all fixed
+together in `run_training`:
+- *Fingerprint verification before loading anything.* `build_run_manifest`
+  now also records `config_identity_fingerprint` (the full config hash
+  MINUS purely operational/scheduling training fields -- `total_steps`,
+  `checkpoint_every_n_steps`, `log_every_n_steps`, `eval_every_n_steps`,
+  `max_wall_clock_hours`, `checkpoint_dir`, `checkpoint_keep_last` -- so a
+  legitimate "bump total_steps and keep training" resume is never
+  refused), `synchronized_init_manifest_sha256` (the sync manifest FILE's
+  own content hash, not just its path, which could stay the same while
+  the file underneath changes), `gigapath_checkpoint_sha256`,
+  `gene_residual_basis_gene_names_hash`, and `gene_scale_sha256`. If
+  `checkpoint_dir/run_manifest.json` already exists, `verify_resume_consistency`
+  compares every one of these fields against the freshly-built manifest
+  and raises (naming the field) on any mismatch -- BEFORE any checkpoint
+  state is loaded and BEFORE the new manifest is saved over the old one.
+- *Optimizer/RNG state now REQUIRED to resume.* `load_optimizer_and_rng_state`
+  returning `False` (file missing) used to be silently treated as "resume
+  anyway, warm-started"; `run_training` now raises if `training_state.json`
+  shows `step > 0` but `optimizer_rng_state.pt` is missing.
+- *Global-step-deterministic sampler.* The shuffled `DataLoader`
+  (`shuffle=not smoke`, reshuffled on every fresh `iter()`, no saved
+  cursor) is gone from the training path entirely.
+  `deterministic_train_index_for_step(step, dataset_len, seed)` derives
+  each step's dataset index from a per-epoch permutation seeded by
+  `(seed, epoch)` -- a pure function, so resume continues the EXACT same
+  sample sequence with nothing to persist or go stale. (Validation keeps
+  its plain, unshuffled `DataLoader`: it is always a fresh, full,
+  order-independent pass over a FIXED set, never resumed mid-epoch.)
+- *Manifest overwrite ordering.* `save_run_manifest` now runs only AFTER
+  `verify_resume_consistency` has passed and the resume-state has been
+  loaded -- the old evidence is never destroyed before being checked.
+
+**#6 -- live-data provenance + full spot-cache identity.**
+`dataset_manifest.py` already recorded real SHA256 content hashes for
+every sample's h5ad/patch-h5 files and the shared metadata CSV, but
+nothing downstream ever re-verified them. New
+`dataset_manifest.verify_content_provenance(hest_data_dir, manifest,
+sample_id)` (per-sample, real file re-read) and
+`verify_metadata_csv_provenance(manifest)` (once per preflight call) now
+run before any training data is loaded -- `gen3_dataset.load_gen3_sample_data`
+calls the former immediately, `gen3_preflight.load_and_preflight_samples`
+calls the latter once. Separately, `Gen3SampleData.__post_init__` used to
+check only `precomputed_spot_features`'s row COUNT against
+`adata.obs_names` -- too weak to catch a mix-up between two samples with
+the same spot count (routine for same-technology grids). It now also
+stores `precomputed_spot_features_barcodes` (the cache record's own
+verified barcodes) and `precomputed_spot_features_digest`, and requires
+the barcodes to exactly equal `adata.obs_names` (identity AND order).
+
+**#7 -- launcher fingerprint checks bound to actual usage
+(`launch_four_gpu_suite.check_required_fingerprints`).** Every key under
+`required_fingerprints` used to be treated as unconditionally required --
+`gene_vocabulary` and the three mask-bank paths are not read by
+`train.py` at all (mask banks are generated on the fly by
+`gen3_dataset.build_gen3_mask_schedule`), so no config, real or
+synthetic, could ever launch a real smoke without
+`--skip-fingerprint-check`. Now: `gigapath_checkpoint` is required only
+when `model.params.use_global_slide` is true; `gene_residual_basis` only
+for Architecture 4; everything else is never checked, regardless of
+whether it is set.
+
+**#8 -- deterministic, useful validation.** Architecture 4's validation
+used to call the SAME `compute_step_losses` training uses, which mixes a
+RANDOMLY-sampled flow loss into `"total"` -- the exact value used to
+decide the best checkpoint could differ between two identical calls. New
+`compute_deterministic_reconstruction_losses` (architecture-generic:
+`model(inputs)` -- Architecture4.forward() already returns only its
+conditioner's output) is now the ONLY function that produces the
+selection metric; Architecture 4's flow loss is logged separately, using
+a FIXED per-run `torch.Generator` (`flow_val_generator`, seeded once from
+`training.seed`), never mixed into the total.
+`architectures.py::Architecture4.compute_losses`/`compute_flow_matching_loss`
+gained an optional `generator` parameter to make this possible without
+touching the global RNG stream. `run_training` also now: rejects a
+non-finite mean validation loss (raises, same discipline as requirement
+#3); persists `validation_history.json` (one entry per validation call);
+and saves `checkpoint_dir/best/` (trainable weights + `best_info.json`)
+whenever a new validation total beats the running best.
+
+**#9 -- finished loss/optimizer configuration.** Four gaps:
+- `compute_training_gene_scale(train_samples)` computes a real,
+  TRAINING-only per-gene std (pooled over every training sample's full
+  `adata.X`) and persists it to `checkpoint_dir/gene_scale.npy`, now
+  threaded through `combined_reconstruction_loss`'s `per_gene_scale` at
+  every training AND validation call -- `losses.py`'s own documented
+  fallback ("falls back to the per-gene std of target_expression WITHIN
+  THIS CALL... not a claim this is the training-set scale") is no longer
+  the production path.
+- `torch.optim.AdamW` now reads `training.optimizer.weight_decay`
+  (default 0.01, AdamW's own default, now explicit and persisted),
+  `.betas`, `.eps` instead of silently using whatever PyTorch defaults.
+- Architecture 4's `flow_weight` (previously hardcoded to `1.0` at the
+  `compute_step_losses` call site) is now read from `loss.flow_weight`.
+- `_validate_numeric_config(training_cfg, loss_cfg)` runs once near the
+  start of `run_training` and rejects (ValueError, naming the field) any
+  non-positive `lr`/`gradient_clip_val`/`total_steps`/
+  `max_wall_clock_hours`/`log_every_n_steps`/`checkpoint_every_n_steps`/
+  `eval_every_n_steps`/`optimizer.eps`, negative
+  `optimizer.weight_decay`/`loss.gradient_weight`/`loss.flow_weight`, or
+  malformed `optimizer.betas`.
+
+**#10 -- diversified masks across samples (`gen3_dataset.py`).** Every
+training sample used to draw its collision-free mask schedule from the
+SAME hardcoded `base_seed=0`, and every validation sample from the same
+hardcoded `700_000` -- two samples sharing an identical regular lattice
+(routine for same-technology HEST-1k grids, and true of this project's
+own synthetic test fixture) would then draw their first raw query-index
+schedule from the exact same seed. New `sample_seed_namespace(sample_id,
+salt)` derives a stable, hash-based, architecture-INDEPENDENT per-sample
+seed offset (pure function of `sample_id`, so all four architectures
+still draw the identical schedule for a given sample -- the fairness-
+matrix requirement is preserved); `build_gen3_mask_schedule` now uses it
+for both the training `base_seed` and an additive offset on the
+validation/test `split_seeds`. Regression-tested directly: two samples
+sharing this project's synthetic fixture's identical grid now realize
+DIFFERENT raw query positions for their first mask.
+
+**#11 -- the real Architecture 4 residual-basis pipeline.** No pipeline
+existed to fit `required_fingerprints.gene_residual_basis` against a
+REAL trained conditioner -- Architecture 4 could only ever start from
+synchronized/random init, contradicting its own docstring ("gene_basis
+must be a GeneResidualBasis already fit on TRAINING-split residuals...
+fit offline"). Two new pieces, implementing Adam's own recommended
+sequence:
+- New `scripts/fit_architecture4_residual_basis.py`: loads a real,
+  already-trained Architecture 3 checkpoint, runs its conditioner (eval
+  mode, no grad) over every item of a real training-role
+  `Gen3SpatialFieldDataset`, computes `target_expression -
+  deterministic_mean` residuals (TRAINING samples only, by construction
+  of the dataset it iterates), fits `fit_gene_residual_basis`, and
+  persists both the basis and a `<path>.provenance.json` sidecar binding
+  it to the Architecture 3 config fingerprint, checkpoint SHA256, dataset
+  manifest fingerprint, gene panel hash, and the exact mask schedule used.
+- New `train.py::maybe_load_pretrained_conditioner_for_architecture4`:
+  for Architecture 4 non-smoke runs, requires
+  `required_fingerprints.architecture3_conditioner_checkpoint` (a real,
+  already-trained Architecture 3 checkpoint_dir), loads it directly onto
+  `model.conditioner` AFTER synchronized-init loading (deliberately
+  overwriting whatever shared init the conditioner started with), then
+  freezes every conditioner parameter (`requires_grad = False`) unless
+  `model.params.freeze_conditioner_initially` is explicitly set false --
+  "initially freeze the conditioner while training flow," literally, via
+  the optimizer never updating those weights, not merely via the
+  existing `.detach()` gradient-flow discipline. `architecture4.yaml`
+  gained both new fields (still `null`/`true` placeholders pending a real
+  deployment). Architecture 4 therefore can no longer be launched
+  meaningfully without a real, already-trained Architecture 3 checkpoint
+  -- it is no longer part of the "four simultaneous, independently-random"
+  launch group in practice, matching "Architecture 4 therefore should not
+  yet run concurrently from random initialization with Architectures
+  1-3."
+
+**#12 -- the minimal real Step 7 evaluator
+(`evaluation/gen3_evaluator.py`).** Explicitly authorized this round
+("Build the minimal Step 7 evaluator before long training" -- superseding
+the earlier "do not implement a large new evaluation system yet"
+instruction for this one deliverable). `evaluate_gen3_checkpoint(config_path,
+checkpoint_dir, split=...)` runs a REAL, already-trained checkpoint over
+the FIXED, deterministic held-out mask schedule (the same one `train.py`'s
+own validation loop uses) and reports, per item, PCC/RMSE with valid-gene
+counts (`per_item_reconstruction_metrics`, built on the already-audited
+`pearson_per_gene`/`rmse`), then patient-level aggregation and 95% CIs
+via `evaluation/metrics.py::aggregate_patient_metrics` (already built in
+Phase 7 for exactly this). Three baselines run alongside the model: mean
+(new, trivial), nearest-neighbour (new, trivial), and harmonic
+(`models/harmonic.py::harmonic_interpolation`, reused unmodified as an
+evaluation baseline -- that module's own docstring already states
+"Harmonic, inverse-distance, and nearest-neighbour must also be computed
+as exact-mask external baselines for every arm"). `split="test"` is
+REFUSED unless the caller explicitly passes `allow_test=True` -- "Never
+select using test samples" is structural, not a naming convention.
+ST-FID/ST-MMD are computed only when `compute_st_fid_mmd=True` is passed
+explicitly and are stored under `secondary_st_fid`/`secondary_st_mmd`,
+never part of the headline per-arm metrics dict.
+
+**Deliverables prepared, per Adam's explicit "prepare -- do not
+automatically start" instruction:** see the new section 50 immediately
+below for the real, resolved commands (single-sample overfit gate,
+four-GPU smoke, short 500-2000-step diagnostic). None of them has been
+run in this sandbox (no real HEST-1k data, no real GigaPath/LongNet
+checkpoint, no GPU here); `scripts/step6_overfit_test.py::run_overfit_gate`
+was newly hardened this round to actually GATE on learning (evaluates a
+FIXED mask before/after training via the real synchronized-init weights
+then the real trained checkpoint, and raises unless RMSE improves by a
+configurable minimum fraction -- "merely completing 200 steps is not a
+capacity test") and is exercised end-to-end in this sandbox's synthetic
+tests (both a genuinely-learning pass and a frozen-optimizer failure
+case).
+
+**No 24-hour run has been started or will be auto-started.**
+
+## 50. Prepared (not started) gates for real hardware -- commit 27e1232's audit round
+
+The three commands below are real and resolved against this repo's own
+scripts/configs; none has been executed in this sandbox (no real
+HEST-1k data, no real GigaPath/LongNet checkpoint, no GPU). Adam (or
+whoever has real hardware access) runs them directly, following this
+project's established "prepared, not auto-run" discipline
+(`scripts/smoke_test_gigapath_slide_encoder.py`'s own header is the
+precedent: "NOT RUN by the agent that wrote this script").
+
+**1. One real single-sample overfit gate**, per architecture:
+```
+python -m gen3_multiscale.scripts.step6_overfit_test \
+    --config gen3_multiscale/configs/architecture1.yaml \
+    --sample-id <a real manifest sample_id> \
+    --n-steps 200 \
+    --checkpoint-dir /path/to/overfit/architecture1 \
+    --min-rmse-improvement-fraction 0.1
+```
+Repeat per architecture (2/3/4) with that architecture's config. Requires
+`data.gen3_manifest_path`/`data.tile_encoder_revision` set in the config
+and `training.synchronized_init_dir` pointing at a real
+`persist_four_architecture_initializations` output (Architecture 4 also
+needs `required_fingerprints.architecture3_conditioner_checkpoint` set
+to a real, already-trained Architecture 3 checkpoint -- see #11 above;
+Architecture 4's overfit gate is only meaningful AFTER Architecture 3's
+own overfit/short-diagnostic gates have passed). Exits non-zero (raises)
+if the fixed-mask RMSE does not improve by at least the configured
+fraction.
+
+**2. One real four-GPU smoke**, using synchronized init and the actual
+LongNet/basis artifacts:
+```
+python -m gen3_multiscale.scripts.step6_four_gpu_diagnostic \
+    --configs gen3_multiscale/configs/architecture1.yaml \
+              gen3_multiscale/configs/architecture2.yaml \
+              gen3_multiscale/configs/architecture3.yaml \
+              gen3_multiscale/configs/architecture4.yaml \
+    --gpus 0 1 2 3 \
+    --log-root /path/to/logs/four_gpu_smoke
+```
+`smoke_only=True` is hardcoded in this script (never
+`run_suite_with_smoke_gate`) -- there is no flag that promotes this to a
+full run. Prerequisites on top of #1's: all four
+`required_fingerprints` entries `check_required_fingerprints` now
+actually requires must be real, on-disk files
+(`architecture3.yaml`/`architecture4.yaml`'s `gigapath_checkpoint`;
+`architecture4.yaml`'s `gene_residual_basis` and
+`architecture3_conditioner_checkpoint`), never
+`--skip-fingerprint-check`.
+
+**3. A short 500-2000-step diagnostic, with validation and baseline
+comparison:**
+```
+python -m gen3_multiscale.training.train \
+    --config gen3_multiscale/configs/architecture1.yaml
+```
+with `training.total_steps` set to a value in [500, 2000] and
+`training.eval_every_n_steps` set small enough (e.g. 100-250) to get
+several real validation points within that budget, THEN:
+```
+python -c "
+from gen3_multiscale.evaluation.gen3_evaluator import evaluate_gen3_checkpoint, save_evaluation_report
+report = evaluate_gen3_checkpoint(
+    'gen3_multiscale/configs/architecture1.yaml', '<training.checkpoint_dir>',
+    split='validation', n_masks_per_sample=8, compute_st_fid_mmd=False,
+)
+save_evaluation_report(report, '<training.checkpoint_dir>/evaluation_validation.json')
+print(report['per_arm_patient_aggregated_metrics'])
+"
+```
+reports the trained model's PCC/RMSE against the mean/nearest-neighbour/
+harmonic baselines, patient-aggregated with 95% CIs -- the real
+"validation and baseline comparison" this deliverable asks for. Repeat
+per architecture. `split='test'` must never be used for this diagnostic
+(`evaluate_gen3_checkpoint` refuses it without `allow_test=True`).
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
 
 ```
-gen3_multiscale/tests/: 589 passed (45 reused-infra + 27 example-schema +
+gen3_multiscale/tests/: 627 passed (45 reused-infra + 27 example-schema +
   11 boundary-graph + 36 slide-context + 9 slide-encoder + 2 debug-plot +
   18 transport-head + 10 tokens + 16 attention + 10 global-context +
   7 harmonic + 7 geometry-utils + 9 backbone + 31 architectures +
   9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
-  27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
-  37 mask-schedule + 17 dataset-manifest + 31 example-builder +
+  28 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 21 dataset-manifest + 31 example-builder +
   46 mask-fingerprint + 22 novae-graph + 4 loaders + 17 spot-feature-cache
-  + 12 tile-encoder-preflight + 10 gen3-dataset + 10 gen3-preflight +
-  12 train + 6 step6-scripts)
-gen2_architectures + gen3_multiscale: 762 passed, 1 skipped
+  + 12 tile-encoder-preflight + 14 gen3-dataset + 10 gen3-preflight +
+  24 train + 8 step6-scripts + 10 gen3-evaluator +
+  5 fit-architecture4-residual-basis)
+gen2_architectures + gen3_multiscale: 800 passed, 1 skipped
 (repo-root tests/: 322 passed, 1 pre-existing unrelated failure --
   tests/test_multi_sample.py::test_inject_multi_sample_n_genes, confirmed
   failing identically on the unmodified branch before this round's

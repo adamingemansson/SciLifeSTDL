@@ -57,6 +57,7 @@ required True.
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -65,6 +66,7 @@ import torch
 
 from gen3_multiscale.data import example_builder, novae_graph, slide_context, spot_feature_cache
 from gen3_multiscale.data import mask_fingerprint
+from gen3_multiscale.data.dataset_manifest import verify_content_provenance
 from gen3_multiscale.data.mask_schedule import ensure_stratified_mask_bank, stratum_to_masking_cfg
 
 
@@ -79,6 +81,8 @@ class Gen3SampleData:
     patches: np.ndarray
     image_source_available: np.ndarray
     precomputed_spot_features: np.ndarray  # VERIFIED via spot_feature_cache.load_gen3_spot_features
+    precomputed_spot_features_barcodes: np.ndarray  # the cache record's OWN verified barcodes -- kept alongside the features, not discarded after the fact
+    precomputed_spot_features_digest: str  # sha256 of the verified features array's bytes -- an auditable identity, not merely a shape
     full_sample_coords: np.ndarray
     coords3d: np.ndarray  # [n, 3], z=0 (single 2D section, not a Track B multi-slice series)
     slice_ids: np.ndarray  # [n] str, every entry == sample_id (mask_bank's single-slice convention)
@@ -87,16 +91,31 @@ class Gen3SampleData:
 
     def __post_init__(self):
         # Mandatory requirement #2's "verify at the trainer call site"
-        # half -- see module docstring. Cheap (array equality over a few
-        # thousand rows), run once here rather than per masking draw
-        # (nothing about these arrays changes between draws for an
-        # already-constructed Gen3SampleData).
+        # half -- see module docstring. Real, confirmed gap (Codex audit
+        # of commit 27e1232): a row-COUNT check alone cannot catch a
+        # caller-side mix-up between two samples with the SAME n_spots
+        # (routine for same-technology HEST-1k grids) -- barcode IDENTITY
+        # AND ORDER is the real invariant, so this now compares the
+        # spot-feature cache's own verified barcodes against this exact
+        # sample's adata.obs_names, not just their lengths.
         obs_names = np.asarray(self.adata.obs_names, dtype=str)
         if self.precomputed_spot_features.shape[0] != obs_names.shape[0]:
             raise ValueError(
                 f"{self.sample_id}: precomputed_spot_features has {self.precomputed_spot_features.shape[0]} "
                 f"rows, expected {obs_names.shape[0]} (aligned with adata.obs_names) -- refusing a "
                 "possible sample mix-up"
+            )
+        cache_barcodes = np.asarray(self.precomputed_spot_features_barcodes, dtype=str)
+        if not np.array_equal(cache_barcodes, obs_names):
+            raise ValueError(
+                f"{self.sample_id}: precomputed_spot_features_barcodes do not exactly equal "
+                "adata.obs_names (identity and order) -- refusing a possible sample mix-up"
+            )
+        expected_digest = hashlib.sha256(np.ascontiguousarray(self.precomputed_spot_features).tobytes()).hexdigest()
+        if self.precomputed_spot_features_digest != expected_digest:
+            raise ValueError(
+                f"{self.sample_id}: precomputed_spot_features_digest does not match the actual "
+                "precomputed_spot_features content -- corrupted or mismatched construction"
             )
 
 
@@ -108,6 +127,14 @@ def load_gen3_sample_data(cfg, manifest: dict, sample_id: str) -> Gen3SampleData
     if record is None:
         raise ValueError(f"{sample_id!r} is not a sample the dataset manifest declares")
     split = str(record["split"])
+
+    # Real, confirmed gap (Codex audit of commit 27e1232): re-verify the
+    # sample's real h5ad/patch-h5 files against the manifest's own
+    # recorded content hashes BEFORE loading anything from them -- a
+    # changed h5ad with identical genes/barcodes could otherwise pass
+    # every downstream check silently (see dataset_manifest.py's
+    # verify_content_provenance docstring).
+    verify_content_provenance(cfg.data.hest_data_dir, manifest, sample_id)
 
     adata, patches, image_source_available = example_builder.load_sample_for_examples(manifest, sample_id)
     obs_names = np.asarray(adata.obs_names, dtype=str)
@@ -141,6 +168,10 @@ def load_gen3_sample_data(cfg, manifest: dict, sample_id: str) -> Gen3SampleData
         patches=patches,
         image_source_available=image_source_available,
         precomputed_spot_features=spot_record["features"],
+        precomputed_spot_features_barcodes=spot_record["barcodes"],
+        precomputed_spot_features_digest=hashlib.sha256(
+            np.ascontiguousarray(spot_record["features"]).tobytes()
+        ).hexdigest(),
         full_sample_coords=full_sample_coords,
         coords3d=coords3d,
         slice_ids=slice_ids,
@@ -182,6 +213,29 @@ class Gen3MaskSchedule:
     reports: dict = field(default_factory=dict)  # sample_id -> report dict
 
 
+def sample_seed_namespace(sample_id: str, *, salt: str) -> int:
+    """Stable, ARCHITECTURE-INDEPENDENT per-sample base seed -- a pure
+    function of `sample_id` (and `salt`, to separate the train/validation/
+    test seed spaces from each other) that never touches model config, so
+    all four architectures still draw the IDENTICAL mask schedule for a
+    given sample (the fairness-matrix requirement is preserved).
+
+    Real, confirmed gap (Codex audit of commit 27e1232): the trainer
+    previously used a single hardcoded `base_seed=0` for EVERY training
+    sample and a single hardcoded `700_000` for EVERY validation sample --
+    two samples with similar/regular spot lattices (routine for same-
+    technology HEST-1k grids) would then draw their raw per-item seed
+    candidates from the exact same starting range, risking near-identical
+    realized query-index schedules across DIFFERENT samples (not the
+    already-guarded-against same-sample collision case). Each sample now
+    gets its own, hash-derived seed range, spaced widely enough
+    (1e8 per bucket) that it cannot practically overlap with
+    `mask_fingerprint.py`'s own per-stratum seed stride (1e6) or
+    `mask_schedule.py`'s validation/test attempt budget."""
+    digest = hashlib.sha256(f"gen3-mask-seed:{salt}:{sample_id}".encode("utf-8")).hexdigest()
+    return (int(digest[:16], 16) % 1_000_000) * 100_000_000
+
+
 def build_gen3_mask_schedule(
     manifest: dict, samples: dict[str, Gen3SampleData], strata: list[dict], role: str,
     *, n_training_masks_per_sample: int = 500, split_counts: dict | None = None,
@@ -199,9 +253,10 @@ def build_gen3_mask_schedule(
             raise ValueError(f"{sample_id}: manifest split {sample.split!r} != requested role {role!r}")
         obs_names = np.asarray(sample.adata.obs_names, dtype=str)
         if role == "train":
+            sample_base_seed = sample_seed_namespace(sample_id, salt="train")
             training_schedule = mask_fingerprint.build_collision_free_training_schedule(
                 sample.coords3d, sample.slice_ids, obs_names, sample_id, strata,
-                n_items=n_training_masks_per_sample, base_seed=0,
+                n_items=n_training_masks_per_sample, base_seed=sample_base_seed,
                 reserved_query_composite_ids=set(),  # nothing reserved: no same-sample val/test masks are drawn -- see module docstring
                 manifest=manifest,
             )
@@ -215,23 +270,25 @@ def build_gen3_mask_schedule(
             for item in training_schedule["items"]:
                 schedule.train_items.append(_TrainMaskItem(sample_id=sample_id, stratum=item["stratum"], seed=item["seed"]))
         else:
+            sample_split_seed = split_seeds[role] + sample_seed_namespace(sample_id, salt=role)
+            sample_split_seeds = {role: sample_split_seed}
             path = Path(mask_bank_dir) / f"{sample_id}_stratified_mask_bank.json" if mask_bank_dir else None
             if path is not None and path.exists():
                 bank = ensure_stratified_mask_bank(
                     path, sample.coords3d, sample.slice_ids, obs_names, strata,
-                    split_counts={role: split_counts[role]}, split_seeds={role: split_seeds[role]},
+                    split_counts={role: split_counts[role]}, split_seeds=sample_split_seeds,
                 )
             else:
                 from gen3_multiscale.data.mask_schedule import build_stratified_mask_bank, save_stratified_mask_bank
                 bank = build_stratified_mask_bank(
                     sample.coords3d, sample.slice_ids, obs_names, strata,
-                    split_counts={role: split_counts[role]}, split_seeds={role: split_seeds[role]},
+                    split_counts={role: split_counts[role]}, split_seeds=sample_split_seeds,
                 )
                 if path is not None:
                     save_stratified_mask_bank(bank, path)
             report = mask_fingerprint.build_held_out_sample_mask_report(
                 manifest, sample_id, sample.coords3d, sample.slice_ids, obs_names, strata, role, bank,
-                expected_split_counts=split_counts, expected_split_seeds=split_seeds,
+                expected_split_counts=split_counts, expected_split_seeds=sample_split_seeds,
             )
             if not report.get("passed"):
                 raise ValueError(f"{sample_id}: held-out mask report did not pass: {report}")

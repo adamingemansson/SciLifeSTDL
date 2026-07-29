@@ -62,6 +62,7 @@ model:
     gene_basis_rank: 64       # rank of the fixed low-rank gene-residual basis (models/gene_basis.py) -- fit offline on TRAINING-split residuals only, before this config is used
     n_flow_samples: 8
     n_ode_steps: 20
+    freeze_conditioner_initially: true   # Adam's Step 6 audit #11: "initially freeze the conditioner while training flow" -- train.py loads the real Architecture3 checkpoint from required_fingerprints.architecture3_conditioner_checkpoint onto self.conditioner, then freezes it (requires_grad=False) whenever this is true
 
 loss:
   gradient_weight: 0.05
@@ -124,7 +125,8 @@ evaluation:
 required_fingerprints:
   gigapath_checkpoint: null   # real checkpoint path REQUIRED before training -- use_global_slide=true (forwarded into self.conditioner) now means construction raises ValueError without a real slide_encoder built from this checkpoint; still null because no real trainer/checkpoint deployment exists yet (Step 6)
   gene_vocabulary: null
-  gene_residual_basis: null   # fit_gene_residual_basis output, TRAINING-split only (models/gene_basis.py)
+  gene_residual_basis: null   # fit_gene_residual_basis output, TRAINING-split only (models/gene_basis.py) -- built by scripts/fit_architecture4_residual_basis.py from architecture3_conditioner_checkpoint below
+  architecture3_conditioner_checkpoint: null   # a real, already-trained Architecture 3 checkpoint_dir -- REQUIRED for any non-smoke run (Adam's Step 6 audit #11: Architecture 4 must never train from a random/synchronized-init conditioner). Train Architecture 3 to completion first.
   train_mask_bank: null
   validation_mask_bank: null
   test_mask_bank: null
