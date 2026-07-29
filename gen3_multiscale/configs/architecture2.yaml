@@ -73,6 +73,20 @@ masking:
 data:
   hest_data_dir: data/raw/hest1k
   hest_cache_dir: data/cache/hest1k
+  # Step 6's real trainer (training/train.py) requires dense_wsi_cache
+  # cache coverage for EVERY manifest-selected sample regardless of
+  # architecture (mandatory requirement #3: exactly <sample>:dense_wsi
+  # and <sample>:spot_features, uniformly) -- kept identical across all
+  # four configs even though Architecture 2 itself never consumes the
+  # dense-WSI tokens (use_regional_he/use_global_slide are false above).
+  slide_context_source: dense_wsi_cache
+  gen3_manifest_path: null   # path to a real, already-built dataset_manifest.py output -- set per deployment, not committed here
+  tile_encoder_revision: null   # the experiment's pinned, immutable GigaPath Hugging Face commit SHA -- set per deployment
+  gex_feature_dim: 256   # the shared GEX conditioning encoder's real output width (see model.params.gex_feature_dim's own null placeholder above)
+  n_training_masks_per_sample: 500
+  n_validation_masks: 4
+  novae:
+    enabled: false
   sample_selection:
     organs: all
     metadata_csv: hf://datasets/MahmoodLab/hest/HEST_v1_3_0.csv
@@ -106,3 +120,4 @@ training:
   checkpoint_every_n_steps: 2000
   checkpoint_dir: gen3_multiscale/results/architecture2
   eval_every_n_steps: 2000
+  synchronized_init_dir: null   # dir written by model_factory.persist_four_architecture_initializations -- required for any non-smoke run (train.py fails closed without it)

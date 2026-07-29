@@ -21,7 +21,9 @@ codebase -- callers must not wrap it in one.
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -90,6 +92,55 @@ def fit_gene_residual_basis(residuals: np.ndarray, gene_names: list[str], rank: 
         gene_names=tuple(gene_names),
         gene_names_hash=gene_names_hash,
     )
+
+
+def save_gene_residual_basis(basis: GeneResidualBasis, path: str | Path) -> Path:
+    """Persist a fitted `GeneResidualBasis` -- Step 6's real trainer needs
+    a real on-disk artifact for Architecture 4's `required_fingerprints.
+    gene_basis` config field to point at ("gene_basis must be a
+    GeneResidualBasis already fit on TRAINING-split residuals... fit
+    offline, outside this class" -- architecture4.yaml's own docs; no
+    persistence for that "offline" step existed anywhere in this
+    codebase before this function). Atomic write, mirroring every other
+    artifact in this package."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    torch.save(
+        {
+            "basis": basis.basis, "gene_names": list(basis.gene_names),
+            "gene_names_hash": basis.gene_names_hash,
+        },
+        tmp,
+    )
+    os.replace(tmp, path)
+    return path
+
+
+def load_gene_residual_basis(path: str | Path) -> GeneResidualBasis:
+    """Load-and-verify a `save_gene_residual_basis` artifact: the saved
+    `gene_names_hash` must match a FRESH hash of the saved `gene_names`
+    (fail closed on a hand-edited or corrupted file, same discipline as
+    `checkpoint.verify_gene_names`), and the basis's own numeric shape
+    must agree with `gene_names`'s length."""
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"gene residual basis not found at {path} -- fit and save one first")
+    payload = torch.load(path, map_location="cpu")
+    gene_names = list(payload["gene_names"])
+    basis_tensor = payload["basis"]
+    expected_hash = hashlib.sha256("\0".join(gene_names).encode()).hexdigest()
+    if payload.get("gene_names_hash") != expected_hash:
+        raise ValueError(
+            f"gene residual basis at {path} has a gene_names_hash that does not match its own "
+            "saved gene_names -- corrupted or hand-edited file"
+        )
+    if basis_tensor.shape[1] != len(gene_names):
+        raise ValueError(
+            f"gene residual basis at {path} has {basis_tensor.shape[1]} basis columns but "
+            f"{len(gene_names)} gene_names -- corrupted file"
+        )
+    return GeneResidualBasis(basis=basis_tensor, gene_names=tuple(gene_names), gene_names_hash=expected_hash)
 
 
 def verify_gene_residual_basis(basis: GeneResidualBasis, gene_names: list[str]) -> None:

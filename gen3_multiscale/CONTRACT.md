@@ -4661,10 +4661,253 @@ parsing guard, mirroring the already-tested check one call deeper in
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 48. Real Gen3 data builder -- Step 6: the real trainer
+
+Both hardware gates the 22nd re-audit deferred (real pinned dense-WSI
+cache build/validate; A100 LongNet/Architecture 3/4 smoke) passed on
+`st-a100`, reported by Adam verbatim: "Pinned dense-WSI cache loaded and
+validated successfully." / "A100 LongNet/Architecture smoke passed
+completely." / "Official checkpoint SHA256 begins `04194a4c393e`." /
+"FlashAttention and FP16 were active." Adam then instructed: "Proceed
+with Step 6: implement the real Gen3 data pipeline and trainer. Do not
+start any training automatically," with 10 mandatory requirements and an
+explicit deliverables list (real entrypoint; manifest-backed dataset/
+DataLoader; mandatory preflight producing a readable JSON report;
+one-step smoke test for all four architectures; tiny single-sample
+overfit/capacity test; four-GPU short diagnostic launcher; progress-check
+and result-summary commands; regression tests for barcode misalignment,
+incomplete cache coverage, provenance disagreement, mask leakage, and
+accidental live image encoding) -- explicitly excluding Step 7's
+evaluator and the 24-hour run itself from this round.
+
+**New: `training/gen3_dataset.py`.** `Gen3SampleData` -- everything
+loaded ONCE per manifest sample (adata, patches, availability, the
+VERIFIED spot-feature cache record via `spot_feature_cache.
+load_gen3_spot_features`, the dense-WSI slide-context record, tile-
+encoder provenance for both) -- re-verifies its own `precomputed_spot_
+features` row count against `adata.obs_names` a second time in
+`__post_init__` (redundant with `load_gen3_spot_features`'s own check,
+deliberately: catches a caller-side sample mix-up the cache loader
+itself cannot see). `load_gen3_sample_data(cfg, manifest, sample_id)`
+reads `split` EXCLUSIVELY from `manifest["samples"][sample_id]["split"]`
+(requirement #1). `build_gen3_mask_schedule(manifest, samples, strata,
+role, ...)` requires every sample's manifest split to equal `role`
+(fails closed otherwise) and dispatches to `mask_fingerprint.build_
+collision_free_training_schedule`/`build_training_sample_mask_report`
+for `role="train"` (reserved_query_composite_ids=set() -- nothing is
+reserved because no same-sample held-out mask is ever drawn against a
+training sample) or `mask_schedule.ensure_stratified_mask_bank`/`build_
+stratified_mask_bank` for validation/test roles (one split key only,
+FIXED and deterministic). Every report's `passed` flag is required True.
+`Gen3SpatialFieldDataset(torch.utils.data.Dataset)` calls `example_
+builder.build_spatial_field_example` with `precomputed_spot_features=`
+ONLY -- there is no code path in this module that imports or calls the
+GigaPath tile-encoder functions at all (requirement #5, proven by
+`test_gen3_dataset_never_calls_the_tile_encoder`, which monkeypatches
+both tile-encoder functions to raise and iterates the whole dataset).
+`gen3_identity_collate` enforces `batch_size=1` (every architecture's
+`forward()` runs one ragged `SpatialFieldInputs` at a time by
+construction -- `RelativePositionBias`'s own docstring).
+
+**Resolving CONTRACT.md section 35 finding #3 (the open cross-split
+mask-leakage design question)** by construction, not a runtime check:
+training masks are drawn ONLY from train-split samples; validation/test
+masks are drawn ONLY from their own held-out samples' fixed banks. Since
+`dataset_manifest.py`'s patient-disjoint split already guarantees train
+and validation/test are entirely DIFFERENT samples, no same-sample
+train+held-out masking is ever performed -- a query spot realized on a
+validation sample cannot equal a query spot realized on a training
+sample because they are different `(sample_id, barcode)` pairs by
+construction. This satisfies requirement #6's disjointness clause
+without a cross-role overlap check; requirement #6's other clauses
+(query barcodes absent from every observed GEX array; query/overlapping
+local H&E unavailable; overlapping WSI tiles excluded before regional
+pooling/LongNet; context-only Novae graphs physically exclude queries)
+were already enforced by Steps 2-5's `build_spatial_field_example`/
+`novae_graph.py`, reused here unmodified -- `Gen3SpatialFieldDataset`
+attaches `novae_graph.verify_novae_context_excludes_query_identities`'s
+result to `inputs.provenance["novae_context_only_check"]` as a diagnostic
+whenever `novae_enabled=True`, never fed into any architecture forward
+pass (CONTRACT.md section 44, unchanged).
+
+**New: `training/gen3_preflight.py`.** `expected_cache_source_labels`/
+`verify_cache_coverage` build the expected `{sample}:dense_wsi`/
+`{sample}:spot_features` label set from EVERY id in the caller's
+`sample_ids` list and reject missing, duplicate, OR extra entries
+(requirement #3, the exact gap the 22nd re-audit deferred into Step 6).
+`load_and_preflight_samples(cfg, manifest, sample_ids, expected_
+provenance)` loads every sample EXACTLY ONCE (real I/O, the one-time
+preflight cost), then runs `verify_cache_coverage` and `tile_encoder_
+preflight.require_consistent_tile_encoder_provenance` BEFORE returning
+-- and returns the ALREADY-LOADED `Gen3SampleData` objects for the real
+trainer's dataset construction to reuse without a second disk read
+(requirement #4: preflight runs before model/optimizer/DataLoader
+construction, without paying for sample data twice). `save_gen3_
+preflight_report`/`load_gen3_preflight_report` write/read the mandatory
+readable JSON report deliverable, atomically.
+
+**New: `training/train.py`** -- the real Step 6 entrypoint, at the exact
+module path and CLI shape `training/launch_four_gpu_suite.py::default_
+command_builder` has assumed since Phase 8, before this module existed:
+`python -m gen3_multiscale.training.train --config <path> [--smoke]`.
+Fixed order, matching requirements #3/#4/#7: load the immutable dataset
+manifest -> mandatory cache-coverage + tile-encoder-provenance preflight
+-> build mask schedule/dataset -> construct the model -> load its
+VERIFIED synchronized initialization (fails closed) -> construct the
+optimizer -> train. `--smoke` runs exactly ONE training step (and one
+validation step, if a validation split exists) then exits -- the "one-
+step smoke test for all four architectures" deliverable literally IS
+`train.py --config <cfg> --smoke` run once per architecture config.
+Nothing below `if __name__ == "__main__":` executes on import, and a
+real multi-step run only ever happens via an explicit CLI invocation
+with `--smoke` omitted.
+
+Per-requirement notes:
+- **#1** -- `train_ids`/`validation_ids` come from `dataset_manifest[...
+  _sample_ids]` only; `run_training` raises if `train_sample_ids` is
+  empty.
+- **#2** -- `Gen3SampleData`'s own construction (above) is the "load the
+  complete verified record at the trainer call site" half; `gen3_
+  dataset.py`'s docstring records this as deliberate, redundant-by-design
+  verification.
+- **#3/#4** -- `load_and_preflight_samples` runs over `train_ids +
+  validation_ids` (the only manifest roles this trainer touches --
+  test-split evaluation is Step 7's job) BEFORE `Gen3SpatialFieldDataset`
+  or any `torch.utils.data.DataLoader` is constructed; the preflight
+  report is saved to `checkpoint_dir/preflight_report.json` immediately.
+- **#5** -- see `gen3_dataset.py` note above; `compute_step_losses`
+  never imports `src.models.conditioning` either.
+- **#6** -- see the mask-schedule note above.
+- **#7** -- `training.synchronized_init_dir` is READ and `model_factory.
+  load_synchronized_initialization` (already fail-closed by design, 5th
+  Codex re-audit) is called whenever it is set; a NON-smoke run with it
+  unset raises `ValueError` naming the requirement rather than silently
+  training from random init. Smoke runs may omit it (a one-step
+  correctness check does not need a shared starting point).
+- **#8** -- `build_run_manifest`/`save_run_manifest` bind `config_
+  fingerprint` (SHA256 of the resolved config), `dataset_manifest_
+  fingerprint` (SHA256 of the full manifest), `gene_panel_hash`, the
+  train/validation/test sample-id lists, the cache preflight report, the
+  train/validation mask-schedule reports, architecture id, checkpoint
+  dir, and the synchronized-init manifest path into one atomic JSON
+  artifact (`checkpoint_dir/run_manifest.json`) saved once per run,
+  before training starts.
+- **#9** -- deterministic fixed-mask validation via `Gen3SpatialFieldDataset`'s
+  held-out role (never shuffled, `shuffle=False`) plus a dedicated test
+  (`test_gen3_dataset_held_out_role_is_deterministic_across_epochs`);
+  checkpointing/resume reuses `checkpoint.py`'s existing `save_
+  checkpoint`/`load_trainable_state`/`load_training_state`/`verify_
+  gene_names`/`load_optimizer_and_rng_state` unmodified; finite-loss and
+  finite-gradient-norm checks (`torch.isfinite`) skip (with a logged
+  message and an incremented `n_skipped_nonfinite` counter persisted into
+  `training_state.json`) rather than stepping the optimizer on a
+  corrupted value -- exercised for real by forcing a NaN loss in
+  `test_run_training_skips_a_nonfinite_loss_step_instead_of_corrupting_the_model`.
+- **#10** -- all four `configs/architectureN.yaml` files extended
+  IDENTICALLY (verified by `static_config_audit`, still 0 violations)
+  with the new shared fields `train.py` reads: `data.slide_context_
+  source: dense_wsi_cache` (previously only on architecture3/4.yaml --
+  requirement #3 needs dense-WSI cache coverage for EVERY architecture
+  uniformly, since Step 8's preflight is architecture-agnostic, so this
+  was extended to architecture1/2.yaml too), `data.gen3_manifest_path`,
+  `data.tile_encoder_revision`, `data.gex_feature_dim`, `data.n_
+  training_masks_per_sample`, `data.n_validation_masks`, `data.novae.
+  enabled`, `training.synchronized_init_dir` -- all still `null`/
+  placeholder pending a real deployment (mirrors every other
+  deployment-specific field these configs already carried).
+
+**Real bug found and fixed while wiring Architecture 4 through the real
+trainer:** `architecture4.yaml`'s `required_fingerprints` key is `gene_
+residual_basis` (matching `gene_basis.py`'s own naming), but the first
+draft of `maybe_load_gene_basis` read `required_fingerprints.gene_
+basis` -- a plain key-name mismatch that would have silently produced
+`path = None` -> a clear `ValueError` on any real Architecture 4 run
+(fails closed, not a silent wrong-value bug, but still wrong and would
+have blocked every real Architecture 4 config). Caught before commit by
+cross-checking the real YAML key against the code, not accepted on
+faith; fixed to read `gene_residual_basis`, and `test_run_training_
+requires_gene_residual_basis_for_architecture4`/`test_run_training_
+smoke_runs_architecture4_with_a_fitted_gene_basis` both exercise the
+corrected key end to end.
+
+**New: `models/gene_basis.py::save_gene_residual_basis`/`load_gene_
+residual_basis`.** `architecture4.yaml`'s own docs require a `Gene
+ResidualBasis` "already fit on TRAINING-split residuals... fit offline,
+outside this class," but no persistence mechanism existed anywhere in
+the codebase for that "offline" step before this round. Added as a
+small, in-scope pair: atomic `torch.save`-based write; load re-verifies
+`gene_names_hash` against a fresh hash of the saved `gene_names`
+(fail-closed, mirrors `checkpoint.verify_gene_names`) and that the
+basis's column count agrees with `len(gene_names)`.
+
+**New deliverable scripts** (`gen3_multiscale/scripts/`), all thin
+wrappers around already-tested primitives, none of them a new orchestration
+engine:
+- `step6_overfit_test.py` -- `build_single_sample_config` derives a
+  temp manifest restricted to exactly one training sample and ZERO
+  validation/test samples (the ORIGINAL on-disk manifest is never
+  modified) plus a temp config pointing at it, then calls `train.py`'s
+  real `run_training` unmodified for a small, explicit number of real
+  optimizer steps -- the "no held-out" single-sample capacity check.
+- `step6_four_gpu_diagnostic.py` -- `run_four_gpu_smoke_diagnostic`
+  calls `launch_four_gpu_suite.launch_suite(..., smoke_only=True)`
+  DIRECTLY, hardcoded, never `run_suite_with_smoke_gate` (which
+  auto-promotes to a full run the instant its smoke gate passes --
+  exactly what Adam's "do not start any training automatically"
+  forbids). There is no CLI flag or code path in this script that can
+  reach a full run; `test_run_four_gpu_smoke_diagnostic_calls_launch_
+  suite_with_smoke_only_true` asserts both the `smoke_only=True` call
+  and that `run_suite_with_smoke_gate` is never touched.
+- `step6_progress.py`/`step6_summary.py` -- read-only JSON reports over
+  `checkpoint_dir`'s existing artifacts (`training_state.json`, `run_
+  manifest.json`, `preflight_report.json`, checkpoint history via
+  `checkpoint.list_checkpoint_history`); never load model weights, never
+  touch a GPU. `step6_progress.py` is a fast glance (current step, skip
+  count, snapshot count); `step6_summary.py` additionally surfaces
+  fingerprints, split sizes, and mask-schedule pass/fail counts.
+
+**Regression tests added** (`gen3_multiscale/tests/test_train.py`,
+`test_gen3_dataset.py`, `test_gen3_preflight.py`, `test_step6_scripts.py`
+-- 38 new tests total this round: 12 + 10 + 10 + 6), covering every deliverable regression
+case Adam listed: barcode misalignment (`Gen3SampleData.__post_init__`'s
+row-count re-check), incomplete cache coverage (`test_run_training_
+rejects_incomplete_cache_coverage`, deletes one real on-disk cache file
+and confirms `run_training` raises before any model is built), tile-
+encoder provenance disagreement (`test_run_training_rejects_provenance_
+disagreement_with_declared_tile_encoder_revision`), mask leakage
+(`test_gen3_dataset_rejects_mixing_a_sample_from_the_wrong_role` plus the
+structural-disjointness argument above), and accidental live image
+encoding (`test_gen3_dataset_never_calls_the_tile_encoder`/`test_run_
+training_never_calls_the_tile_encoder_during_a_smoke_run`, both
+monkeypatch the real GigaPath functions to raise and run the full path).
+A real, small, end-to-end synthetic fixture (`tests/_step6_fixtures.py`,
+shared by all four new test files) spans `dataset_manifest` ->
+`example_builder` -> `spot_feature_cache` -> `slide_context` ->
+`mask_fingerprint` -> `mask_schedule`; only the GigaPath tile encoder
+itself is ever monkeypatched (deterministic stub weights, fixed after an
+early self-caught bug: `nn.Linear`'s default RANDOM init made two stubbed
+loads of the "same" pinned revision disagree, which is not what the real
+system's pinning guarantee looks like).
+
+Architecture 3/4 are exercised through the real trainer with
+`use_regional_he=True`/`use_global_gex=True` but `use_global_slide=False`
+-- a real, legitimate partial-feature configuration (regional H&E
+pooling needs only the already-cached tile FEATURES; only `use_global_
+slide` needs the real `gigapath` package and a real LongNet checkpoint,
+neither available in this sandbox). `use_global_slide=True` itself was
+validated separately on real A100 hardware (this round's own hardware
+gate, reported above) and is not re-exercised in these CPU tests.
+
+**Explicitly NOT built this round, per Adam's own scoping:** Step 7's
+evaluator, Step 8's mandatory preflight GATES beyond the cache/provenance
+one `gen3_preflight.py` already implements, and the 24-hour run itself.
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
 
 ```
-gen3_multiscale/tests/: 551 passed (45 reused-infra + 27 example-schema +
+gen3_multiscale/tests/: 589 passed (45 reused-infra + 27 example-schema +
   11 boundary-graph + 36 slide-context + 9 slide-encoder + 2 debug-plot +
   18 transport-head + 10 tokens + 16 attention + 10 global-context +
   7 harmonic + 7 geometry-utils + 9 backbone + 31 architectures +
@@ -4672,12 +4915,16 @@ gen3_multiscale/tests/: 551 passed (45 reused-infra + 27 example-schema +
   27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
   37 mask-schedule + 17 dataset-manifest + 31 example-builder +
   46 mask-fingerprint + 22 novae-graph + 4 loaders + 17 spot-feature-cache
-  + 12 tile-encoder-preflight)
-gen2_architectures + gen3_multiscale: 724 passed, 1 skipped
-(repo-root tests/test_conditioning.py: 13 passed, unchanged this round)
+  + 12 tile-encoder-preflight + 10 gen3-dataset + 10 gen3-preflight +
+  12 train + 6 step6-scripts)
+gen2_architectures + gen3_multiscale: 762 passed, 1 skipped
+(repo-root tests/: 322 passed, 1 pre-existing unrelated failure --
+  tests/test_multi_sample.py::test_inject_multi_sample_n_genes, confirmed
+  failing identically on the unmodified branch before this round's
+  changes via `git stash`; not touched by anything in this round)
 ```
 
-The block immediately below (pre-21st-re-audit test counts) is kept for
+The block immediately below (pre-Step-6-trainer test counts) is kept for
 historical continuity rather than deleted, per this document's
 append-only discipline:
 
