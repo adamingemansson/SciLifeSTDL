@@ -3123,7 +3123,215 @@ too).
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 37. Response to the twelfth external Codex re-audit (of commit 1bb66d6)
+
+Codex confirmed the 11th round's fixes (train-only compatibility,
+patient namespacing, example validation, partial-overlap leakage
+detection) as real improvements, then found the Step 4 "Novae graph"
+was not actually usable with real Novae, plus three deeper gaps in
+Step 3's mask scheduling/reporting and one in Step 1's held-out
+dropping -- 8 launch-blocking findings total, verified individually
+against the real code (and, for finding #1, against Novae's real
+published API, fetched live from github.com/MICS-Lab/novae) before any
+fix.
+
+**Finding #1 (CONFIRMED against Novae's real quickstart): the Novae
+adapter signature could not accept a real Novae call.** Fetched
+`github.com/MICS-Lab/novae`'s README directly: real Novae's interface
+is AnnData-in, AnnData-mutated-in-place-out --
+`novae.spatial_neighbors(adata)` then `Novae.from_pretrained(...)` then
+`model.compute_representations(adata, zero_shot=True)` -- `spatial_neighbors`
+builds Novae's OWN graph internally from `adata.obsm['spatial']`; it
+does not accept a caller-supplied graph at all. §36's
+`build_context_only_novae_graph` built its own separate k-NN adjacency
+(`boundary_graph.build_knn_adjacency`) and fed `(node_expression,
+edge_index)` to the injected function -- a signature real Novae could
+never actually be plugged into, and a graph never proven to be the one
+Novae would build. Also confirmed: `gen2_architectures.models.conditioning.precompute_novae_features`
+ALREADY implements the real, correct adapter (read in full) -- it takes
+a whole `adata`, calls `novae.spatial_neighbors(adata)` itself, loads a
+cached `Novae.from_pretrained(checkpoint)`, calls
+`model.compute_representations(adata, zero_shot=True)`, and extracts
+the new `obsm` key defensively. Fixed: `novae_graph.py` rewritten so
+`build_context_only_novae_input` builds the PHYSICALLY context-only
+AnnData real Novae needs (real `var_names`, context-only `obs_names`,
+context-only `obsm['spatial']`, context-only `X` -- a genuine
+`adata[...].copy()`, never a view or closure over the full `adata`),
+and the injected `novae_feature_fn` now has the SAME
+`Callable[[adata], np.ndarray]` contract `ContextOnlyNovaeProvider`
+already uses -- `precompute_novae_features` (or an equivalent) can be
+plugged in directly, unmodified. Since the graph Novae builds is
+constructed FROM this exact context-only AnnData (inside the injected
+function), proving the AnnData itself excludes every query row is what
+proves the downstream graph does too; this module no longer fabricates
+a second, unverified graph structure to police instead. `NovaeGraphInputs`
+is renamed `NovaeContextInputs`; `edge_index`/`node_coords`/
+`node_expression` fields are replaced by `context_adata`. Verified:
+`test_build_context_only_novae_input_is_a_real_copy_not_a_view_of_the_full_adata`
+mutates the returned `context_adata.X` and confirms the original
+`adata` is unaffected.
+
+**Finding #2 (CONFIRMED): the cache key hashed only context-node
+identities.** Fixed by reusing
+`gen2_architectures.data.context_features._adata_feature_signature` --
+the ALREADY-AUDITED comprehensive fingerprint (real expression matrix
+bytes, obs/var names, spatial coordinates, preprocessing state, and the
+feature function's module-qualified name) this project has already
+relied on for the exact same problem, rather than inventing a weaker
+one. `ensure_cached_novae_embeddings` gained a `checkpoint_signature`
+parameter folded into `_adata_feature_signature`'s `extra_signature`
+(its own documented mechanism for a caller-supplied real checkpoint
+identity, e.g. `f"{repo}:{revision}"`) plus this module's own
+`_CACHE_SCHEMA_VERSION`. Verified:
+`test_cache_key_changes_when_checkpoint_signature_changes` confirms two
+calls differing only in `checkpoint_signature` write to different
+cache files.
+
+**Finding #3 (CONFIRMED): cached embeddings were not validated on
+load.** `ensure_cached_novae_embeddings` now checks, before ever
+returning a cached result: every required `.npz` key is present; the
+recorded `cache_key` matches exactly; the recorded node identities/
+order match the current context exactly; the embeddings array is 2D
+with the correct row count; `float32`; all-finite; and (if an
+`expected_dim` is supplied) has the expected width -- any failure is a
+hard refusal, not a silent cache miss. Verified by 4 new tests, each
+tampering one specific aspect of a valid cache file (missing keys,
+wrong dtype, wrong width via `expected_dim`) and confirming the
+specific corresponding rejection.
+
+**Finding #4 (CONFIRMED): the preflight report's "checks" dict
+overclaimed.** §36's report asserted `True` for claims like "an
+arbitrary injected function didn't leak external data," which no
+amount of input/output shape checking can actually establish. Fixed:
+`build_novae_preflight_report` now returns a `"verified"` list (what
+was actually, structurally checked) and a
+`"not_provable_from_this_module_alone"` list (named limits -- an
+injected function's internal behavior, and checkpoint identity beyond
+whatever string the caller supplies), replacing the old boolean
+`"checks"` dict.
+
+**Finding #5 (CONFIRMED): Step 3 could detect a mask collision but not
+prevent one.** The 11th round's own tests proved
+`verify_realized_pool_uniqueness` DETECTS a collision, but nothing in
+this package could PRODUCE a collision-free schedule other than a test
+searching thousands of `base_seed` values for a lucky non-colliding
+one. Fixed: new `mask_fingerprint.build_collision_free_training_schedule`
+deterministically builds a training schedule GUARANTEED, by
+construction, to never query a reserved (validation/test) composite
+identity and never repeat an already-accepted mask -- round-robinning
+across strata, trying candidate seeds from a deterministic per-stratum
+counter (reusing `mask_schedule._STRATUM_SEED_STRIDE`'s offset
+convention so seeds never collide with that module's own ranges),
+advancing by 1 on every rejection, up to a bounded `max_attempts_per_item`,
+raising (fail-closed) if no valid seed is found for any item. Verified:
+`test_build_collision_free_training_schedule_avoids_reserved_and_duplicate_masks`
+reuses the EXACT small-grid, large-radius-strata configuration that
+previously forced a thousands-of-seeds search, and now succeeds
+deterministically on the first call with zero retries from the caller.
+
+**Finding #6 (CONFIRMED): the mask report was not bound to its
+inputs.** §34's report recorded only summary counts. Fixed: every
+report now includes `input_fingerprints` (SHA256 of the manifest, the
+`mask_bank.spatial_fingerprint` of the coordinate lattice, and the
+`mask_schedule.strata_fingerprint`) -- a consumer (Step 8's preflight
+gate, or the trainer) is expected to recompute these from its own live
+data and refuse a report whose fingerprints don't match; this module
+records them but does not itself re-verify a loaded report against live
+data (documented as the consuming caller's job, since only it has the
+live data to compare against). Verified:
+`test_report_input_fingerprints_change_when_the_manifest_changes`.
+
+**Finding #7 (CONFIRMED): duplicate masks within one split went
+undetected.** The prior cross-split leakage check only ever compared
+DIFFERENT splits against each other -- never whether two records
+WITHIN the same split (e.g. validation mask #2 and validation mask #5)
+realized the identical mask, silently halving that split's real
+effective sample size while still counting as two independent draws.
+Fixed: new `verify_no_duplicate_masks_within_split`, wired into both
+new report builders (below) for every split they process.
+
+**Finding #8 (CONFIRMED): sample splitting and mask splitting were
+conceptually mixed.** §34's single `build_mask_fingerprint_report`
+processed train/validation/test masks for one sample as if all three
+normally coexist. Under this project's patient-disjoint SAMPLE-level
+split (`dataset_manifest.py`), a TRAINING sample's real evaluation
+happens on ENTIRELY DIFFERENT held-out samples -- `mask_bank.py`/
+`mask_schedule.py`'s per-sample validation/test split_counts concept,
+realized on a training sample at all, is at most a SECONDARY
+same-sample capacity/early-stopping diagnostic. `build_mask_fingerprint_report`
+is REMOVED (not deprecated in place -- no external caller depends on
+it yet, and keeping two semantically-conflicting APIs would be worse
+than a clean replacement) and split into two sample-role-aware
+functions:
+- `build_training_sample_mask_report(manifest, sample_id, coords3d,
+  slice_ids, obs_names, strata, training_schedule, *,
+  same_sample_diagnostic_mask_bank=None)` -- primary = the
+  collision-free training schedule; if same-sample validation/test
+  masks are supplied, they appear under an explicitly separate,
+  clearly-labeled `"same_sample_capacity_diagnostic"` section (with an
+  inline warning never to substitute it for cross-sample evaluation),
+  cross-checked for leakage against the primary schedule.
+- `build_held_out_sample_mask_report(manifest, sample_id, coords3d,
+  slice_ids, obs_names, strata, split, stratified_mask_bank)` --
+  primary = the ONE split (`"validation"` or `"test"`) this held-out
+  sample actually belongs to; FAILS CLOSED if the mask bank contains
+  any record for a different split (a held-out sample must never carry
+  training-labeled masks, and a validation sample must never carry
+  test-labeled masks or vice versa).
+
+**Finding #9 (CONFIRMED): held-out samples were silently dropped after
+splitting, without re-checking quotas.** `dataset_manifest.py`'s exact
+100%-panel-coverage check (§35 finding #2's fix) drops non-conforming
+held-out samples, but `resolve_sample_selection` always selects EXACTLY
+`n_validation_per_organ`/`n_test_per_organ` distinct PATIENTS for every
+organ it keeps at all -- so dropping even one held-out sample can
+silently leave an organ's quota unmet or its balance distorted, with
+nobody noticing. Fixed: `build_dataset_manifest` now re-validates, per
+organ, that the requested validation/test PATIENT counts (not just raw
+sample counts -- patient-disjoint splitting keeps every sample from one
+patient in the same split) are still met whenever any held-out sample
+was dropped for a panel mismatch; raises (fail-closed) otherwise.
+Verified by two companion tests: the original "excluded" scenario (only
+1 validation sample requested, that sample gets dropped) now correctly
+raises; a new scenario where the held-out PATIENT has a SECOND, fully
+compatible sample demonstrates the quota surviving and the manifest
+building successfully, excluding only the specific bad sample.
+
+**What the audit confirmed as correct, no fix needed:** file hashes
+freshly recomputed (not cache-trusted); the gene panel derived from
+training samples only; held-out samples checked against the final
+frozen panel; query fingerprints using composite (sample, spot)
+identities; duplicate query identities and cross-configuration mask
+collisions detected; query spots physically absent from the Novae
+input; Novae using all GEX-available context spots independent of H&E
+availability.
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 422 passed (45 reused-infra + 12 example-schema +
+  11 boundary-graph + 5 slide-context + 7 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 23 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 16 dataset-manifest + 16 example-builder +
+  27 mask-fingerprint + 17 novae-graph)
+gen2_architectures + gen3_multiscale: 595 passed, 1 skipped
+```
+
+Note: a full monorepo run (`pytest -q` from the repo root, everything
+including the top-level `tests/` directory) still shows the same one
+pre-existing failure noted since §26,
+`tests/test_multi_sample.py::test_inject_multi_sample_n_genes`,
+unrelated to `gen2_architectures/` or `gen3_multiscale/`; unchanged and
+still out of scope for this pass.
+
+The block immediately below (pre-12th-audit-response test counts) is
+kept for historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 409 passed (45 reused-infra + 12 example-schema +

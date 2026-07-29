@@ -248,16 +248,99 @@ def test_held_out_samples_missing_genes_from_the_final_panel_are_excluded(tmp_pa
     meta_path = tmp_path / "meta.csv"
     pd.DataFrame(rows).to_csv(meta_path, index=False)
 
+    # 12th Codex re-audit of commit 1bb66d6, finding #8/#9 (CONFIRMED):
+    # resolve_sample_selection always selects EXACTLY n_validation_per_organ
+    # distinct patients into validation_ids -- never more -- so dropping
+    # the ONLY validation patient's only sample here necessarily leaves
+    # the organ's validation quota unmet (0 < 1 requested). This must now
+    # fail closed rather than silently building a manifest that no
+    # longer matches what the caller asked for (see the companion test
+    # below for the case where the held-out PATIENT has ANOTHER sample
+    # that still covers the panel, so the quota survives and the build
+    # succeeds).
+    with pytest.raises(ValueError, match="no longer meets the requested validation/test patient quotas"):
+        build_dataset_manifest(
+            hest_dir, str(meta_path), organs="all", min_samples_per_organ=6,
+            n_validation_per_organ=1, n_test_per_organ=0, split_seed=0,
+            check_gene_panel_compatibility=True,  # the coarse pre-filter this test proves is insufficient alone
+            min_gene_coverage=0.5, min_sample_coverage=0.9, min_panel_size=5,
+            min_nb_genes=None, gene_min_genes_per_spot=1, gene_min_cells=0,
+        )
+
+
+def test_held_out_sample_exclusion_preserves_validation_quota_when_the_patient_has_another_sample(tmp_path):
+    """Successful-exclusion companion to the quota-violation test above:
+    when the held-out PATIENT (not just the one degraded SAMPLE) still
+    has another real sample that fully covers the frozen panel, dropping
+    the degraded sample does not violate the validation patient quota
+    (patient-disjoint splitting keeps every sample from one patient in
+    the same split), and manifest construction succeeds, correctly
+    excluding only the bad sample."""
+    full_genes = [f"GENE{i}" for i in range(20)]
+    degraded_genes = full_genes[:19]
+    patient_ids = [f"P{i}" for i in range(6)]
+
+    dry_run_dir, dry_run_meta, _ = _make_synthetic_hest1k(
+        tmp_path / "dry_run", {"Lung": patient_ids}, gene_names=full_genes, n_spots_per_sample=1,
+        patient_by_id={pid: pid for pid in patient_ids},
+    )
+    dry_run = build_dataset_manifest(
+        dry_run_dir, str(dry_run_meta), organs="all", min_samples_per_organ=6,
+        n_validation_per_organ=1, n_test_per_organ=0, split_seed=0,
+        check_gene_panel_compatibility=False, min_nb_genes=None, gene_min_genes_per_spot=1, gene_min_cells=0,
+    )
+    held_out_sample = dry_run["validation_sample_ids"][0]
+    held_out_patient = dry_run["samples"][held_out_sample]["patient_id"]
+
+    sample_ids: list[str] = []
+    patient_by_id: dict[str, str] = {}
+    sample_genes: dict[str, list[str]] = {}
+    good_sid = f"{held_out_patient}-good"
+    bad_sid = f"{held_out_patient}-bad"
+    for pid in patient_ids:
+        if pid == held_out_patient:
+            sample_ids += [good_sid, bad_sid]
+            patient_by_id[good_sid] = pid
+            patient_by_id[bad_sid] = pid
+            sample_genes[good_sid] = full_genes
+            sample_genes[bad_sid] = degraded_genes
+        else:
+            sample_ids.append(pid)
+            patient_by_id[pid] = pid
+            sample_genes[pid] = full_genes
+
+    hest_dir = tmp_path / "hest1k"
+    (hest_dir / "st").mkdir(parents=True)
+    (hest_dir / "patches").mkdir(parents=True)
+    rng = np.random.default_rng(0)
+    rows = []
+    for sid, genes in sample_genes.items():
+        n = 5
+        barcodes = [f"{sid}-SPOT{i}-1" for i in range(n)]
+        counts = rng.poisson(5, size=(n, len(genes))).astype(np.float32)
+        coords = rng.uniform(0, 1000, size=(n, 2))
+        adata = ad.AnnData(
+            X=counts, obs=pd.DataFrame(index=pd.Index(barcodes)), var=pd.DataFrame(index=pd.Index(genes)),
+        )
+        adata.obsm["spatial"] = coords
+        adata.write_h5ad(hest_dir / "st" / f"{sid}.h5ad")
+        (hest_dir / "patches" / f"{sid}.h5").touch()
+        rows.append({
+            "id": sid, "organ": "Lung", "st_technology": "Visium", "species": "Homo sapiens",
+            "nb_genes": len(genes), "patient": patient_by_id[sid],
+        })
+    meta_path = tmp_path / "meta.csv"
+    pd.DataFrame(rows).to_csv(meta_path, index=False)
+
     manifest = build_dataset_manifest(
         hest_dir, str(meta_path), organs="all", min_samples_per_organ=6,
         n_validation_per_organ=1, n_test_per_organ=0, split_seed=0,
-        check_gene_panel_compatibility=True,  # the coarse pre-filter this test proves is insufficient alone
+        check_gene_panel_compatibility=True,
         min_gene_coverage=0.5, min_sample_coverage=0.9, min_panel_size=5,
         min_nb_genes=None, gene_min_genes_per_spot=1, gene_min_cells=0,
     )
-    assert set(manifest["gene_panel"]) == set(full_genes)  # unaffected -- train samples are all fully compatible
-    assert held_out_id not in manifest["validation_sample_ids"]
-    assert held_out_id not in manifest["samples"]
+    assert bad_sid not in manifest["validation_sample_ids"]
+    assert good_sid in manifest["validation_sample_ids"]
 
 
 def test_manifest_excludes_spots_that_fail_the_per_spot_min_genes_filter(tmp_path):

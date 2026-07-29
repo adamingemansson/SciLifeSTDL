@@ -1,30 +1,75 @@
-"""Context-only Novae graph construction -- Step 4 of the real Gen3 data
+"""Context-only Novae input construction -- Step 4 of the real Gen3 data
 builder/trainer (Adam's explicit 9-step implementation order,
 CONTRACT.md section 30, item 4: "Build context-only Novae graphs";
-sharpened by the 11th Codex re-audit's decision on Step 4: "the Novae
-graph must use all GEX-available context spots -- including spots whose
-H&E patch is unavailable due to overlap -- while query nodes are
-physically absent. The cache key and preflight report must prove that
-no query composite identity appears in: graph nodes; graph edges; Novae
-input expression; global/induced pools; cached embeddings.").
+sharpened by the 11th Codex re-audit's decision on Step 4, then
+corrected by the 12th Codex re-audit of commit 1bb66d6 finding #1).
 
-Novae (https://github.com/MICS-Lab/novae) is a graph-based spatial-
-domain model: it propagates information between spatially neighboring
-spots, so its features MUST be computed on a graph built from context
-spots ONLY -- computing them on the full slide (context + query) before
-hiding query expression would leak hidden query information through
-message passing, exactly the concern already documented and solved once
-for `gen2_architectures.data.context_features.ContextOnlyNovaeProvider`.
-This module is the gen3_multiscale analog, adapted to this package's
-barcode-list convention (matching example_builder.py) and composite-
-identity leakage discipline (matching mask_fingerprint.py). Unlike
-`ContextOnlyNovaeProvider` (which only wraps an opaque `feature_fn` call
-on a subset AnnData, never exposing a graph as its own artifact), this
-module builds the GRAPH STRUCTURE itself (nodes, edges) as a first-class,
-independently-verifiable object -- required by Step 4's explicit safety
-demand to prove non-leakage at every one of: graph nodes, graph edges,
-the Novae input expression matrix, any global/induced pooled feature,
-and any cached embedding.
+**The 12th re-audit's finding #1 (CONFIRMED against Novae's real
+published quickstart, github.com/MICS-Lab/novae) was a real design bug
+in the first version of this module, not a style nit.** Real Novae's
+interface is AnnData-in, AnnData-mutated-in-place-out:
+```
+novae.spatial_neighbors(adata)
+model = novae.Novae.from_pretrained("prism-oncology/novae-human-0")
+model.compute_representations(adata, zero_shot=True)
+```
+`novae.spatial_neighbors` builds Novae's OWN spatial graph internally
+from `adata.obsm["spatial"]` -- it does not accept a caller-supplied
+graph at all. A prior version of this module built its own separate
+k-NN adjacency (`boundary_graph.build_knn_adjacency`) and fed
+`(node_expression, edge_index)` to the injected feature function --
+that graph was never proven to be the one real Novae would actually
+build or use, and the function signature could not even accept real
+Novae's real call pattern. `gen2_architectures.models.conditioning.precompute_novae_features`
+already implements the REAL, correct adapter (confirmed by reading it
+in full): it takes a whole `adata`, calls `novae.spatial_neighbors(adata)`
+itself, loads a cached `Novae.from_pretrained(checkpoint)`, calls
+`model.compute_representations(adata, zero_shot=True)`, and extracts
+the new `obsm` key defensively. This module's job is therefore NOT to
+build a competing graph -- it is to build the PHYSICALLY context-only
+AnnData real Novae needs (ordered `var_names`, context-only `obs_names`,
+context-only `obsm["spatial"]`, context-only `X`), prove it excludes
+every query composite identity, and pass THAT to an injected adapter
+function with the same `Callable[[adata], np.ndarray]` contract
+`gen2_architectures.data.context_features.ContextOnlyNovaeProvider`
+already uses and this project has already audited -- not a bespoke
+`(expression, edge_index)` signature nobody could actually plug a real
+Novae adapter into.
+
+Since the context-only AnnData structurally excludes every query row,
+and real Novae's OWN internal `spatial_neighbors` graph is built FROM
+that exact AnnData (inside the injected function, not here), the graph
+Novae's `spatial_neighbors` produces cannot contain a query node or
+edge EITHER -- proving the input AnnData is query-free is what actually
+proves the downstream graph is too. This module does not fabricate a
+second, unverified graph structure to police instead.
+
+**Cache fingerprinting (12th re-audit finding #2, CONFIRMED: the first
+version's cache key hashed only context-node identities, ignoring
+expression content, preprocessing, gene panel, coordinates, and the
+feature function's own identity/checkpoint).** Fixed by reusing
+`gen2_architectures.data.context_features._adata_feature_signature` --
+the already-audited fingerprint (real matrix bytes, obs_names,
+var_names, spatial coordinates, preprocessing state, and the feature
+function's module-qualified name) this project has already relied on
+for the exact same problem, rather than reinventing a weaker one.
+`checkpoint_signature`/`extra_signature` lets a caller fold in a real
+checkpoint identity (e.g. `f"{repo}:{revision}"` or a file hash) so a
+changed checkpoint invalidates the cache even when the wrapping
+Python function's name doesn't change -- exactly `_adata_feature_signature`'s
+own documented `extra_signature` use case.
+
+**Cached embeddings are now fully validated on load (12th re-audit
+finding #3, CONFIRMED: the first version only checked node-identity
+overlap with the query set, never shape/dtype/finiteness/width)**: see
+`ensure_cached_novae_embeddings`.
+
+**The preflight report is now honest about what it can and cannot prove
+(12th re-audit finding #4, CONFIRMED: a prior "checks" dict asserted
+`True` for claims like "an arbitrary injected function didn't leak
+external data," which this module has no way to actually verify)**: see
+`build_novae_preflight_report`'s `verified` vs `not_provable_from_this_module_alone`
+split.
 
 GEX availability, not H&E availability, is what this module reads:
 `example_builder.build_spatial_field_example` (Step 2) EXCLUDES context
@@ -42,55 +87,61 @@ spot, exactly as instructed.
 The actual Novae model/checkpoint is never called here (no such
 dependency exists anywhere in this repo -- confirmed: no `novae` or
 `torch_geometric` package is installed). `novae_feature_fn` is
-INJECTED, matching every other pluggable-feature-function pattern
-already established in this codebase (`example_builder.image_feature_fn`,
-`ContextOnlyNovaeProvider`'s own `feature_fn`)."""
+INJECTED and receives the context-only AnnData ITSELF (never the full
+adata, and never through a closure that could smuggle in the full
+adata either -- this module builds a genuinely new `adata[...].copy()`
+subset object and passes only that)."""
 from __future__ import annotations
 
 import json
 import os
 from dataclasses import dataclass
-from hashlib import sha256
 from pathlib import Path
 from typing import Callable, Iterable
 
 import numpy as np
 
-from gen3_multiscale.data.boundary_graph import build_knn_adjacency
+from gen2_architectures.data.context_features import _adata_feature_signature
 from gen3_multiscale.data.dataset_manifest import composite_spot_id
 
-_REPORT_VERSION = 1
+_REPORT_VERSION = 2
 
-NovaeFeatureFn = Callable[[np.ndarray, np.ndarray], np.ndarray]  # (node_expression, edge_index) -> [n_nodes, dim]
+# Bumped whenever THIS module's cache file schema (required keys,
+# meaning of stored fields) changes -- folded into the cache fingerprint
+# via _adata_feature_signature's extra_signature so an old-schema cache
+# file is never misread as the new schema, even if every other input is
+# unchanged.
+_CACHE_SCHEMA_VERSION = "1"
+
+NovaeFeatureFn = Callable[[object], np.ndarray]  # (context_only_adata) -> [n_context, dim]
 
 
 @dataclass(frozen=True)
-class NovaeGraphInputs:
-    """A context-only Novae graph for one sample. `node_barcodes` is
-    sorted (deterministic, independent of the caller's context_barcodes
-    order) -- every other array is aligned 1:1 to it by position."""
+class NovaeContextInputs:
+    """The physically context-only AnnData real Novae needs, plus
+    composite-identity bookkeeping for leakage verification.
+    `node_barcodes` is sorted (deterministic, independent of the
+    caller's context_barcodes order); `context_adata.obs_names` is
+    identical to it by construction."""
     sample_id: str
-    node_barcodes: np.ndarray          # [n_nodes] str
-    node_composite_ids: np.ndarray     # [n_nodes] str, composite_spot_id(sample_id, barcode)
-    node_coords: np.ndarray            # [n_nodes, 2] float32
-    node_expression: np.ndarray        # [n_nodes, n_genes] float32 -- the real "Novae input expression"
-    edge_index: np.ndarray             # [2, E] int -- source/target node POSITIONS in [0, n_nodes)
-    cache_key: str                     # sha256 over sorted node_composite_ids + graph params ONLY
+    node_barcodes: np.ndarray          # [n_context] str, sorted
+    node_composite_ids: np.ndarray     # [n_context] str, composite_spot_id(sample_id, barcode)
+    context_adata: object              # "ad.AnnData" -- physically excludes every query row
 
 
-def build_context_only_novae_graph(
+def build_context_only_novae_input(
     adata: "ad.AnnData",  # noqa: F821
-    context_barcodes: list[str], query_barcodes: list[str], *,
-    sample_id: str, k_neighbors: int = 6,
-) -> NovaeGraphInputs:
-    """Build the graph structure for every GEX-available context spot
-    (all of `context_barcodes`, with no H&E-overlap-based reduction --
-    see module docstring). Query spots are structurally absent: this
-    function never reads `query_barcodes`' expression or coordinates for
-    anything beyond the disjointness/leakage checks. Raises (fail-closed)
-    if the resulting graph is found to reference any query composite
-    identity -- verified immediately via
-    verify_novae_graph_excludes_query_identities before returning."""
+    context_barcodes: list[str], query_barcodes: list[str], *, sample_id: str,
+) -> NovaeContextInputs:
+    """Build the PHYSICALLY context-only AnnData real Novae needs (real
+    `var_names`/gene identities, context-only `obs_names`, context-only
+    `obsm['spatial']`, context-only `X`) -- not a fabricated graph. Query
+    spots are structurally absent: this function never reads
+    `query_barcodes`' expression or coordinates for anything beyond the
+    disjointness/leakage checks. Raises (fail-closed) if the result is
+    found to reference any query composite identity -- verified
+    immediately via `verify_novae_context_excludes_query_identities`
+    before returning."""
     obs_names = np.asarray(adata.obs_names, dtype=str)
     barcode_to_pos = {b: i for i, b in enumerate(obs_names)}
 
@@ -104,76 +155,58 @@ def build_context_only_novae_graph(
     if set(context_barcodes) & set(query_barcodes):
         raise ValueError(f"{sample_id}: context and query barcodes overlap")
     if not context_barcodes:
-        raise ValueError(f"{sample_id}: context_barcodes is empty -- no context to build a graph over")
+        raise ValueError(f"{sample_id}: context_barcodes is empty -- no context to build Novae input from")
 
     node_barcodes = np.asarray(sorted(str(b) for b in context_barcodes), dtype=str)
-    node_pos = np.asarray([barcode_to_pos[b] for b in node_barcodes], dtype=int)
-    all_coords = np.asarray(adata.obsm["spatial"], dtype=np.float64)
-    node_coords = all_coords[node_pos].astype(np.float32)
-
-    X = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()
-    node_expression = np.asarray(X[node_pos], dtype=np.float32)
-
-    adjacency = build_knn_adjacency(node_coords, k_neighbors=k_neighbors)
-    sources: list[int] = []
-    targets: list[int] = []
-    for i, neighbors in enumerate(adjacency):
-        for j in neighbors:
-            sources.append(i)
-            targets.append(int(j))
-    edge_index = np.asarray([sources, targets], dtype=int) if sources else np.zeros((2, 0), dtype=int)
-
+    node_pos = [barcode_to_pos[b] for b in node_barcodes]
+    # A genuinely NEW object, never a view over the full adata -- the
+    # injected novae_feature_fn physically cannot reach query rows
+    # through this, regardless of what it does internally.
+    context_adata = adata[node_pos].copy()
     node_composite_ids = np.asarray(
         [composite_spot_id(sample_id, b) for b in node_barcodes], dtype=str,
     )
-    cache_key = sha256("\n".join(sorted(node_composite_ids.tolist())).encode("utf-8")).hexdigest()
 
-    graph = NovaeGraphInputs(
+    inputs = NovaeContextInputs(
         sample_id=sample_id, node_barcodes=node_barcodes, node_composite_ids=node_composite_ids,
-        node_coords=node_coords, node_expression=node_expression, edge_index=edge_index, cache_key=cache_key,
+        context_adata=context_adata,
     )
-    verify_novae_graph_excludes_query_identities(graph, query_barcodes)
-    return graph
+    verify_novae_context_excludes_query_identities(inputs, query_barcodes)
+    return inputs
 
 
-def verify_novae_graph_excludes_query_identities(graph: NovaeGraphInputs, query_barcodes: Iterable[str]) -> dict:
-    """Fail-closed: prove no query composite identity appears in graph
-    NODES, and that graph EDGES are structurally valid (every edge index
-    references a real node position -- by construction this can only
-    ever be a context node, since `edge_index` is built exclusively from
-    positions within `node_barcodes`; asserted here rather than merely
-    assumed). The Novae INPUT EXPRESSION matrix is row-aligned 1:1 with
-    `node_barcodes` by construction, so proving node non-leakage proves
-    expression non-leakage too -- the row-count check below makes that
-    alignment itself an explicit, verified invariant rather than an
-    unstated assumption."""
-    query_composite_ids = {composite_spot_id(graph.sample_id, b) for b in query_barcodes}
-    node_composite_ids = set(graph.node_composite_ids.tolist())
+def verify_novae_context_excludes_query_identities(
+    inputs: NovaeContextInputs, query_barcodes: Iterable[str],
+) -> dict:
+    """Fail-closed: prove no query composite identity appears among the
+    context-only AnnData's own `obs_names`, and that `node_barcodes`/
+    `node_composite_ids`/`context_adata.obs_names` are all exactly
+    aligned (so a bug that desynchronized them, rather than the
+    subsetting itself, would also be caught here, not silently
+    trusted)."""
+    query_composite_ids = {composite_spot_id(inputs.sample_id, b) for b in query_barcodes}
+    node_composite_ids = set(inputs.node_composite_ids.tolist())
     leaked = query_composite_ids & node_composite_ids
     if leaked:
         raise ValueError(
-            f"{graph.sample_id}: {len(leaked)} query composite identit(y/ies) leaked into Novae graph "
-            f"nodes: {sorted(leaked)[:5]}"
+            f"{inputs.sample_id}: {len(leaked)} query composite identit(y/ies) leaked into the "
+            f"context-only Novae input: {sorted(leaked)[:5]}"
         )
-    n_nodes = graph.node_barcodes.shape[0]
-    if graph.edge_index.size and (graph.edge_index.min() < 0 or graph.edge_index.max() >= n_nodes):
+    context_obs_names = np.asarray(inputs.context_adata.obs_names, dtype=str)
+    if not np.array_equal(context_obs_names, inputs.node_barcodes):
         raise ValueError(
-            f"{graph.sample_id}: Novae graph edge_index references a node position outside "
-            f"[0, {n_nodes}) -- the graph is structurally corrupt"
+            f"{inputs.sample_id}: context_adata.obs_names does not match node_barcodes -- the "
+            "context-only AnnData is desynchronized from its own identity bookkeeping"
         )
-    if graph.node_expression.shape[0] != n_nodes:
+    query_barcode_set = {str(b) for b in query_barcodes}
+    leaked_barcodes = set(context_obs_names.tolist()) & query_barcode_set
+    if leaked_barcodes:
         raise ValueError(
-            f"{graph.sample_id}: Novae input expression has {graph.node_expression.shape[0]} rows "
-            f"but the graph has {n_nodes} nodes -- expression must be 1:1 with nodes"
-        )
-    if graph.node_coords.shape[0] != n_nodes:
-        raise ValueError(
-            f"{graph.sample_id}: node_coords has {graph.node_coords.shape[0]} rows but the graph "
-            f"has {n_nodes} nodes"
+            f"{inputs.sample_id}: context_adata itself contains {len(leaked_barcodes)} query "
+            f"barcode(s): {sorted(leaked_barcodes)[:5]} -- this must structurally never happen"
         )
     return {
-        "n_nodes": n_nodes,
-        "n_edges": int(graph.edge_index.shape[1]),
+        "n_context": int(context_obs_names.shape[0]),
         "n_query_checked": len(query_composite_ids),
         "passed": True,
     }
@@ -181,72 +214,136 @@ def verify_novae_graph_excludes_query_identities(graph: NovaeGraphInputs, query_
 
 def pool_novae_embeddings(node_embeddings: np.ndarray) -> np.ndarray:
     """Mean-pool node-level Novae embeddings into one 'global/induced'
-    per-graph summary vector. Leakage-safe BY CONSTRUCTION: it operates
+    per-sample summary vector. Leakage-safe BY CONSTRUCTION: it operates
     only on `node_embeddings`, an array whose rows already correspond
-    1:1 with `NovaeGraphInputs.node_barcodes` (context spots only) --
-    there is no code path here that could introduce a query row that
-    wasn't already excluded upstream."""
+    1:1 with the context-only AnnData's `obs_names` -- there is no code
+    path here that could introduce a query row that wasn't already
+    excluded upstream."""
     node_embeddings = np.asarray(node_embeddings, dtype=np.float32)
     if node_embeddings.ndim != 2 or node_embeddings.shape[0] == 0:
         raise ValueError(
-            f"node_embeddings must be a non-empty [n_nodes, dim] array, got shape {node_embeddings.shape}"
+            f"node_embeddings must be a non-empty [n_context, dim] array, got shape {node_embeddings.shape}"
         )
     return node_embeddings.mean(axis=0)
 
 
-def compute_novae_embeddings(graph: NovaeGraphInputs, novae_feature_fn: NovaeFeatureFn) -> np.ndarray:
-    """Call the injected Novae feature function on the context-only
-    graph's node expression and edge structure. Injected rather than
-    called directly -- this module has no hard dependency on a real
-    Novae checkpoint, matching every other pluggable-feature-function
-    pattern already established in this codebase."""
-    embeddings = np.asarray(novae_feature_fn(graph.node_expression, graph.edge_index), dtype=np.float32)
-    if embeddings.ndim != 2 or embeddings.shape[0] != graph.node_barcodes.shape[0]:
+def compute_novae_embeddings(inputs: NovaeContextInputs, novae_feature_fn: NovaeFeatureFn) -> np.ndarray:
+    """Call the injected Novae adapter on the context-only AnnData --
+    the SAME object built by `build_context_only_novae_input`, never a
+    closure capturing the original full `adata`. Injected rather than
+    called directly: this module has no hard dependency on a real
+    Novae checkpoint, matching `ContextOnlyNovaeProvider`'s own
+    `feature_fn` contract exactly (`Callable[[adata], np.ndarray]`), so
+    a real adapter (`gen2_architectures.models.conditioning.precompute_novae_features`,
+    or an equivalent wrapping the real
+    `novae.spatial_neighbors`/`Novae.from_pretrained`/`compute_representations`
+    call sequence) can be plugged in directly without adapting its
+    signature."""
+    embeddings = np.asarray(novae_feature_fn(inputs.context_adata), dtype=np.float32)
+    if embeddings.ndim != 2 or embeddings.shape[0] != inputs.node_barcodes.shape[0]:
         raise ValueError(
-            f"{graph.sample_id}: novae_feature_fn must return [n_nodes, dim] with n_nodes="
-            f"{graph.node_barcodes.shape[0]}, got shape {embeddings.shape}"
+            f"{inputs.sample_id}: novae_feature_fn must return [n_context, dim] with n_context="
+            f"{inputs.node_barcodes.shape[0]}, got shape {embeddings.shape}"
         )
     if not np.isfinite(embeddings).all():
-        raise ValueError(f"{graph.sample_id}: novae_feature_fn returned non-finite values")
+        raise ValueError(f"{inputs.sample_id}: novae_feature_fn returned non-finite values")
     return embeddings
 
 
 def ensure_cached_novae_embeddings(
-    cache_dir: str | Path, graph: NovaeGraphInputs, novae_feature_fn: NovaeFeatureFn,
-    query_barcodes: Iterable[str],
+    cache_dir: str | Path, inputs: NovaeContextInputs, novae_feature_fn: NovaeFeatureFn,
+    query_barcodes: Iterable[str], *, expected_dim: int | None = None, checkpoint_signature: str = "",
 ) -> tuple[np.ndarray, Path]:
-    """Load-or-compute-and-cache the Novae node embeddings for this
-    context-only graph, atomically, keyed ONLY by `graph.cache_key` (a
-    hash over sorted context-node composite identities -- never derived
-    from or touching query barcodes, so the cache key itself cannot leak
-    or vary with which spots were held out). Before ever returning
-    CACHED embeddings, re-verifies the cache file's own recorded node
-    identities against the CURRENT query set -- a real, positive
-    assertion, not just an assumption that a matching cache_key implies
-    safety (e.g. against a corrupted or hand-edited cache file)."""
-    verify_novae_graph_excludes_query_identities(graph, query_barcodes)  # fail closed before touching the cache
-    query_composite_ids = {composite_spot_id(graph.sample_id, b) for b in query_barcodes}
+    """Load-or-compute-and-cache the Novae embeddings for this
+    context-only input, atomically. The cache key is
+    `_adata_feature_signature(context_adata, novae_feature_fn,
+    extra_signature=...)` -- a COMPREHENSIVE fingerprint over real
+    expression bytes, obs/var names, spatial coordinates, preprocessing
+    state, the feature function's identity, `checkpoint_signature` (a
+    caller-supplied real checkpoint identity string, e.g. `f"{repo}:
+    {revision}"`), and this module's own cache-schema version -- never
+    just context-node identities alone (12th Codex re-audit finding #2).
 
+    Before ever returning a CACHED result, this function validates: the
+    cache file has every required key; its recorded `cache_key` matches
+    exactly; its recorded node identities/order match the CURRENT
+    context exactly (never just "no query leak", which alone doesn't
+    prove it's even the RIGHT context); its embeddings array has the
+    correct row count, is 2D, is `float32`, is all-finite, and (if
+    `expected_dim` is supplied) has the expected width (12th Codex
+    re-audit finding #3) -- any failure is a hard refusal to reuse the
+    cache, not a silent fallback to treating it as a miss."""
+    verify_novae_context_excludes_query_identities(inputs, query_barcodes)  # fail closed before touching the cache
+    query_composite_ids = {composite_spot_id(inputs.sample_id, b) for b in query_barcodes}
+
+    cache_key = _adata_feature_signature(
+        inputs.context_adata, novae_feature_fn,
+        extra_signature=f"gen3-novae-cache-schema-v{_CACHE_SCHEMA_VERSION}:{checkpoint_signature}",
+    )
     cache_dir = Path(cache_dir)
-    cache_path = cache_dir / f"{graph.sample_id}.novae.{graph.cache_key}.npz"
+    cache_path = cache_dir / f"{inputs.sample_id}.novae.{cache_key}.npz"
     if cache_path.exists():
         cached = np.load(cache_path, allow_pickle=False)
+        required_keys = {"embeddings", "node_composite_ids", "cache_key"}
+        missing_keys = required_keys - set(cached.files)
+        if missing_keys:
+            raise ValueError(
+                f"{inputs.sample_id}: cached Novae embeddings at {cache_path} are missing required "
+                f"key(s) {sorted(missing_keys)} -- refusing to trust a malformed cache file"
+            )
+        cached_cache_key = str(cached["cache_key"].item())
+        if cached_cache_key != cache_key:
+            raise ValueError(
+                f"{inputs.sample_id}: cached Novae embeddings at {cache_path} record cache_key "
+                f"{cached_cache_key!r}, expected {cache_key!r} -- refusing a mismatched cache"
+            )
         cached_node_ids = cached["node_composite_ids"].astype(str)
         leaked = set(cached_node_ids.tolist()) & query_composite_ids
         if leaked:
             raise ValueError(
-                f"{graph.sample_id}: cached Novae embeddings at {cache_path} record {len(leaked)} "
+                f"{inputs.sample_id}: cached Novae embeddings at {cache_path} record {len(leaked)} "
                 f"query composite identit(y/ies) -- refusing to reuse a leaked cache: {sorted(leaked)[:5]}"
             )
-        if np.array_equal(cached_node_ids, graph.node_composite_ids):
-            return cached["embeddings"].astype(np.float32, copy=False), cache_path
+        if not np.array_equal(cached_node_ids, inputs.node_composite_ids):
+            raise ValueError(
+                f"{inputs.sample_id}: cached Novae embeddings at {cache_path} record a different "
+                "node identity/order than the current context -- refusing a mismatched cache"
+            )
+        embeddings = cached["embeddings"]
+        n_context = inputs.node_barcodes.shape[0]
+        if embeddings.ndim != 2 or embeddings.shape[0] != n_context:
+            raise ValueError(
+                f"{inputs.sample_id}: cached Novae embeddings at {cache_path} have shape "
+                f"{embeddings.shape}, expected ({n_context}, dim) -- refusing a malformed cache"
+            )
+        if expected_dim is not None and embeddings.shape[1] != expected_dim:
+            raise ValueError(
+                f"{inputs.sample_id}: cached Novae embeddings at {cache_path} have width "
+                f"{embeddings.shape[1]}, expected {expected_dim} -- refusing a stale/mismatched cache"
+            )
+        if embeddings.dtype != np.float32:
+            raise ValueError(
+                f"{inputs.sample_id}: cached Novae embeddings at {cache_path} have dtype "
+                f"{embeddings.dtype}, expected float32 -- refusing a malformed cache"
+            )
+        if not np.isfinite(embeddings).all():
+            raise ValueError(
+                f"{inputs.sample_id}: cached Novae embeddings at {cache_path} contain non-finite "
+                "values -- refusing a corrupted cache"
+            )
+        return embeddings.astype(np.float32, copy=False), cache_path
 
-    embeddings = compute_novae_embeddings(graph, novae_feature_fn)
+    embeddings = compute_novae_embeddings(inputs, novae_feature_fn)
+    if expected_dim is not None and embeddings.shape[1] != expected_dim:
+        raise ValueError(
+            f"{inputs.sample_id}: novae_feature_fn returned width {embeddings.shape[1]}, expected "
+            f"{expected_dim}"
+        )
     cache_dir.mkdir(parents=True, exist_ok=True)
     tmp = cache_path.with_name(f"{cache_path.stem}.tmp.{os.getpid()}.npz")
     np.savez(
-        tmp, embeddings=embeddings, node_composite_ids=graph.node_composite_ids,
-        cache_key=np.asarray(graph.cache_key),
+        tmp, embeddings=embeddings, node_composite_ids=inputs.node_composite_ids,
+        cache_key=np.asarray(cache_key),
     )
     os.replace(tmp, cache_path)
     return embeddings, cache_path
@@ -255,38 +352,46 @@ def ensure_cached_novae_embeddings(
 def build_novae_preflight_report(
     adata: "ad.AnnData",  # noqa: F821
     context_barcodes: list[str], query_barcodes: list[str], novae_feature_fn: NovaeFeatureFn, *,
-    sample_id: str, cache_dir: str | Path, k_neighbors: int = 6,
+    sample_id: str, cache_dir: str | Path, expected_dim: int | None = None, checkpoint_signature: str = "",
 ) -> dict:
-    """Build the context-only graph, compute (or reuse cached)
-    embeddings, pool them, and prove -- explicitly, per check -- that no
-    query composite identity appears in ANY of the five places Step 4's
-    safety requirement names: graph nodes, graph edges, the Novae input
-    expression matrix, the global/induced pool, and the cached
-    embeddings file. This is the artifact Step 8's preflight gate is
-    meant to require before a real training run touches Novae features."""
-    graph = build_context_only_novae_graph(
-        adata, context_barcodes, query_barcodes, sample_id=sample_id, k_neighbors=k_neighbors,
+    """Build the context-only Novae input, compute (or reuse cached)
+    embeddings, pool them, and record what was ACTUALLY verified versus
+    what this module cannot prove on its own (12th Codex re-audit
+    finding #4: a prior version's "checks" dict asserted `True` for
+    claims -- like "an arbitrary injected function didn't leak external
+    data" -- that no amount of checking the INPUT/OUTPUT shape here can
+    actually establish). This is the artifact Step 8's preflight gate
+    is meant to require before a real training run touches Novae
+    features."""
+    inputs = build_context_only_novae_input(adata, context_barcodes, query_barcodes, sample_id=sample_id)
+    context_check = verify_novae_context_excludes_query_identities(inputs, query_barcodes)
+    embeddings, cache_path = ensure_cached_novae_embeddings(
+        cache_dir, inputs, novae_feature_fn, query_barcodes,
+        expected_dim=expected_dim, checkpoint_signature=checkpoint_signature,
     )
-    node_check = verify_novae_graph_excludes_query_identities(graph, query_barcodes)  # nodes + edges + expression alignment
-    embeddings, cache_path = ensure_cached_novae_embeddings(cache_dir, graph, novae_feature_fn, query_barcodes)
-    pooled = pool_novae_embeddings(embeddings)  # global/induced pool -- leakage-safe by construction, see its own docstring
+    pooled = pool_novae_embeddings(embeddings)
 
     return {
         "version": _REPORT_VERSION,
         "sample_id": sample_id,
-        "cache_key": graph.cache_key,
         "cache_path": str(cache_path),
-        "n_nodes": node_check["n_nodes"],
-        "n_edges": node_check["n_edges"],
-        "n_query_checked": node_check["n_query_checked"],
+        "n_context": context_check["n_context"],
+        "n_query_checked": context_check["n_query_checked"],
         "pooled_embedding_dim": int(pooled.shape[0]),
-        "checks": {
-            "graph_nodes_exclude_query": True,
-            "graph_edges_structurally_valid": True,
-            "novae_input_expression_row_aligned_to_nodes": True,
-            "global_pool_derived_only_from_node_embeddings": True,
-            "cached_embeddings_exclude_query": True,
-        },
+        "verified": [
+            "context_adata.obs_names contains no query composite identity or query barcode "
+            "(checked directly against the AnnData object actually passed to novae_feature_fn)",
+            "context_adata.obs_names, node_barcodes, and node_composite_ids are mutually consistent",
+            "the returned embeddings are row-aligned 1:1 with context_adata (shape checked)",
+            "if reused from cache: the cache's recorded cache_key, node identity/order, required "
+            "keys, shape, dtype, and finiteness were all validated before trusting it",
+        ],
+        "not_provable_from_this_module_alone": [
+            "that an arbitrary injected novae_feature_fn did not internally read data beyond the "
+            "context_adata object it was given (this module cannot inspect the function's body)",
+            "that cached or freshly-computed embeddings came from the exact real Novae checkpoint "
+            "claimed, beyond whatever identity string the caller supplied via checkpoint_signature",
+        ],
         "passed": True,
     }
 
