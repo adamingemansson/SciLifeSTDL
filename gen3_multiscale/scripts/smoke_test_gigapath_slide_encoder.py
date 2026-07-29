@@ -22,20 +22,25 @@ realistic tile count, and its own internal cache genuinely avoids a
 second real forward pass (not merely coincidentally-deterministic
 output); and (2) a real Architecture3 and Architecture4 forward pass,
 with this real encoder wired in via use_regional_he/use_global_slide,
-completes end to end on CUDA within a memory bound -- not just the
-isolated LongNet call in isolation (17th Codex re-audit, Step 5 Part 2,
-"Important before Step 6/7").
+completes end to end on CUDA within a memory bound -- built through the
+REAL data pipeline (a real, on-disk dense_wsi_cache ->
+slide_context.load_slide_context -> example_builder.build_spatial_field_example),
+not a hand-rolled SpatialFieldInputs, and with each architecture proven
+to independently exercise a REAL LongNet forward pass (not merely serve
+the other architecture's cached result) via an explicit call counter
+(17th/18th Codex re-audits, Step 5 Part 2, "Important before Step 6/7" /
+"Other real gaps").
 """
 from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import torch
 
-from gen3_multiscale.data.boundary_graph import extract_boundary_and_local_context
-from gen3_multiscale.data.example import SpatialFieldInputs, SpatialFieldTargets, validate_spatial_field_example
 from gen3_multiscale.models.architectures import Architecture3, Architecture4
 from gen3_multiscale.models.gene_basis import fit_gene_residual_basis
 from gen3_multiscale.models.slide_encoder import FrozenGigaPathSlideEncoder
@@ -153,40 +158,88 @@ def run_slide_encoder_smoke_test(
     return encoder
 
 
-def _synthetic_inputs_with_wsi_context(n_genes: int, gex_dim: int, image_dim: int, n_wsi_tiles: int, seed: int = 0):
-    rng = np.random.default_rng(seed)
-    n = 15
-    lo = -(n // 2)
-    xs, ys = np.meshgrid(np.arange(lo, lo + n), np.arange(lo, lo + n))
-    grid = np.stack([xs.ravel(), ys.ravel()], axis=1).astype(np.float64)
-    dist = np.linalg.norm(grid, axis=1)
-    observed_coords, query_coords = grid[dist > 2.5], grid[dist <= 2.5]
-    n_observed, n_query = observed_coords.shape[0], query_coords.shape[0]
-    boundary = extract_boundary_and_local_context(observed_coords, query_coords, k_neighbors=6, local_k=6, max_rings=3)
+def _build_real_inputs_through_the_data_pipeline(
+    n_genes: int, image_dim: int, tmp_dir: Path, seed: int = 0,
+):
+    """18th Codex re-audit (Step 5 Part 2, "Other real gaps"): a prior
+    version hand-built a SpatialFieldInputs directly, bypassing
+    load_slide_context/build_spatial_field_example entirely -- this
+    smoke test is supposed to catch real data-layer bugs too, not just
+    exercise the model forward pass on inputs that were never actually
+    produced by the real pipeline. Writes a real, on-disk synthetic
+    dense_wsi_cache .npz (the same schema
+    scripts/precompute_gigapath_wsi_tiles.py writes, tile-encoder
+    provenance included), loads it through the REAL
+    slide_context.load_slide_context, and builds the example through the
+    REAL example_builder.build_spatial_field_example -- the actual
+    functions Step 6's trainer will call, not a hand-rolled substitute."""
+    import anndata as ad
+    import pandas as pd
+    from omegaconf import OmegaConf
 
-    grid_bound = 10.0
-    inputs = SpatialFieldInputs(
-        sample_id="smoke-test", patient_id="smoke-test-patient",
-        observed_barcodes=np.array([f"o{i}" for i in range(n_observed)]),
-        query_barcodes=np.array([f"q{i}" for i in range(n_query)]),
-        observed_coords=observed_coords.astype(np.float32),
-        query_coords=query_coords.astype(np.float32),
-        observed_full_gene_expression=rng.normal(size=(n_observed, n_genes)).astype(np.float32),
-        observed_gigapath_features=rng.normal(size=(n_observed, image_dim)).astype(np.float32),
-        observed_image_available=np.ones(n_observed, dtype=bool),
-        query_local_neighbor_idx=boundary.query_local_neighbor_idx,
-        boundary_idx=boundary.boundary_idx,
-        boundary_ring=boundary.boundary_ring,
-        query_depth_to_boundary=boundary.query_depth_to_boundary,
-        wsi_tile_longnet_coords=rng.uniform(10_000.0, 20_000.0, size=(n_wsi_tiles, 2)).astype(np.float32),
-        wsi_tile_regional_coords=rng.uniform(-grid_bound + 0.5, grid_bound - 0.5, size=(n_wsi_tiles, 2)).astype(np.float32),
-        wsi_tile_features=rng.normal(size=(n_wsi_tiles, image_dim)).astype(np.float32),
-        full_slide_coord_bounds=(-grid_bound, grid_bound, -grid_bound, grid_bound),
-        slide_cache_namespace="smoke-test-slide-namespace",
+    from gen3_multiscale.data import example_builder
+    from gen3_multiscale.data.slide_context import load_slide_context
+
+    rng = np.random.default_rng(seed)
+    n_side, spacing = 15, 300.0  # real-Visium-scale pixel spacing, not a tiny synthetic unit
+    coords = np.asarray([[x * spacing, y * spacing] for x in range(n_side) for y in range(n_side)], dtype=np.float64)
+    n_spots = coords.shape[0]
+    barcodes = [f"SPOT{i}-1" for i in range(n_spots)]
+    gene_names = [f"GENE{i}" for i in range(n_genes)]
+    counts = rng.poisson(5, size=(n_spots, n_genes)).astype(np.float32)
+    adata = ad.AnnData(
+        X=counts, obs=pd.DataFrame(index=pd.Index(barcodes)), var=pd.DataFrame(index=pd.Index(gene_names)),
     )
-    targets = SpatialFieldTargets(query_expression=rng.normal(size=(n_query, n_genes)).astype(np.float32))
-    validate_spatial_field_example(inputs, targets)
-    return inputs, targets
+    adata.obsm["spatial"] = coords
+    patches = np.zeros((n_spots, 4, 4, 3), dtype=np.uint8)  # content irrelevant -- image_feature_fn below is a stub
+
+    query_idx = n_spots // 2
+    query_barcodes = [barcodes[query_idx]]
+    context_barcodes = [b for b in barcodes if b != barcodes[query_idx]]
+
+    # A REAL, regularly-gridded (not random-scatter) dense WSI tile
+    # cache -- matches scripts/precompute_gigapath_wsi_tiles.py's actual
+    # output structure (a real, non-overlapping tile grid), guaranteeing
+    # full ST-spot/WSI-tile coverage deterministically rather than
+    # depending on a random scatter happening to align.
+    tile_step = 256.0
+    tile_xs = np.arange(0.0, (n_side - 1) * spacing + tile_step, tile_step)
+    tile_ys = np.arange(0.0, (n_side - 1) * spacing + tile_step, tile_step)
+    tile_gx, tile_gy = np.meshgrid(tile_xs, tile_ys)
+    tile_xy = np.stack([tile_gx.ravel(), tile_gy.ravel()], axis=1).astype(np.float32)
+    n_wsi_tiles = tile_xy.shape[0]
+    tile_features = rng.normal(size=(n_wsi_tiles, image_dim)).astype(np.float32)
+
+    cache_dir = tmp_dir / "gigapath_slide_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        cache_dir / "smoke-test.npz",
+        features=tile_features, coords=tile_xy.copy(), level0_coords=tile_xy.copy(),
+        tile_size=np.asarray(tile_step, dtype=np.float32), level0_tile_size=np.asarray(tile_step, dtype=np.float32),
+        coords_are_centers=np.asarray(True),
+        tile_encoder_hf_repo_id=np.asarray("prov-gigapath/prov-gigapath"),
+        tile_encoder_hf_revision=np.asarray("smoke-test"),
+        tile_encoder_timm_version=np.asarray("smoke-test"),
+        tile_encoder_preprocessing_spec=np.asarray("smoke-test"),
+        tile_encoder_state_dict_sha256=np.asarray("f" * 64),
+        tile_encoder_schema_version=np.asarray(1),
+    )
+    cfg = OmegaConf.create({
+        "data": {
+            "slide_context_source": "dense_wsi_cache", "hest_data_dir": str(tmp_dir),
+            "slide_context_cache_dir": str(cache_dir),
+        },
+    })
+    slide_ctx = load_slide_context(cfg, "smoke-test", None, coords)
+
+    def _stub_image_feature_fn(patch_batch: np.ndarray) -> np.ndarray:
+        return rng.normal(size=(patch_batch.shape[0], image_dim)).astype(np.float32)
+
+    return example_builder.build_spatial_field_example(
+        adata, patches, context_barcodes, query_barcodes, _stub_image_feature_fn,
+        sample_id="smoke-test", patient_id="smoke-test-patient", patch_size_fullres=1.0,
+        full_sample_coords=coords, slide_context=slide_ctx, expected_feature_width=image_dim,
+    )
 
 
 def run_architecture_smoke_test(
@@ -195,17 +248,36 @@ def run_architecture_smoke_test(
     gex_dim: int = 16,
     image_dim: int = 1536,
     hidden_dim: int = 256,
-    n_wsi_tiles: int = 512,
     max_memory_gb: float = 20.0,
 ) -> None:
-    """17th Codex re-audit (Step 5 Part 2, "Important before Step 6/7"):
-    the isolated FrozenGigaPathSlideEncoder call above proves the
-    encoder itself behaves correctly, but says nothing about a real
-    Architecture3/Architecture4 forward pass with use_regional_he=True/
-    use_global_slide=True actually wired to it -- run one of each here,
-    on CUDA, with a real checkpoint SHA256 cross-check."""
+    """17th/18th Codex re-audits (Step 5 Part 2, "Important before Step
+    6/7" / "Other real gaps"): the isolated FrozenGigaPathSlideEncoder
+    call above proves the encoder itself behaves correctly, but says
+    nothing about (1) a real Architecture3/Architecture4 forward pass
+    with use_regional_he=True/use_global_slide=True actually wired to
+    it, built through the REAL data pipeline (load_slide_context ->
+    build_spatial_field_example), and (2) whether LongNet actually runs
+    TWICE, independently, for Architecture3 and Architecture4 -- a prior
+    version reused the identical inputs/cache_namespace for both calls,
+    so Architecture4 silently served Architecture3's CACHED LongNet
+    result and never independently exercised the real forward pass at
+    all."""
     torch.manual_seed(0)
-    inputs, targets = _synthetic_inputs_with_wsi_context(n_genes, gex_dim, image_dim, n_wsi_tiles)
+    with tempfile.TemporaryDirectory(prefix="gen3_smoke_test_") as tmp_dir_str:
+        inputs, targets = _build_real_inputs_through_the_data_pipeline(n_genes, image_dim, Path(tmp_dir_str))
+
+    # Count REAL LongNet forward passes (not cache hits) by wrapping the
+    # frozen model's own forward -- proves each architecture below
+    # genuinely exercises LongNet, rather than one silently reusing the
+    # other's cached result.
+    real_longnet_forward = slide_encoder.model.forward
+    longnet_call_count = {"n": 0}
+
+    def _counting_longnet_forward(*args, **kwargs):
+        longnet_call_count["n"] += 1
+        return real_longnet_forward(*args, **kwargs)
+
+    slide_encoder.model.forward = _counting_longnet_forward
 
     model3 = Architecture3(
         n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim, hidden_dim=hidden_dim,
@@ -225,7 +297,16 @@ def run_architecture_smoke_test(
         _fail("Architecture3 produced non-finite predictions")
     if peak_gb > max_memory_gb:
         _fail(f"Architecture3 forward pass peak CUDA memory {peak_gb:.2f} GB exceeded the {max_memory_gb:.2f} GB bound")
-    print(f"PASS: real Architecture3 forward pass (use_regional_he=True, use_global_slide=True) succeeded on CUDA, peak {peak_gb:.2f} GB")
+    if longnet_call_count["n"] != 1:
+        _fail(f"expected exactly 1 real LongNet forward pass for Architecture3, got {longnet_call_count['n']}")
+    print(f"PASS: real Architecture3 forward pass (use_regional_he=True, use_global_slide=True) succeeded on CUDA, peak {peak_gb:.2f} GB, LongNet called for real")
+
+    # 18th Codex re-audit, CONFIRMED real: clear the encoder's own cache
+    # before the Architecture4 call -- with the SAME slide_encoder,
+    # inputs, and cache_namespace as Architecture3 just used, this call
+    # would otherwise be served entirely from cache, never actually
+    # re-running LongNet under Architecture4's own code path.
+    slide_encoder._cache.clear()
 
     gene_names = [f"g{i}" for i in range(n_genes)]
     gene_basis = fit_gene_residual_basis(
@@ -247,7 +328,15 @@ def run_architecture_smoke_test(
         _fail("Architecture4 produced non-finite predictions")
     if peak_gb4 > max_memory_gb:
         _fail(f"Architecture4 forward pass peak CUDA memory {peak_gb4:.2f} GB exceeded the {max_memory_gb:.2f} GB bound")
-    print(f"PASS: real Architecture4 forward pass (conditioner use_regional_he=True, use_global_slide=True) succeeded on CUDA, peak {peak_gb4:.2f} GB")
+    if longnet_call_count["n"] != 2:
+        _fail(
+            f"expected exactly 2 TOTAL real LongNet forward passes after Architecture4 (1 from "
+            f"Architecture3 + 1 independently from Architecture4), got {longnet_call_count['n']} -- "
+            "Architecture4 may have silently served Architecture3's cached LongNet result instead "
+            "of independently exercising the real forward pass"
+        )
+    slide_encoder.model.forward = real_longnet_forward
+    print(f"PASS: real Architecture4 forward pass (conditioner use_regional_he=True, use_global_slide=True) succeeded on CUDA, peak {peak_gb4:.2f} GB, LongNet called for real (independently of Architecture3's cache)")
 
     print("\nALL Architecture3/Architecture4 CHECKS PASSED")
 

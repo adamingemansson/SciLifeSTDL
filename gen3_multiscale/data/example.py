@@ -306,9 +306,13 @@ def validate_spatial_field_example(inputs: SpatialFieldInputs, targets: SpatialF
             "none) -- regional/global GigaPath context requires all of them"
         )
     if inputs.wsi_tile_features is not None:
-        n_visible_tiles = inputs.wsi_tile_features.shape[0]
+        # 18th Codex re-audit (Step 5 Part 2, "Other real gaps"),
+        # CONFIRMED: ndim must be checked BEFORE reading shape[0] -- a
+        # scalar (0-d) array has shape () and shape[0] raises a raw
+        # IndexError, not the intended, actionable ValueError.
         if inputs.wsi_tile_features.ndim != 2:
             raise ValueError(f"wsi_tile_features must be [N, F], got shape {inputs.wsi_tile_features.shape}")
+        n_visible_tiles = inputs.wsi_tile_features.shape[0]
         # 17th Codex re-audit (Step 5 Part 2), CONFIRMED: a prior version
         # only checked ROW counts against wsi_tile_features -- never that
         # the coordinate arrays were actually [N, 2] (a [N, 3] or [N]

@@ -246,6 +246,19 @@ def test_native_and_regional_wsi_coords_are_independently_scaled():
     validate_spatial_field_example(good_inputs, targets)  # must not raise
 
 
+def test_rejects_a_scalar_wsi_tile_features_with_a_clean_valueerror():
+    """18th Codex re-audit (Step 5 Part 2, "Other real gaps"), CONFIRMED:
+    a prior version read wsi_tile_features.shape[0] BEFORE checking
+    ndim -- a scalar (0-d) array has shape () and shape[0] raises a raw
+    IndexError, not the intended, actionable ValueError."""
+    inputs, targets = _valid_example()
+    kwargs = dict(_VALID_WSI_KWARGS)
+    kwargs["wsi_tile_features"] = np.asarray(7.0)  # a genuine 0-d scalar array
+    bad_inputs = _replace(inputs, **kwargs)
+    with pytest.raises(ValueError, match=r"wsi_tile_features must be \[N, F\]"):
+        validate_spatial_field_example(bad_inputs, targets)
+
+
 def test_rejects_a_wsi_coordinate_array_with_the_wrong_column_count():
     """17th Codex re-audit (Step 5 Part 2 launch blocker, "Important
     before Step 6/7"), CONFIRMED: a prior version only checked ROW

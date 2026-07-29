@@ -75,7 +75,7 @@ _SUPPORTED_IMAGE_MODES = frozenset({"target_zero"})
 
 def load_sample_for_examples(
     manifest: dict, sample_id: str, hest_data_dir: str | Path | None = None,
-) -> tuple["ad.AnnData", np.ndarray]:  # noqa: F821 -- anndata imported lazily below
+) -> tuple["ad.AnnData", np.ndarray, np.ndarray]:  # noqa: F821 -- anndata imported lazily below
     """Real, QC'd, gene-panel-aligned expression AND H&E patches for one
     manifest sample, ready for build_spatial_field_example.
 
@@ -86,16 +86,24 @@ def load_sample_for_examples(
     source of truth (the manifest), not two independently-configured
     ones that could silently drift apart.
 
-    KNOWN, DELIBERATE SCOPE BOUNDARY: the manifest's recorded spot
-    barcodes (dataset_manifest.py) reflect the real EXPRESSION data's
-    per-spot QC filter only -- it never loads H&E patches (a
-    deliberately lightweight Step-1 artifact). `loaders.align_patches_to_adata`
-    below can drop additional spots that have no matching H&E patch (a
-    normal ~4.5% HEST-1k gap, not an error -- see that function's own
-    docstring). The barcode universe this function actually returns can
-    therefore be a SUBSET of the manifest's declared one; this is
-    checked (never silently grows beyond the manifest, only shrinks for
-    an already-documented reason) but not treated as an error."""
+    18th Codex re-audit (Step 5 Part 2 launch blocker #1), CONFIRMED
+    real: a prior version let `loaders.align_patches_to_adata` SILENTLY
+    DROP any spot with no matching H&E patch (a normal ~4.5% HEST-1k
+    gap) -- but realized masks (mask_bank.py) are generated against the
+    MANIFEST's expression-QC spot set (dataset_manifest.py), which never
+    accounts for H&E-patch availability at all. A mask could therefore
+    reference a barcode this function used to silently drop, making
+    `build_spatial_field_example` raise (the barcode is absent from
+    `adata.obs_names`) far downstream of manifest/mask construction --
+    or worse, contradicting the whole point of `observed_image_available`
+    (a spot with GEX but no H&E should be RETAINED as GEX-only, not
+    dropped outright). Fixed: `align_patches_to_adata` no longer drops
+    ANY spot -- the third return value, `image_source_available`, is a
+    real per-spot boolean (aligned with the returned `adata`/`patches`)
+    marking which spots actually have a real H&E patch on disk; the
+    barcode universe this function returns is now EXACTLY the manifest's
+    declared set (checked both directions below), never a silently-
+    shrunk subset."""
     hest_data_dir = Path(hest_data_dir) if hest_data_dir is not None else Path(manifest["hest_data_dir"])
     record = manifest["samples"][sample_id]
     args = manifest["build_args"]
@@ -124,7 +132,7 @@ def load_sample_for_examples(
     adata = adata[:, manifest["gene_panel"]].copy()
 
     patches, patch_barcodes = loaders.load_hest_patches(hest_data_dir, sample_id)
-    adata, patches = loaders.align_patches_to_adata(adata, patches, patch_barcodes)
+    adata, patches, image_source_available = loaders.align_patches_to_adata(adata, patches, patch_barcodes)
 
     manifest_barcodes = set(record["barcodes"])
     unexpected = set(adata.obs_names) - manifest_barcodes
@@ -134,7 +142,14 @@ def load_sample_for_examples(
             f"declared (examples: {sorted(unexpected)[:5]}) -- the real data changed since the "
             "manifest was built; rebuild the manifest"
         )
-    return adata, patches
+    missing = manifest_barcodes - set(adata.obs_names)
+    if missing:
+        raise ValueError(
+            f"{sample_id}: real data is now missing {len(missing)} spot(s) the manifest "
+            f"declared (examples: {sorted(missing)[:5]}) -- the real data changed since the "
+            "manifest was built; rebuild the manifest"
+        )
+    return adata, patches, image_source_available
 
 
 def _median_nearest_neighbor_spacing(coords: np.ndarray) -> float:
@@ -169,6 +184,7 @@ def build_spatial_field_example(
     expected_feature_width: int | None = None,
     slide_context: dict | None = None,
     image_mode: str = "target_zero",
+    image_source_available: np.ndarray | None = None,
 ) -> tuple[SpatialFieldInputs, SpatialFieldTargets]:
     """Build one real SpatialFieldInputs/SpatialFieldTargets pair from
     one realized (context, query) barcode split.
@@ -233,12 +249,31 @@ def build_spatial_field_example(
     real tile-cache content, the visible tile set, and this example's
     hole (15th/16th Codex re-audits).
 
-    `image_mode` (17th Codex re-audit, Step 5 Part 2 launch blocker #4)
-    accepts only `"target_zero"` today -- `all_zero`/`shuffled`/`full`
-    are not yet implemented consistently across the WSI-context and
-    spot-H&E-availability paths (e.g. `all_zero` currently removes WSI
-    context while leaving spot H&E features populated); any other value
-    raises rather than silently producing an inconsistent example.
+    `image_mode` accepts only `"target_zero"` today -- `all_zero`/
+    `shuffled`/`full` are not yet implemented consistently across the
+    WSI-context and spot-H&E-availability paths (e.g. `all_zero`
+    currently removes WSI context while leaving spot H&E features
+    populated); any other value raises rather than silently producing
+    an inconsistent example.
+
+    `image_source_available` (default: None -- every spot assumed to
+    have a real H&E patch on disk) is `loaders.align_patches_to_adata`'s
+    real per-spot boolean, aligned with `adata`/`patches` (18th Codex
+    re-audit, Step 5 Part 2 launch blocker #1): `load_sample_for_examples`
+    now RETAINS every manifest-declared spot even when it has no
+    matching H&E patch (never silently drops it -- see that function's
+    own docstring for why silently dropping broke the manifest/mask
+    contract), so a context spot's real H&E availability is now TWO
+    independent facts ANDed together --
+    `observed_image_available = image_source_available[context] &
+    nonoverlapping_context_patch_mask(...)` -- missing on disk, or
+    physically overlapping the hole. Either reason zeroes
+    `observed_gigapath_features` and excludes the spot from
+    `image_feature_fn`'s input identically; the None default (every
+    source available) is safe only because every REAL caller
+    (`load_sample_for_examples`) always supplies the true array
+    explicitly -- reserved for test fixtures that build patches with no
+    missing rows.
     """
     if full_sample_coords is None and require_full_sample_coords:
         raise ValueError(
@@ -260,7 +295,15 @@ def build_spatial_field_example(
             "across masks depends on a coordinate reference derived from the complete sample "
             "lattice, not a per-example subset) -- pass full_sample_coords explicitly"
         )
-    if slide_context is not None and image_mode not in _SUPPORTED_IMAGE_MODES:
+    # 18th Codex re-audit (Step 5 Part 2, "Other real gaps"), CONFIRMED
+    # real: this check used to run ONLY when slide_context was given --
+    # a caller building an Architecture 1/2 example (no WSI context at
+    # all) could pass image_mode="all_zero"/"full"/"shuffled" and it
+    # would be silently ignored (image_mode is never even read when
+    # slide_context is None), giving the false impression the mode had
+    # some effect. Unconditional now: an unsupported image_mode always
+    # raises, regardless of whether slide_context happens to be set.
+    if image_mode not in _SUPPORTED_IMAGE_MODES:
         raise ValueError(
             f"{sample_id}: image_mode={image_mode!r} is not yet implemented consistently -- "
             f"only {sorted(_SUPPORTED_IMAGE_MODES)} is supported until all_zero/shuffled/full are "
@@ -288,6 +331,15 @@ def build_spatial_field_example(
             f"{sample_id}: patches has {patches.shape[0]} rows but adata has {adata.n_obs} spots -- "
             "patches must already be aligned to adata (load_sample_for_examples's contract)"
         )
+    if image_source_available is None:
+        image_source_available_arr = np.ones(adata.n_obs, dtype=bool)
+    else:
+        image_source_available_arr = np.asarray(image_source_available, dtype=bool)
+        if image_source_available_arr.shape != (adata.n_obs,):
+            raise ValueError(
+                f"{sample_id}: image_source_available has shape {image_source_available_arr.shape}, "
+                f"expected ({adata.n_obs},) aligned with adata/patches"
+            )
 
     all_coords = np.asarray(adata.obsm["spatial"], dtype=np.float64)
     if all_coords.ndim != 2 or all_coords.shape[1] != 2:
@@ -318,9 +370,21 @@ def build_spatial_field_example(
     # SpotTokenProjection's modality_flags input -- never silently
     # inferred from a zero-valued image feature.
     context_pos = context_pos_all
-    observed_image_available = nonoverlapping_context_patch_mask(
+    # 18th Codex re-audit (Step 5 Part 2 launch blocker #1), CONFIRMED
+    # real: H&E availability now has TWO independent real-world causes
+    # -- no matching patch on disk at all (image_source_available,
+    # real per-spot data from load_sample_for_examples/
+    # align_patches_to_adata) and physical overlap with THIS example's
+    # hole (nonoverlapping_context_patch_mask, geometry-only, mask-
+    # dependent) -- ANDed together; either reason alone must zero the
+    # feature and exclude the spot from image_feature_fn identically.
+    context_image_source_available = image_source_available_arr[context_pos]
+    physically_nonoverlapping = nonoverlapping_context_patch_mask(
         context_coords_all_raw, query_coords_raw, patch_size_fullres,
     )
+    observed_image_available = context_image_source_available & physically_nonoverlapping
+    n_image_source_unavailable = int((~context_image_source_available).sum())
+    n_physical_overlap_unavailable = int((~physically_nonoverlapping).sum())
     n_image_unavailable = int((~observed_image_available).sum())
 
     observed_barcodes = obs_names[context_pos]
@@ -483,7 +547,13 @@ def build_spatial_field_example(
         slide_cache_namespace=slide_cache_namespace,
         provenance={
             "n_context_requested": len(context_barcodes),
-            "n_context_image_unavailable_for_physical_he_overlap": n_image_unavailable,
+            # 18th Codex re-audit (Step 5 Part 2 launch blocker #1): now
+            # two independent, separately-tracked reasons -- missing on
+            # disk (image_source_available) vs. physical hole overlap
+            # (mask-dependent geometry) -- plus their combined total.
+            "n_context_image_unavailable_for_missing_source_patch": n_image_source_unavailable,
+            "n_context_image_unavailable_for_physical_he_overlap": n_physical_overlap_unavailable,
+            "n_context_image_unavailable_total": n_image_unavailable,
             "spot_spacing_scale": scale,
             # 17th Codex re-audit, Step 5 Part 2 launch blocker #2: the
             # coordinate reference is now recorded explicitly (previously

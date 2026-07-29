@@ -4052,7 +4052,185 @@ semantics, deferred to before Step 7 per Adam's own framing.
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 43. Response to the eighteenth external Codex re-audit (of commit 8058df4) -- 2 launch blockers plus "other real gaps"
+
+Adam inspected the exact `8058df4` code directly (not a summary) and found
+2 further launch blockers plus 6 smaller real gaps before Step 6 could
+begin. All re-confirmed against the actual code before any fix.
+
+**Launch blocker #1 (CONFIRMED real): expression-valid spots without
+H&E patches were still silently dropped, corrupting the manifest/mask
+contract.** `loaders.align_patches_to_adata` subset `adata` to only
+spots with a matching H&E patch -- but realized masks (mask_bank.py)
+are generated against the MANIFEST's expression-QC spot set
+(dataset_manifest.py), which never accounts for H&E-patch availability
+at all. A mask could therefore reference a barcode this function
+silently dropped, making `build_spatial_field_example` raise ("mask
+references barcodes absent from the aligned sample data") arbitrarily
+far downstream of manifest/mask construction -- or, more subtly,
+contradict the whole point of Step 5 Part 1's `observed_image_available`
+design (a spot with GEX but no H&E should be RETAINED as GEX-only, not
+dropped outright). Fixed:
+- `align_patches_to_adata` (gen3_multiscale's copy only -- a deliberate,
+  documented divergence from gen2_architectures'/src's identically-named
+  function, which is correct to keep subsetting for ITS OWN
+  architectures, which have no per-modality-availability concept at
+  all) now NEVER drops a spot. Returns `(adata, aligned_patches,
+  image_source_available)` -- a real per-spot boolean, aligned with the
+  (now full-length) `adata`/`patches`; a spot with no matching patch
+  gets an explicit zero-placeholder row, never dropped, never a
+  garbage/misaligned value.
+- `load_sample_for_examples` now checks BOTH directions (real data
+  has nothing unexpected AND nothing missing relative to the manifest's
+  declared set) -- the barcode universe it returns is now EXACTLY the
+  manifest's declared set, never a silently-shrunk subset.
+- `build_spatial_field_example` gained an `image_source_available`
+  parameter; `observed_image_available` is now the AND of two
+  independent real-world facts: `image_source_available[context]`
+  (missing on disk) and the existing `nonoverlapping_context_patch_mask(...)`
+  (physical hole overlap, mask-dependent geometry) -- either reason
+  alone zeroes the feature and excludes the spot from
+  `image_feature_fn`'s input identically. Provenance now separately
+  records `n_context_image_unavailable_for_missing_source_patch`,
+  `n_context_image_unavailable_for_physical_he_overlap`, and their
+  total.
+- Verified by a new end-to-end regression test: a real manifest +
+  synthetic HEST-1k sample with ONE spot's H&E patch deliberately
+  missing from the patches `.h5` file, a mask (built exactly as
+  mask_bank.py would) that places that exact barcode in CONTEXT, and a
+  successful `build_spatial_field_example` call proving the spot is
+  retained end to end with `observed_image_available=False` and a
+  zeroed feature row -- the precise failure mode described.
+
+**Launch blocker #2 (CONFIRMED real): the GigaPath TILE encoder
+(distinct from the LongNet slide encoder) was neither pinned nor
+provenance-bound.** The dense WSI cache's tile encoder
+(`src/models/conditioning.py`'s `_load_gigapath_tile_encoder`, called
+by `scripts/precompute_gigapath_wsi_tiles.py`) used
+`timm.create_model("hf_hub:prov-gigapath/prov-gigapath", pretrained=True)`
+with no revision pin and no recorded identity -- two caches built from
+different tile-encoder weights or a fixed preprocessing bug could both
+appear equally valid under the same cache schema. This is a REAL,
+CONFIRMED gap, and genuinely distinct from `FrozenGigaPathSlideEncoder.checkpoint_sha256`
+(the separate LongNet slide encoder, a local checkpoint FILE -- already
+fixed in the 17th re-audit). Fixed:
+- `_load_gigapath_tile_encoder` gained an optional `revision` parameter
+  to pin an immutable Hugging Face commit/tag (never fabricated by this
+  code -- a caller who wants one must supply a real one they've
+  verified themselves).
+- New `gigapath_tile_encoder_provenance(tile_encoder, revision=None)`
+  (`src/models/conditioning.py`) computes a REAL identity from the
+  actual loaded weights: a SHA256 of the real state dict (never assumed
+  from the repo id/revision string alone, so it's real even when the HF
+  revision can't be resolved), the resolved HF revision (best-effort,
+  via `huggingface_hub`), the installed `timm` version, and
+  `_GIGAPATH_PREPROCESS_VERSION` -- reusing the SAME preprocessing
+  version string `get_gigapath_features`'s own cache fingerprint already
+  uses, rather than a second, independently-drifting one.
+- `scripts/precompute_gigapath_wsi_tiles.py` now computes this
+  provenance immediately after loading the tile encoder and writes all
+  six fields into every dense WSI cache `.npz`.
+- `gen3_multiscale/data/slide_context.py`'s `load_slide_context` now
+  REQUIRES these six fields for `dense_wsi_cache` (fails closed on an
+  old-format cache built before this fix -- rebuild required, never
+  silently trusted) and binds `tile_encoder_state_dict_sha256` into the
+  SAME content digest that already drives `context_id`, extending the
+  16th/17th re-audits' content-hash discipline: a cache regenerated with
+  a different tile encoder now gets a different identity even if its
+  features/coords happened to match. The real provenance is exposed in
+  `load_slide_context`'s returned dict (`tile_encoder_provenance`) for a
+  future manifest/preflight report (Step 8) to bind. `spot_aligned`
+  (already documented as an explicit diagnostic fallback, never
+  production coverage) has no accompanying metadata to validate --
+  `tile_encoder_provenance` is explicitly `None` there, never fabricated;
+  cross-validating it against a real dense-cache's provenance is
+  deferred, not silently skipped.
+- Verified by new tests in `tests/test_conditioning.py` (provenance is
+  real, deterministic, and content-sensitive, via a stub `nn.Linear` --
+  no real gated GigaPath weights needed) and `test_slide_context.py`
+  (missing-provenance cache rejected; a cache changed ONLY in
+  `tile_encoder_state_dict_sha256` gets a new `context_id`; real
+  provenance is exposed for `dense_wsi_cache`; `None` for `spot_aligned`).
+
+**Other real gaps, all fixed in this pass:**
+- `image_mode` was validated ONLY when `slide_context` was also given
+  -- an Architecture 1/2 caller (no WSI context at all) could pass
+  `image_mode="all_zero"/"full"/"shuffled"` and it would be silently
+  ignored, giving the false impression the mode had some real effect.
+  Now unconditional: an unsupported `image_mode` always raises.
+- The A100 smoke script reused the SAME `slide_encoder`/inputs/cache
+  namespace for both the Architecture3 and Architecture4 calls, so
+  Architecture4 could silently serve Architecture3's CACHED LongNet
+  result and never independently exercise the real forward pass at all.
+  Fixed: the smoke script now wraps `slide_encoder.model.forward` with a
+  real call counter, clears `slide_encoder._cache` before the
+  Architecture4 call, and asserts LongNet was genuinely invoked exactly
+  once per architecture (2 total), failing loudly if Architecture4 ever
+  serves a cached result instead.
+- The smoke test used purely synthetic model input, never exercising
+  `load_slide_context`/`build_spatial_field_example`. Fixed: it now
+  writes a real, regularly-gridded (matching
+  `precompute_gigapath_wsi_tiles.py`'s actual output structure), on-disk
+  dense WSI cache `.npz` (tile-encoder provenance included) and builds
+  the example through the REAL `load_slide_context` ->
+  `build_spatial_field_example` pipeline -- verified directly in this
+  session (the data-layer half only; CUDA/GPU parts remain unrunnable
+  here) to produce a real, valid `SpatialFieldInputs` with 323/324 WSI
+  tiles surviving hole-overlap filtering as expected.
+- The coordinate-stability regression test (17th re-audit) used the
+  COMPLETE non-query complement as context for both masks -- too easy a
+  case; the original bug was specifically about CAPPED, RESERVED, or
+  otherwise FILTERED/incomplete context. Rewritten to use two DISJOINT,
+  genuinely capped context subsets (14 of 35 available spots each,
+  neither the full complement) sharing the same `full_sample_coords`,
+  still proving identical `coordinate_reference`/`spot_spacing_scale`/
+  `full_slide_coord_bounds` and an identical regional coordinate for a
+  tile visible under both.
+- `validate_spatial_field_example` read `wsi_tile_features.shape[0]`
+  BEFORE checking `.ndim != 2` -- a scalar (0-d) array has shape `()`
+  and `shape[0]` raises a raw `IndexError`, not the intended, actionable
+  `ValueError`. Fixed: `ndim` is now checked first.
+- `load_slide_context` only rejected duplicate coordinates in `coords`
+  (the LongNet frame) -- `mask_coords` (level0_coords, the frame the
+  hole-overlap test actually runs in) is an independently-sourced field
+  for a `dense_wsi_cache` and could contain duplicates of its own even
+  when `coords` has none. Now checked independently too.
+
+**Explicitly still open:** the real trainer (Step 6); someone with real
+A100 access running the (now more thorough) smoke test; the consistent
+redesign of `all_zero`/`shuffled`/`full` image intervention semantics
+(deferred to before Step 7, per Adam's own framing); and Novae's status
+as documented, unconsumed infrastructure (`WeightedGeneExpressionEncoder`
+is what all four architectures actually use) -- Adam's own explicit
+recommendation is to keep it that way for a clean first architecture
+comparison, then run a matched encoder ablation (weighted-linear vs.
+frozen context-only Novae) afterward; not started in this pass, noted
+here for the record.
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 495 passed (45 reused-infra + 27 example-schema +
+  11 boundary-graph + 18 slide-context + 9 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 31 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 17 dataset-manifest + 26 example-builder +
+  46 mask-fingerprint + 22 novae-graph)
+gen2_architectures + gen3_multiscale: 668 passed, 1 skipped
+(repo-root tests/test_conditioning.py: +1 additional real, passing test
+for gigapath_tile_encoder_provenance -- outside this document's own
+gen2_architectures/gen3_multiscale count, noted here since the fix it
+covers lives in src/models/conditioning.py, shared infrastructure this
+document does not otherwise track test counts for)
+```
+
+The block immediately below (pre-18th-re-audit test counts) is kept for
+historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 485 passed (45 reused-infra + 26 example-schema +

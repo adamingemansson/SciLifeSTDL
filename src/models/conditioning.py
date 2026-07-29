@@ -355,13 +355,21 @@ class ImagePatchEncoder(nn.Module):
         return self.proj(h)
 
 
-def _load_gigapath_tile_encoder():
+def _load_gigapath_tile_encoder(revision: str | None = None):
     """Shared loader for Prov-GigaPath's tile encoder — used by both
     GigapathPatchEncoder below (task #20) and
     src/models/stpath_encoder.py's STPathContextEncoder (task #18, which
     needs the same raw 1536-dim features, without a trainable projection
     on top). Frozen (eval mode, no gradient) — the RAE idea (Zheng et al.
     2025) applied here: reuse a strong pretrained representation as-is.
+
+    `revision` (18th Codex re-audit, Step 5 Part 2: "pin the tile
+    encoder to an immutable Hugging Face revision") pins the exact
+    commit/tag loaded from the hub instead of implicitly resolving
+    whatever "main" currently points to at call time; default None
+    preserves the prior (unpinned) behavior for callers not yet passing
+    one. See gigapath_tile_encoder_provenance below for recording which
+    revision (and real loaded weights) actually got used.
 
     Requires, neither a default dependency of this repo:
       1. `pip install timm` (>=1.0.3 per the model's own README) — not in
@@ -374,11 +382,77 @@ def _load_gigapath_tile_encoder():
          environment. Not something this code can obtain on your behalf.
     """
     import timm
-    tile_encoder = timm.create_model("hf_hub:prov-gigapath/prov-gigapath", pretrained=True)
+    hub_id = "hf_hub:prov-gigapath/prov-gigapath"
+    if revision:
+        # timm/huggingface_hub convention: pin an immutable revision
+        # (commit SHA or tag) by appending it to the hub identifier.
+        # 18th Codex re-audit ("pin the tile encoder to an immutable
+        # Hugging Face revision"): omitted by default (None) rather than
+        # a fabricated/guessed hash -- a caller who wants to pin a real
+        # revision must supply one they've verified themselves; this
+        # function does not invent one.
+        hub_id = f"{hub_id}@{revision}"
+    tile_encoder = timm.create_model(hub_id, pretrained=True)
     tile_encoder.eval()
     for p in tile_encoder.parameters():
         p.requires_grad_(False)
     return tile_encoder
+
+
+def gigapath_tile_encoder_provenance(tile_encoder, revision: str | None = None) -> dict:
+    """Real, verifiable identity of a loaded GigaPath tile encoder --
+    18th Codex re-audit (Step 5 Part 2, "the dense WSI cache uses
+    timm.create_model(...) but stores no resolved Hugging Face revision,
+    model identifier, preprocessing version, library versions, or tile-
+    encoder fingerprint... two caches produced with different tile-
+    encoder weights/preprocessing can both appear valid").
+
+    Distinguished from `FrozenGigaPathSlideEncoder.checkpoint_sha256`
+    (gen3_multiscale/models/slide_encoder.py): that hashes a LOCAL
+    checkpoint FILE for the frozen LongNet slide encoder; this hashes
+    the actual loaded STATE DICT of the (HuggingFace-hub-loaded) tile
+    encoder -- a genuinely different model, loaded a genuinely different
+    way, with no local file to hash. `state_dict_sha256` is computed
+    from the real, in-memory loaded weights (never assumed from the repo
+    id/revision string alone), so it is real even when `hf_revision`
+    could not be resolved (e.g. no network at call time -- best-effort,
+    not required to be present).
+
+    `preprocessing_spec` is `_GIGAPATH_PREPROCESS_VERSION` -- the SAME
+    string `get_gigapath_features`'s cache fingerprint already uses, so
+    a preprocessing-logic change that already invalidates ONE cache
+    invalidates this provenance identically, rather than tracking two
+    independently-maintained preprocessing version strings that could
+    drift apart."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    for name, tensor in sorted(tile_encoder.state_dict().items()):
+        digest.update(name.encode())
+        digest.update(tensor.detach().to(device="cpu").numpy().tobytes())
+
+    resolved_revision = revision
+    if resolved_revision is None:
+        try:
+            import huggingface_hub
+            resolved_revision = huggingface_hub.HfApi().model_info("prov-gigapath/prov-gigapath").sha
+        except Exception:
+            resolved_revision = None  # best-effort only -- never blocks provenance recording
+
+    try:
+        import timm
+        timm_version = timm.__version__
+    except ImportError:
+        timm_version = None  # best-effort only -- the real GigaPath-loading environment always has timm
+
+    return {
+        "hf_repo_id": "prov-gigapath/prov-gigapath",
+        "hf_revision": resolved_revision,
+        "timm_version": timm_version,
+        "preprocessing_spec": _GIGAPATH_PREPROCESS_VERSION,
+        "state_dict_sha256": digest.hexdigest(),
+        "schema_version": 1,
+    }
 
 
 _IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)

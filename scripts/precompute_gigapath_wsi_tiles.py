@@ -162,13 +162,20 @@ def _tile_grid(slide, source_span: int, output_size: int, min_tissue_fraction: f
                 yield x, y, tile
 
 
-def _encode_batches(records, batch_size: int, device: str):
+def _encode_batches(records, batch_size: int, device: str, tile_encoder_revision: str | None = None):
     from src.models.conditioning import (
         _gigapath_preprocess_and_encode,
         _load_gigapath_tile_encoder,
+        gigapath_tile_encoder_provenance,
     )
 
-    encoder = _load_gigapath_tile_encoder().to(device).eval()
+    encoder = _load_gigapath_tile_encoder(revision=tile_encoder_revision).to(device).eval()
+    # 18th Codex re-audit (Step 5 Part 2 launch blocker #2): record the
+    # REAL tile-encoder identity actually loaded (never assumed from the
+    # revision string alone) -- distinguishes this cache from one built
+    # with different tile-encoder weights/preprocessing, which would
+    # otherwise both appear equally valid.
+    provenance = gigapath_tile_encoder_provenance(encoder, revision=tile_encoder_revision)
     coords, features, batch = [], [], []
     with torch.inference_mode():
         for x, y, tile in records:
@@ -185,11 +192,11 @@ def _encode_batches(records, batch_size: int, device: str):
             features.append(_gigapath_preprocess_and_encode(encoder, tensor).cpu().numpy())
     if not features:
         raise ValueError("no tissue tiles survived WSI background filtering")
-    return np.asarray(coords, dtype=np.float32), np.concatenate(features).astype(np.float32)
+    return np.asarray(coords, dtype=np.float32), np.concatenate(features).astype(np.float32), provenance
 
 
 def build_cache(cfg, sample_id: str, batch_size: int, target_mpp: float,
-                min_tissue_fraction: float, device: str) -> Path:
+                min_tissue_fraction: float, device: str, tile_encoder_revision: str | None = None) -> Path:
     root = Path(str(cfg.data.hest_data_dir))
     wsi_path = _resolve_wsi(root, sample_id)
     slide, backend = _open_slide(wsi_path)
@@ -212,8 +219,9 @@ def build_cache(cfg, sample_id: str, batch_size: int, target_mpp: float,
             f"mpp=({mpp_x:.4f},{mpp_y:.4f}) level0_span={source_span}",
             flush=True,
         )
-        level0_coords, features = _encode_batches(
-            _tile_grid(slide, source_span, 256, min_tissue_fraction), batch_size, device
+        level0_coords, features, tile_encoder_provenance = _encode_batches(
+            _tile_grid(slide, source_span, 256, min_tissue_fraction), batch_size, device,
+            tile_encoder_revision=tile_encoder_revision,
         )
     finally:
         slide.close()
@@ -243,6 +251,17 @@ def build_cache(cfg, sample_id: str, batch_size: int, target_mpp: float,
             source_mpp=np.asarray([mpp_x, mpp_y], dtype=np.float32),
             wsi_dimensions=np.asarray(dimensions, dtype=np.int64),
             wsi_path=np.asarray(str(wsi_path)),
+            # 18th Codex re-audit (Step 5 Part 2 launch blocker #2): the
+            # real tile-encoder identity, distinguished from
+            # FrozenGigaPathSlideEncoder's separate LongNet checkpoint
+            # SHA256 -- see gigapath_tile_encoder_provenance's own
+            # docstring (src/models/conditioning.py).
+            tile_encoder_hf_repo_id=np.asarray(tile_encoder_provenance["hf_repo_id"]),
+            tile_encoder_hf_revision=np.asarray(str(tile_encoder_provenance["hf_revision"])),
+            tile_encoder_timm_version=np.asarray(str(tile_encoder_provenance["timm_version"])),
+            tile_encoder_preprocessing_spec=np.asarray(tile_encoder_provenance["preprocessing_spec"]),
+            tile_encoder_state_dict_sha256=np.asarray(tile_encoder_provenance["state_dict_sha256"]),
+            tile_encoder_schema_version=np.asarray(tile_encoder_provenance["schema_version"]),
         )
     temporary.replace(output)
     print(f"{sample_id}: wrote {features.shape[0]} tiles to {output}", flush=True)
@@ -281,6 +300,12 @@ def main() -> None:
     parser.add_argument("--min-tissue-fraction", type=float, default=0.10)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--probe-only", action="store_true")
+    parser.add_argument(
+        "--tile-encoder-revision", default=None,
+        help="Pin an immutable Hugging Face revision (commit SHA or tag) for "
+             "prov-gigapath/prov-gigapath's tile encoder -- see _load_gigapath_tile_encoder's "
+             "docstring. Omit to use the current default (unpinned) revision.",
+    )
     args = parser.parse_args()
     if args.target_mpp <= 0 or not 0 <= args.min_tissue_fraction <= 1:
         raise ValueError("target-mpp must be positive and min-tissue-fraction must be in [0,1]")
@@ -295,6 +320,7 @@ def main() -> None:
             build_cache(
                 cfg, str(sample_id), args.batch_size, args.target_mpp,
                 args.min_tissue_fraction, args.device,
+                tile_encoder_revision=args.tile_encoder_revision,
             )
 
 

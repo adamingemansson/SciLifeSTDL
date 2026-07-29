@@ -498,23 +498,34 @@ def test_build_spatial_field_example_excludes_hole_overlapping_wsi_tiles_but_kee
 
 
 def test_build_spatial_field_example_wsi_regional_coordinates_are_stable_across_different_masks():
-    """17th Codex re-audit (Step 5 Part 2 launch blocker #2), CONFIRMED:
-    a prior version derived `reference` from ONLY this example's own
-    observed+query subset -- the SAME physical WSI tile would land at a
-    DIFFERENT regional coordinate depending purely on which mask
-    happened to be realized on the identical sample, contradicting the
-    slide-stable regional-grid contract. Two DIFFERENT single-spot
-    queries on the SAME sample/slide_context must agree exactly on the
-    regional coordinate of a tile visible under both, and on
-    full_slide_coord_bounds and the recorded coordinate_reference."""
+    """17th/18th Codex re-audits (Step 5 Part 2 launch blocker #2),
+    CONFIRMED: a prior version derived `reference` from ONLY this
+    example's own observed+query subset -- the SAME physical WSI tile
+    would land at a DIFFERENT regional coordinate depending purely on
+    which mask happened to be realized on the identical sample,
+    contradicting the slide-stable regional-grid contract. The 18th
+    re-audit specifically flagged that using the COMPLETE non-query
+    complement as context (as an earlier version of this test did) is
+    too easy a case -- the original bug was about CAPPED, RESERVED, or
+    otherwise FILTERED/incomplete context, not just a different query.
+    Two DIFFERENT single-spot queries, each with a DIFFERENT, genuinely
+    CAPPED (far short of the full non-query complement) and DISJOINT
+    context subset, on the SAME sample/slide_context, must still agree
+    exactly on the regional coordinate of a tile visible under both, and
+    on full_slide_coord_bounds and the recorded coordinate_reference."""
     adata = _square_grid_adata(n_side=6, spacing=10.0)
     patches = _matching_patches(adata)
     barcodes = list(adata.obs_names)
     full_coords = adata.obsm["spatial"]
 
-    def _build(query_idx: int):
+    def _build(query_idx: int, context_idx_range: range):
         query_barcode = barcodes[query_idx]
-        context = [b for b in barcodes if b != query_barcode]
+        # A genuinely CAPPED context: 14 of the sample's 35 non-query
+        # spots, not the full complement -- and, across the two calls
+        # below, a DISJOINT range, so this is real, different, filtered
+        # context, exactly the "capped/reserved/filtered" scenario the
+        # 18th Codex re-audit named.
+        context = [barcodes[i] for i in context_idx_range if i != query_idx]
         slide_context = _wsi_slide_context(_WSI_LEVEL0_TILES)
         inputs, _ = build_spatial_field_example(
             adata, patches, context, [query_barcode], _stub_image_feature_fn,
@@ -528,8 +539,8 @@ def test_build_spatial_field_example_wsi_regional_coordinates_are_stable_across_
     # tile at (0, 10) visible (verified by hand against the same
     # overlap-threshold arithmetic _wsi_slide_context's docstring uses),
     # while removing different OTHER tiles -- a real, different mask.
-    inputs_a = _build(14)
-    inputs_b = _build(20)
+    inputs_a = _build(14, range(0, 15))  # capped context: barcodes 0..14 only
+    inputs_b = _build(20, range(20, 35))  # capped, DISJOINT-from-A context: barcodes 20..34 only
     assert inputs_a.provenance["coordinate_reference"] == inputs_b.provenance["coordinate_reference"]
     assert inputs_a.provenance["spot_spacing_scale"] == inputs_b.provenance["spot_spacing_scale"]
     assert inputs_a.full_slide_coord_bounds == inputs_b.full_slide_coord_bounds
@@ -587,6 +598,28 @@ def test_build_spatial_field_example_rejects_unsupported_image_modes():
             )
 
 
+def test_build_spatial_field_example_rejects_unsupported_image_modes_even_without_slide_context():
+    """18th Codex re-audit (Step 5 Part 2, "Other real gaps"), CONFIRMED
+    real: a prior version only validated image_mode when slide_context
+    was ALSO given -- an Architecture 1/2 caller (no WSI context at all)
+    could pass image_mode="all_zero"/"full"/"shuffled" and it would be
+    silently ignored, giving the false impression the mode had some
+    real effect. Must raise unconditionally now."""
+    adata = _square_grid_adata(n_side=6, spacing=10.0)
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query_barcode = barcodes[14]
+    context = [b for b in barcodes if b != query_barcode]
+
+    for unsupported in ("all_zero", "full", "shuffled"):
+        with pytest.raises(ValueError, match="not yet implemented consistently"):
+            build_spatial_field_example(
+                adata, patches, context, [query_barcode], _stub_image_feature_fn,
+                sample_id="S0", patient_id="P0", patch_size_fullres=15.0,
+                require_full_sample_coords=False, image_mode=unsupported,  # NO slide_context at all
+            )
+
+
 def test_build_spatial_field_example_no_slide_context_leaves_wsi_fields_unset():
     adata = _square_grid_adata()
     patches = _matching_patches(adata)
@@ -606,9 +639,10 @@ def test_build_spatial_field_example_no_slide_context_leaves_wsi_fields_unset():
 
 def _make_synthetic_hest1k_with_patches(
     tmp_path: Path, organ_sample_ids: dict[str, list[str]], n_spots_per_sample: int = 6,
-    gene_names: list[str] | None = None, seed: int = 0,
+    gene_names: list[str] | None = None, seed: int = 0, missing_patch_barcodes: set[str] | None = None,
 ) -> tuple[Path, Path, list[str]]:
     gene_names = gene_names or [f"GENE{i}" for i in range(8)]
+    missing_patch_barcodes = missing_patch_barcodes or set()
     rng = np.random.default_rng(seed)
     hest_dir = tmp_path / "hest1k"
     (hest_dir / "st").mkdir(parents=True, exist_ok=True)
@@ -625,9 +659,16 @@ def _make_synthetic_hest1k_with_patches(
             adata.obsm["spatial"] = coords
             adata.write_h5ad(hest_dir / "st" / f"{sid}.h5ad")
 
+            # 18th Codex re-audit (Step 5 Part 2 launch blocker #1): a
+            # real HEST-1k patches .h5 can be missing a barcode that IS
+            # present (and expression-QC-valid) in the .h5ad -- this is
+            # the normal ~4.5% tissue/WSI-edge gap, simulated here by
+            # simply omitting `missing_patch_barcodes` members from the
+            # patches file entirely.
+            patch_barcodes = [b for b in barcodes if b not in missing_patch_barcodes]
             with h5py.File(hest_dir / "patches" / f"{sid}.h5", "w") as f:
-                f.create_dataset("img", data=np.zeros((len(barcodes), 4, 4, 3), dtype=np.uint8))
-                f.create_dataset("barcode", data=np.array([[b.encode()] for b in barcodes]))
+                f.create_dataset("img", data=np.zeros((len(patch_barcodes), 4, 4, 3), dtype=np.uint8))
+                f.create_dataset("barcode", data=np.array([[b.encode()] for b in patch_barcodes]))
 
             rows.append({
                 "id": sid, "organ": organ, "st_technology": "Visium",
@@ -648,10 +689,16 @@ def test_load_sample_for_examples_matches_the_manifests_declared_gene_panel_and_
         check_gene_panel_compatibility=False, min_nb_genes=None,
         gene_min_genes_per_spot=1, gene_min_cells=0,
     )
-    adata, patches = load_sample_for_examples(manifest, "L0")
+    adata, patches, image_source_available = load_sample_for_examples(manifest, "L0")
     assert list(adata.var_names) == manifest["gene_panel"]
-    assert set(adata.obs_names).issubset(set(manifest["samples"]["L0"]["barcodes"]))
+    # 18th Codex re-audit (Step 5 Part 2 launch blocker #1): the barcode
+    # universe is now EXACTLY the manifest's declared set, never a
+    # silently-shrunk subset (align_patches_to_adata no longer drops
+    # spots for missing H&E patches).
+    assert set(adata.obs_names) == set(manifest["samples"]["L0"]["barcodes"])
     assert patches.shape[0] == adata.n_obs
+    assert image_source_available.shape == (adata.n_obs,)
+    assert image_source_available.dtype == bool
 
 
 def test_end_to_end_manifest_to_example(tmp_path):
@@ -666,7 +713,7 @@ def test_end_to_end_manifest_to_example(tmp_path):
         check_gene_panel_compatibility=False, min_nb_genes=None,
         gene_min_genes_per_spot=1, gene_min_cells=0,
     )
-    adata, patches = load_sample_for_examples(manifest, "L0")
+    adata, patches, image_source_available = load_sample_for_examples(manifest, "L0")
     barcodes = list(adata.obs_names)
     query = barcodes[3:5]
     context = [b for b in barcodes if b not in query]
@@ -675,6 +722,80 @@ def test_end_to_end_manifest_to_example(tmp_path):
         adata, patches, context, query, _stub_image_feature_fn,
         sample_id="L0", patient_id=manifest["samples"]["L0"]["patient_id"], patch_size_fullres=1.0,
         full_sample_coords=adata.obsm["spatial"],  # the recommended real usage, not the test-only escape hatch
+        image_source_available=image_source_available,
     )
     assert set(inputs.query_barcodes.tolist()) == set(query)
     assert set(inputs.observed_barcodes.tolist()).issubset(set(context))
+
+
+def test_a_mask_referencing_a_gex_valid_spot_with_no_h_e_patch_builds_successfully(tmp_path):
+    """18th Codex re-audit (Step 5 Part 2 launch blocker #1), CONFIRMED
+    real: masks (mask_bank.py) are realized against the MANIFEST's
+    expression-QC spot set, which never accounts for H&E-patch
+    availability -- a prior version of align_patches_to_adata silently
+    DROPPED any spot with no matching patch, so a mask referencing that
+    barcode as CONTEXT would make build_spatial_field_example raise
+    "mask references barcodes absent from the aligned sample data" far
+    downstream of manifest/mask construction, or (worse) silently use a
+    different spot universe than the mask was built against. Fixed: the
+    spot is retained end to end -- through load_sample_for_examples,
+    through the real (context, query) split, all the way to a
+    successfully-built example with observed_image_available=False and
+    a zeroed feature row for exactly that spot, nothing else."""
+    missing_barcode = "L0-SPOT3-1"
+    hest_dir, meta_path, gene_names = _make_synthetic_hest1k_with_patches(
+        tmp_path, {"Lung": [f"L{i}" for i in range(3)]}, n_spots_per_sample=8,
+        missing_patch_barcodes={missing_barcode},
+    )
+    manifest = build_dataset_manifest(
+        hest_dir, str(meta_path), organs="all", min_samples_per_organ=3,
+        n_validation_per_organ=0, n_test_per_organ=0, split_seed=0,
+        check_gene_panel_compatibility=False, min_nb_genes=None,
+        gene_min_genes_per_spot=1, gene_min_cells=0,
+    )
+    # The manifest's declared barcode set is built from expression QC
+    # alone -- it includes missing_barcode, exactly like a real mask
+    # realized against it would.
+    assert missing_barcode in manifest["samples"]["L0"]["barcodes"]
+
+    adata, patches, image_source_available = load_sample_for_examples(manifest, "L0")
+    barcodes = list(adata.obs_names)
+    assert missing_barcode in barcodes  # RETAINED, not dropped
+    missing_pos = barcodes.index(missing_barcode)
+    assert image_source_available[missing_pos] == False  # noqa: E712 -- real numpy bool
+    assert np.all(patches[missing_pos] == 0)  # explicit zero placeholder, never a garbage/misaligned patch
+
+    # A mask (built exactly as mask_bank.py would, from the manifest's
+    # own declared set) that puts missing_barcode in CONTEXT, far from
+    # any query spot -- must build successfully, not raise.
+    query = [barcodes[6]]
+    context = [b for b in barcodes if b != barcodes[6]]
+    assert missing_barcode in context
+
+    inputs, targets = build_spatial_field_example(
+        adata, patches, context, query, _stub_image_feature_fn,
+        sample_id="L0", patient_id=manifest["samples"]["L0"]["patient_id"], patch_size_fullres=1.0,
+        full_sample_coords=adata.obsm["spatial"], image_source_available=image_source_available,
+        expected_feature_width=_N_FEATURES,
+    )
+    observed_barcodes = inputs.observed_barcodes.tolist()
+    assert missing_barcode in observed_barcodes  # RETAINED in the built example too
+    missing_observed_pos = observed_barcodes.index(missing_barcode)
+    assert inputs.observed_image_available[missing_observed_pos] == False  # noqa: E712
+    assert np.all(inputs.observed_gigapath_features[missing_observed_pos] == 0.0)
+    assert inputs.provenance["n_context_image_unavailable_for_missing_source_patch"] == 1
+
+
+def test_build_spatial_field_example_rejects_a_malformed_image_source_available(tmp_path):
+    adata = _square_grid_adata()
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query = barcodes[:1]
+    context = barcodes[1:]
+    wrong_shape = np.ones(adata.n_obs - 1, dtype=bool)  # one row short
+    with pytest.raises(ValueError, match="image_source_available has shape"):
+        build_spatial_field_example(
+            adata, patches, context, query, _stub_image_feature_fn,
+            sample_id="S0", patient_id="P0", patch_size_fullres=1.0,
+            require_full_sample_coords=False, image_source_available=wrong_shape,
+        )

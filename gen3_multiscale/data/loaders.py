@@ -255,32 +255,58 @@ def align_adata_to_patch_barcodes(adata: ad.AnnData, barcodes: np.ndarray) -> ad
     return adata[has_patch].copy()
 
 def align_patches_to_adata(adata: ad.AnnData, patches: np.ndarray, barcodes: np.ndarray
-                            ) -> tuple[ad.AnnData, np.ndarray]:
-    """Subset adata to only the spots with a matching H&E patch, and
-    return (filtered_adata, aligned_patches) in that same (filtered)
-    order. HEST-1k's own patch extraction naturally drops some spots
+                            ) -> tuple[ad.AnnData, np.ndarray, np.ndarray]:
+    """Align patches to EVERY adata spot -- never drops one for lacking
+    an H&E patch -- and return (adata, aligned_patches,
+    image_source_available), a real per-spot boolean flag marking which
+    rows of aligned_patches hold a genuine patch (the rest are an
+    explicit zero placeholder, never a garbage/misaligned value).
+
+    18th Codex re-audit (Step 5 Part 2 launch blocker #1), CONFIRMED
+    real, gen3_multiscale-only deliberate divergence from
+    gen2_architectures'/src's identical-named function (which still
+    subsets, and is correct to for ITS OWN architectures -- they have no
+    per-modality-availability concept at all): gen3_multiscale's
+    example_builder.py deliberately RETAINS every GEX-available context
+    spot even when its H&E is unavailable
+    (SpatialFieldInputs.observed_image_available), so subsetting adata
+    here would silently contradict that design AND, much more
+    seriously, corrupt the DATA CONTRACT between mask generation and
+    example building: realized masks (mask_bank.py) are generated
+    against the MANIFEST's expression-QC spot set (dataset_manifest.py),
+    which never accounts for H&E-patch availability at all -- a mask
+    could reference a barcode this function used to silently drop,
+    making that mask fail (or worse, allowing a subtly different -- but
+    silently accepted -- spot universe) at build_spatial_field_example
+    time, arbitrarily far downstream of manifest/mask construction. Do
+    NOT let gen2_architectures'/src's copies drift to match this
+    behavior without checking they don't also need the change.
+
+    HEST-1k's own patch extraction naturally misses some spots
     (tissue-mask/WSI-border edge cases) — confirmed 2026-07-15 on real
-    INT1 data: 49/1080 spots had no matching patch, a normal ~4.5% gap in
-    HEST-1k's own pipeline, not a data-mismatch bug (an earlier version of
-    this function raised on ANY gap, which was too strict for real data).
-    Only raises if NONE of the spots match at all — that would indicate a
-    genuine version/sample mismatch, not normal partial coverage."""
+    INT1 data: 49/1080 spots had no matching patch, a normal ~4.5% gap
+    in HEST-1k's own pipeline, not a data-mismatch bug. Only raises if
+    NONE of the spots match at all — that would indicate a genuine
+    version/sample mismatch, not normal partial coverage."""
     barcode_to_idx = {b: i for i, b in enumerate(barcodes)}
-    has_patch = np.array([name in barcode_to_idx for name in adata.obs_names])
-    if not has_patch.any():
+    image_source_available = np.array([name in barcode_to_idx for name in adata.obs_names], dtype=bool)
+    if not image_source_available.any():
         raise ValueError(
             "None of the adata spots matched any H&E patch barcode — patches "
             "and expression data are likely from different downloads/versions "
             "of this sample."
         )
-    n_dropped = int((~has_patch).sum())
-    if n_dropped:
-        print(f"align_patches_to_adata: dropping {n_dropped}/{adata.n_obs} spots "
-              f"with no matching H&E patch (HEST-1k's own patch extraction misses "
-              f"some spots at tissue/WSI edges — this is normal)")
-    filtered_adata = adata[has_patch].copy()
-    order = [barcode_to_idx[name] for name in filtered_adata.obs_names]
-    return filtered_adata, patches[order]
+    n_missing = int((~image_source_available).sum())
+    if n_missing:
+        print(f"align_patches_to_adata: {n_missing}/{adata.n_obs} spots have no matching H&E "
+              f"patch (HEST-1k's own patch extraction misses some spots at tissue/WSI edges — "
+              f"this is normal); RETAINED with a zero placeholder patch and "
+              f"image_source_available=False, never dropped")
+    aligned_patches = np.zeros((adata.n_obs, *patches.shape[1:]), dtype=patches.dtype)
+    available_idx = np.flatnonzero(image_source_available)
+    source_idx = [barcode_to_idx[adata.obs_names[i]] for i in available_idx]
+    aligned_patches[available_idx] = patches[source_idx]
+    return adata, aligned_patches, image_source_available
 
 
 def load_hest_sample(hest_data_dir: str | Path, sample_id: str,

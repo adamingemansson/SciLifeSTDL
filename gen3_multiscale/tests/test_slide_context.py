@@ -155,10 +155,22 @@ def test_visible_slide_context_id_is_stable_for_the_same_hole():
     assert a["context_id"] == b["context_id"]
 
 
-def _write_dense_wsi_cache(path, features, coords, tile_size=256.0):
+_TILE_ENCODER_PROVENANCE_KWARGS = dict(
+    tile_encoder_hf_repo_id=np.asarray("prov-gigapath/prov-gigapath"),
+    tile_encoder_hf_revision=np.asarray("unit-test-revision"),
+    tile_encoder_timm_version=np.asarray("1.0.3"),
+    tile_encoder_preprocessing_spec=np.asarray("centercrop224_no_resize_v2_2026-07-24"),
+    tile_encoder_state_dict_sha256=np.asarray("a" * 64),
+    tile_encoder_schema_version=np.asarray(1),
+)
+
+
+def _write_dense_wsi_cache(path, features, coords, tile_size=256.0, **extra_provenance):
+    kwargs = dict(_TILE_ENCODER_PROVENANCE_KWARGS)
+    kwargs.update(extra_provenance)
     np.savez(
         path, features=features, coords=coords, tile_size=np.asarray(tile_size),
-        coords_are_centers=np.asarray(False),
+        coords_are_centers=np.asarray(False), **kwargs,
     )
 
 
@@ -205,6 +217,7 @@ def test_load_slide_context_id_changes_when_only_the_level0_mask_fields_change(t
         coords_are_centers=np.asarray(False),
         level0_coords=np.asarray([[0, 0], [512, 0]], dtype=np.float32),  # different level0 mask coords
         level0_tile_size=np.asarray(256.0),
+        **_TILE_ENCODER_PROVENANCE_KWARGS,
     )
     ctx_a = load_slide_context(cfg, "S0", None, spot_coords)
 
@@ -213,6 +226,7 @@ def test_load_slide_context_id_changes_when_only_the_level0_mask_fields_change(t
         coords_are_centers=np.asarray(False),
         level0_coords=np.asarray([[0, 0], [1024, 0]], dtype=np.float32),  # changed ONLY this
         level0_tile_size=np.asarray(256.0),
+        **_TILE_ENCODER_PROVENANCE_KWARGS,
     )
     ctx_b = load_slide_context(cfg, "S0", None, spot_coords)
 
@@ -234,3 +248,114 @@ def test_load_slide_context_rejects_duplicate_tile_coordinates(tmp_path):
 
     with pytest.raises(ValueError, match="duplicate tile coordinates"):
         load_slide_context(cfg, "S0", None, spot_coords)
+
+
+def test_load_slide_context_rejects_duplicate_level0_coords_even_with_unique_coords(tmp_path):
+    """18th Codex re-audit (Step 5 Part 2, "Other real gaps"), CONFIRMED
+    real: only `coords` (the LongNet frame) was checked for duplicates
+    -- `mask_coords` (level0_coords) is an independently-sourced field
+    for a dense_wsi_cache and could contain duplicates of its own even
+    when `coords` has none."""
+    cache_dir = tmp_path / "hest1k" / "gigapath_slide_cache"
+    cache_dir.mkdir(parents=True)
+    unique_coords = np.asarray([[0, 0], [256, 0], [512, 0]], dtype=np.float32)  # no duplicates here
+    duplicate_level0 = np.asarray([[0, 0], [0, 0], [512, 0]], dtype=np.float32)  # but here
+    features = np.ones((3, 1536), dtype=np.float32)
+    kwargs = dict(_TILE_ENCODER_PROVENANCE_KWARGS)
+    np.savez(
+        cache_dir / "S0.npz", features=features, coords=unique_coords, tile_size=np.asarray(256.0),
+        coords_are_centers=np.asarray(False), level0_coords=duplicate_level0,
+        level0_tile_size=np.asarray(256.0), **kwargs,
+    )
+    cfg = OmegaConf.create({"data": {"slide_context_source": "dense_wsi_cache", "hest_data_dir": str(tmp_path / "hest1k")}})
+    spot_coords = np.asarray([[10, 10]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="duplicate level0_coords"):
+        load_slide_context(cfg, "S0", None, spot_coords)
+
+
+def test_load_slide_context_requires_tile_encoder_provenance(tmp_path):
+    """18th Codex re-audit (Step 5 Part 2 launch blocker #2), CONFIRMED
+    real: a dense_wsi_cache written before this fix (no tile-encoder
+    provenance fields at all) must be rejected explicitly -- rebuilding
+    is required, not a silent "assume it's fine"."""
+    cache_dir = tmp_path / "hest1k" / "gigapath_slide_cache"
+    cache_dir.mkdir(parents=True)
+    coords = np.asarray([[0, 0], [256, 0]], dtype=np.float32)
+    features = np.ones((2, 1536), dtype=np.float32)
+    np.savez(  # deliberately WITHOUT any tile_encoder_* field -- an old-format cache
+        cache_dir / "S0.npz", features=features, coords=coords, tile_size=np.asarray(256.0),
+        coords_are_centers=np.asarray(False),
+    )
+    cfg = OmegaConf.create({"data": {"slide_context_source": "dense_wsi_cache", "hest_data_dir": str(tmp_path / "hest1k")}})
+    spot_coords = np.asarray([[10, 10]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="tile_encoder_hf_repo_id"):
+        load_slide_context(cfg, "S0", None, spot_coords)
+
+
+def test_load_slide_context_id_changes_when_only_the_tile_encoder_provenance_changes(tmp_path):
+    """18th Codex re-audit (Step 5 Part 2 launch blocker #2), CONFIRMED
+    real: a cache regenerated with a DIFFERENT tile encoder (or a fixed
+    preprocessing bug), with IDENTICAL features/coords/tile_size, must
+    still get a new context_id -- otherwise two caches produced with
+    different tile-encoder weights/preprocessing could both appear
+    equally valid under the same identity."""
+    cache_dir = tmp_path / "hest1k" / "gigapath_slide_cache"
+    cache_dir.mkdir(parents=True)
+    coords = np.asarray([[0, 0], [256, 0]], dtype=np.float32)
+    features = np.ones((2, 1536), dtype=np.float32)
+    cfg = OmegaConf.create({"data": {"slide_context_source": "dense_wsi_cache", "hest_data_dir": str(tmp_path / "hest1k")}})
+    spot_coords = np.asarray([[10, 10]], dtype=np.float32)
+
+    _write_dense_wsi_cache(cache_dir / "S0.npz", features, coords)
+    ctx_a = load_slide_context(cfg, "S0", None, spot_coords)
+
+    _write_dense_wsi_cache(
+        cache_dir / "S0.npz", features, coords,
+        tile_encoder_state_dict_sha256=np.asarray("b" * 64),  # changed ONLY this
+    )
+    ctx_b = load_slide_context(cfg, "S0", None, spot_coords)
+
+    assert ctx_a["context_id"] != ctx_b["context_id"]
+
+
+def test_load_slide_context_exposes_real_tile_encoder_provenance_for_dense_cache(tmp_path):
+    cache_dir = tmp_path / "hest1k" / "gigapath_slide_cache"
+    cache_dir.mkdir(parents=True)
+    coords = np.asarray([[0, 0], [256, 0]], dtype=np.float32)
+    features = np.ones((2, 1536), dtype=np.float32)
+    _write_dense_wsi_cache(cache_dir / "S0.npz", features, coords)
+    cfg = OmegaConf.create({"data": {"slide_context_source": "dense_wsi_cache", "hest_data_dir": str(tmp_path / "hest1k")}})
+    spot_coords = np.asarray([[10, 10]], dtype=np.float32)
+
+    ctx = load_slide_context(cfg, "S0", None, spot_coords)
+    provenance = ctx["tile_encoder_provenance"]
+    assert provenance["hf_repo_id"] == "prov-gigapath/prov-gigapath"
+    assert provenance["hf_revision"] == "unit-test-revision"
+    assert provenance["state_dict_sha256"] == "a" * 64
+    assert provenance["schema_version"] == 1
+
+
+def test_load_slide_context_rejects_a_blank_tile_encoder_state_dict_sha256(tmp_path):
+    cache_dir = tmp_path / "hest1k" / "gigapath_slide_cache"
+    cache_dir.mkdir(parents=True)
+    coords = np.asarray([[0, 0], [256, 0]], dtype=np.float32)
+    features = np.ones((2, 1536), dtype=np.float32)
+    _write_dense_wsi_cache(cache_dir / "S0.npz", features, coords, tile_encoder_state_dict_sha256=np.asarray("   "))
+    cfg = OmegaConf.create({"data": {"slide_context_source": "dense_wsi_cache", "hest_data_dir": str(tmp_path / "hest1k")}})
+    spot_coords = np.asarray([[10, 10]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="blank tile_encoder_state_dict_sha256"):
+        load_slide_context(cfg, "S0", None, spot_coords)
+
+
+def test_load_slide_context_spot_aligned_has_no_tile_encoder_provenance():
+    """spot_aligned is an explicit diagnostic fallback with no
+    accompanying tile-encoder metadata to validate -- explicitly None,
+    never fabricated."""
+    cfg = OmegaConf.create({"data": {"slide_context_source": "spot_aligned"}})
+    spot_features = np.ones((2, 1536), dtype=np.float32)
+    spot_coords = np.asarray([[10, 10], [20, 20]], dtype=np.float32)
+    ctx = load_slide_context(cfg, "S0", spot_features, spot_coords)
+    assert ctx["tile_encoder_provenance"] is None

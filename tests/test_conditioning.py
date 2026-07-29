@@ -10,8 +10,9 @@ as a module with -m from the repo root, not as a plain script, so `src` is
 importable — same convention as src/training/train.py)
 """
 import torch
+import torch.nn as nn
 
-from src.models.conditioning import SpatialContextEncoder
+from src.models.conditioning import SpatialContextEncoder, gigapath_tile_encoder_provenance
 
 
 def _run_case(coord_dim: int, n_context: int, n_query: int, n_genes: int, label: str):
@@ -145,6 +146,34 @@ def _run_edge_cases():
     c2 = encoder2(torch.randn(20, 3), torch.rand(20, 10), torch.randn(1, 3))
     assert c2.shape == (1, 32)
     print("[edge: single query point] OK")
+
+
+def test_gigapath_tile_encoder_provenance_is_real_and_content_sensitive():
+    """18th Codex re-audit (Step 5 Part 2, "the dense WSI cache... stores
+    no resolved Hugging Face revision, model identifier, preprocessing
+    version, library versions, or tile-encoder fingerprint"): a real
+    tile-encoder identity, computed from actual loaded weights rather
+    than assumed from the repo id/revision string alone. Uses a small
+    stub nn.Module rather than the real (gated, network-dependent)
+    GigaPath weights -- gigapath_tile_encoder_provenance only needs
+    something with a real state_dict()."""
+    encoder_a = nn.Linear(4, 4)
+    encoder_b = nn.Linear(4, 4)
+    with torch.no_grad():
+        encoder_a.weight.fill_(1.0)
+        encoder_b.weight.fill_(2.0)  # genuinely different real weights
+
+    prov_a = gigapath_tile_encoder_provenance(encoder_a, revision="deadbeef")
+    prov_a_again = gigapath_tile_encoder_provenance(encoder_a, revision="deadbeef")
+    prov_b = gigapath_tile_encoder_provenance(encoder_b, revision="deadbeef")
+
+    assert prov_a["state_dict_sha256"] == prov_a_again["state_dict_sha256"]  # stable/deterministic
+    assert prov_a["state_dict_sha256"] != prov_b["state_dict_sha256"]  # real content-sensitivity
+    assert prov_a["hf_revision"] == "deadbeef"  # explicit revision passed through, never overridden
+    assert prov_a["hf_repo_id"] == "prov-gigapath/prov-gigapath"
+    assert "timm_version" in prov_a  # None here (timm not installed in this sandbox) is the documented best-effort fallback
+    assert prov_a["preprocessing_spec"]
+    assert prov_a["schema_version"] == 1
 
 
 if __name__ == "__main__":
