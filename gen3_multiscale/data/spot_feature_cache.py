@@ -32,6 +32,7 @@ encoder's output for a given patch never changes.
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 import numpy as np
@@ -84,26 +85,62 @@ def _patch_content_sha256(
     image_source_available = np.asarray(image_source_available, dtype=bool)
     patches = np.asarray(patches)
     available_idx = np.flatnonzero(image_source_available)
+    available_patches = np.ascontiguousarray(patches[available_idx])
     digest = hashlib.sha256()
     digest.update(b"\x1f".join(b.encode("utf-8") for b in barcodes))
     digest.update(image_source_available.tobytes())
-    digest.update(np.ascontiguousarray(patches[available_idx]).tobytes())
+    # 21st Codex re-audit hardening: shape and dtype were NOT previously
+    # part of the digest -- two arrays with a different shape/dtype but
+    # coincidentally identical raw bytes (e.g. a reshape or an int8-vs-
+    # uint8 reinterpretation of the same underlying memory) would
+    # silently hash identically. Bind them explicitly, matching
+    # src.training.train.get_gigapath_features's own patch_fingerprint
+    # convention.
+    digest.update(str(available_patches.shape).encode("ascii"))
+    digest.update(str(available_patches.dtype).encode("ascii"))
+    digest.update(available_patches.tobytes())
     return digest.hexdigest()
 
 
-def build_gen3_spot_feature_cache(
+def load_gigapath_tile_encoder_for_gen3(tile_encoder_revision: str, device: str = "cuda"):
+    """Load the frozen GigaPath tile encoder ONCE, with its full
+    provenance recorded once, for reuse across every sample in a
+    precompute run via ``encode_gen3_spot_feature_cache`` -- 21st Codex
+    re-audit hardening: "prefer loading the tile encoder once per worker
+    and reusing it across samples; the current CLI reloads the large
+    model for every sample." Returns ``(encoder, provenance)``."""
+    from src.models.conditioning import (
+        _load_gigapath_tile_encoder, _validate_immutable_hf_revision, gigapath_tile_encoder_provenance,
+    )
+
+    tile_encoder_revision = _validate_immutable_hf_revision(tile_encoder_revision)
+    encoder = _load_gigapath_tile_encoder(revision=tile_encoder_revision).to(device).eval()
+    provenance = gigapath_tile_encoder_provenance(encoder, revision=tile_encoder_revision)
+    return encoder, provenance
+
+
+def encode_gen3_spot_feature_cache(
     cfg,
     sample_id: str,
     barcodes: np.ndarray,
     patches: np.ndarray,
     image_source_available: np.ndarray,
-    tile_encoder_revision: str,
+    encoder,
+    provenance: dict,
     device: str = "cuda",
     batch_size: int = 32,
 ) -> Path:
     """Encode every AVAILABLE H&E patch for one manifest sample exactly
-    once, with a MANDATORY immutable tile-encoder revision, and cache the
-    result keyed to this sample's real barcode order and patch content.
+    once, using an ALREADY-LOADED ``encoder``/``provenance`` (see
+    ``load_gigapath_tile_encoder_for_gen3``), and cache the result keyed
+    to this sample's real barcode order and patch content. A caller
+    processing many samples should call ``load_gigapath_tile_encoder_
+    for_gen3`` ONCE and reuse the same ``encoder``/``provenance`` across
+    every call to this function -- see ``build_gen3_spot_feature_cache``
+    below for the single-sample convenience wrapper that does NOT reuse
+    across samples, and
+    ``scripts/precompute_gen3_spot_features.py`` for the real multi-
+    sample reuse pattern.
 
     ``barcodes``/``patches``/``image_source_available``: the ALIGNED
     triple ``loaders.align_patches_to_adata`` (via
@@ -117,13 +154,11 @@ def build_gen3_spot_feature_cache(
     matching what ``build_spatial_field_example`` already does for a
     context spot with ``observed_image_available=False``.
     """
-    from src.models.conditioning import (
-        _gigapath_preprocess_and_encode, _load_gigapath_tile_encoder,
-        _validate_immutable_hf_revision, gigapath_tile_encoder_provenance,
-    )
+    from src.models.conditioning import _gigapath_preprocess_and_encode
     import torch
 
-    tile_encoder_revision = _validate_immutable_hf_revision(tile_encoder_revision)
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
     barcodes = np.asarray([str(b) for b in barcodes])
     image_source_available = np.asarray(image_source_available, dtype=bool)
     patches = np.asarray(patches)
@@ -142,9 +177,6 @@ def build_gen3_spot_feature_cache(
             f"{duplicated[:5].tolist()}) -- refusing to build an ambiguous cache"
         )
 
-    encoder = _load_gigapath_tile_encoder(revision=tile_encoder_revision).to(device).eval()
-    provenance = gigapath_tile_encoder_provenance(encoder, revision=tile_encoder_revision)
-
     features = np.zeros((n, _GIGAPATH_FEAT_DIM), dtype=np.float32)
     available_idx = np.flatnonzero(image_source_available)
     with torch.inference_mode():
@@ -153,11 +185,32 @@ def build_gen3_spot_feature_cache(
             tensor = torch.from_numpy(patches[batch_idx]).permute(0, 3, 1, 2)
             tensor = tensor.to(device=device, dtype=torch.float32).div_(255.0)
             out = _gigapath_preprocess_and_encode(encoder, tensor).cpu().numpy()
+            # 21st Codex re-audit hardening: "validate encoder output
+            # shape and finiteness before writing" -- a broken/mismatched
+            # encoder could otherwise silently corrupt a cache that later
+            # only gets a shape/finiteness check averaged over the WHOLE
+            # features array, long after the real cause (this specific
+            # batch) is gone.
+            expected_shape = (batch_idx.shape[0], _GIGAPATH_FEAT_DIM)
+            if out.shape != expected_shape:
+                raise ValueError(
+                    f"{sample_id}: tile encoder returned features with shape {out.shape}, "
+                    f"expected {expected_shape}"
+                )
+            if not np.isfinite(out).all():
+                raise ValueError(f"{sample_id}: tile encoder returned non-finite feature values")
             features[batch_idx] = out.astype(np.float32)
 
     path = _cache_path(cfg, sample_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".npz.tmp")
+    # 21st Codex re-audit hardening: "use process-specific temporary
+    # filenames for atomic writes" -- a plain ".npz.tmp" suffix would
+    # collide if two processes ever built the SAME sample's cache
+    # concurrently (e.g. two preflight retries, or two workers assigned
+    # the same sample by mistake), corrupting whichever write finished
+    # last. Matches dataset_manifest.py's own save_dataset_manifest/
+    # save_digest_cache convention.
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     with tmp.open("wb") as handle:
         np.savez(
             handle,
@@ -174,10 +227,36 @@ def build_gen3_spot_feature_cache(
             tile_encoder_state_dict_sha256=np.asarray(provenance["state_dict_sha256"]),
             tile_encoder_schema_version=np.asarray(provenance["schema_version"]),
         )
-    tmp.replace(path)
+    os.replace(tmp, path)
     print(f"{sample_id}: wrote Gen3 spot-feature cache for {available_idx.shape[0]}/{n} "
           f"available spots to {path}", flush=True)
     return path
+
+
+def build_gen3_spot_feature_cache(
+    cfg,
+    sample_id: str,
+    barcodes: np.ndarray,
+    patches: np.ndarray,
+    image_source_available: np.ndarray,
+    tile_encoder_revision: str,
+    device: str = "cuda",
+    batch_size: int = 32,
+) -> Path:
+    """Single-sample convenience wrapper: loads the tile encoder FRESH
+    (see ``load_gigapath_tile_encoder_for_gen3``) then encodes exactly
+    one sample via ``encode_gen3_spot_feature_cache``. A caller
+    processing MORE than one sample should call
+    ``load_gigapath_tile_encoder_for_gen3`` once and reuse it across
+    multiple ``encode_gen3_spot_feature_cache`` calls instead -- see
+    ``scripts/precompute_gen3_spot_features.py``. This wrapper exists
+    for single-sample callers and tests where reuse across samples does
+    not apply."""
+    encoder, provenance = load_gigapath_tile_encoder_for_gen3(tile_encoder_revision, device=device)
+    return encode_gen3_spot_feature_cache(
+        cfg, sample_id, barcodes, patches, image_source_available, encoder, provenance,
+        device=device, batch_size=batch_size,
+    )
 
 
 def load_gen3_spot_features(
@@ -258,6 +337,21 @@ def load_gen3_spot_features(
         )
     if not np.isfinite(features).all():
         raise ValueError(f"Gen3 spot-feature cache {path} contains non-finite feature values")
+
+    # 21st Codex re-audit hardening: "require unavailable feature rows
+    # to be exactly zero on load" -- build_gen3_spot_feature_cache never
+    # writes anything else there, but a hand-edited or corrupted cache
+    # file could; a nonzero row for a spot marked unavailable would
+    # silently leak a "real" feature value for a patch that must be
+    # modeled as physically/measurement-absent.
+    unavailable_idx = np.flatnonzero(~real_availability)
+    if unavailable_idx.size and not np.array_equal(
+        features[unavailable_idx], np.zeros((unavailable_idx.size, _GIGAPATH_FEAT_DIM), dtype=np.float32)
+    ):
+        raise ValueError(
+            f"Gen3 spot-feature cache {path} has a nonzero feature row for a spot marked "
+            "image_source_available=False -- corrupted cache, refusing to load"
+        )
 
     real_patch_content_sha256 = _patch_content_sha256(real_barcodes, real_availability, real_patches)
     cached_patch_content_sha256 = str(cached["patch_content_sha256"])

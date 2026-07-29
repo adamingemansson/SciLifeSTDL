@@ -65,6 +65,118 @@ def test_build_spatial_field_example_basic_shapes_and_disjointness():
     assert inputs.sample_id == "S0" and inputs.patient_id == "P0"
 
 
+def test_build_spatial_field_example_requires_exactly_one_of_image_feature_fn_or_precomputed_spot_features():
+    """21st Codex re-audit, Step 5/6 boundary #2: precomputed_spot_features
+    must be mutually exclusive with image_feature_fn -- never both, never
+    neither."""
+    adata = _square_grid_adata()
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query = barcodes[14:16]
+    context = [b for b in barcodes if b not in query]
+
+    with pytest.raises(ValueError, match="exactly one"):
+        build_spatial_field_example(
+            adata, patches, context, query, None,
+            sample_id="S0", patient_id="P0", require_full_sample_coords=False,
+        )
+    with pytest.raises(ValueError, match="exactly one"):
+        build_spatial_field_example(
+            adata, patches, context, query, _stub_image_feature_fn,
+            sample_id="S0", patient_id="P0", require_full_sample_coords=False,
+            precomputed_spot_features=np.zeros((adata.n_obs, _N_FEATURES), dtype=np.float32),
+        )
+
+
+def test_build_spatial_field_example_precomputed_spot_features_matches_image_feature_fn_output():
+    """The production path (precomputed_spot_features) must select
+    exactly the same rows image_feature_fn(patches[...]) would have
+    computed from scratch -- a real correctness check, not just a shape
+    check."""
+    adata = _square_grid_adata()
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query = barcodes[14:16]
+    context = [b for b in barcodes if b not in query]
+    kwargs = dict(sample_id="S0", patient_id="P0", patch_size_fullres=1.0, require_full_sample_coords=False)
+
+    inputs_fn, _ = build_spatial_field_example(adata, patches, context, query, _stub_image_feature_fn, **kwargs)
+    precomputed = _stub_image_feature_fn(patches)  # the SAME per-spot features, precomputed for every spot
+    inputs_precomputed, _ = build_spatial_field_example(
+        adata, patches, context, query, None, precomputed_spot_features=precomputed, **kwargs,
+    )
+    np.testing.assert_array_equal(inputs_fn.observed_gigapath_features, inputs_precomputed.observed_gigapath_features)
+    np.testing.assert_array_equal(inputs_fn.observed_image_available, inputs_precomputed.observed_image_available)
+
+
+def test_build_spatial_field_example_precomputed_spot_features_ignores_query_row_changes():
+    """21st Codex re-audit: 'Add adversarial tests proving that changing
+    cached query rows... cannot change the constructed model input.'
+    Query spots never appear in context_pos, so precomputed_spot_features
+    rows at query positions must have ZERO effect on the built example --
+    a real leakage-guard test, not just a documentation claim."""
+    adata = _square_grid_adata()
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query = barcodes[14:16]
+    context = [b for b in barcodes if b not in query]
+    query_pos = [barcodes.index(b) for b in query]
+    kwargs = dict(sample_id="S0", patient_id="P0", patch_size_fullres=1.0, require_full_sample_coords=False)
+
+    precomputed_a = np.arange(adata.n_obs * _N_FEATURES, dtype=np.float32).reshape(adata.n_obs, _N_FEATURES)
+    precomputed_b = precomputed_a.copy()
+    precomputed_b[query_pos] = -999.0  # corrupt ONLY the query rows
+
+    inputs_a, _ = build_spatial_field_example(
+        adata, patches, context, query, None, precomputed_spot_features=precomputed_a, **kwargs,
+    )
+    inputs_b, _ = build_spatial_field_example(
+        adata, patches, context, query, None, precomputed_spot_features=precomputed_b, **kwargs,
+    )
+    np.testing.assert_array_equal(inputs_a.observed_gigapath_features, inputs_b.observed_gigapath_features)
+
+
+def test_build_spatial_field_example_precomputed_spot_features_ignores_physically_hidden_rows():
+    """21st Codex re-audit: 'Add adversarial tests proving that changing
+    ...rows hidden by physical overlap—cannot change the constructed
+    model input.' A context spot whose H&E physically overlaps the query
+    hole must be zeroed in observed_gigapath_features regardless of what
+    value precomputed_spot_features actually holds for that row -- the
+    same "never leak an unavailable feature" guarantee image_feature_fn
+    already has, now proven for the precomputed path too."""
+    adata = _square_grid_adata(n_side=6, spacing=10.0)
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    coords = adata.obsm["spatial"]
+
+    query_idx = 14
+    query_barcode = barcodes[query_idx]
+    query_xy = coords[query_idx]
+    distances = np.linalg.norm(coords - query_xy, axis=1)
+    distances[query_idx] = np.inf
+    neighbor_idx = int(np.argmin(distances))  # close enough to physically overlap -> unavailable
+    neighbor_barcode = barcodes[neighbor_idx]
+
+    context = [b for b in barcodes if b != query_barcode]
+    kwargs = dict(
+        sample_id="S0", patient_id="P0", patch_size_fullres=30.0, require_full_sample_coords=False,
+    )
+    precomputed_a = np.zeros((adata.n_obs, _N_FEATURES), dtype=np.float32)
+    precomputed_b = precomputed_a.copy()
+    precomputed_b[neighbor_idx] = 12345.0  # a distinctive, real-looking value at the physically hidden row
+
+    inputs_a, _ = build_spatial_field_example(
+        adata, patches, context, [query_barcode], None, precomputed_spot_features=precomputed_a, **kwargs,
+    )
+    inputs_b, _ = build_spatial_field_example(
+        adata, patches, context, [query_barcode], None, precomputed_spot_features=precomputed_b, **kwargs,
+    )
+    np.testing.assert_array_equal(inputs_a.observed_gigapath_features, inputs_b.observed_gigapath_features)
+    neighbor_pos = inputs_b.observed_barcodes.tolist().index(neighbor_barcode)
+    assert inputs_b.observed_image_available[neighbor_pos] == False  # noqa: E712 -- real numpy bool
+    assert np.all(inputs_b.observed_gigapath_features[neighbor_pos] == 0.0)
+
+
 def test_build_spatial_field_example_flags_but_retains_context_patches_overlapping_the_hole():
     """15th Codex re-audit (Step 5 acceptance criteria): a context spot
     whose barcode is NOT a query barcode, but whose patch footprint
@@ -307,6 +419,32 @@ def test_build_spatial_field_example_rejects_an_unexpected_feature_width():
             adata, patches, context, query, _stub_image_feature_fn,
             sample_id="S0", patient_id="P0", patch_size_fullres=1.0, require_full_sample_coords=False,
             expected_feature_width=_N_FEATURES + 1,
+        )
+
+
+def test_build_spatial_field_example_rejects_a_malformed_precomputed_spot_features():
+    adata = _square_grid_adata()
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query = barcodes[:1]
+    context = barcodes[1:]
+    kwargs = dict(sample_id="S0", patient_id="P0", patch_size_fullres=1.0, require_full_sample_coords=False)
+
+    with pytest.raises(ValueError, match="precomputed_spot_features"):
+        build_spatial_field_example(  # wrong row count
+            adata, patches, context, query, None,
+            precomputed_spot_features=np.zeros((adata.n_obs - 1, _N_FEATURES), dtype=np.float32), **kwargs,
+        )
+    with pytest.raises(ValueError, match="precomputed_spot_features"):
+        build_spatial_field_example(  # 1D, not [N, feature_dim]
+            adata, patches, context, query, None,
+            precomputed_spot_features=np.zeros(adata.n_obs, dtype=np.float32), **kwargs,
+        )
+    with pytest.raises(ValueError, match="non-finite"):
+        bad = np.zeros((adata.n_obs, _N_FEATURES), dtype=np.float32)
+        bad[0, 0] = np.nan
+        build_spatial_field_example(
+            adata, patches, context, query, None, precomputed_spot_features=bad, **kwargs,
         )
 
 

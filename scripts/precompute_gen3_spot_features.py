@@ -29,7 +29,9 @@ from omegaconf import OmegaConf
 
 from gen3_multiscale.data import example_builder
 from gen3_multiscale.data.dataset_manifest import load_dataset_manifest
-from gen3_multiscale.data.spot_feature_cache import build_gen3_spot_feature_cache
+from gen3_multiscale.data.spot_feature_cache import (
+    encode_gen3_spot_feature_cache, load_gigapath_tile_encoder_for_gen3,
+)
 
 
 def main() -> None:
@@ -60,15 +62,21 @@ def main() -> None:
     cfg = OmegaConf.load(args.config)
     manifest = load_dataset_manifest(args.manifest)
     ids = list(args.sample_ids or manifest["samples"].keys())
+    # 21st Codex re-audit hardening: "prefer loading the tile encoder
+    # once per worker and reusing it across samples; the current CLI
+    # reloads the large model for every sample." Load once here, reuse
+    # the same encoder/provenance for every sample in this run.
+    print(f"Loading GigaPath tile encoder (revision {args.tile_encoder_revision}) once for "
+          f"{len(ids)} sample(s)...", flush=True)
+    encoder, provenance = load_gigapath_tile_encoder_for_gen3(args.tile_encoder_revision, device=args.device)
     for index, sample_id in enumerate(ids, start=1):
         print(f"Gen3 spot-feature cache {index}/{len(ids)}: {sample_id}", flush=True)
         adata, patches, image_source_available = example_builder.load_sample_for_examples(
             manifest, sample_id,
         )
-        build_gen3_spot_feature_cache(
+        encode_gen3_spot_feature_cache(
             cfg, sample_id, np.asarray(adata.obs_names), patches, image_source_available,
-            tile_encoder_revision=args.tile_encoder_revision, device=args.device,
-            batch_size=args.batch_size,
+            encoder, provenance, device=args.device, batch_size=args.batch_size,
         )
 
 

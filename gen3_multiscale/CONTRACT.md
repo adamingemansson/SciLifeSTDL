@@ -4470,7 +4470,143 @@ fixes need undoing.
 
 **No 24-hour run has been started or will be auto-started.**
 
+## 46. Response to the twenty-first external Codex re-audit -- 3 contained fixes to the Step 6 boundaries before training begins
+
+Adam confirmed this round's Gen3 cache/provider + preflight gate are
+conceptually correct, but identified 3 contained issues that must be
+closed before Step 6's precomputed-feature interface and mandatory
+preflight invocation can be wired in. All 3 re-confirmed against the
+actual code before any fix.
+
+**Issue #1 (CONFIRMED real): the preflight gate could accept invalid
+provenance.** `require_consistent_tile_encoder_provenance({"a": {}, "b":
+{}})` passed silently -- two empty dicts "agree" with each other on
+every field being `None`. Separately, `expected_provenance` was
+optional, so every cache in an experiment could consistently agree on
+the WRONG revision without the gate ever noticing. Fixed
+(`gen3_multiscale/data/tile_encoder_preflight.py`):
+- Every entry is now checked for the 6 required fields, then run
+  through `slide_context.validate_tile_encoder_provenance` (real
+  syntactic validation, the same 6-field check `load_slide_context`/
+  `load_gen3_spot_features` already apply on load), BEFORE any pairwise
+  comparison.
+- `expected_provenance` is now a MANDATORY argument and must declare at
+  least `hf_revision` -- an omitted or empty `expected_provenance`
+  raises immediately.
+
+**Issue #2 (CONFIRMED real): the spot cache was not yet cleanly
+consumable.** `build_spatial_field_example` only accepted
+`image_feature_fn(patches)`, which receives neither barcodes nor
+aligned positions, so it could not safely slice
+`spot_feature_cache.load_gen3_spot_features`'s cached feature matrix.
+Fixed (`gen3_multiscale/data/example_builder.py`):
+- New keyword-only `precomputed_spot_features: np.ndarray | None`
+  parameter, `[adata.n_obs, feature_dim]`, aligned EXACTLY with
+  `adata.obs_names` (the same contract `load_gen3_spot_features`'s
+  `features` already returns). Mutually exclusive with
+  `image_feature_fn` -- exactly one of the two must be given, raises
+  otherwise.
+- When given, the function selects
+  `precomputed_spot_features[context_pos[available_pos]]` directly --
+  no encoder call, no `image_feature_fn` involved at all. This makes
+  "never invoke the frozen GigaPath tile encoder per training example"
+  (CONTRACT.md section 44) concrete rather than merely a documented
+  convention: the real trainer (Step 6) must use
+  `precomputed_spot_features`; `image_feature_fn` remains for tests/
+  smoke scripts with no precomputed cache to load.
+- Adversarial tests added, proving the leakage guarantee, not just
+  documenting it: changing `precomputed_spot_features` rows at QUERY
+  positions (never read -- query spots never appear in `context_pos`)
+  produces an IDENTICAL built example; changing a row at a spot whose
+  H&E physically overlaps the query hole (`observed_image_available=
+  False`) to a distinctive nonzero value ALSO produces an identical
+  (zeroed) `observed_gigapath_features` row for that spot -- proving
+  the "never leak an unavailable feature" guarantee `image_feature_fn`
+  already had extends correctly to the precomputed path.
+
+**Issue #3 (CONFIRMED real): several small cache-validation hardenings
+were missing.** All fixed in `gen3_multiscale/data/spot_feature_cache.py`:
+- Unavailable feature rows (`image_source_available=False`) are now
+  required to be exactly zero ON LOAD -- a hand-corrupted or tampered
+  cache with a real, nonzero value there is rejected, not silently
+  trusted.
+- `patch_content_sha256` now binds the encoded patches' real shape and
+  dtype, not just their raw bytes -- two arrays with identical
+  underlying bytes but a different shape/dtype view (e.g. a reshape)
+  previously hashed identically; matches
+  `src.training.train.get_gigapath_features`'s own `patch_fingerprint`
+  convention.
+- The tile encoder's per-batch output shape and finiteness are now
+  validated BEFORE being written into the features array, catching a
+  broken/mismatched encoder at the exact batch that produced bad
+  output rather than as a generic whole-array mismatch discovered
+  later.
+- `batch_size <= 0` is now rejected explicitly -- a negative batch size
+  previously made the encode loop's `range(...)` silently EMPTY,
+  leaving every available spot's feature row at its zero-initialized
+  default with no error raised at all.
+- Atomic writes now use a process-specific temporary filename
+  (`f"{path.name}.tmp.{os.getpid()}"`, matching
+  `dataset_manifest.py`'s own convention) instead of a plain
+  `.npz.tmp` suffix, which could collide if two processes ever built
+  the same sample's cache concurrently.
+- New `load_gigapath_tile_encoder_for_gen3` (loads the encoder +
+  provenance once) and `encode_gen3_spot_feature_cache` (encodes ONE
+  sample given an already-loaded encoder/provenance) let a caller
+  processing many samples load the ~1.1B-parameter tile encoder ONCE
+  and reuse it, instead of reloading it per sample.
+  `build_gen3_spot_feature_cache` is now a thin single-sample
+  convenience wrapper over these two. `scripts/precompute_gen3_spot_
+  features.py` updated to load once and reuse across its whole sample
+  loop -- proven, not just asserted, by a test that counts real calls
+  to `_load_gigapath_tile_encoder` across 3 samples and confirms
+  exactly 1.
+
+**Tests added:** 5 new `gen3_multiscale/tests/test_tile_encoder_
+preflight.py` tests (malformed entries rejected, an entry with a
+syntactically invalid field rejected, missing `expected_provenance` is
+a `TypeError`, empty `expected_provenance` rejected, `expected_
+provenance` missing `hf_revision` rejected); 6 new `gen3_multiscale/
+tests/test_spot_feature_cache.py` tests (non-positive batch_size,
+malformed/non-finite encoder output, load-once-reuse call-counting,
+nonzero-row-for-unavailable-spot rejected on load, `patch_content_
+sha256` shape/dtype sensitivity); 5 new `gen3_multiscale/tests/
+test_example_builder.py` tests (mutual-exclusivity, precomputed-vs-
+image_feature_fn output equality, the two adversarial leakage-guard
+tests described above, malformed `precomputed_spot_features` shapes/
+finiteness).
+
+**Explicitly still open, per Adam's own stated order:** the two
+independent hardware gates (build and validate one real dense cache
+with a pinned revision; run the A100 LongNet/Architecture 3/4 smoke)
+still require real GPU/HuggingFace/checkpoint access this sandbox does
+not have -- Adam confirmed these may proceed now, since they are
+independent of this round's 3 fixes. After both pass, Step 6 should
+begin with the precomputed-feature interface and mandatory preflight
+invocation wired in (both closed this round) -- not directly with the
+training loop. No previous fixes need undoing.
+
+**No 24-hour run has been started or will be auto-started.**
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 551 passed (45 reused-infra + 27 example-schema +
+  11 boundary-graph + 36 slide-context + 9 slide-encoder + 2 debug-plot +
+  18 transport-head + 10 tokens + 16 attention + 10 global-context +
+  7 harmonic + 7 geometry-utils + 9 backbone + 31 architectures +
+  9 gene-basis + 11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  27 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 17 dataset-manifest + 31 example-builder +
+  46 mask-fingerprint + 22 novae-graph + 4 loaders + 17 spot-feature-cache
+  + 12 tile-encoder-preflight)
+gen2_architectures + gen3_multiscale: 724 passed, 1 skipped
+(repo-root tests/test_conditioning.py: 13 passed, unchanged this round)
+```
+
+The block immediately below (pre-21st-re-audit test counts) is kept for
+historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 535 passed (45 reused-infra + 27 example-schema +

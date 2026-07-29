@@ -170,7 +170,7 @@ def build_spatial_field_example(
     patches: np.ndarray,
     context_barcodes: list[str],
     query_barcodes: list[str],
-    image_feature_fn: Callable[[np.ndarray], np.ndarray],
+    image_feature_fn: Callable[[np.ndarray], np.ndarray] | None = None,
     *,
     sample_id: str,
     patient_id: str,
@@ -185,19 +185,38 @@ def build_spatial_field_example(
     slide_context: dict | None = None,
     image_mode: str = "target_zero",
     image_source_available: np.ndarray | None = None,
+    precomputed_spot_features: np.ndarray | None = None,
 ) -> tuple[SpatialFieldInputs, SpatialFieldTargets]:
     """Build one real SpatialFieldInputs/SpatialFieldTargets pair from
     one realized (context, query) barcode split.
 
     `adata`/`patches` must already be QC'd, gene-panel-aligned, and
     barcode-aligned to each other (load_sample_for_examples's contract).
-    `image_feature_fn` computes per-spot image features from raw patches
-    (e.g. the real GigaPath tile encoder) -- injected rather than called
-    directly here, so this module has no hard dependency on a real
-    GigaPath checkpoint and is fully testable with a cheap stub, matching
-    every other pluggable-feature-function pattern already established
-    in this codebase (models/slide_encoder.py, gen2_architectures'
-    context_features.py).
+
+    EXACTLY ONE of `image_feature_fn` or `precomputed_spot_features` must
+    be given -- mutually exclusive, never both, never neither (21st
+    Codex re-audit, Step 5/6 boundary #2, CONFIRMED real: "the spot
+    cache is not yet cleanly consumable -- build_spatial_field_example()
+    still receives image_feature_fn(patches). That callback receives
+    neither barcodes nor aligned positions, so it cannot safely slice
+    the newly cached feature matrix"). `image_feature_fn` computes
+    per-spot image features from raw patches (e.g. a real GigaPath
+    forward pass) -- injected rather than called directly here, so this
+    module has no hard dependency on a real GigaPath checkpoint and is
+    fully testable with a cheap stub, matching every other pluggable-
+    feature-function pattern already established in this codebase
+    (models/slide_encoder.py, gen2_architectures' context_features.py).
+    `precomputed_spot_features` is a `[adata.n_obs, feature_dim]` array
+    aligned EXACTLY with `adata.obs_names` (the same row order/contract
+    `spot_feature_cache.load_gen3_spot_features` already returns its
+    `features` in) -- the production path: this function selects
+    `precomputed_spot_features[context_pos[available_pos]]` directly,
+    never calling any encoder, satisfying "never invoke the frozen
+    GigaPath tile encoder per training example" (CONTRACT.md section 44)
+    concretely rather than merely by convention. The real trainer (Step
+    6) must use `precomputed_spot_features`, never `image_feature_fn` --
+    `image_feature_fn` remains for tests/smoke scripts that have no
+    precomputed cache to load.
 
     `full_sample_coords` (default: this example's own observed+query
     union) lets a caller pass the sample's COMPLETE coordinate lattice
@@ -341,6 +360,30 @@ def build_spatial_field_example(
                 f"expected ({adata.n_obs},) aligned with adata/patches"
             )
 
+    # 21st Codex re-audit, Step 5/6 boundary #2, CONFIRMED real: the
+    # production path needs a way to slice a precomputed, barcode-
+    # aligned feature matrix directly -- image_feature_fn only ever
+    # receives raw pixel patches, never barcodes or absolute positions,
+    # so it cannot safely index into spot_feature_cache's cached array.
+    # Mutually exclusive with image_feature_fn: never both (ambiguous
+    # which one is authoritative), never neither (nothing would ever
+    # populate observed_gigapath_features).
+    if (image_feature_fn is None) == (precomputed_spot_features is None):
+        raise ValueError(
+            f"{sample_id}: exactly one of image_feature_fn or precomputed_spot_features must be "
+            "given -- never both, never neither"
+        )
+    precomputed_spot_features_arr = None
+    if precomputed_spot_features is not None:
+        precomputed_spot_features_arr = np.asarray(precomputed_spot_features, dtype=np.float32)
+        if precomputed_spot_features_arr.ndim != 2 or precomputed_spot_features_arr.shape[0] != adata.n_obs:
+            raise ValueError(
+                f"{sample_id}: precomputed_spot_features must be [N, feature_dim] aligned with "
+                f"adata.obs_names ({adata.n_obs} rows), got shape {precomputed_spot_features_arr.shape}"
+            )
+        if not np.isfinite(precomputed_spot_features_arr).all():
+            raise ValueError(f"{sample_id}: precomputed_spot_features contains non-finite values")
+
     all_coords = np.asarray(adata.obsm["spatial"], dtype=np.float64)
     if all_coords.ndim != 2 or all_coords.shape[1] != 2:
         raise ValueError(f"{sample_id}: adata.obsm['spatial'] must be [N, 2], got shape {all_coords.shape}")
@@ -483,13 +526,27 @@ def build_spatial_field_example(
     observed_full_gene_expression = np.asarray(X[context_pos], dtype=np.float32)
     query_expression = np.asarray(X[query_pos], dtype=np.float32)
 
-    # Only feed AVAILABLE patches to image_feature_fn -- a spot whose H&E
-    # overlaps the synthetic hole models a REAL deployment scenario where
-    # that patch would not exist; its real (undamaged, in this training
-    # setup) pixels must never reach the encoder just because they
-    # happen to still be present on disk.
+    # Only feed AVAILABLE patches/rows to image_feature_fn/
+    # precomputed_spot_features -- a spot whose H&E overlaps the
+    # synthetic hole models a REAL deployment scenario where that patch
+    # would not exist; its real (undamaged, in this training setup)
+    # pixels/cached feature must never reach the model just because they
+    # happen to still be present on disk/in the cache.
     available_pos = np.flatnonzero(observed_image_available)
-    if available_pos.size > 0:
+    if precomputed_spot_features_arr is not None:
+        # Production path: a direct slice into a barcode-aligned,
+        # already-encoded feature matrix -- no encoder call of any kind.
+        # `context_pos[available_pos]` are absolute row indices into
+        # `adata`/`patches`/`precomputed_spot_features_arr`'s SHARED
+        # alignment (all three are row-aligned to adata.obs_names), so
+        # this selects exactly the same physical spots image_feature_fn
+        # would otherwise have been asked to encode from raw pixels --
+        # never a query-spot row (query spots never appear in
+        # context_pos) and never an unavailable spot's row (excluded by
+        # available_pos).
+        computed_features = precomputed_spot_features_arr[context_pos[available_pos]]
+        feature_width = precomputed_spot_features_arr.shape[1]
+    elif available_pos.size > 0:
         computed_features = np.asarray(image_feature_fn(patches[context_pos[available_pos]]), dtype=np.float32)
         if computed_features.ndim != 2:
             raise ValueError(
@@ -515,8 +572,9 @@ def build_spatial_field_example(
         )
     if expected_feature_width is not None and feature_width != expected_feature_width:
         raise ValueError(
-            f"{sample_id}: image_feature_fn returned feature width {feature_width}, expected "
-            f"{expected_feature_width}"
+            f"{sample_id}: image feature width {feature_width} (from "
+            f"{'precomputed_spot_features' if precomputed_spot_features_arr is not None else 'image_feature_fn'}), "
+            f"expected {expected_feature_width}"
         )
     observed_gigapath_features = np.zeros((context_pos.shape[0], feature_width), dtype=np.float32)
     observed_gigapath_features[available_pos] = computed_features
