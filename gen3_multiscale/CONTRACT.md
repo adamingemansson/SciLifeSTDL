@@ -5533,7 +5533,318 @@ here") -- unchanged by this round's work. Every other adversarial
 scenario requested was exercised for real, including the closely related
 `use_regional_he=True` dense-WSI path, which needs no external package.
 
+## 52. Response to the Codex re-audit of commit 90f853e -- 11 fixes before hardware testing, plus adversarial tests and staged A100 commands
+
+Adam forwarded a re-audit of commit `90f853e` (the previous round's own
+response). Verdict: "the Architecture 4 predictive-flow correction is
+genuine, and no new query-GEX, coordinate, or masked-H&E leakage was
+found. Do not start the long runs yet." 11 mandatory fixes followed,
+plus a request for 10 specific adversarial tests and exact staged A100
+commands. Every one of the 11 items was verified against the real code
+before being fixed; all 11 were confirmed real. **No 24-hour run has
+been started.**
+
+**#1 -- immutable, uniquely-named checkpoint bundles.** Confirmed real:
+`checkpoint.py`'s prior scheme named history bundles by step alone
+(`history/step_XXXXXXXX/`), `shutil.rmtree`'d an existing same-named
+bundle before replacing it, and pruned old bundles BEFORE the pointer
+was updated -- both are crash-safety holes (a crash mid-delete-then-
+replace could leave the pointer referencing a bundle a crash had just
+deleted; a crash between pruning and the pointer update could leave the
+pointer referencing a bundle pruning had just deleted). Rewrote
+`checkpoint.py`: every bundle directory name now embeds a fresh, unique
+id (`step_XXXXXXXX__<time_ns>_<pid>_<seq>`), so `save_checkpoint` NEVER
+deletes or overwrites an existing directory -- two saves at the same
+step simply produce two bundles, and `_latest_bundle_for_step` resolves
+to the most recently written one. The pointer (`latest_bundle.json`,
+renamed from `latest_step.json`) is written and fsync'd BEFORE pruning
+runs, and pruning is told explicitly which bundle to protect. Every file
+in a staging bundle (and the bundle's own directory entry, and the
+pointer's parent directory) is best-effort fsync'd before being
+considered durable.
+
+**#2 -- canonical `CheckpointIdentity`, never a root-mirror hash.**
+Confirmed real: `maybe_load_pretrained_conditioner_for_architecture4`
+and `fit_architecture4_residual_basis.py` both hashed
+`checkpoint_dir/trainable_weights.pt` directly -- a ROOT convenience
+mirror that could disagree with the real bundle after a crash between
+the two. New `resolve_checkpoint_identity(checkpoint_dir) ->
+CheckpointIdentity` (`resolved_dir`, `step`, `bundle_dir`,
+`manifest_sha256`, `weights_sha256`) always resolves through the
+VERIFIED bundle first; both call sites (and `checkpoint_load_refuses_a_
+bundle_file_corrupted_after_writing`'s test helper) now use it
+exclusively.
+
+**#3 -- mandatory basis provenance sidecar for every non-smoke run.**
+Confirmed real: the sidecar was optional and silently skipped any
+missing field. `maybe_load_gene_basis` now REQUIRES the sidecar (a plain
+`--smoke` stays exempt), and requires every field present: exact-equality
+checks for `dataset_manifest_fingerprint`/`gene_panel_hash` (a directly
+comparable "current" value exists), presence-only checks for
+`architecture3_config_fingerprint`/`mask_schedule_reports` (they describe
+the DIFFERENT Architecture 3 run the basis was fit from, with no
+comparable "current" value from an Architecture 4 run's perspective),
+and the conditioner checkpoint's identity via `resolve_checkpoint_
+identity(...).weights_sha256`.
+
+**#4 -- fail-closed best/latest evaluation.**
+Confirmed real: `use_best=True` silently fell back to the latest
+checkpoint when `best/` was missing, and evaluating the latest checkpoint
+directly never compared its run manifest against the evaluation dataset
+at all. `evaluate_gen3_checkpoint` now raises if `use_best=True` and no
+real `best/` bundle exists; the `use_best=False` path requires and
+verifies `checkpoint_dir/run_manifest.json` via a new
+`verify_checkpoint_run_manifest_against_evaluation` (config/dataset/
+gene-panel/architecture/synchronized-init/conditioner/basis identity, all
+required present) before any weights load.
+
+**#5 -- real per-sample cache CONTENT identity, not just encoder
+provenance.** Confirmed real: `gen3_preflight.py`'s coverage/provenance
+checks only compared the tile ENCODER's own identity (repo/revision/
+weights sha256), which stays identical if a cache is validly rebuilt
+(same encoder, same real patches) but produces DIFFERENT numeric feature
+content -- and `cache_preflight_report` (which does carry the real,
+already-computed `precomputed_spot_features_digest`/`context_id` per
+sample) was never lifted into `_RESUME_CONSISTENCY_FIELDS` at all, so
+none of it was ever compared on resume. New
+`collect_sample_cache_content_identity`/`cache_content_fingerprint`
+(`gen3_preflight.py`) bind each sample's real spot-feature content sha256,
+barcode-order sha256, availability-mask sha256, and (when applicable)
+dense-WSI `context_id` into one deterministic fingerprint, lifted to
+`run_manifest["cache_content_fingerprint"]` and added to
+`_RESUME_CONSISTENCY_FIELDS`.
+
+**#6 -- common random numbers for Architecture 4 validation.** Confirmed
+real: `_run_validation`'s predictive-sampling generator was reseeded from
+`(seed, current_step)` -- every checkpoint therefore sampled DIFFERENT
+noise on the SAME held-out item, so best-checkpoint selection partly
+reflected Monte Carlo noise-draw luck rather than genuine model
+differences. Reseeded per validation ITEM INDEX instead (`val_loader` is
+`shuffle=False`, so the index names the same item at every call,
+independent of `current_step`); extracted into a new, directly unit-
+tested `common_random_validation_seed(seed, item_index)`.
+
+**#7 -- completed-step semantics fixed; no duplicate final save.**
+Confirmed real: the pre-increment `step` (used for validation/logging)
+and the post-increment `step` (used for periodic checkpoint saving)
+disagreed by one, so "step N" named two different real training states
+depending on which code path produced the label. `completed_steps =
+step + 1` is now computed once, immediately after `optimizer.step()`,
+and used uniformly for logging, validation, best-checkpoint labeling, and
+periodic-checkpoint labeling. The in-loop periodic save is skipped when
+`completed_steps == step_target` (the run's natural end), since the
+post-loop final save already covers that exact step with the correct
+`completion_reason`.
+
+**#8 -- real staged smoke wired into the launcher.** Confirmed real:
+`launch_suite`/`run_suite_with_smoke_gate` launched every config it was
+given CONCURRENTLY, including Architecture 4 -- structurally wrong, since
+Architecture 4's `required_fingerprints.architecture3_conditioner_
+checkpoint`/`gene_residual_basis` name a checkpoint/basis it must LOAD,
+never one it can race a freshly (re)started Architecture 3 job to
+produce. New `launch_staged_suite`: any config with `model.architecture
+== "4"` is pulled out of the concurrent group and launched alone, on its
+own originally-assigned GPU, only after the other configs' phase has
+fully finished AND its fingerprints are re-checked (the checkpoint/basis
+may not have existed when the call was first made). New
+`check_required_fingerprints(..., staged_smoke=...)` and
+`default_staged_smoke_command_builder` (adds `--staged-smoke`) so a
+staged-smoke phase genuinely exercises the real, checkpoint-loading path,
+not a relabeled construction-only smoke. `run_suite_with_smoke_gate`
+routes both phases through `launch_staged_suite` and merges the (possibly
+two-phase) result back into one `SuiteResult` per phase, so its external
+contract is unchanged for callers with no Architecture 4 config.
+
+**#9 -- evaluator completeness.** Confirmed real: `gene_panel_metrics`/
+`nonzero_auc`/the t-distribution machinery existed in `metrics.py` but
+were never wired into `gen3_evaluator.py`; there was no per-stratum
+breakdown, no per-item query/mask fingerprint, and no Architecture 4
+interval-coverage/calibration report; `aggregate_patient_metrics`'s CI
+used a fixed z=1.96 normal approximation regardless of `n_patients`.
+Fixed: `load_configured_gene_panels` resolves `evaluation.gene_panels`
+(name -> JSON path, `"genes"` key) into real gene lists;
+`per_panel_patient_aggregated_metrics`/`gene_panel_metadata` report them.
+`nonzero_auc` added to `per_item_reconstruction_metrics`.
+`per_stratum_patient_aggregated_metrics` groups the same patient-safe
+aggregation by `masking.strata` name. `Gen3SpatialFieldDataset.item_
+identity` gained `query_fingerprint` (sha256 of sample_id + sorted query
+barcodes), threaded into `per_item_records`. New
+`architecture4_calibration_summary`: pooled standardized residuals
+`z = (true - pred) / predictive_std` across every query spot/gene/item,
+reporting `z_mean`/`z_std`/`coverage_68`/`coverage_90`/`coverage_95`
+against the standard normal's own nominal intervals (`{"n_values": 0}`
+for Architectures 1-3, which report no `predictive_std`).
+`aggregate_patient_metrics`'s CI now uses `scipy.stats.t.ppf(0.975, df=
+n_patients-1)` instead of a fixed z=1.96 -- wider (more honest) at the
+small patient counts this evaluator realistically runs against,
+converging to the same value as `n_patients` grows.
+
+**#10 -- code state bound on resume, with an explicit override.**
+Confirmed real: `code_commit_hash` was recorded but never compared on
+resume (documented as "informational only"), and no worktree-diff
+identity existed at all. New `_worktree_diff_hash()` (sha256 of `git
+diff HEAD` + `git status --porcelain`); `code_worktree_diff_hash` added
+to the run manifest. `verify_resume_consistency` gained a dedicated
+code-state check (separate from the generic `_RESUME_CONSISTENCY_FIELDS`
+loop, since it needs its own override): a resume whose commit or
+worktree-diff hash changed since the last checkpoint now raises unless
+`allow_code_drift=True` is passed (`run_training(...,
+allow_code_drift=True)` / `--allow-code-drift`). The override is never a
+silent bypass -- `run_training` records whether it was actually NEEDED
+(not merely passed) into the new run manifest's `code_drift_acknowledged`
+field.
+
+**#11 -- bounded-memory residual accumulation.** Confirmed real:
+`compute_training_residuals` appended every item's residual array to a
+Python list, then `np.concatenate`d the whole thing -- two full copies of
+the full-gene residual matrix in RAM at the peak, for what can realistically
+be tens of thousands of rows against a ~17,000-gene panel. Rewritten to
+write each item's residual directly into a pre-sized, disk-backed
+`numpy.memmap` file (two passes over `train_dataset`: a cheap shape-only
+pass to size the file, then the real one running the model once per item
+exactly as before); `sklearn.utils.extmath.randomized_svd` (inside
+`fit_gene_residual_basis`) accepts the memmap directly, no special-casing
+needed. `fit_and_save_architecture4_basis` always removes the temp
+memmap file afterward, success or failure.
+
+**A real bug found (and fixed) BY writing the requested adversarial
+tests, not by inspection alone:** `save_checkpoint`'s root-mirror refresh
+tried `os.link` (a HARDLINK) before falling back to `shutil.copy2` on
+OSError. On any filesystem where hardlinking actually succeeds (the
+common same-filesystem POSIX case -- true in this sandbox), the root
+mirror and the canonical bundle file become the SAME inode: an in-place
+rewrite of the "disposable convenience mirror" (e.g. a corrupted-root-
+mirror adversarial test using `Path.write_bytes`, which truncates)
+silently corrupted the CANONICAL bundle too, defeating the "root is only
+ever a mirror" invariant this module's own docstring promises. Fixed:
+the root-mirror refresh now always does a REAL, independent
+`shutil.copy2`, never a hardlink. Caught by
+`test_root_mirror_disagreeing_with_the_canonical_bundle_is_ignored_by_
+every_real_loader`, written for the adversarial-test request below.
+
+A second real gap found while implementing the adversarial tests:
+`_resolve_checkpoint_source`'s per-file hash loop only checked files
+LISTED in a bundle's own `manifest.json` -- a file physically present in
+the bundle but OMITTED from that list (a bug, or tampering) would never
+be hash-checked at all, so a tampered-but-structurally-valid replacement
+for it would load silently. Fixed: `_resolve_checkpoint_source` now
+cross-checks the manifest's file list against the bundle's REAL
+directory contents first, refusing any bundle whose manifest does not
+fully account for what is actually there.
+
+**Adversarial tests requested and added** (all 10 items from Adam's
+list, across `test_checkpoint.py`, `test_launch_four_gpu_suite.py`,
+`test_gen3_evaluator.py`, and `test_a32051b_adversarial.py`):
+crash before pointer replacement (`test_crash_before_pointer_write_
+leaves_the_prior_checkpoint_fully_loadable`); crash after pointer
+replacement, before pruning, with `keep_last=1`
+(`test_crash_after_pointer_write_before_pruning_leaves_checkpoint_
+intact_with_keep_last_one`); repeated save of the same step
+(`test_repeated_save_at_the_same_step_is_handled_safely`); a manifest
+omitting a required file (`test_bundle_with_a_file_omitted_from_its_own_
+manifest_is_refused` -- the fix above); the root mirror disagreeing with
+the canonical bundle (`test_root_mirror_disagreeing_with_the_canonical_
+bundle_is_ignored_by_every_real_loader` -- the other fix above); missing
+basis provenance fields
+(`test_maybe_load_gene_basis_refuses_a_provenance_sidecar_missing_a_
+required_field`); the requested-best bundle absent
+(`test_evaluate_gen3_checkpoint_use_best_true_raises_when_best_bundle_
+is_absent`); a validly-regenerated cache with changed contents but
+identical encoder provenance
+(`test_resume_refuses_a_regenerated_spot_feature_cache_with_different_
+content_but_identical_provenance`); identical Architecture 4 validation
+seeds independent of training step
+(`test_common_random_validation_seed_is_independent_of_training_step`,
+plus a direct end-to-end architecture4-calibration test); and a staged
+Architecture 4 smoke loading the actual canonical Architecture 3 bundle
+(`test_staged_architecture4_smoke_loads_the_real_canonical_architecture3_
+bundle`, plus `launch_staged_suite`'s own 4 dedicated tests in
+`test_launch_four_gpu_suite.py`).
+
+**Staged A100 command sequence, exactly as requested (A-F), only run
+manually and never as part of implementation:**
+
+```
+# A) real staged smoke for Architectures 1-3 (construction-only, no
+#    trained checkpoint required):
+for n in 1 2 3; do
+  python -m gen3_multiscale.training.train \
+    --config gen3_multiscale/configs/architecture$n.yaml --smoke
+done
+
+# B) short overfit gates (a handful of real steps each, on a tiny
+#    hand-picked sample set -- confirms each architecture can actually
+#    learn before committing GPU-hours to it):
+for n in 1 2 3; do
+  python -m gen3_multiscale.scripts.step6_overfit_test \
+    --config gen3_multiscale/configs/architecture$n.yaml
+done
+
+# C) short diagnostic run (a few hundred steps, real data, to sanity-
+#    check loss curves/gradient norms/mask diversity before the long run):
+python -m gen3_multiscale.training.train \
+  --config gen3_multiscale/configs/architecture3.yaml   # total_steps overridden low in a copy of the config
+
+# D) Architecture 3 evaluation and basis fitting (REQUIRES a real,
+#    already-trained Architecture 3 checkpoint from B or C above):
+python -m gen3_multiscale.evaluation.gen3_evaluator \
+  --config gen3_multiscale/configs/architecture3.yaml \
+  --checkpoint-dir <architecture3_checkpoint_dir> --split validation
+python -m gen3_multiscale.scripts.fit_architecture4_residual_basis \
+  --config gen3_multiscale/configs/architecture3.yaml \
+  --architecture3-checkpoint-dir <architecture3_checkpoint_dir> \
+  --output-basis-path <gene_residual_basis.pt> \
+  --n-masks-per-sample 20 --rank 64
+
+# E) staged Architecture 4 smoke/overfit (REQUIRES D's real checkpoint +
+#    basis to already exist -- set required_fingerprints.
+#    architecture3_conditioner_checkpoint / gene_residual_basis in
+#    architecture4.yaml to D's real paths FIRST):
+python -m gen3_multiscale.training.train \
+  --config gen3_multiscale/configs/architecture4.yaml --smoke --staged-smoke
+python -m gen3_multiscale.scripts.step6_overfit_test \
+  --config gen3_multiscale/configs/architecture4.yaml
+
+# F) only THEN the long runs, staged via the launcher (Architecture 4
+#    launched only after Architectures 1-3 finish and its fingerprints
+#    are re-verified -- see launch_staged_suite, launch blocker #8):
+python -m gen3_multiscale.training.launch_four_gpu_suite \
+  --configs gen3_multiscale/configs/architecture{1,2,3,4}.yaml \
+  --gpus <gpu0> <gpu1> <gpu2> <gpu3> \
+  --log-root <log_root> --staged-smoke
+```
+
+Stages A-E are cheap, fast sanity gates; stage F is the only one that
+starts real 24-hour-scale training, and it was NOT run as part of this
+response -- Adam's own instruction ("do not start the long runs yet")
+and this session's standing constraint both apply.
+
 ## Test status as of this document
+
+```
+gen3_multiscale/tests/: 666 passed (23 hest1k-catalog + 5 gene-panel-compat
+  + 4 query-overlap-report + 27 example-schema + 11 boundary-graph +
+  36 slide-context + 9 slide-encoder + 2 debug-plot + 18 transport-head +
+  10 tokens + 16 attention + 10 global-context + 7 harmonic +
+  7 geometry-utils + 9 backbone + 31 architectures + 9 gene-basis +
+  11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  36 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 21 dataset-manifest + 31 example-builder +
+  46 mask-fingerprint + 22 novae-graph + 4 loaders + 17 spot-feature-cache
+  + 12 tile-encoder-preflight + 15 gen3-dataset + 10 gen3-preflight +
+  28 train + 8 step6-scripts + 17 gen3-evaluator +
+  7 fit-architecture4-residual-basis + 12 a32051b-adversarial +
+  18 checkpoint)
+gen2_architectures + gen3_multiscale: 839 passed, 1 skipped
+(repo-root tests/: 322 passed, 1 pre-existing unrelated failure --
+  tests/test_multi_sample.py::test_inject_multi_sample_n_genes, confirmed
+  failing identically before this round's changes; not touched by
+  anything in this round)
+```
+
+The block immediately below (pre-90f853e-audit-response test counts) is
+kept for historical continuity rather than deleted, per this document's
+append-only discipline:
 
 ```
 gen3_multiscale/tests/: 636 passed (23 hest1k-catalog + 5 gene-panel-compat

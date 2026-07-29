@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -41,33 +42,74 @@ from omegaconf import OmegaConf
 
 from gen3_multiscale.data.dataset_manifest import gene_panel_hash, load_dataset_manifest
 from gen3_multiscale.models.gene_basis import fit_gene_residual_basis, save_gene_residual_basis
+from gen3_multiscale.training import checkpoint as checkpoint_module
 from gen3_multiscale.training.gen3_dataset import Gen3SpatialFieldDataset, build_gen3_mask_schedule
 from gen3_multiscale.training.gen3_preflight import load_and_preflight_samples
 from gen3_multiscale.training.train import (
     build_model_for_inference, config_fingerprint, dataset_manifest_fingerprint,
-    expected_tile_encoder_provenance, file_sha256, resolved_config,
+    expected_tile_encoder_provenance, resolved_config,
 )
 
 
-def compute_training_residuals(architecture3_model: torch.nn.Module, train_dataset, device: torch.device) -> np.ndarray:
+def compute_training_residuals(
+    architecture3_model: torch.nn.Module, train_dataset, device: torch.device, *, memmap_path: str | Path,
+) -> np.memmap:
     """Real residuals -- `target_expression - Architecture3's own
     deterministic conditioner mean` -- over EVERY item currently in
     `train_dataset`. `train_dataset` is a real `Gen3SpatialFieldDataset`
     built with `role="train"`, so this never touches validation/test data
     by construction (Adam's "generate residuals on training samples
-    only")."""
+    only").
+
+    Codex re-audit of commit 90f853e, launch blocker #11: "Do not
+    accumulate all full-gene residuals in RAM for basis fitting; use a
+    bounded-memory method or disk-backed matrix." The prior version
+    appended every item's residual array to a Python list, then
+    `np.concatenate`d the whole thing -- for a real gene panel (tens of
+    thousands of genes) and hundreds/thousands of training masks, that
+    holds TWO full copies in process RAM simultaneously (the list of
+    chunks, plus the freshly concatenated array) at its peak. This
+    writes each item's residual directly into a pre-sized
+    `numpy.memmap`-backed file at `memmap_path` instead -- a real,
+    disk-backed matrix the OS pages in/out as needed, never fully
+    resident in process RAM at once. Two passes over `train_dataset` are
+    required (the per-item row count is not known ahead of time, since
+    hole size varies by stratum/draw): the FIRST is target-shape-only
+    (`targets.query_expression.shape`, no model forward pass, cheap);
+    the SECOND is the real one, running `architecture3_model` exactly
+    once per item exactly as before. The returned `np.memmap` is a real
+    `np.ndarray` subclass -- `fit_gene_residual_basis`'s
+    `sklearn.utils.extmath.randomized_svd` call accepts it directly, no
+    special-casing needed at the call site."""
+    if len(train_dataset) == 0:
+        raise ValueError("compute_training_residuals: train_dataset produced zero items")
+
+    row_counts = [np.asarray(train_dataset[idx][1].query_expression).shape[0] for idx in range(len(train_dataset))]
+    total_rows = int(sum(row_counts))
+    if total_rows == 0:
+        raise ValueError("compute_training_residuals: train_dataset produced zero residual rows")
+    n_genes = np.asarray(train_dataset[0][1].query_expression).shape[1]
+
+    memmap_path = Path(memmap_path)
+    memmap_path.parent.mkdir(parents=True, exist_ok=True)
+    residuals = np.lib.format.open_memmap(
+        memmap_path, mode="w+", dtype=np.float32, shape=(total_rows, n_genes),
+    )
     architecture3_model.eval()
-    residuals = []
     with torch.no_grad():
+        offset = 0
         for idx in range(len(train_dataset)):
             inputs, targets = train_dataset[idx]
             target_expression = torch.as_tensor(targets.query_expression, dtype=torch.float32, device=device)
             out = architecture3_model(inputs)
             residual = target_expression - torch.as_tensor(out["expression"], dtype=torch.float32, device=device)
-            residuals.append(residual.detach().cpu().numpy())
-    if not residuals:
-        raise ValueError("compute_training_residuals: train_dataset produced zero items")
-    return np.concatenate(residuals, axis=0).astype(np.float32)
+            n_rows = residual.shape[0]
+            residuals[offset:offset + n_rows] = residual.detach().cpu().numpy().astype(np.float32)
+            offset += n_rows
+    residuals.flush()
+    if not np.all(np.isfinite(residuals)):
+        raise ValueError("compute_training_residuals: computed residuals contain non-finite values")
+    return residuals
 
 
 def fit_and_save_architecture4_basis(
@@ -122,12 +164,27 @@ def fit_and_save_architecture4_basis(
         dataset_manifest=dataset_manifest,
     )
 
-    residuals = compute_training_residuals(architecture3_model, train_dataset, device)
-    basis = fit_gene_residual_basis(residuals, gene_names, rank=rank)
+    # Launch blocker #11: a real, disk-backed memmap file, not a Python
+    # list of chunks -- see compute_training_residuals's own docstring.
+    # Placed next to the output basis (same filesystem, so no surprise
+    # cross-device temp-dir space usage), and always removed afterward
+    # regardless of whether fitting succeeds.
+    memmap_path = Path(f"{output_basis_path}.residuals.tmp.{os.getpid()}.npy")
+    try:
+        residuals = compute_training_residuals(architecture3_model, train_dataset, device, memmap_path=memmap_path)
+        n_residual_rows = int(residuals.shape[0])
+        basis = fit_gene_residual_basis(residuals, gene_names, rank=rank)
+        del residuals  # drop the memmap reference before unlinking its backing file
+    finally:
+        memmap_path.unlink(missing_ok=True)
     saved_basis_path = save_gene_residual_basis(basis, output_basis_path)
 
-    weights_path = Path(architecture3_checkpoint_dir) / "trainable_weights.pt"
-    checkpoint_sha256 = file_sha256(weights_path) if weights_path.is_file() else None
+    # Codex re-audit of commit 90f853e, launch blocker #2: resolve
+    # through the SAME verified-bundle path `build_model_for_inference`
+    # above just loaded weights from -- never hash `architecture3_checkpoint_dir`'s
+    # root convenience-mirror file directly, which could disagree with
+    # the real bundle after a crash between the two.
+    checkpoint_sha256 = checkpoint_module.resolve_checkpoint_identity(architecture3_checkpoint_dir).weights_sha256
     provenance = {
         "version": 1,
         "kind": "gen3_architecture4_residual_basis_provenance",
@@ -140,7 +197,7 @@ def fit_and_save_architecture4_basis(
         "n_genes": len(gene_names),
         "train_sample_ids": sorted(train_ids),
         "n_masks_per_sample": int(n_masks_per_sample),
-        "n_residual_rows": int(residuals.shape[0]),
+        "n_residual_rows": n_residual_rows,
         "rank": basis.rank,
         "mask_schedule_reports": train_schedule.reports,
         "output_basis_path": str(saved_basis_path),

@@ -15,9 +15,12 @@ dataset construction both need it.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
+
+import numpy as np
 
 from gen3_multiscale.data.dataset_manifest import verify_metadata_csv_provenance
 from gen3_multiscale.data.tile_encoder_preflight import require_consistent_tile_encoder_provenance
@@ -81,6 +84,57 @@ def collect_sample_cache_provenance(sample: Gen3SampleData, *, require_dense_wsi
     return entries
 
 
+def collect_sample_cache_content_identity(sample: Gen3SampleData, *, require_dense_wsi: bool = True) -> dict:
+    """Codex re-audit of commit 90f853e, launch blocker #5: "Bind every
+    per-sample spot-feature and dense-WSI cache CONTENT digest, barcode
+    identity and availability identity into the run manifest, and
+    compare them on resume. Encoder provenance alone is insufficient" --
+    `require_consistent_tile_encoder_provenance` (used by
+    `load_and_preflight_samples` below) only checks the tile ENCODER's
+    own identity (repo/revision/weights sha256), which stays identical
+    if a cache is validly rebuilt (same encoder, same real H&E patches)
+    but produces DIFFERENT numeric feature content -- a non-deterministic
+    encoding bug, a corrupted rebuild, or an accidental wrong-sample
+    write would all pass provenance checks while silently changing what
+    the model actually trains/evaluates on. This binds the REAL,
+    already-verified content identity `Gen3SampleData` computed at load
+    time (`precomputed_spot_features_digest` -- sha256 of the verified
+    features array's own bytes -- plus the exact barcode order and
+    availability mask) so a resume can detect the cache changing under
+    it, not merely the encoder identity staying superficially the same.
+    """
+    barcodes = np.asarray(sample.precomputed_spot_features_barcodes, dtype=str)
+    availability = np.asarray(sample.image_source_available, dtype=bool)
+    identity = {
+        "spot_features_content_sha256": sample.precomputed_spot_features_digest,
+        "spot_features_barcodes_sha256": hashlib.sha256(
+            b"\x1f".join(b.encode("utf-8") for b in barcodes)
+        ).hexdigest(),
+        "spot_features_availability_sha256": hashlib.sha256(availability.tobytes()).hexdigest(),
+    }
+    if require_dense_wsi:
+        context_id = (sample.slide_context_record or {}).get("context_id")
+        if context_id is None:
+            raise ValueError(
+                f"{sample.sample_id}: no dense-WSI content identity (context_id) available -- is "
+                "data.slide_context_source configured to dense_wsi_cache for this experiment?"
+            )
+        identity["dense_wsi_context_id"] = str(context_id)
+    return identity
+
+
+def cache_content_fingerprint(content_identity_by_sample: dict[str, dict]) -> str:
+    """A single fingerprint over EVERY sample's real cache-content
+    identity (see `collect_sample_cache_content_identity`), deterministic
+    regardless of dict/sample iteration order -- this is what
+    `train.py::verify_resume_consistency` actually compares, so a
+    validly-regenerated-but-different cache for even one sample changes
+    this fingerprint and refuses the resume."""
+    return hashlib.sha256(
+        json.dumps(content_identity_by_sample, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
 def load_and_preflight_samples(
     cfg, manifest: dict, sample_ids: list[str], expected_tile_encoder_provenance: dict,
 ) -> tuple[dict[str, Gen3SampleData], dict]:
@@ -112,10 +166,14 @@ def load_and_preflight_samples(
 
     samples: dict[str, Gen3SampleData] = {}
     provenance_by_source: dict[str, dict] = {}
+    content_identity_by_sample: dict[str, dict] = {}
     for sample_id in sample_ids:
         sample = load_gen3_sample_data(cfg, manifest, sample_id)
         samples[sample_id] = sample
         provenance_by_source.update(collect_sample_cache_provenance(sample, require_dense_wsi=require_dense_wsi))
+        content_identity_by_sample[sample_id] = collect_sample_cache_content_identity(
+            sample, require_dense_wsi=require_dense_wsi,
+        )
 
     coverage = verify_cache_coverage(
         expected_cache_source_labels(sample_ids, require_dense_wsi=require_dense_wsi), provenance_by_source.keys(),
@@ -123,13 +181,19 @@ def load_and_preflight_samples(
     require_consistent_tile_encoder_provenance(provenance_by_source, expected_tile_encoder_provenance)
 
     report = {
-        "version": 1,
+        "version": 2,
         "kind": "gen3_step6_cache_preflight",
         "n_samples": len(sample_ids),
         "sample_ids": sorted(sample_ids),
         "cache_coverage": coverage,
         "tile_encoder_provenance_expected": expected_tile_encoder_provenance,
         "tile_encoder_provenance_reference": next(iter(provenance_by_source.values())),
+        # Launch blocker #5: real per-sample cache CONTENT identity
+        # (never merely encoder provenance), bound into a single
+        # deterministic fingerprint `train.py::build_run_manifest` lifts
+        # to the top level for `verify_resume_consistency` to compare.
+        "cache_content_by_sample": content_identity_by_sample,
+        "cache_content_fingerprint": cache_content_fingerprint(content_identity_by_sample),
         "passed": True,
     }
     return samples, report

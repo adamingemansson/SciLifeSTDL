@@ -361,18 +361,34 @@ class Gen3SpatialFieldDataset(torch.utils.data.Dataset):
         return len(self._items)
 
     def item_identity(self, idx: int) -> dict:
-        """`sample_id`/`stratum` for item `idx` in this FIXED, deterministic
-        schedule -- Adam's Step 6 audit #7 of commit a32051b: the
-        evaluator needs "sample/patient/mask/stratum identity" per
-        retained record, which the raw `(inputs, targets)` pair returned
-        by `__getitem__` doesn't carry (`patient_id` is on `inputs`
-        itself; `stratum` is schedule-level and train items already
-        carry it, so this exposes the same field for held-out items).
-        `stratum` is `None` for a schedule built before `_HeldOutMaskItem`
-        gained this field, or if the underlying mask bank record never
-        had one (defensive, not expected in real use)."""
+        """`sample_id`/`stratum`/`query_fingerprint` for item `idx` in this
+        FIXED, deterministic schedule -- Adam's Step 6 audit #7 of commit
+        a32051b: the evaluator needs "sample/patient/mask/stratum
+        identity" per retained record, which the raw `(inputs, targets)`
+        pair returned by `__getitem__` doesn't carry (`patient_id` is on
+        `inputs` itself; `stratum` is schedule-level and train items
+        already carry it, so this exposes the same field for held-out
+        items). `stratum` is `None` for a schedule built before
+        `_HeldOutMaskItem` gained this field, or if the underlying mask
+        bank record never had one (defensive, not expected in real use).
+
+        `query_fingerprint` (Codex re-audit of commit 90f853e, launch
+        blocker #9: "per-item query/mask fingerprint") -- sha256 of
+        `sample_id` plus the exact, sorted query barcode set THIS item
+        realized, via the same `_resolve_barcodes` `__getitem__` itself
+        calls to build the real example; a caller can use it to detect
+        two nominally-different items that happened to realize the
+        identical held-out mask, or to verify a report's items truly
+        match this dataset's own schedule."""
         item = self._items[idx % len(self._items)]
-        return {"sample_id": item.sample_id, "stratum": getattr(item, "stratum", None)}
+        _context_obs_names, query_obs_names = self._resolve_barcodes(item)
+        query_fingerprint = hashlib.sha256(
+            f"{item.sample_id}:{','.join(sorted(str(b) for b in query_obs_names))}".encode("utf-8")
+        ).hexdigest()
+        return {
+            "sample_id": item.sample_id, "stratum": getattr(item, "stratum", None),
+            "query_fingerprint": query_fingerprint,
+        }
 
     def _resolve_barcodes(self, item) -> tuple[list, list]:
         if isinstance(item, _TrainMaskItem):

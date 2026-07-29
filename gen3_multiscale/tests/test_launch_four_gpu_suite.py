@@ -18,8 +18,8 @@ from omegaconf import OmegaConf
 
 import gen3_multiscale.training.launch_four_gpu_suite as launch_four_gpu_suite_module
 from gen3_multiscale.training.launch_four_gpu_suite import (
-    check_required_fingerprints, default_command_builder, launch_suite, main, run_suite_with_smoke_gate,
-    static_config_audit,
+    check_required_fingerprints, default_command_builder, default_staged_smoke_command_builder,
+    launch_staged_suite, launch_suite, main, run_suite_with_smoke_gate, static_config_audit,
 )
 
 _CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
@@ -54,6 +54,24 @@ def _minimal_named_configs(n: int = 2) -> tuple[dict, dict]:
         name = f"cfg{i}"
         named_configs[name] = {"experiment_name": name, "shared_field": 1, "training": {"checkpoint_dir": f"/tmp/{name}"}}
         config_paths[name] = Path(f"/tmp/{name}.yaml")
+    return named_configs, config_paths
+
+
+def _named_configs_with_architecture4(tmp_path, n_others: int = 2) -> tuple[dict, dict]:
+    """Like `_minimal_named_configs`, plus one config whose
+    `model.architecture == "4"` -- the shape `launch_staged_suite` looks
+    for to decide what must be held out of the concurrent group."""
+    named_configs, config_paths = {}, {}
+    for i in range(n_others):
+        name = f"cfg{i}"
+        named_configs[name] = {"experiment_name": name, "shared_field": 1, "training": {"checkpoint_dir": str(tmp_path / name)}}
+        config_paths[name] = Path(f"/tmp/{name}.yaml")
+    named_configs["arch4"] = {
+        "experiment_name": "arch4", "shared_field": 1, "model": {"architecture": "4"},
+        "training": {"checkpoint_dir": str(tmp_path / "arch4")},
+        "required_fingerprints": {},
+    }
+    config_paths["arch4"] = Path("/tmp/arch4.yaml")
     return named_configs, config_paths
 
 
@@ -539,6 +557,104 @@ def test_smoke_gate_runs_the_full_suite_after_smoke_succeeds(tmp_path):
     assert full_result.ok is True
     assert "SMOKE=True" in (tmp_path / "smoke" / "cfg0.log").read_text()
     assert "SMOKE=False" in (tmp_path / "full" / "cfg0.log").read_text()
+
+
+# ---------------------------------------------------------------------------
+# launch_staged_suite -- Codex re-audit of commit 90f853e, launch blocker
+# #8: "Architecture 4 must run only after the selected Architecture 3
+# checkpoint and residual basis exist; it must not be launched
+# concurrently with the Architecture 3 run it depends on."
+# ---------------------------------------------------------------------------
+def test_launch_staged_suite_launches_architecture4_only_after_the_other_configs_finish(tmp_path):
+    order: list[str] = []
+
+    def _order_tracking_builder(config, config_path, smoke):
+        name = Path(config_path).stem
+        code = f"import time,sys; time.sleep(0.05); print({name!r}); sys.exit(0)"
+        return [sys.executable, "-c", code]
+
+    named_configs, config_paths = _named_configs_with_architecture4(tmp_path)
+    stage1_result, stage2_result = launch_staged_suite(
+        named_configs, config_paths, gpu_list=["0", "1", "2"], log_root=tmp_path,
+        command_builder=_order_tracking_builder, skip_fingerprint_check=True,
+    )
+    assert stage1_result.ok is True
+    assert {job.name for job in stage1_result.jobs} == {"cfg0", "cfg1"}
+    assert stage2_result is not None
+    assert stage2_result.ok is True
+    assert [job.name for job in stage2_result.jobs] == ["arch4"]
+    # Architecture 4's own log only exists in stage 2's directory,
+    # written strictly after stage 1's jobs (started together, in
+    # parallel, in stage 1) have both already exited.
+    assert (tmp_path / "architecture4" / "arch4.log").is_file()
+    assert not (tmp_path / "pre_architecture4" / "arch4.log").exists()
+
+
+def test_launch_staged_suite_never_launches_architecture4_when_its_prerequisites_are_missing_after_stage1(tmp_path):
+    named_configs, config_paths = _named_configs_with_architecture4(tmp_path)
+    named_configs["arch4"]["required_fingerprints"] = {"gene_residual_basis": str(tmp_path / "does_not_exist.pt")}
+    with pytest.raises(ValueError, match="missing required fingerprints"):
+        launch_staged_suite(
+            named_configs, config_paths, gpu_list=["0", "1", "2"], log_root=tmp_path,
+            command_builder=_stub_command_builder(), skip_fingerprint_check=False,
+        )
+
+
+def test_launch_staged_suite_stops_promotion_when_stage1_fails(tmp_path):
+    named_configs, config_paths = _named_configs_with_architecture4(tmp_path)
+    stage1_result, stage2_result = launch_staged_suite(
+        named_configs, config_paths, gpu_list=["0", "1", "2"], log_root=tmp_path,
+        command_builder=_stub_command_builder(fail_for=frozenset({"cfg1"})), skip_fingerprint_check=True,
+    )
+    assert stage1_result.ok is False
+    assert stage2_result is None
+    assert not (tmp_path / "architecture4").exists()  # Architecture 4 never even started
+
+
+def test_launch_staged_suite_degenerates_to_a_single_concurrent_stage_with_no_architecture4_present(tmp_path):
+    named_configs, config_paths = _minimal_named_configs(n=2)
+    stage1_result, stage2_result = launch_staged_suite(
+        named_configs, config_paths, gpu_list=["0", "1"], log_root=tmp_path,
+        command_builder=_stub_command_builder(),
+    )
+    assert stage2_result is None
+    assert {job.name for job in stage1_result.jobs} == {"cfg0", "cfg1"}
+    # No staging subdirectories -- log paths are IDENTICAL to plain launch_suite's.
+    assert (tmp_path / "cfg0.log").is_file()
+
+
+def test_default_staged_smoke_command_builder_adds_the_staged_smoke_flag_only_when_smoke():
+    command_smoke = default_staged_smoke_command_builder({}, Path("/tmp/architecture4.yaml"), smoke=True)
+    assert "--smoke" in command_smoke
+    assert "--staged-smoke" in command_smoke
+    command_full = default_staged_smoke_command_builder({}, Path("/tmp/architecture4.yaml"), smoke=False)
+    assert "--staged-smoke" not in command_full
+
+
+def test_check_required_fingerprints_staged_smoke_requires_the_conditioner_even_during_smoke_only(tmp_path):
+    config = {"model": {"architecture": "4"}, "required_fingerprints": {"gene_residual_basis": str(tmp_path / "b.pt")}}
+    (tmp_path / "b.pt").write_text("x")
+    # Plain smoke_only=True: conditioner NOT required (construction-only).
+    assert check_required_fingerprints(config, smoke_only=True) == []
+    # staged_smoke=True during a smoke_only phase: conditioner IS required.
+    missing = check_required_fingerprints(config, smoke_only=True, staged_smoke=True)
+    assert any("architecture3_conditioner_checkpoint" in entry for entry in missing)
+
+
+def test_run_suite_with_smoke_gate_stages_architecture4_in_both_phases(tmp_path):
+    named_configs, config_paths = _named_configs_with_architecture4(tmp_path)
+    smoke_result, full_result = run_suite_with_smoke_gate(
+        named_configs, config_paths, gpu_list=["0", "1", "2"], log_root=tmp_path,
+        command_builder=_stub_command_builder(), skip_fingerprint_check=True,
+    )
+    assert smoke_result.ok is True
+    assert {job.name for job in smoke_result.jobs} == {"cfg0", "cfg1", "arch4"}
+    assert full_result is not None
+    assert full_result.ok is True
+    assert {job.name for job in full_result.jobs} == {"cfg0", "cfg1", "arch4"}
+    # Architecture 4's full-phase log lives under its own staged
+    # subdirectory, proving it really ran as stage 2, not concurrently.
+    assert (tmp_path / "full" / "architecture4" / "arch4.log").is_file()
 
 
 # ---------------------------------------------------------------------------

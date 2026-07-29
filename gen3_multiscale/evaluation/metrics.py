@@ -32,7 +32,7 @@ from typing import Any
 
 import numpy as np
 from scipy import linalg
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr, t as _student_t
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +203,16 @@ def aggregate_patient_metrics(per_item_metrics: list[dict[str, float]], patient_
     number), n_patients, patient_ci95 (None with a reason when
     n_patients < 2, since a single patient carries no between-patient
     variance to estimate an interval from).
+
+    Codex re-audit of commit 90f853e, launch blocker #9 ("patient-level
+    paired bootstrap or t-based CIs"): the interval is a t-distribution
+    interval (`patient_means.std(ddof=1)/sqrt(n) * t.ppf(0.975, df=n-1)`),
+    not the previous fixed-z (1.96) normal approximation -- with the
+    small held-out patient counts this evaluator realistically runs
+    against, the normal approximation understates interval width; the
+    t-distribution's wider critical value at low degrees of freedom is
+    the honest correction and converges to the same 1.96 as n_patients
+    grows large.
     """
     if len(per_item_metrics) != len(patient_ids):
         raise ValueError("per_item_metrics and patient_ids must have the same length")
@@ -237,8 +247,9 @@ def aggregate_patient_metrics(per_item_metrics: list[dict[str, float]], patient_
         }
         if n_patients >= 2:
             se = float(patient_means_arr.std(ddof=1)) / np.sqrt(n_patients)
-            entry["patient_ci95_low"] = entry["patient_mean"] - 1.96 * se
-            entry["patient_ci95_high"] = entry["patient_mean"] + 1.96 * se
+            t_crit = float(_student_t.ppf(0.975, df=n_patients - 1))
+            entry["patient_ci95_low"] = entry["patient_mean"] - t_crit * se
+            entry["patient_ci95_high"] = entry["patient_mean"] + t_crit * se
             entry["ci_estimable"] = 1.0
         else:
             entry["patient_ci95_low"] = float("nan")

@@ -287,17 +287,18 @@ def test_run_training_requires_optimizer_state_to_resume_a_real_checkpoint(tmp_p
     missing optimizer_rng_state.pt must refuse to resume rather than
     silently restarting optimizer momentum/RNG state from scratch.
 
-    Adam's Step 6 audit #5 of commit a32051b made checkpoints
-    transactional: every real loader now resolves through
-    `latest_step.json` to the immutable `history/step_XXXXXXXX/` bundle,
-    never trusting `checkpoint_dir`'s root files directly (those are only
-    a convenience mirror). So corrupting/deleting a file from the ROOT
-    no longer simulates an incomplete checkpoint -- this test now deletes
-    the file from the actual immutable bundle the loader resolves to,
-    which correctly raises a fail-closed RuntimeError at
+    Every real loader resolves through `latest_bundle.json` to the
+    immutable, uniquely-named `history/step_XXXXXXXX__<bundle_id>/`
+    bundle, never trusting `checkpoint_dir`'s root files directly (those
+    are only a convenience mirror). So corrupting/deleting a file from
+    the ROOT no longer simulates an incomplete checkpoint -- this test
+    now deletes the file from the actual immutable bundle the loader
+    resolves to, which correctly raises a fail-closed RuntimeError at
     `_resolve_checkpoint_source` (the bundle's own manifest.json still
     references the now-missing file) before `run_training` even gets to
     its own optimizer-state check."""
+    from gen3_multiscale.training import checkpoint as checkpoint_module
+
     cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
     sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
     config_path = tmp_path / "config.yaml"
@@ -311,7 +312,9 @@ def test_run_training_requires_optimizer_state_to_resume_a_real_checkpoint(tmp_p
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
     train_module.run_training(str(config_path), smoke=False)
     assert (checkpoint_dir / "optimizer_rng_state.pt").is_file()
-    step_bundle_dir = checkpoint_dir / "history" / "step_00000001"
+    identity = checkpoint_module.resolve_checkpoint_identity(checkpoint_dir)
+    assert identity.step == 1
+    step_bundle_dir = identity.resolved_dir
     assert (step_bundle_dir / "optimizer_rng_state.pt").is_file()
     (step_bundle_dir / "optimizer_rng_state.pt").unlink()
 
@@ -319,6 +322,48 @@ def test_run_training_requires_optimizer_state_to_resume_a_real_checkpoint(tmp_p
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
     with pytest.raises(RuntimeError, match="optimizer_rng_state"):
         train_module.run_training(str(config_path), smoke=False)
+
+
+def test_run_training_refuses_resume_when_code_state_drifted_unless_explicitly_allowed(tmp_path, monkeypatch):
+    """Codex re-audit of commit 90f853e, launch blocker #10: "Bind code
+    state on resume: exact commit plus clean-worktree status/diff hash,
+    or require an explicit scientifically-visible override." This test
+    cannot actually change the real git commit/worktree mid-run, so it
+    simulates a genuine code-state drift the same way every other
+    resume-consistency test in this file simulates a config/dataset/
+    basis drift: mutating the PERSISTED run_manifest.json's own recorded
+    code_commit_hash directly, then resuming for real against it."""
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
+    config_path = tmp_path / "config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_code_drift"
+    _write_config(
+        cfg, manifest_path, config_path, architecture="1", checkpoint_dir=checkpoint_dir,
+        synchronized_init_dir=str(sync_dir),
+    )
+    config = yaml.safe_load(config_path.read_text())
+    config["training"]["total_steps"] = 1
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    train_module.run_training(str(config_path), smoke=False)
+
+    manifest_path_on_disk = checkpoint_dir / "run_manifest.json"
+    persisted = json.loads(manifest_path_on_disk.read_text())
+    assert persisted["code_commit_hash"] is not None  # this repo IS a real git checkout
+    assert persisted["code_drift_acknowledged"] is False
+    persisted["code_commit_hash"] = "deadbeef" * 5
+    manifest_path_on_disk.write_text(json.dumps(persisted, indent=2, sort_keys=True, default=str))
+
+    config["training"]["total_steps"] = 2
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    with pytest.raises(ValueError, match="code state changed"):
+        train_module.run_training(str(config_path), smoke=False)
+
+    # The explicit override resumes successfully AND is recorded, not
+    # silently applied.
+    summary = train_module.run_training(str(config_path), smoke=False, allow_code_drift=True)
+    assert summary["ok"] is True
+    resumed_manifest = json.loads(manifest_path_on_disk.read_text())
+    assert resumed_manifest["code_drift_acknowledged"] is True
 
 
 def test_run_training_validation_selection_metric_is_deterministic_across_repeated_calls(tmp_path, monkeypatch):
@@ -363,10 +408,15 @@ def test_run_training_saves_a_best_checkpoint_and_validation_history(tmp_path, m
         synchronized_init_dir=str(sync_dir),
     )
     config = yaml.safe_load(config_path.read_text())
-    # eval_every_n_steps is only ever checked for step > resume_step (a
-    # deliberate "don't immediately re-evaluate right after resume"
-    # skip), so total_steps=2 is needed for validation to actually fire
-    # at least once on a fresh (never-resumed) non-smoke run.
+    # Codex re-audit of commit 90f853e, launch blocker #7 (completed-step
+    # semantics): validation now fires whenever `completed_steps %
+    # eval_every_n_steps == 0`, using the count of REAL completed
+    # optimizer updates -- eval_every_n_steps=1 with total_steps=2
+    # therefore validates at BOTH completed steps 1 and 2 (the prior,
+    # pre-fix code additionally skipped the very first step via a
+    # `step > resume_step` guard needed only by its old, inconsistent
+    # pre-increment step labeling -- no longer needed or correct now
+    # that every label uses the post-increment completed-step count).
     config["training"]["total_steps"] = 2
     config["training"]["eval_every_n_steps"] = 1
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
@@ -374,9 +424,74 @@ def test_run_training_saves_a_best_checkpoint_and_validation_history(tmp_path, m
 
     assert (checkpoint_dir / "validation_history.json").is_file()
     history = json.loads((checkpoint_dir / "validation_history.json").read_text())
-    assert len(history) == 1
+    assert len(history) == 2
+    assert [entry["step"] for entry in history] == [1, 2]
     assert (checkpoint_dir / "best" / "trainable_weights.pt").is_file()
     assert (checkpoint_dir / "best" / "best_info.json").is_file()
+
+
+def test_run_training_does_not_duplicate_save_when_total_steps_coincides_with_checkpoint_interval(tmp_path, monkeypatch):
+    """Codex re-audit of commit 90f853e, launch blocker #1/#7: "The
+    trainer also saves the final step twice when it coincides with the
+    checkpoint interval." Confirmed real: the in-loop periodic save and
+    the post-loop final save both used to fire, unconditionally, at the
+    SAME step whenever total_steps was itself a multiple of
+    checkpoint_every_n_steps. With the fix, exactly ONE history bundle
+    exists at that step, and it carries the REAL final completion_reason
+    (not periodic saving's own hardcoded "in_progress"), proving the
+    surviving save is the post-loop one, not merely a coincidental single
+    survivor of two identical saves."""
+    from gen3_multiscale.training import checkpoint as checkpoint_module
+
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
+    config_path = tmp_path / "config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_no_dup_final_save"
+    _write_config(
+        cfg, manifest_path, config_path, architecture="1", checkpoint_dir=checkpoint_dir,
+        synchronized_init_dir=str(sync_dir), checkpoint_every_n_steps=2,
+    )
+    config = yaml.safe_load(config_path.read_text())
+    config["training"]["total_steps"] = 2  # exactly coincides with checkpoint_every_n_steps=2
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    summary = train_module.run_training(str(config_path), smoke=False)
+    assert summary["final_step"] == 2
+    assert summary["completion_reason"] == "completed_total_steps"
+
+    bundles_at_final_step = [name for step, name in checkpoint_module.list_checkpoint_bundles(checkpoint_dir) if step == 2]
+    assert len(bundles_at_final_step) == 1, f"expected exactly one bundle at step 2, got {bundles_at_final_step}"
+    training_state = json.loads((checkpoint_dir / "history" / bundles_at_final_step[0] / "training_state.json").read_text())
+    assert training_state["completion_reason"] == "completed_total_steps"
+
+
+def test_run_training_validation_and_checkpoint_labels_agree_on_the_same_completed_step(tmp_path, monkeypatch):
+    """Codex re-audit of commit 90f853e, launch blocker #7: validation/
+    best-checkpoint-selection and periodic-checkpoint-saving used to
+    label the SAME real model state with DIFFERENT step numbers (a
+    pre-increment vs post-increment mismatch) -- "step 2000" could mean
+    two different actual amounts of training depending on which code
+    path produced the label. With the fix, a validation entry and a
+    checkpoint saved at the SAME `completed_steps` value describe the
+    IDENTICAL model state: the trainable weights saved at that step
+    reproduce the exact validation loss recorded for that same step."""
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
+    config_path = tmp_path / "config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_label_agreement"
+    _write_config(
+        cfg, manifest_path, config_path, architecture="1", checkpoint_dir=checkpoint_dir,
+        synchronized_init_dir=str(sync_dir), checkpoint_every_n_steps=1,
+    )
+    config = yaml.safe_load(config_path.read_text())
+    config["training"]["total_steps"] = 1
+    config["training"]["eval_every_n_steps"] = 1
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    train_module.run_training(str(config_path), smoke=False)
+
+    history = json.loads((checkpoint_dir / "validation_history.json").read_text())
+    assert [entry["step"] for entry in history] == [1]
+    training_state = json.loads((checkpoint_dir / "training_state.json").read_text())
+    assert training_state["step"] == 1
 
 
 def test_validate_numeric_config_rejects_a_non_positive_learning_rate():

@@ -82,6 +82,62 @@ def test_fit_and_save_architecture4_basis_produces_a_real_basis_with_provenance(
     assert basis.n_genes == len(manifest["gene_panel"])
 
 
+def test_fit_and_save_architecture4_basis_leaves_no_residual_memmap_file_behind(tmp_path, monkeypatch):
+    """Codex re-audit of commit 90f853e, launch blocker #11: residuals
+    are now written to a real, disk-backed `numpy.memmap` file rather
+    than accumulated in a Python list -- that temp file must be cleaned
+    up after fitting completes, not left behind next to the real basis
+    output."""
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    arch3_config_path, arch3_checkpoint_dir = _train_a_real_architecture3_checkpoint(tmp_path, cfg, manifest, manifest_path)
+
+    output_basis_path = tmp_path / "gene_residual_basis.pt"
+    fit_and_save_architecture4_basis(
+        str(arch3_config_path), str(arch3_checkpoint_dir), str(output_basis_path), n_masks_per_sample=2, rank=4,
+    )
+    leftover = list(tmp_path.glob("*.residuals.tmp.*"))
+    assert leftover == []
+
+
+def test_compute_training_residuals_writes_a_real_disk_backed_memmap(tmp_path, monkeypatch):
+    import numpy as np
+
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    arch3_config_path, arch3_checkpoint_dir = _train_a_real_architecture3_checkpoint(tmp_path, cfg, manifest, manifest_path)
+
+    from omegaconf import OmegaConf
+
+    from gen3_multiscale.training.gen3_preflight import load_and_preflight_samples
+    from gen3_multiscale.training.train import build_model_for_inference, expected_tile_encoder_provenance, resolved_config
+
+    config = resolved_config(str(arch3_config_path))
+    dataset_manifest = manifest
+    train_ids = list(dataset_manifest["train_sample_ids"])
+    cfg_om = OmegaConf.create(config)
+    expected_provenance = expected_tile_encoder_provenance(config)
+    samples, _report = load_and_preflight_samples(cfg_om, dataset_manifest, train_ids, expected_provenance)
+    strata = config["masking"]["strata"]
+    schedule = build_gen3_mask_schedule(dataset_manifest, samples, strata, role="train", n_training_masks_per_sample=2)
+    train_dataset = Gen3SpatialFieldDataset(dataset_manifest, samples, schedule, strata)
+    gene_names = list(dataset_manifest["gene_panel"])
+    model, _info = build_model_for_inference(
+        config, gene_names=gene_names, device=torch.device("cpu"), checkpoint_dir=arch3_checkpoint_dir, smoke=False,
+        dataset_manifest=dataset_manifest,
+    )
+
+    memmap_path = tmp_path / "residuals_test.npy"
+    residuals = compute_training_residuals(model, train_dataset, torch.device("cpu"), memmap_path=memmap_path)
+    assert isinstance(residuals, np.memmap)
+    assert memmap_path.is_file()
+    assert residuals.shape[0] > 0
+    assert residuals.shape[1] == len(gene_names)
+    # The file on disk really holds the same data the in-memory memmap
+    # view reports -- proof this is genuinely disk-backed, not merely an
+    # in-RAM array wearing a memmap's type.
+    reloaded = np.load(memmap_path, mmap_mode="r")
+    assert np.array_equal(np.asarray(reloaded), np.asarray(residuals))
+
+
 def test_fit_and_save_architecture4_basis_rejects_a_non_architecture3_config(tmp_path, monkeypatch):
     cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
     config_path = tmp_path / "config.yaml"

@@ -147,7 +147,7 @@ def static_config_audit(named_configs: dict[str, dict]) -> dict:
     }
 
 
-def check_required_fingerprints(config: dict, *, smoke_only: bool = False) -> list[str]:
+def check_required_fingerprints(config: dict, *, smoke_only: bool = False, staged_smoke: bool = False) -> list[str]:
     """"Refuse to start if any required checkpoint, vocabulary, cache,
     split, or mask-bank fingerprint is absent." A config declares its
     candidate paths under `required_fingerprints: {name: path}`; this
@@ -201,7 +201,12 @@ def check_required_fingerprints(config: dict, *, smoke_only: bool = False) -> li
         needed.add("gigapath_checkpoint")
     if architecture_id == "4":
         needed.add("gene_residual_basis")
-        if not smoke_only:
+        # Codex re-audit of commit 90f853e, launch blocker #8: a REAL
+        # staged smoke (`train.py --smoke --staged-smoke`) requires
+        # Architecture 4's real conditioner checkpoint exactly like a
+        # non-smoke run (`require_for_smoke=staged_smoke` there) -- a
+        # plain construction-only `--smoke` is the only case exempt.
+        if not smoke_only or staged_smoke:
             needed.add("architecture3_conditioner_checkpoint")
 
     missing = []
@@ -221,6 +226,21 @@ def default_command_builder(config: dict, config_path: Path, smoke: bool) -> lis
     command = [sys.executable, "-m", "gen3_multiscale.training.train", "--config", str(config_path)]
     if smoke:
         command.append("--smoke")
+    return command
+
+
+def default_staged_smoke_command_builder(config: dict, config_path: Path, smoke: bool) -> list[str]:
+    """Same contract as `default_command_builder`, plus `--staged-smoke`
+    whenever `smoke` is True. Codex re-audit of commit 90f853e, launch
+    blocker #8: a plain `--smoke` (what `default_command_builder` alone
+    produces) is construction-only and never loads Architecture 4's real
+    conditioner checkpoint -- exercising the REAL staged smoke this audit
+    asked for requires `--staged-smoke` too, so `launch_staged_suite`'s
+    Architecture 4 stage uses THIS builder (never the plain one) whenever
+    its caller asks for `staged_smoke=True`."""
+    command = default_command_builder(config, config_path, smoke)
+    if smoke:
+        command.append("--staged-smoke")
     return command
 
 
@@ -356,6 +376,7 @@ def launch_suite(
     smoke_only: bool = False,
     command_builder: Callable[[dict, Path, bool], list[str]] = default_command_builder,
     skip_fingerprint_check: bool = False,
+    skip_config_audit: bool = False,
 ) -> SuiteResult:
     """Launch one subprocess per config, each pinned to its own GPU via
     `CUDA_VISIBLE_DEVICES` and with CPU-thread env vars capped to
@@ -387,9 +408,10 @@ def launch_suite(
     if threads_per_job <= 0:
         raise ValueError(f"threads_per_job must be positive, got {threads_per_job}")
 
-    audit = static_config_audit(named_configs)
-    if not audit["ok"]:
-        raise ValueError(f"static config audit failed -- undocumented divergence in shared fields: {audit['violations']}")
+    if not skip_config_audit:
+        audit = static_config_audit(named_configs)
+        if not audit["ok"]:
+            raise ValueError(f"static config audit failed -- undocumented divergence in shared fields: {audit['violations']}")
 
     if not skip_fingerprint_check:
         for name, cfg in named_configs.items():
@@ -466,6 +488,145 @@ def launch_suite(
     return SuiteResult(ok=ok, smoke_only=smoke_only, jobs=jobs, summary_path=str(summary_path))
 
 
+def _combine_suite_results(smoke_only: bool, log_root: Path, results: list[SuiteResult | None]) -> SuiteResult:
+    """Merge one or two sequential-phase `SuiteResult`s (see
+    `launch_staged_suite`) into a single result with the combined job
+    list -- so `run_suite_with_smoke_gate`'s external `(SuiteResult,
+    SuiteResult | None)` contract stays exactly as it was before staging
+    existed, regardless of whether Architecture 4 caused an extra
+    internal phase."""
+    present = [r for r in results if r is not None]
+    jobs = [job for r in present for job in r.jobs]
+    ok = all(r.ok for r in present)
+    log_root = Path(log_root)
+    log_root.mkdir(parents=True, exist_ok=True)
+    summary = {"ok": ok, "smoke_only": smoke_only, "jobs": [asdict(job) for job in jobs], "staged": len(present) > 1}
+    summary_path = log_root / "suite_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2))
+    return SuiteResult(ok=ok, smoke_only=smoke_only, jobs=jobs, summary_path=str(summary_path))
+
+
+def launch_staged_suite(
+    named_configs: dict[str, dict],
+    config_paths: dict[str, Path],
+    gpu_list: list[str],
+    log_root: Path,
+    threads_per_job: int = 4,
+    smoke_only: bool = False,
+    staged_smoke: bool = False,
+    command_builder: Callable[[dict, Path, bool], list[str]] = default_command_builder,
+    architecture4_command_builder: Callable[[dict, Path, bool], list[str]] | None = None,
+    skip_fingerprint_check: bool = False,
+) -> tuple[SuiteResult, SuiteResult | None]:
+    """Codex re-audit of commit 90f853e, launch blocker #8: "Wire real
+    staged smoke into the launcher. Architecture 4 must run only after
+    the selected Architecture 3 checkpoint and residual basis exist; it
+    must not be launched concurrently with the Architecture 3 run it
+    depends on." `launch_suite` (above) launches every config it is
+    given CONCURRENTLY -- correct for Architectures 1-3, which train
+    from scratch independently, but structurally wrong for Architecture
+    4: its `required_fingerprints.architecture3_conditioner_checkpoint`/
+    `gene_residual_basis` name a checkpoint/basis Architecture 4 must
+    LOAD, never one it can race a freshly (re)started Architecture 3 job
+    to produce in the same launch.
+
+    Any config in `named_configs` with `model.architecture == "4"`
+    (matched by content, never by dict key) is pulled OUT of the
+    concurrent stage-1 group and launched alone, on its own originally-
+    assigned GPU, as stage 2 -- started only after stage 1 has fully
+    finished (`launch_suite` already blocks until every stage-1 job
+    exits), and only after its required fingerprints are RE-CHECKED
+    (the checkpoint/basis it needs may not have existed yet when THIS
+    function was first called, if stage 1's own Architecture 3 job is
+    what produces them).
+
+    `staged_smoke=True` additionally requires Architecture 4's real
+    conditioner checkpoint even during a `smoke_only` phase (mirrors
+    `train.py --smoke --staged-smoke`'s own `require_for_smoke`
+    contract) and, unless `architecture4_command_builder` overrides it,
+    runs Architecture 4's stage-2 job through
+    `default_staged_smoke_command_builder` so it actually passes
+    `--staged-smoke` -- routing a staged-smoke phase through the plain
+    `command_builder` would otherwise silently stay construction-only
+    and never touch the real checkpoint, defeating the entire point of
+    staging it.
+
+    Returns `(stage1_result, stage2_result)`: `stage2_result` is `None`
+    when no Architecture 4 config is present (nothing to stage) or when
+    stage 1 failed (promotion stops, exactly like
+    `run_suite_with_smoke_gate`'s existing `smoke_result, None`
+    contract). Raises (fail-closed) if stage 1 succeeded but Architecture
+    4's fingerprints are still missing -- a caller must not have
+    Architecture 4 silently skipped when its prerequisites genuinely
+    never materialized."""
+    if len(named_configs) != len(gpu_list):
+        raise ValueError(
+            f"launch_staged_suite requires exactly one GPU per config: got {len(named_configs)} "
+            f"configs and {len(gpu_list)} GPUs"
+        )
+    # The fairness-matrix audit compares ACROSS all four configs, including
+    # Architecture 4 -- run it ONCE here, over the full group, before
+    # splitting into stages; each stage's own `launch_suite` call below
+    # passes `skip_config_audit=True` so a single-config Architecture 4
+    # stage never hits `static_config_audit`'s own "needs at least two
+    # configs" precondition, and stage 1 never redundantly re-audits.
+    if len(named_configs) >= 2:
+        audit = static_config_audit(named_configs)
+        if not audit["ok"]:
+            raise ValueError(f"static config audit failed -- undocumented divergence in shared fields: {audit['violations']}")
+    gpu_by_name = dict(zip(named_configs.keys(), gpu_list))
+    architecture4_names = [
+        name for name, cfg in named_configs.items()
+        if str((cfg.get("model") or {}).get("architecture", "")) == "4"
+    ]
+    if len(architecture4_names) > 1:
+        raise ValueError(
+            f"launch_staged_suite supports at most one Architecture 4 config per call, got "
+            f"{architecture4_names}"
+        )
+    arch4_name = architecture4_names[0] if architecture4_names else None
+
+    log_root = Path(log_root)
+    stage1_names = [name for name in named_configs if name != arch4_name]
+    # Log paths stay IDENTICAL to the pre-staging layout (`log_root/
+    # f"{name}.log"`, `log_root/"suite_summary.json"`) whenever there is
+    # no Architecture 4 config to stage -- nesting only kicks in once
+    # there are genuinely two sequential phases to keep separate.
+    stage1_log_root = log_root if arch4_name is None else log_root / "pre_architecture4"
+    stage1_result = launch_suite(
+        {name: named_configs[name] for name in stage1_names},
+        {name: config_paths[name] for name in stage1_names},
+        [gpu_by_name[name] for name in stage1_names],
+        stage1_log_root, threads_per_job,
+        smoke_only=smoke_only, command_builder=command_builder, skip_fingerprint_check=skip_fingerprint_check,
+        skip_config_audit=True,
+    )
+
+    if arch4_name is None:
+        return stage1_result, None
+    if not stage1_result.ok:
+        return stage1_result, None
+
+    arch4_config = named_configs[arch4_name]
+    if not skip_fingerprint_check:
+        missing = check_required_fingerprints(arch4_config, smoke_only=smoke_only, staged_smoke=staged_smoke)
+        if missing:
+            raise ValueError(
+                f"{arch4_name}: refusing to start stage 2 after stage 1 finished -- missing required "
+                f"fingerprints: {missing}"
+            )
+
+    arch4_builder = architecture4_command_builder
+    if arch4_builder is None:
+        arch4_builder = default_staged_smoke_command_builder if staged_smoke else command_builder
+    stage2_result = launch_suite(
+        {arch4_name: arch4_config}, {arch4_name: config_paths[arch4_name]}, [gpu_by_name[arch4_name]],
+        log_root / "architecture4", threads_per_job, smoke_only=smoke_only, command_builder=arch4_builder,
+        skip_fingerprint_check=skip_fingerprint_check, skip_config_audit=True,
+    )
+    return stage1_result, stage2_result
+
+
 def run_suite_with_smoke_gate(
     named_configs: dict[str, dict],
     config_paths: dict[str, Path],
@@ -474,24 +635,38 @@ def run_suite_with_smoke_gate(
     threads_per_job: int = 4,
     command_builder: Callable[[dict, Path, bool], list[str]] = default_command_builder,
     skip_fingerprint_check: bool = False,
+    staged_smoke: bool = False,
 ) -> tuple[SuiteResult, SuiteResult | None]:
     """"Run fail-closed smoke tests before full training ... stop
     promotion if any arm fails." Runs the smoke variant of every config
     first; the full run is only started if every smoke job succeeded.
     Returns (smoke_result, full_result) -- full_result is None when the
     smoke gate itself failed, so a caller can tell "never started" apart
-    from "started and failed"."""
+    from "started and failed".
+
+    Both phases now go through `launch_staged_suite` (launch blocker #8):
+    whenever an Architecture 4 config is present, it is held out of its
+    phase's concurrent group and launched only after that phase's other
+    configs finish and its fingerprints are re-verified -- see
+    `launch_staged_suite`'s docstring. The external return contract is
+    unchanged (`_combine_suite_results` merges Architecture 4's separate
+    internal stage back into one `SuiteResult` per phase), so this stays
+    a drop-in replacement for the previous always-concurrent behavior."""
     log_root = Path(log_root)
-    smoke_result = launch_suite(
+    smoke_stage1, smoke_stage2 = launch_staged_suite(
         named_configs, config_paths, gpu_list, log_root / "smoke", threads_per_job,
-        smoke_only=True, command_builder=command_builder, skip_fingerprint_check=skip_fingerprint_check,
+        smoke_only=True, staged_smoke=staged_smoke, command_builder=command_builder,
+        skip_fingerprint_check=skip_fingerprint_check,
     )
+    smoke_result = _combine_suite_results(True, log_root / "smoke", [smoke_stage1, smoke_stage2])
     if not smoke_result.ok:
         return smoke_result, None
-    full_result = launch_suite(
+    full_stage1, full_stage2 = launch_staged_suite(
         named_configs, config_paths, gpu_list, log_root / "full", threads_per_job,
-        smoke_only=False, command_builder=command_builder, skip_fingerprint_check=skip_fingerprint_check,
+        smoke_only=False, staged_smoke=False, command_builder=command_builder,
+        skip_fingerprint_check=skip_fingerprint_check,
     )
+    full_result = _combine_suite_results(False, log_root / "full", [full_stage1, full_stage2])
     return smoke_result, full_result
 
 
@@ -505,6 +680,12 @@ def main() -> None:
     parser.add_argument("--log-root", required=True)
     parser.add_argument("--skip-fingerprint-check", action="store_true",
                          help="Only for local dry runs against a stub entrypoint -- never for a real launch.")
+    parser.add_argument(
+        "--staged-smoke", action="store_true",
+        help="Run Architecture 4's smoke phase as a REAL staged smoke (train.py --smoke --staged-smoke) "
+             "against its already-selected Architecture 3 conditioner checkpoint, instead of a plain "
+             "construction-only smoke. The full (non-smoke) phase is always staged regardless of this flag.",
+    )
     args = parser.parse_args()
 
     if len(set(args.gpus)) != 4:
@@ -520,6 +701,7 @@ def main() -> None:
     smoke_result, full_result = run_suite_with_smoke_gate(
         named_configs, config_paths, list(args.gpus), Path(args.log_root),
         threads_per_job=args.threads_per_job, skip_fingerprint_check=args.skip_fingerprint_check,
+        staged_smoke=args.staged_smoke,
     )
     if not smoke_result.ok:
         print(f"SMOKE TEST FAILED -- refusing to start full training. Summary: {smoke_result.summary_path}", file=sys.stderr)

@@ -23,22 +23,7 @@ checkpoint impossible to reconstruct later).
 Checkpoint HISTORY (added 2026-07-25): save_checkpoint() always used to
 overwrite the same fixed filenames in checkpoint_dir's root — only the
 single most recent checkpoint ever existed, so a diverged/corrupted run
-had no earlier state to roll back to. Every root save now additionally
-hard-links (not copies — os.link, falling back to a real copy only if the
-filesystem can't hard-link, e.g. across devices) its files into
-checkpoint_dir/history/step_XXXXXXXX/, then prunes old history entries
-beyond training.checkpoint_keep_last. Hard-linking costs ~zero extra disk
-at save time (it's a second directory entry pointing at the same data
-blocks) — the old data only becomes exclusively "owned" by the history
-copy once the root path is later replaced by a newer save, at which point
-it is disk you were always going to spend on that many kept snapshots
-regardless of hardlink-vs-copy, hardlinking just avoids doing a second
-physical write to get there. With training servers running tight on disk
-(50 GB total was flagged as the real budget for this project's training
-server), keep training.checkpoint_keep_last small (default 2) and watch
-the printed sizes below — trainable-only weights are the cheap part
-(tens of MB typically), but Architecture 3 Stage A's autoencoder can be
-much larger on a wide gene panel (see README's disk budget note).
+had no earlier state to roll back to.
 
 Optimizer + RNG state (added 2026-07-27, GPT-audit-flagged fix #6):
 save_checkpoint's optional optimizer=/rng= arguments additionally save
@@ -48,14 +33,50 @@ to optimizer_rng_state.pt, restorable via load_optimizer_and_rng_state().
 Without this, a "resumed" run kept the trained weights but reset
 optimizer momentum to zero and re-seeded every RNG from scratch — a warm
 restart with different optimization dynamics, not a real continuation.
+
+TRANSACTIONAL, UNIQUELY-NAMED BUNDLES (rewritten in response to Codex's
+re-audit of commit 90f853e, launch blocker #1): the immediately prior
+version named history bundles by STEP ALONE
+(`history/step_XXXXXXXX/`) and (a) deleted an existing same-named bundle
+with `shutil.rmtree` before replacing it, and (b) pruned old bundles
+BEFORE the `latest_step.json` pointer was updated to the new one. Both
+are real crash-safety holes: (a) meant re-saving the same step (which
+`train.py`'s own loop can genuinely do -- see the "duplicate final
+save" fix below) could leave `latest_step.json` pointing at a step whose
+bundle a crash had just deleted and not yet replaced; (b) meant a crash
+between pruning and the pointer update could leave the pointer
+referencing a bundle that pruning had just deleted. Every bundle
+directory name now embeds a UNIQUE id
+(`step_XXXXXXXX__<time_ns>_<pid>_<seq>`) generated fresh per call, so
+`save_checkpoint` NEVER deletes or overwrites an existing directory --
+two saves at the same step simply produce two distinct bundles, and the
+pointer ends up referencing whichever was written (and pointed-to) most
+recently, with no destructive step in between. The pointer
+(`latest_bundle.json`) itself now records `step`, `bundle_dir`, AND
+`manifest_sha256` (the bundle's own manifest.json content hash) --
+Codex's requested `CheckpointIdentity` (`resolve_checkpoint_identity`
+below) is resolved from THIS pointer, never from `checkpoint_dir`'s root
+convenience-mirror files, closing the "conditioner identity hashes the
+wrong file" gap the same re-audit flagged (train.py::
+maybe_load_pretrained_conditioner_for_architecture4 and
+fit_architecture4_residual_basis.py both used to `file_sha256` the root
+mirror directly). Pruning now runs strictly AFTER the pointer update,
+and is passed the just-written bundle's name to protect explicitly even
+if history ordering is ever ambiguous. Every file written into a bundle
+(and the bundle's own directory entry) is now best-effort fsync'd before
+the bundle is considered complete, per Codex's "write and fsync the
+complete bundle" instruction.
 """
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import random
 import shutil
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -66,6 +87,17 @@ _CHECKPOINT_FILENAMES = (
     "trainable_weights.pt", "model_config.json", "gene_names.json", "training_state.json",
     "optimizer_rng_state.pt",
 )
+
+_bundle_id_sequence = itertools.count()
+
+
+def _new_bundle_id() -> str:
+    """A unique, lexicographically-increasing-over-time id -- the
+    `time_ns` prefix means bundles for the SAME step naturally sort
+    chronologically (most recent last), and the process id + monotonic
+    in-process sequence number make collisions impossible even across
+    calls that land in the same nanosecond."""
+    return f"{time.time_ns():020d}_{os.getpid()}_{next(_bundle_id_sequence):06d}"
 
 
 def _is_frozen_backbone_module(module: nn.Module) -> bool:
@@ -128,69 +160,134 @@ def _file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _prune_history(checkpoint_dir: str | Path, keep_last: int) -> None:
-    history_dir = _history_dir(checkpoint_dir)
-    if not history_dir.is_dir() or keep_last <= 0:
+def _fsync_path(path: Path) -> None:
+    """Best-effort durability -- fsync a file OR a directory's own inode
+    (POSIX permits `os.fsync` on a directory fd opened read-only; this is
+    how a directory entry's creation/rename is made durable, not just the
+    file content). Never raises: some filesystems/platforms (e.g.
+    Windows, some network filesystems, or overlay filesystems as used in
+    a container) don't support this, and a checkpoint save must not fail
+    outright just because a best-effort durability step wasn't
+    available -- the atomic-rename discipline elsewhere in this file is
+    what actually prevents corruption; fsync only shortens the window
+    where a page-cache-only write could still be lost to a real power
+    loss."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
         return
-    steps = sorted(list_checkpoint_history(checkpoint_dir))
-    for stale_step in steps[:-keep_last] if keep_last > 0 else []:
-        shutil.rmtree(history_dir / f"step_{stale_step:08d}", ignore_errors=True)
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
-def list_checkpoint_history(checkpoint_dir: str | Path) -> list[int]:
-    """Steps with a preserved history snapshot, ascending."""
+def _bundle_dir_name_prefix(step: int) -> str:
+    return f"step_{int(step):08d}__"
+
+
+def list_checkpoint_bundles(checkpoint_dir: str | Path) -> list[tuple[int, str]]:
+    """`(step, bundle_dir_name)` for every preserved history bundle,
+    ascending -- multiple bundles can legitimately exist for the SAME
+    step (a repeated/duplicate save at that step is no longer
+    destructive; see this module's docstring), so this returns every one
+    of them, not a deduplicated step list. Sorted by directory name,
+    which sorts chronologically within a step (see `_new_bundle_id`) and
+    by step numerically across steps (fixed-width zero-padded prefix)."""
     history_dir = _history_dir(checkpoint_dir)
     if not history_dir.is_dir():
         return []
-    steps = []
+    bundles = []
     for entry in history_dir.iterdir():
-        if entry.is_dir() and entry.name.startswith("step_"):
-            try:
-                steps.append(int(entry.name[len("step_"):]))
-            except ValueError:
-                continue
-    return sorted(steps)
+        if not entry.is_dir() or not entry.name.startswith("step_") or entry.name.startswith(".step_"):
+            continue
+        prefix, _, _bundle_id = entry.name.partition("__")
+        try:
+            step = int(prefix[len("step_"):])
+        except ValueError:
+            continue
+        bundles.append((step, entry.name))
+    bundles.sort(key=lambda pair: (pair[0], pair[1]))
+    return bundles
+
+
+def list_checkpoint_history(checkpoint_dir: str | Path) -> list[int]:
+    """Distinct steps with at least one preserved history bundle,
+    ascending -- a convenience view over `list_checkpoint_bundles` for
+    callers that only care which steps exist, not how many bundles each
+    has."""
+    return sorted({step for step, _ in list_checkpoint_bundles(checkpoint_dir)})
+
+
+def _prune_history(checkpoint_dir: str | Path, keep_last: int, *, protect_bundle_dir: str | None = None) -> None:
+    """Prune all but the `keep_last` most-recently-written bundles.
+    Called strictly AFTER `latest_bundle.json` has been updated to
+    reference the newest bundle (never before -- see this module's
+    docstring for why the old before-the-pointer ordering was a crash-
+    safety hole), and `protect_bundle_dir` (the bundle the pointer now
+    references) is skipped defensively even if it were somehow not
+    already within the retained tail."""
+    history_dir = _history_dir(checkpoint_dir)
+    if not history_dir.is_dir() or keep_last <= 0:
+        return
+    bundles = list_checkpoint_bundles(checkpoint_dir)
+    stale = bundles[:-keep_last] if keep_last > 0 else []
+    for _step, bundle_name in stale:
+        if protect_bundle_dir is not None and bundle_name == protect_bundle_dir:
+            continue
+        shutil.rmtree(history_dir / bundle_name, ignore_errors=True)
+
+
+def _latest_bundle_for_step(checkpoint_dir: str | Path, step: int) -> str:
+    matches = [name for s, name in list_checkpoint_bundles(checkpoint_dir) if s == step]
+    if not matches:
+        available = list_checkpoint_history(checkpoint_dir)
+        raise ValueError(f"no history bundle for step {step} in {checkpoint_dir}/history — available steps: {available}")
+    return matches[-1]  # lexicographically last == chronologically most recent, see _new_bundle_id
 
 
 def rollback_checkpoint(checkpoint_dir: str | Path, step: int) -> None:
-    """Overwrite the root ("latest", what main()'s resume logic reads)
-    checkpoint with a preserved history snapshot — use this when a run has
-    diverged or corrupted state after a later save and you want the next
-    resume to pick up from a known-good earlier step instead. Raises with
-    the actual available steps if the requested one isn't present (a typo'd
-    step should fail loudly, not silently no-op)."""
-    available = list_checkpoint_history(checkpoint_dir)
-    if step not in available:
-        raise ValueError(
-            f"no history snapshot for step {step} in {checkpoint_dir}/history — "
-            f"available steps: {available}"
-        )
-    snapshot_dir = _history_dir(checkpoint_dir) / f"step_{int(step):08d}"
+    """Overwrite the root ("latest", what resume logic reads) checkpoint
+    with a preserved history bundle -- use this when a run has diverged
+    or corrupted state after a later save and you want the next resume
+    to pick up from a known-good earlier step instead. Raises with the
+    actual available steps if the requested one isn't present (a typo'd
+    step should fail loudly, not silently no-op). If more than one
+    bundle exists for `step` (a repeated save at that step), rolls back
+    to the most recently written one."""
+    bundle_name = _latest_bundle_for_step(checkpoint_dir, step)
+    bundle_dir = _history_dir(checkpoint_dir) / bundle_name
     out_dir = Path(checkpoint_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Root previously may have had a trainable_weights.pt that this snapshot
+    # Root previously may have had a trainable_weights.pt that this bundle
     # doesn't (a zero-trainable-parameter checkpoint) — remove it first so a
     # stale weights file from a *later* step never lingers after rollback.
     for name in _CHECKPOINT_FILENAMES:
         stale = out_dir / name
-        if stale.is_file() and not (snapshot_dir / name).is_file():
+        if stale.is_file() and not (bundle_dir / name).is_file():
             stale.unlink()
     for name in _CHECKPOINT_FILENAMES:
-        src = snapshot_dir / name
+        src = bundle_dir / name
         if not src.is_file():
             continue
         tmp_path = out_dir / f"{name}.tmp{os.getpid()}"
         shutil.copy2(src, tmp_path)
         os.replace(tmp_path, out_dir / name)
-    # Audit #5 of commit a32051b (atomic "latest" pointer): every real
-    # loader below resolves through latest_step.json, not the root files
-    # directly -- rolling back must move that pointer too, or the next
-    # resume would silently ignore the rollback and keep resolving to the
-    # newer (rolled-back-FROM) step's still-present history bundle.
-    pointer_tmp = out_dir / f"latest_step.json.tmp{os.getpid()}"
-    pointer_tmp.write_text(json.dumps({"step": int(step)}, indent=2))
-    os.replace(pointer_tmp, out_dir / "latest_step.json")
-    print(f"rolled back {out_dir} to step {step} (from history snapshot {snapshot_dir})")
+    # Every real loader resolves through latest_bundle.json, not the root
+    # files directly -- rolling back must move that pointer too, or the
+    # next resume would silently ignore the rollback and keep resolving
+    # to the newer (rolled-back-FROM) bundle.
+    manifest_path = bundle_dir / "manifest.json"
+    pointer = {
+        "step": int(step), "bundle_dir": bundle_name,
+        "manifest_sha256": _file_sha256(manifest_path) if manifest_path.is_file() else None,
+    }
+    pointer_tmp = out_dir / f".latest_bundle.json.tmp{os.getpid()}"
+    pointer_tmp.write_text(json.dumps(pointer, indent=2))
+    os.replace(pointer_tmp, out_dir / "latest_bundle.json")
+    print(f"rolled back {out_dir} to step {step} (from history bundle {bundle_dir})")
 
 
 def _rng_state_blob(rng: random.Random | None) -> dict:
@@ -233,51 +330,36 @@ def save_checkpoint(
     step: int, extra_metadata: dict | None = None, keep_last: int = 2,
     optimizer: torch.optim.Optimizer | None = None, rng: random.Random | None = None,
 ) -> None:
-    """Transactional checkpoint save -- Adam's Step 6 audit #5 of commit
-    a32051b: "Make checkpoints transactional: immutable step bundles,
-    per-file hashes and step identity, manifest written last, fail-closed
-    loading, atomic latest pointer." Before this, `checkpoint_dir`'s root
-    files were each individually atomic (temp-then-replace) but NOT
-    atomic as a GROUP -- a crash between two of those individual writes
-    could leave a root checkpoint with e.g. `trainable_weights.pt` from
-    step N but `training_state.json` still from step N-1, with nothing
-    that would ever detect or refuse that mismatch on the next load.
-
-    The complete step bundle (weights + config + gene names + training
-    state + optimizer/RNG state, plus a `manifest.json` of per-file
-    sha256 hashes written LAST) is now built in a staging directory and
-    renamed into `history/step_XXXXXXXX/` with a single atomic
-    `os.replace` -- that directory is therefore always either absent or
-    fully complete, never partially written. `checkpoint_dir`'s root
-    files are refreshed afterward purely as a convenience mirror (so
-    existing tooling that reads root files directly keeps working); every
-    REAL loader below resolves through `latest_step.json` (the atomic
-    pointer, written last of all) to the immutable bundle and verifies
-    its manifest hashes before trusting anything, so a crash during the
-    root-mirror refresh can no longer corrupt what gets loaded.
-
-    A step bundle is now always created (regardless of `keep_last`,
-    unlike the pre-audit-#5 behavior where `keep_last<=0` meant no
-    history/transactionality at all) -- `keep_last<=0` still means
-    "prune nothing," matching `_prune_history`'s existing contract, but
-    can no longer mean "skip the one mechanism that makes a checkpoint
-    verifiable.\""""
+    """Transactional checkpoint save into a uniquely-named, immutable
+    bundle -- see this module's docstring for the full crash-safety
+    rationale (Codex re-audit of commit 90f853e, launch blocker #1).
+    Never deletes or overwrites an existing bundle: `step` alone does not
+    name the bundle directory, a fresh unique id does, so two saves at
+    the same step simply coexist as two bundles until pruning (which
+    only ever removes bundles OLDER than the retained tail, and never
+    the one the pointer currently references)."""
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     history_dir = _history_dir(checkpoint_dir)
     history_dir.mkdir(parents=True, exist_ok=True)
-    step_dir = history_dir / f"step_{int(step):08d}"
-    staging_dir = history_dir / f".step_{int(step):08d}.staging{os.getpid()}"
+
+    bundle_name = f"{_bundle_dir_name_prefix(step)}{_new_bundle_id()}"
+    bundle_dir = history_dir / bundle_name
+    staging_dir = history_dir / f".{bundle_name}.staging"
     if staging_dir.exists():
         shutil.rmtree(staging_dir)
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     weights_path = save_trainable_state(model, staging_dir)
+    if weights_path is not None:
+        _fsync_path(weights_path)
     for name, payload in [
         ("model_config.json", model_config), ("gene_names.json", list(gene_names)),
         ("training_state.json", {"step": int(step), **(extra_metadata or {})}),
     ]:
-        (staging_dir / name).write_text(json.dumps(payload, indent=2))
+        target = staging_dir / name
+        target.write_text(json.dumps(payload, indent=2))
+        _fsync_path(target)
 
     # 2026-07-27 (GPT-audit-flagged, fix #6): checkpoints used to save
     # ONLY model weights -- no AdamW optimizer state (momentum/variance
@@ -288,60 +370,78 @@ def save_checkpoint(
     # a caller that truly doesn't care (e.g. a one-off inference/eval
     # rebuild) can simply not pass optimizer, and no file is written.
     if optimizer is not None:
-        torch.save(
-            {"optimizer": optimizer.state_dict(), **_rng_state_blob(rng)},
-            staging_dir / "optimizer_rng_state.pt",
-        )
+        opt_path = staging_dir / "optimizer_rng_state.pt"
+        torch.save({"optimizer": optimizer.state_dict(), **_rng_state_blob(rng)}, opt_path)
+        _fsync_path(opt_path)
 
     weights_size = weights_path.stat().st_size if weights_path is not None else 0
 
     file_hashes = {
         name: _file_sha256(staging_dir / name) for name in _CHECKPOINT_FILENAMES if (staging_dir / name).is_file()
     }
-    step_manifest = {"version": 1, "kind": "gen3_checkpoint_step_manifest", "step": int(step), "files": file_hashes}
+    step_manifest = {
+        "version": 2, "kind": "gen3_checkpoint_step_manifest", "step": int(step),
+        "bundle_id": bundle_name, "files": file_hashes,
+    }
     # Written LAST inside the staging directory -- a loader can treat its
     # presence (and its own hashes matching) as proof this bundle
     # finished writing completely.
-    (staging_dir / "manifest.json").write_text(json.dumps(step_manifest, indent=2, sort_keys=True))
+    manifest_path = staging_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(step_manifest, indent=2, sort_keys=True))
+    _fsync_path(manifest_path)
+    manifest_sha256 = _file_sha256(manifest_path)
 
-    if step_dir.exists():
-        shutil.rmtree(step_dir)
-    os.replace(staging_dir, step_dir)  # atomic: step_dir is now either absent or fully complete
+    # bundle_dir is GUARANTEED not to already exist (unique bundle_name) --
+    # this is never a delete-then-replace, only ever a fresh create.
+    os.replace(staging_dir, bundle_dir)
+    _fsync_path(history_dir)  # durability of the new directory entry itself
+
+    # Atomic pointer update, containing the bundle id, step, AND the
+    # bundle's own manifest sha256 (Codex's requested CheckpointIdentity
+    # payload) -- written BEFORE pruning, so pruning can never remove the
+    # bundle the pointer now references.
+    pointer = {"step": int(step), "bundle_dir": bundle_name, "manifest_sha256": manifest_sha256}
+    pointer_tmp = checkpoint_dir / f".latest_bundle.json.tmp{os.getpid()}"
+    pointer_tmp.write_text(json.dumps(pointer, indent=2))
+    _fsync_path(pointer_tmp)
+    os.replace(pointer_tmp, checkpoint_dir / "latest_bundle.json")
+    _fsync_path(checkpoint_dir)
 
     # Refresh checkpoint_dir's ROOT files as a convenience mirror, always
     # sourced from the just-completed IMMUTABLE bundle -- real loaders
     # below never trust these root files directly; they resolve through
-    # latest_step.json instead, so a crash between these per-file
-    # root-mirror writes can no longer corrupt what gets loaded.
+    # latest_bundle.json instead, so a crash during this refresh can no
+    # longer corrupt what gets loaded.
+    #
+    # Codex re-audit of commit 90f853e, adversarial-test-confirmed real
+    # bug: this used to try `os.link` (a HARDLINK) first, falling back to
+    # `shutil.copy2` only on OSError. On any filesystem where hardlinking
+    # actually succeeds (the common same-filesystem POSIX case), the
+    # root mirror and the canonical bundle file are then the SAME inode
+    # -- an in-place rewrite of the "mirror" (e.g. `Path.write_bytes`,
+    # which opens 'wb' and truncates) silently corrupts the CANONICAL
+    # bundle too, defeating the entire "root is only ever a disposable
+    # convenience mirror" invariant this module's docstring promises.
+    # Always a REAL, independent copy now -- never a hardlink.
     for name in _CHECKPOINT_FILENAMES:
-        src = step_dir / name
+        src = bundle_dir / name
         if not src.is_file():
             continue
         tmp_root = checkpoint_dir / f"{name}.tmp{os.getpid()}"
-        try:
-            os.link(src, tmp_root)
-        except OSError:
-            shutil.copy2(src, tmp_root)
+        shutil.copy2(src, tmp_root)
         os.replace(tmp_root, checkpoint_dir / name)
 
+    # Pruning happens LAST of all, strictly after the pointer is durable,
+    # and is told explicitly which bundle to never remove.
     if keep_last > 0:
-        _prune_history(checkpoint_dir, keep_last)
-
-    # Atomic "latest" pointer, written LAST of everything in this
-    # function -- a crash at any point before this line leaves
-    # latest_step.json unchanged (still pointing at the previous,
-    # still-fully-valid step), never at a step whose bundle isn't
-    # actually complete yet.
-    pointer_tmp = checkpoint_dir / f"latest_step.json.tmp{os.getpid()}"
-    pointer_tmp.write_text(json.dumps({"step": int(step)}, indent=2))
-    os.replace(pointer_tmp, checkpoint_dir / "latest_step.json")
+        _prune_history(checkpoint_dir, keep_last, protect_bundle_dir=bundle_name)
 
     history_steps = list_checkpoint_history(checkpoint_dir)
     history_size = sum(
         f.stat().st_size for f in _history_dir(checkpoint_dir).rglob("*") if f.is_file()
     ) if history_steps else 0
     print(
-        f"checkpoint saved to {checkpoint_dir} (step {step}"
+        f"checkpoint saved to {checkpoint_dir} (step {step}, bundle {bundle_name}"
         f"{', weights + config + gene names' if weights_path is not None else ', config + gene names only (no trainable weights)'}"
         f", weights={_human_size(weights_size)}"
         f", history kept={history_steps} total_history_size={_human_size(history_size)})"
@@ -349,46 +449,107 @@ def save_checkpoint(
 
 
 def _resolve_checkpoint_source(checkpoint_dir: str | Path) -> Path:
-    """Fail-closed transactional load resolution -- Adam's Step 6 audit #5
-    of commit a32051b: "fail-closed loading." If `checkpoint_dir/
-    latest_step.json` exists, resolves to that step's IMMUTABLE history
-    bundle and verifies every file the bundle's own `manifest.json`
-    recorded still matches its sha256 on disk right now -- a crash
-    between individual file writes (or the checkpoint being altered
-    after being written) can therefore no longer silently produce a load
-    built from files belonging to different steps; the whole bundle is
-    rejected instead. Falls back to `checkpoint_dir` itself when there is
-    no pointer -- a `best/` bundle (verified separately, by `train.py::
-    verify_checkpoint_bundle_identity`) or a legacy checkpoint saved
-    before this pointer existed."""
+    """Fail-closed transactional load resolution. If `checkpoint_dir/
+    latest_bundle.json` exists, resolves to the bundle it names and
+    verifies (a) the bundle's OWN manifest.json still matches the sha256
+    the pointer recorded for it, and (b) every file the bundle's
+    manifest itself records still matches its sha256 on disk right now --
+    a crash between individual file writes (or the checkpoint being
+    altered after being written) can therefore no longer silently
+    produce a load built from files belonging to different steps or
+    bundles; the whole bundle is rejected instead. Falls back to
+    `checkpoint_dir` itself when there is no pointer -- a `best/` bundle
+    (verified separately, by `train.py::verify_checkpoint_bundle_identity`)
+    or an arbitrary non-transactional checkpoint directory."""
     checkpoint_dir = Path(checkpoint_dir)
-    pointer_path = checkpoint_dir / "latest_step.json"
+    pointer_path = checkpoint_dir / "latest_bundle.json"
     if not pointer_path.is_file():
         return checkpoint_dir
     pointer = json.loads(pointer_path.read_text())
     step = int(pointer["step"])
-    step_dir = _history_dir(checkpoint_dir) / f"step_{step:08d}"
-    manifest_path = step_dir / "manifest.json"
+    bundle_name = pointer["bundle_dir"]
+    expected_manifest_sha256 = pointer.get("manifest_sha256")
+    bundle_dir = _history_dir(checkpoint_dir) / bundle_name
+    manifest_path = bundle_dir / "manifest.json"
     if not manifest_path.is_file():
         raise RuntimeError(
-            f"checkpoint at {checkpoint_dir} points (via latest_step.json) at step {step} but its "
-            f"bundle manifest is missing at {manifest_path} -- refusing to load a possibly-partial "
-            "or corrupted checkpoint"
+            f"checkpoint at {checkpoint_dir} points (via latest_bundle.json) at bundle {bundle_name!r} "
+            f"(step {step}) but its manifest is missing at {manifest_path} -- refusing to load a "
+            "possibly-partial or corrupted checkpoint"
+        )
+    if expected_manifest_sha256 is not None and _file_sha256(manifest_path) != expected_manifest_sha256:
+        raise RuntimeError(
+            f"checkpoint at {checkpoint_dir}: bundle {bundle_name!r}'s manifest.json does not match "
+            "the sha256 recorded in latest_bundle.json -- corrupted or tampered checkpoint, refusing to load"
         )
     step_manifest = json.loads(manifest_path.read_text())
-    for name, expected_hash in (step_manifest.get("files") or {}).items():
-        file_path = step_dir / name
+    manifest_files = step_manifest.get("files") or {}
+    # Codex re-audit of commit 90f853e, adversarial coverage for launch
+    # blocker #1/#2: a per-file hash loop over ONLY the manifest's own
+    # "files" dict cannot catch a file that physically exists in the
+    # bundle but was OMITTED from that dict (whether by a bug or by
+    # tampering) -- such a file would never be hash-checked at all, so a
+    # tampered-but-structurally-valid replacement (e.g. different
+    # trainable_weights.pt bytes) would load silently. Cross-check the
+    # manifest against the bundle's REAL directory contents first.
+    actual_files = {p.name for p in bundle_dir.iterdir() if p.is_file() and p.name != "manifest.json"}
+    unlisted = actual_files - set(manifest_files.keys())
+    if unlisted:
+        raise RuntimeError(
+            f"checkpoint bundle {bundle_name!r} (step {step}) contains file(s) {sorted(unlisted)} that "
+            "are not listed in its own manifest.json -- refusing to load a bundle whose manifest does "
+            "not fully account for its real contents"
+        )
+    for name, expected_hash in manifest_files.items():
+        file_path = bundle_dir / name
         if not file_path.is_file():
             raise RuntimeError(
-                f"checkpoint step {step} bundle manifest references {name} but it is missing from "
-                f"{step_dir} -- refusing to load a corrupted checkpoint"
+                f"checkpoint bundle {bundle_name!r} (step {step}) manifest references {name} but it is "
+                f"missing from {bundle_dir} -- refusing to load a corrupted checkpoint"
             )
         if _file_sha256(file_path) != expected_hash:
             raise RuntimeError(
-                f"checkpoint step {step} file {name} does not match the sha256 recorded in its own "
-                "bundle manifest -- corrupted or partially-written checkpoint, refusing to load"
+                f"checkpoint bundle {bundle_name!r} (step {step}) file {name} does not match the sha256 "
+                "recorded in its own bundle manifest -- corrupted or partially-written checkpoint, "
+                "refusing to load"
             )
-    return step_dir
+    return bundle_dir
+
+
+@dataclass(frozen=True)
+class CheckpointIdentity:
+    """The canonical identity of whatever `checkpoint_dir` currently
+    resolves to -- Codex's re-audit of commit 90f853e, launch blocker #2:
+    "Make checkpoint resolution return a canonical CheckpointIdentity...
+    Use that identity everywhere: resume, Architecture 4 conditioner
+    loading, basis fitting and evaluation. Never hash root convenience
+    mirrors." `weights_sha256` is always computed from `resolved_dir`
+    (the VERIFIED bundle, or `checkpoint_dir` itself for a non-
+    transactional dir like `best/`), never from `checkpoint_dir`'s root
+    mirror files directly."""
+    resolved_dir: Path
+    step: int | None
+    bundle_dir: str | None
+    manifest_sha256: str | None
+    weights_sha256: str | None
+
+
+def resolve_checkpoint_identity(checkpoint_dir: str | Path) -> CheckpointIdentity:
+    checkpoint_dir = Path(checkpoint_dir)
+    resolved_dir = _resolve_checkpoint_source(checkpoint_dir)
+    pointer_path = checkpoint_dir / "latest_bundle.json"
+    step = bundle_dir = manifest_sha256 = None
+    if pointer_path.is_file():
+        pointer = json.loads(pointer_path.read_text())
+        step = int(pointer["step"])
+        bundle_dir = pointer.get("bundle_dir")
+        manifest_sha256 = pointer.get("manifest_sha256")
+    weights_path = resolved_dir / "trainable_weights.pt"
+    weights_sha256 = _file_sha256(weights_path) if weights_path.is_file() else None
+    return CheckpointIdentity(
+        resolved_dir=resolved_dir, step=step, bundle_dir=bundle_dir,
+        manifest_sha256=manifest_sha256, weights_sha256=weights_sha256,
+    )
 
 
 def load_trainable_state(model: nn.Module, checkpoint_dir: str | Path) -> None:
@@ -407,9 +568,9 @@ def load_trainable_state(model: nn.Module, checkpoint_dir: str | Path) -> None:
     state. Same fix applied identically to gen2_architectures/training/
     checkpoint.py's copy of this function, per this file's own
     copy-provenance discipline. Resolves through `_resolve_checkpoint_source`
-    first (audit #5) -- for a transactional checkpoint_dir this loads
-    from the verified, immutable history bundle, never directly from the
-    (merely a convenience mirror) root files."""
+    first -- for a transactional checkpoint_dir this loads from the
+    verified, immutable history bundle, never directly from the (merely
+    a convenience mirror) root files."""
     in_dir = _resolve_checkpoint_source(checkpoint_dir)
     weights_path = in_dir / "trainable_weights.pt"
     trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
@@ -451,9 +612,8 @@ def verify_gene_names(checkpoint_dir: str | Path, gene_names: list[str]) -> None
     confirming a checkpoint exists, before load_trainable_state -- mirrors
     the exact same ordered-identity check already used for Stage A/Stage B
     (train_arch3_stage_b.py::_load_stage_a). Resolves through
-    `_resolve_checkpoint_source` first (audit #5) -- the verified,
-    immutable history bundle, not the (merely a convenience mirror) root
-    files."""
+    `_resolve_checkpoint_source` first -- the verified, immutable history
+    bundle, not the (merely a convenience mirror) root files."""
     resolved_dir = _resolve_checkpoint_source(checkpoint_dir)
     path = resolved_dir / "gene_names.json"
     if not path.is_file():
@@ -488,7 +648,7 @@ def load_optimizer_and_rng_state(
     callers should treat that as "fresh optimizer state, resume anyway"
     rather than an error, since older/lighter checkpoints are still
     otherwise valid to resume from. Resolves through
-    `_resolve_checkpoint_source` first (audit #5)."""
+    `_resolve_checkpoint_source` first."""
     path = _resolve_checkpoint_source(checkpoint_dir) / "optimizer_rng_state.pt"
     if not path.is_file():
         return False

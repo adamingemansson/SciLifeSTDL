@@ -1,6 +1,8 @@
+import json
 import os
 import random
 import tempfile
+from pathlib import Path
 
 import pytest
 import torch
@@ -8,8 +10,8 @@ import torch.nn as nn
 
 from gen3_multiscale.training.checkpoint import (
     save_checkpoint, load_trainable_state, load_training_state,
-    list_checkpoint_history, rollback_checkpoint,
-    load_optimizer_and_rng_state, verify_gene_names,
+    list_checkpoint_history, list_checkpoint_bundles, rollback_checkpoint,
+    load_optimizer_and_rng_state, verify_gene_names, resolve_checkpoint_identity,
 )
 
 
@@ -113,7 +115,7 @@ def test_checkpoint_history_pruning_disabled_when_keep_last_zero():
     """Adam's Step 6 audit #5 of commit a32051b made checkpoints
     transactional: a step's history bundle (history/step_XXXXXXXX/) is
     now ALWAYS created, since every real loader resolves through it via
-    latest_step.json -- keep_last<=0 now means "prune nothing" (matching
+    latest_bundle.json -- keep_last<=0 now means "prune nothing" (matching
     _prune_history's own contract), not "no history/transactionality at
     all" (the old, pre-audit-#5 meaning)."""
     m = _Tiny()
@@ -122,7 +124,7 @@ def test_checkpoint_history_pruning_disabled_when_keep_last_zero():
         save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=1, keep_last=0)
         assert list_checkpoint_history(tmp) == [0, 1]
         assert os.path.exists(os.path.join(tmp, "model_config.json"))
-        assert os.path.exists(os.path.join(tmp, "latest_step.json"))
+        assert os.path.exists(os.path.join(tmp, "latest_bundle.json"))
 
 
 def test_rollback_checkpoint_restores_an_earlier_known_good_snapshot():
@@ -166,8 +168,9 @@ def test_history_snapshots_survive_root_being_overwritten():
             m.lin.weight.fill_(2.0)
         save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=200, keep_last=5)
 
+        bundle_name_100 = next(name for step, name in list_checkpoint_bundles(tmp) if step == 100)
         snapshot_100 = _Tiny()
-        load_trainable_state(snapshot_100, os.path.join(tmp, "history", "step_00000100"))
+        load_trainable_state(snapshot_100, os.path.join(tmp, "history", bundle_name_100))
         assert torch.allclose(snapshot_100.lin.weight, torch.full((4, 4), 1.0))
 
         latest = _Tiny()
@@ -244,3 +247,183 @@ def test_verify_gene_names_raises_when_gene_names_json_is_missing():
     with tempfile.TemporaryDirectory() as tmp:
         with pytest.raises(ValueError, match="gene_names.json"):
             verify_gene_names(tmp, ["g1"])
+
+
+# ---------------------------------------------------------------------------
+# Codex re-audit of commit 90f853e, requested adversarial coverage for
+# launch blockers #1/#2: crash-safety of the transactional bundle scheme.
+# ---------------------------------------------------------------------------
+
+def test_crash_before_pointer_write_leaves_the_prior_checkpoint_fully_loadable():
+    """Simulates a crash between a NEW bundle finishing its atomic
+    `os.replace` into history/ and `latest_bundle.json` being updated to
+    point at it (save_checkpoint's own pointer-update line never runs).
+    The OLD pointer -- and therefore the OLD checkpoint -- must remain
+    exactly as loadable as before; a crash here must never corrupt or
+    lose the PRIOR good state, only fail to advance to the new one."""
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        with torch.no_grad():
+            m.lin.weight.fill_(1.0)
+        save_checkpoint(m, {"name": "tiny"}, ["g1", "g2"], tmp, step=1, keep_last=1)
+        pointer_before = json.loads((Path(tmp) / "latest_bundle.json").read_text())
+
+        # Simulate the crash: write a SECOND bundle directly (mirroring
+        # what save_checkpoint's own staging+os.replace does), but never
+        # touch latest_bundle.json -- exactly "crash before pointer
+        # replacement".
+        with torch.no_grad():
+            m.lin.weight.fill_(2.0)
+        history_dir = Path(tmp) / "history"
+        crashed_bundle = history_dir / "step_00000002__crashed_bundle"
+        crashed_bundle.mkdir(parents=True)
+        torch.save(m.state_dict(), crashed_bundle / "trainable_weights.pt")
+        (crashed_bundle / "model_config.json").write_text(json.dumps({"name": "tiny"}))
+        (crashed_bundle / "gene_names.json").write_text(json.dumps(["g1", "g2"]))
+        (crashed_bundle / "training_state.json").write_text(json.dumps({"step": 2}))
+
+        pointer_after = json.loads((Path(tmp) / "latest_bundle.json").read_text())
+        assert pointer_after == pointer_before  # untouched by the "crashed" write
+
+        m2 = _Tiny()
+        load_trainable_state(m2, tmp)  # resolves through the UNCHANGED pointer
+        assert torch.allclose(m2.lin.weight, torch.full_like(m2.lin.weight, 1.0))
+        assert load_training_state(tmp)["step"] == 1
+        identity = resolve_checkpoint_identity(tmp)
+        assert identity.step == 1
+
+
+def test_crash_after_pointer_write_before_pruning_leaves_checkpoint_intact_with_keep_last_one():
+    """Simulates a crash AFTER `latest_bundle.json` is durably updated to
+    the new bundle but BEFORE `_prune_history` runs (pruning is the LAST
+    step of save_checkpoint) -- the checkpoint itself must be fully
+    valid and loadable even though the stale bundle from the previous
+    step was never cleaned up."""
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        import gen3_multiscale.training.checkpoint as checkpoint_module
+
+        with torch.no_grad():
+            m.lin.weight.fill_(1.0)
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=1, keep_last=1)
+
+        original_prune = checkpoint_module._prune_history
+
+        def _crash_during_prune(*args, **kwargs):
+            raise RuntimeError("simulated crash during pruning")
+
+        checkpoint_module._prune_history = _crash_during_prune
+        try:
+            with torch.no_grad():
+                m.lin.weight.fill_(2.0)
+            with pytest.raises(RuntimeError, match="simulated crash during pruning"):
+                save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=2, keep_last=1)
+        finally:
+            checkpoint_module._prune_history = original_prune
+
+        # The pointer update (and the new bundle it points at) completed
+        # BEFORE pruning was ever attempted -- the checkpoint is fully
+        # valid and resolves to step 2's real weights, despite pruning
+        # having "crashed."
+        m2 = _Tiny()
+        load_trainable_state(m2, tmp)
+        assert torch.allclose(m2.lin.weight, torch.full_like(m2.lin.weight, 2.0))
+        assert load_training_state(tmp)["step"] == 2
+        # Both bundles still exist -- pruning never got to run.
+        assert list_checkpoint_history(tmp) == [1, 2]
+
+
+def test_repeated_save_at_the_same_step_is_handled_safely():
+    """"Handle repeated saves at the same step safely" (launch blocker
+    #1) -- e.g. a training loop that retries a step after a transient
+    failure. Two saves at step=5 with DIFFERENT weight content must both
+    succeed (never collide/overwrite each other destructively), and the
+    checkpoint must end up reflecting the SECOND (most recent) save."""
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        with torch.no_grad():
+            m.lin.weight.fill_(1.0)
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=5, keep_last=2)
+        with torch.no_grad():
+            m.lin.weight.fill_(2.0)
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=5, keep_last=2)
+
+        bundles_at_step_5 = [name for step, name in list_checkpoint_bundles(tmp) if step == 5]
+        assert len(bundles_at_step_5) == 2  # two DISTINCT bundles, neither overwritten
+        assert len(set(bundles_at_step_5)) == 2  # genuinely different bundle_ids
+
+        m2 = _Tiny()
+        load_trainable_state(m2, tmp)
+        assert torch.allclose(m2.lin.weight, torch.full_like(m2.lin.weight, 2.0))
+        identity = resolve_checkpoint_identity(tmp)
+        assert identity.step == 5
+        assert identity.bundle_dir == bundles_at_step_5[-1]  # the most RECENT of the two
+
+
+# ---------------------------------------------------------------------------
+# Codex re-audit of commit 90f853e, requested adversarial coverage: manifest
+# omitting a required file, and the root mirror disagreeing with the
+# canonical bundle.
+# ---------------------------------------------------------------------------
+
+def test_bundle_with_a_file_omitted_from_its_own_manifest_is_refused():
+    """A file that physically exists inside a bundle but is NOT listed in
+    that bundle's own manifest.json's "files" dict would otherwise never
+    be hash-checked at all -- a tampered-but-structurally-valid
+    replacement for it would load silently. `_resolve_checkpoint_source`
+    must cross-check the manifest against the bundle's REAL contents,
+    not merely validate whatever the manifest happens to list."""
+    import hashlib
+
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(m, {"name": "tiny"}, ["g1", "g2"], tmp, step=1)
+        identity = resolve_checkpoint_identity(tmp)
+        bundle_dir = identity.resolved_dir
+        manifest_path = bundle_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        assert "gene_names.json" in manifest["files"]
+        del manifest["files"]["gene_names.json"]  # OMIT it, without touching the real file
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        # Simulates the realistic version of this bug -- save_checkpoint
+        # itself failing to record one file in "files" from the start
+        # (rather than a hostile post-hoc edit) -- by keeping the OUTER
+        # pointer's manifest_sha256 self-consistent with the (buggy)
+        # manifest, so the test actually exercises the NEW per-bundle
+        # "does the manifest account for every real file" cross-check,
+        # not the separate, already-covered outer-pointer-hash check.
+        pointer_path = Path(tmp) / "latest_bundle.json"
+        pointer = json.loads(pointer_path.read_text())
+        pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        pointer_path.write_text(json.dumps(pointer, indent=2))
+
+        m2 = _Tiny()
+        with pytest.raises(RuntimeError, match="not listed in its own manifest"):
+            load_trainable_state(m2, tmp)
+
+
+def test_root_mirror_disagreeing_with_the_canonical_bundle_is_ignored_by_every_real_loader():
+    """checkpoint_dir's root-level files are ONLY EVER a convenience
+    mirror -- every real loader resolves through latest_bundle.json to
+    the immutable history bundle instead. Corrupting the ROOT mirror
+    directly (simulating a crash mid-refresh, or direct tampering) must
+    have NO effect on what actually gets loaded."""
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        with torch.no_grad():
+            m.lin.weight.fill_(1.0)
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=1)
+
+        # Corrupt the root mirror's weights file directly -- the bundle
+        # underneath (and the pointer referencing it) are untouched.
+        (Path(tmp) / "trainable_weights.pt").write_bytes(b"not a real torch checkpoint at all")
+
+        m2 = _Tiny()
+        load_trainable_state(m2, tmp)  # must succeed, reading through the bundle, not the corrupted root
+        assert torch.allclose(m2.lin.weight, torch.full_like(m2.lin.weight, 1.0))
+        identity = resolve_checkpoint_identity(tmp)
+        assert identity.weights_sha256 is not None
+        # The identity's own weights_sha256 must be computed from the
+        # BUNDLE's file, never the corrupted root mirror.
+        import hashlib
+        assert identity.weights_sha256 == hashlib.sha256((identity.resolved_dir / "trainable_weights.pt").read_bytes()).hexdigest()
