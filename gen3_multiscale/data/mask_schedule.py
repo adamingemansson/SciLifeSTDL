@@ -35,6 +35,7 @@ from typing import Iterable
 import numpy as np
 
 from gen3_multiscale.data import mask_bank
+from gen3_multiscale.data.boundary_graph import EmptyBoundaryError, extract_boundary_and_local_context
 
 # Keeps every stratum's seed range from ever colliding with another
 # stratum's, for any split_seeds a caller supplies (default validation=
@@ -52,7 +53,37 @@ _STRATUM_SEED_STRIDE = 1_000_000
 # have left any already-persisted (buggy) schedule looking identical by
 # every OTHER fingerprint field, since none of dataset/spatial/strata
 # content actually changed -- only the algorithm did.
-_MASK_GENERATION_VERSION = "2"
+_MASK_GENERATION_VERSION = "3"
+_MAX_MASK_ATTEMPTS = 1000
+
+
+def validate_mask_has_observed_boundary(
+    coords3d: np.ndarray,
+    obs_names: Iterable[str],
+    context_obs_names: Iterable[str],
+    query_obs_names: Iterable[str],
+    *,
+    k_neighbors: int = 6,
+) -> dict:
+    """Require a realized mask to represent a hole with observed tissue around it.
+
+    A mask that removes an entire disconnected tissue fragment can have a
+    non-empty context and query while still having no observed boundary.
+    Such a mask is not a missing-tissue reconstruction example and makes
+    the model's mandatory boundary-attention branch undefined.
+    """
+    names = np.asarray([str(x) for x in obs_names])
+    position_by_name = {name: pos for pos, name in enumerate(names)}
+    try:
+        context_pos = np.asarray([position_by_name[str(x)] for x in context_obs_names], dtype=int)
+        query_pos = np.asarray([position_by_name[str(x)] for x in query_obs_names], dtype=int)
+    except KeyError as exc:
+        raise ValueError(f"mask references unknown observation {exc.args[0]!r}") from exc
+    result = extract_boundary_and_local_context(
+        np.asarray(coords3d)[context_pos, :2], np.asarray(coords3d)[query_pos, :2],
+        k_neighbors=k_neighbors, local_k=1, max_rings=1,
+    )
+    return result.diagnostic
 
 
 def stratum_to_masking_cfg(stratum: dict, default_n_patches: int = 1) -> dict:
@@ -125,23 +156,69 @@ def build_stratified_mask_bank(
     split_counts = dict(split_counts or {"validation": 4, "test": 8})
     split_seeds = dict(split_seeds or {"validation": 700_000, "test": 900_000})
 
+    names_arr = np.asarray([str(x) for x in obs_names])
     all_records = []
     per_stratum_fingerprints = {}
+    accepted_query_sets_by_split: dict[str, set[tuple[str, ...]]] = {
+        split: set() for split in split_counts
+    }
     for i, stratum in enumerate(strata):
         stratum_name = stratum["name"]
         masking_cfg = stratum_to_masking_cfg(stratum)
         stratum_seeds = {split: int(seed) + i * _STRATUM_SEED_STRIDE for split, seed in split_seeds.items()}
-        bank = mask_bank.build_mask_bank(
-            coords3d, slice_ids, obs_names, masking_cfg,
-            split_counts=split_counts, split_seeds=stratum_seeds,
+        max_context = mask_bank._cfg_get(masking_cfg, "max_context_points", None)
+        context_selection = str(mask_bank._cfg_get(masking_cfg, "context_selection", "random"))
+        for split, raw_count in split_counts.items():
+            count = int(raw_count)
+            if count < 0:
+                raise ValueError(f"split_counts[{split!r}] must be non-negative, got {count}")
+            for record_index in range(count):
+                accepted = None
+                for attempt in range(_MAX_MASK_ATTEMPTS):
+                    # Each record gets a disjoint deterministic retry stream:
+                    # index + attempt*count.  Retrying record i can therefore
+                    # never consume record j's seed.
+                    seed = int(stratum_seeds[split]) + record_index + attempt * max(count, 1)
+                    context, query = mask_bank.make_split(coords3d, slice_ids, masking_cfg, seed)
+                    context = mask_bank.cap_context_mask(
+                        context, max_context, seed, coords3d=coords3d,
+                        query_mask=query, selection=context_selection,
+                    )
+                    if not query.any() or not context.any():
+                        continue
+                    context_names = names_arr[context].tolist()
+                    query_names = names_arr[query].tolist()
+                    try:
+                        validate_mask_has_observed_boundary(
+                            coords3d, names_arr, context_names, query_names,
+                        )
+                    except EmptyBoundaryError:
+                        continue
+                    query_identity = tuple(sorted(query_names))
+                    if query_identity in accepted_query_sets_by_split[split]:
+                        continue
+                    accepted = {
+                        "split": split,
+                        "index": record_index,
+                        "seed": seed,
+                        "seed_attempt": attempt,
+                        "context_obs_names": context_names,
+                        "query_obs_names": query_names,
+                        "stratum": stratum_name,
+                    }
+                    accepted_query_sets_by_split[split].add(query_identity)
+                    break
+                if accepted is None:
+                    raise ValueError(
+                        f"could not realize a non-empty, boundary-valid, unique {split!r} mask "
+                        f"for stratum {stratum_name!r}, index {record_index} within "
+                        f"{_MAX_MASK_ATTEMPTS} deterministic attempts"
+                    )
+                all_records.append(accepted)
+        per_stratum_fingerprints[stratum_name] = mask_bank.masking_fingerprint(
+            masking_cfg, split_counts, stratum_seeds,
         )
-        for record in bank["records"]:
-            record = dict(record)
-            record["stratum"] = stratum_name
-            all_records.append(record)
-        per_stratum_fingerprints[stratum_name] = bank["masking_fingerprint"]
 
-    names_arr = np.asarray([str(x) for x in obs_names])
     return {
         "version": 1,
         "mask_generation_version": _MASK_GENERATION_VERSION,

@@ -75,6 +75,41 @@ def test_build_stratified_mask_bank_tags_every_record_with_its_stratum():
         assert record["stratum"] in {"small_compact", "large_irregular"}
 
 
+def test_build_stratified_mask_bank_retries_a_boundaryless_mask_deterministically(monkeypatch):
+    """A non-empty mask can still remove an entire disconnected tissue
+    fragment.  The fixed held-out schedule must replace it deterministically
+    rather than letting training crash at its first validation pass."""
+    query_cluster = np.stack(
+        [np.arange(7, dtype=np.float64) * 0.01, np.zeros(7)], axis=1,
+    )
+    observed_cluster = np.stack(
+        [10.0 + np.arange(7, dtype=np.float64) * 0.01, np.zeros(7)], axis=1,
+    )
+    coords2d = np.concatenate([query_cluster, observed_cluster], axis=0)
+    coords3d = np.concatenate([coords2d, np.zeros((coords2d.shape[0], 1))], axis=1)
+    slice_ids = np.full(coords3d.shape[0], "S0", dtype=object)
+    obs_names = np.asarray([f"spot{i}" for i in range(coords3d.shape[0])])
+
+    def fake_make_split(_coords3d, _slice_ids, _masking_cfg, seed):
+        query = np.zeros(coords3d.shape[0], dtype=bool)
+        if seed == 123:
+            query[:7] = True  # whole disconnected fragment: invalid
+        else:
+            query[0] = True   # surrounded by observed spots: valid
+        return ~query, query
+
+    monkeypatch.setattr(mask_bank, "make_split", fake_make_split)
+    bank = build_stratified_mask_bank(
+        coords3d, slice_ids, obs_names,
+        [{"name": "only", "radius_range": [1.0, 2.0], "radius_unit": "coordinate", "shape": "circle"}],
+        split_counts={"validation": 1}, split_seeds={"validation": 123},
+    )
+    assert len(bank["records"]) == 1
+    assert bank["records"][0]["seed"] == 124
+    assert bank["records"][0]["seed_attempt"] == 1
+    assert bank["records"][0]["query_obs_names"] == ["spot0"]
+
+
 def test_build_stratified_mask_bank_never_reuses_a_seed_across_strata():
     coords3d, slice_ids, obs_names = _synthetic_slide()
     bank = build_stratified_mask_bank(

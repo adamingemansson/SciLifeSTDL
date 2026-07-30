@@ -82,9 +82,11 @@ from typing import Iterable
 import numpy as np
 
 from gen3_multiscale.data import mask_bank
+from gen3_multiscale.data.boundary_graph import EmptyBoundaryError
 from gen3_multiscale.data.dataset_manifest import composite_spot_id
 from gen3_multiscale.data.mask_schedule import (
-    _MASK_GENERATION_VERSION, _STRATUM_SEED_STRIDE, strata_fingerprint, stratum_to_masking_cfg,
+    _MASK_GENERATION_VERSION, _STRATUM_SEED_STRIDE, strata_fingerprint,
+    stratum_to_masking_cfg, validate_mask_has_observed_boundary,
 )
 
 _REPORT_VERSION = 4
@@ -178,6 +180,9 @@ def realize_seed_and_fingerprint(
         raise EmptyMaskRealizationError(f"mask seed {seed} produced an empty context or query")
     context_obs_names = names[context].tolist()
     query_obs_names = names[query].tolist()
+    validate_mask_has_observed_boundary(
+        coords3d, names, context_obs_names, query_obs_names,
+    )
     if manifest is not None:
         validate_realized_barcodes_against_manifest(manifest, sample_id, context_obs_names)
         validate_realized_barcodes_against_manifest(manifest, sample_id, query_obs_names)
@@ -397,8 +402,12 @@ def build_collision_free_training_schedule(
                 record = realize_seed_and_fingerprint(
                     coords3d, slice_ids, obs_names, sample_id, masking_cfg, seed, manifest=manifest,
                 )
-            except EmptyMaskRealizationError:
-                continue  # empty context/query for this seed -- try the next one
+            except (EmptyMaskRealizationError, EmptyBoundaryError):
+                # Empty context/query, or a mask that removes an entire
+                # disconnected fragment and has no observed boundary: both
+                # are seed-specific invalid realizations, so try the next
+                # deterministic seed. Structural errors still propagate.
+                continue
             fp = record["query_composite_fingerprint"]
             query_composite_ids = {composite_spot_id(sample_id, b) for b in record["query_obs_names"]}
             if query_composite_ids & reserved_query_composite_ids:
@@ -851,12 +860,20 @@ def build_held_out_sample_mask_report(
         record_by_index = {int(r["index"]): r for r in stratum_records}
         for i in range(expected_count_per_stratum):
             record = record_by_index[i]
-            expected_seed = stratum_base_seed + i
+            seed_attempt = int(record.get("seed_attempt", -1))
+            if seed_attempt < 0:
+                raise ValueError(
+                    f"{sample_id}: stratum {stratum_name!r} {split!r} record index {i} "
+                    "has no valid non-negative seed_attempt -- the bank predates deterministic "
+                    "boundary-valid mask regeneration"
+                )
+            expected_seed = stratum_base_seed + i + seed_attempt * expected_count_per_stratum
             if int(record["seed"]) != expected_seed:
                 raise ValueError(
                     f"{sample_id}: stratum {stratum_name!r} {split!r} record index {i} has seed "
                     f"{record['seed']}, expected {expected_seed} (base_seed={base_seed}, "
-                    f"stratum_index={stratum_index}, _STRATUM_SEED_STRIDE={_STRATUM_SEED_STRIDE})"
+                    f"stratum_index={stratum_index}, seed_attempt={seed_attempt}, "
+                    f"_STRATUM_SEED_STRIDE={_STRATUM_SEED_STRIDE})"
                 )
             validate_realized_barcodes_against_manifest(manifest, sample_id, record["context_obs_names"])
             validate_realized_barcodes_against_manifest(manifest, sample_id, record["query_obs_names"])
