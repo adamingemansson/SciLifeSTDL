@@ -8,7 +8,7 @@ import numpy as np
 from gen3_multiscale.gen5.autoencoder import ExpressionAutoencoder
 from gen3_multiscale.tests._gen4_fixtures import (  # noqa: F401 -- re-exported for Gen5 tests
     GEN4_MODEL_KWARGS, Gen4STPathStub, StubSCFoundationEncoder, StubUNI2Encoder, synthetic_gen4_inputs,
-    with_synthetic_wsi_context,
+    with_synthetic_uni2_features, with_synthetic_wsi_context,
 )
 
 GEN5_MODEL_KWARGS = GEN4_MODEL_KWARGS

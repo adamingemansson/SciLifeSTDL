@@ -17,7 +17,7 @@ from gen3_multiscale.models.gene_basis import fit_gene_residual_basis
 from gen3_multiscale.tests._gen4_fixtures import Gen4STPathStub, StubUNI2Encoder
 
 _CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs" / "gen4"
-_ARMS = ["gen4a", "gen4b", "gen4c", "gen4d"]
+_ARMS = ["gen4a", "gen4b", "gen4c", "gen4d", "gen4e"]
 
 
 class _StubSlideEncoder(torch.nn.Module):
@@ -68,7 +68,7 @@ def test_conditioner_config_constructs_a_real_model_at_its_actual_dims(arm):
         kwargs["uni2_global_pool"] = MaskAwareCoordinateAttentionPool(
             tile_feature_dim=image_dim, output_dim=params["global_slide_dim"], hidden_dim=32, n_heads=2,
         )
-    if arm == "gen4d":
+    if arm in {"gen4d", "gen4e"}:
         kwargs["stpath_encoder"] = Gen4STPathStub(n_genes=n_genes, hidden_dim=image_dim)
     model = build_gen4_conditioner(**kwargs)
     assert sum(p.numel() for p in model.parameters()) > 0
@@ -99,7 +99,7 @@ def test_flow_config_constructs_a_real_model_at_its_actual_dims(arm):
         kwargs["uni2_global_pool"] = MaskAwareCoordinateAttentionPool(
             tile_feature_dim=image_dim, output_dim=params["global_slide_dim"], hidden_dim=32, n_heads=2,
         )
-    if arm == "gen4d":
+    if arm in {"gen4d", "gen4e"}:
         kwargs["stpath_encoder"] = Gen4STPathStub(n_genes=n_genes, hidden_dim=image_dim)
     model = build_gen4_flow(**kwargs)
     assert sum(p.numel() for p in model.parameters()) > 0

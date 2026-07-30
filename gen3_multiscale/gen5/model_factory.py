@@ -21,7 +21,7 @@ _KNOWN_NON_CONSTRUCTOR_FIELDS = frozenset({"init_seed"})
 # is keyed by the gen4 ids; this mapping is the single place that
 # translates between the two naming schemes so it can never silently
 # drift out of sync arm-by-arm.
-GEN5_TO_GEN4_ARM = {"gen5a": "gen4a", "gen5b": "gen4b", "gen5c": "gen4c", "gen5d": "gen4d"}
+GEN5_TO_GEN4_ARM = {"gen5a": "gen4a", "gen5b": "gen4b", "gen5c": "gen4c", "gen5d": "gen4d", "gen5e": "gen4e"}
 
 
 def _constructor_param_names(cls: type) -> frozenset[str]:
@@ -87,7 +87,7 @@ def build_gen5_model(
     kwargs["gex_feature_dim"] = gex_feature_dim
     kwargs["image_feature_dim"] = image_feature_dim
     kwargs["autoencoder"] = autoencoder
-    if kwargs["gex_feature_source"] == "frozen_context":
+    if kwargs["gex_feature_source"] in ("frozen_context", "hybrid_context"):
         if not gex_context_embedding_dim:
             raise ValueError(f"arm {arm!r} requires gex_context_embedding_dim (frozen scFoundation cache width)")
         kwargs["gex_context_embedding_dim"] = gex_context_embedding_dim
@@ -100,7 +100,7 @@ def build_gen5_model(
         if uni2_global_pool is None:
             raise ValueError(f"arm {arm!r} requires a real uni2_global_pool module")
         kwargs["uni2_global_pool"] = uni2_global_pool
-    if kwargs["image_feature_source"] == "stpath_context":
+    if kwargs["image_feature_source"] in ("stpath_context", "hybrid_context"):
         if stpath_encoder is None:
             raise ValueError(f"arm {arm!r} requires a real stpath_encoder module")
         kwargs["stpath_encoder"] = stpath_encoder

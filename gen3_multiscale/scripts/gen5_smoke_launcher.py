@@ -104,11 +104,18 @@ def _with_wsi_context(inputs, wsi_tile_feature_provenance=None):
     )
 
 
+def _with_uni2_features(inputs, seed: int = 3):
+    n_observed = inputs.observed_coords.shape[0]
+    rng = np.random.default_rng(seed)
+    return dataclasses.replace(inputs, observed_uni2_features=rng.normal(size=(n_observed, IMAGE_DIM)).astype(np.float32))
+
+
 _ARM_SETUP = {
     "gen5a": dict(gex_feature_source="weighted_linear", image_feature_source="precomputed", global_context_source="uni2_pool", gex_context_dim=None),
     "gen5b": dict(gex_feature_source="frozen_context", image_feature_source="precomputed", global_context_source="gigapath", gex_context_dim=CONTEXT_DIM),
     "gen5c": dict(gex_feature_source="frozen_context", image_feature_source="precomputed", global_context_source="uni2_pool", gex_context_dim=CONTEXT_DIM),
     "gen5d": dict(gex_feature_source="stpath_joint", image_feature_source="stpath_context", global_context_source="none", gex_context_dim=None),
+    "gen5e": dict(gex_feature_source="hybrid_context", image_feature_source="hybrid_context", global_context_source="none", gex_context_dim=CONTEXT_DIM),
 }
 
 
@@ -130,7 +137,7 @@ def _build_flow_model(arm: str, autoencoder: ExpressionAutoencoder) -> Gen5Laten
     elif setup["global_context_source"] == "uni2_pool":
         kwargs["uni2_global_pool"] = MaskAwareCoordinateAttentionPool(tile_feature_dim=IMAGE_DIM, output_dim=16, hidden_dim=16, n_heads=2)
         kwargs["global_slide_dim"] = 16
-    if setup["image_feature_source"] == "stpath_context":
+    if setup["image_feature_source"] in ("stpath_context", "hybrid_context"):
         kwargs["stpath_encoder"] = _StubSTPathEncoder(n_genes=N_GENES, hidden_dim=IMAGE_DIM)
     return Gen5LatentFlowModel(**kwargs)
 
@@ -158,6 +165,8 @@ def smoke_one_arm(arm: str, autoencoder: ExpressionAutoencoder) -> dict:
     if setup["global_context_source"] != "none":
         provenance = "uni2" if setup["global_context_source"] == "uni2_pool" else None
         inputs = _with_wsi_context(inputs, wsi_tile_feature_provenance=provenance)
+    if setup["image_feature_source"] == "hybrid_context":
+        inputs = _with_uni2_features(inputs)
     target = torch.as_tensor(targets.query_expression, dtype=torch.float32)
 
     torch.manual_seed(0)
@@ -184,7 +193,7 @@ def main() -> None:
     autoencoder_report = smoke_autoencoder()
     print({k: v for k, v in autoencoder_report.items() if k != "autoencoder"})
     autoencoder = autoencoder_report["autoencoder"]
-    for arm in ("gen5a", "gen5b", "gen5c", "gen5d"):
+    for arm in ("gen5a", "gen5b", "gen5c", "gen5d", "gen5e"):
         print(smoke_one_arm(arm, autoencoder))
     peak_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     print({"peak_cpu_rss_kb": peak_rss_kb, "note": "CPU-only stand-in for gate 9's real CUDA memory smoke test"})

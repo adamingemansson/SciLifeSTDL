@@ -34,7 +34,7 @@ def static_audit_gen5_config(config: dict) -> dict:
     latent_dim = params.get("latent_dim")
     if latent_dim is not None and int(latent_dim) <= 0:
         raise ValueError("model.params.latent_dim must be positive when set")
-    if arm in {"gen5b", "gen5c"}:
+    if arm in {"gen5b", "gen5c", "gen5e"}:
         context_dim = params.get("gex_context_embedding_dim")
         if not context_dim or int(context_dim) <= 0:
             raise ValueError(f"arm {arm!r} requires a positive model.params.gex_context_embedding_dim")

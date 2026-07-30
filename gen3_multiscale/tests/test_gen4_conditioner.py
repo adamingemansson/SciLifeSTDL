@@ -7,7 +7,7 @@ import torch
 from gen3_multiscale.gen4.conditioner import Gen4Conditioner
 from gen3_multiscale.gen4.uni2_global_pool import MaskAwareCoordinateAttentionPool
 from gen3_multiscale.tests._gen4_fixtures import (
-    GEN4_MODEL_KWARGS, Gen4STPathStub, synthetic_gen4_inputs, with_synthetic_wsi_context,
+    GEN4_MODEL_KWARGS, Gen4STPathStub, synthetic_gen4_inputs, with_synthetic_uni2_features, with_synthetic_wsi_context,
 )
 
 
@@ -103,6 +103,66 @@ def test_arm_d_stpath_context_conditioner_forward_and_gradients():
     loss.backward()
     assert stpath_stub.proj.weight.grad is not None
     assert torch.any(stpath_stub.proj.weight.grad != 0)
+
+
+def test_arm4_hybrid_conditioner_forward_and_gradients():
+    """Arm 4 (intended-design hybrid): STPath's joint context token fused
+    with UNI2's own per-spot morphology token (image slot) and frozen
+    scFoundation observed-GEX context (GEX slot) via small trainable
+    fusion layers -- image_feature_source='hybrid_context' and
+    gex_feature_source='hybrid_context' together. STPath's trainable
+    proj layer AND the fusion layers must all receive real, nonzero
+    gradients after backward()."""
+    n_genes, gex_dim, image_dim, context_dim = 6, 4, 8, 5
+    inputs, targets = synthetic_gen4_inputs(n_genes=n_genes, gex_dim=gex_dim, image_dim=image_dim, gex_context_dim=context_dim)
+    inputs = with_synthetic_uni2_features(inputs, image_dim)
+    stpath_stub = Gen4STPathStub(n_genes=n_genes, hidden_dim=image_dim)
+    model = Gen4Conditioner(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        gex_feature_source="hybrid_context", image_feature_source="hybrid_context",
+        gex_context_embedding_dim=context_dim, stpath_encoder=stpath_stub,
+        use_regional_he=False, global_context_source="none", **GEN4_MODEL_KWARGS,
+    )
+    out = model(inputs)
+    assert out["expression"].shape == targets.query_expression.shape
+    assert model.slide_encoder is None
+    assert model.stpath_encoder is stpath_stub
+    assert any(p is stpath_stub.proj.weight for p in model.parameters())
+
+    target = torch.as_tensor(targets.query_expression, dtype=torch.float32)
+    loss = torch.nn.functional.mse_loss(out["expression"], target)
+    loss.backward()
+    assert stpath_stub.proj.weight.grad is not None
+    assert torch.any(stpath_stub.proj.weight.grad != 0)
+    for name, module in (("hybrid_scf_proj", model.hybrid_scf_proj), ("hybrid_image_fusion", model.hybrid_image_fusion), ("hybrid_gex_fusion", model.hybrid_gex_fusion)):
+        for parameter in module.parameters():
+            assert parameter.grad is not None, f"{name} received no gradient"
+
+
+def test_arm4_hybrid_requires_matched_image_and_gex_sources():
+    import pytest
+    stpath_stub = Gen4STPathStub(n_genes=6, hidden_dim=8)
+    with pytest.raises(ValueError, match="must be used"):
+        Gen4Conditioner(
+            n_genes=6, gex_feature_dim=4, image_feature_dim=8,
+            image_feature_source="hybrid_context", stpath_encoder=stpath_stub,
+            use_regional_he=False, global_context_source="none", **GEN4_MODEL_KWARGS,
+        )
+
+
+def test_arm4_hybrid_requires_observed_uni2_features():
+    import pytest
+    n_genes, gex_dim, image_dim, context_dim = 6, 4, 8, 5
+    inputs, _targets = synthetic_gen4_inputs(n_genes=n_genes, gex_dim=gex_dim, image_dim=image_dim, gex_context_dim=context_dim)
+    stpath_stub = Gen4STPathStub(n_genes=n_genes, hidden_dim=image_dim)
+    model = Gen4Conditioner(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        gex_feature_source="hybrid_context", image_feature_source="hybrid_context",
+        gex_context_embedding_dim=context_dim, stpath_encoder=stpath_stub,
+        use_regional_he=False, global_context_source="none", **GEN4_MODEL_KWARGS,
+    )
+    with pytest.raises(ValueError, match="observed_uni2_features"):
+        model(inputs)  # observed_uni2_features left unset (None)
 
 
 def test_uni2_pool_rejects_wsi_tile_features_without_uni2_provenance():

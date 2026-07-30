@@ -7,7 +7,8 @@ import torch
 from gen3_multiscale.gen4.uni2_global_pool import MaskAwareCoordinateAttentionPool
 from gen3_multiscale.gen5.latent_flow import Gen5LatentFlowModel
 from gen3_multiscale.tests._gen5_fixtures import (
-    GEN5_MODEL_KWARGS, Gen4STPathStub, synthetic_gen4_inputs, tiny_autoencoder, with_synthetic_wsi_context,
+    GEN5_MODEL_KWARGS, Gen4STPathStub, synthetic_gen4_inputs, tiny_autoencoder, with_synthetic_uni2_features,
+    with_synthetic_wsi_context,
 )
 
 N_GENES, GEX_DIM, IMAGE_DIM, CONTEXT_DIM, LATENT_DIM = 6, 4, 8, 5, 8
@@ -94,6 +95,29 @@ def test_arm_d_stpath_context_construction_and_forward():
         n_genes=N_GENES, gene_names=GENE_NAMES, gex_feature_dim=GEX_DIM, image_feature_dim=IMAGE_DIM,
         autoencoder=autoencoder, gex_feature_source="stpath_joint", image_feature_source="stpath_context",
         stpath_encoder=stpath_stub, use_regional_he=False, global_context_source="none",
+        n_flow_blocks=1, n_flow_samples=2, n_ode_steps=2, **GEN5_MODEL_KWARGS,
+    )
+    assert model.conditioner.stpath_encoder is stpath_stub
+    assert any(p is stpath_stub.proj.weight for p in model.parameters())
+    target = torch.as_tensor(targets.query_expression, dtype=torch.float32)
+    out = model.compute_losses(inputs, target, generator=torch.Generator().manual_seed(0))
+    assert torch.isfinite(out["flow_loss"])
+    out["flow_loss"].backward()
+    assert stpath_stub.proj.weight.grad is None  # detached-conditioner discipline: no flow-stage gradient reaches it
+
+
+def test_arm4_hybrid_construction_and_forward():
+    """Arm 4 (intended-design hybrid), mirroring Gen4's own arm 4/gen4e.
+    Same detached-conditioner discipline as arm D/3's own test above."""
+    autoencoder = tiny_autoencoder(n_genes=N_GENES, latent_dim=LATENT_DIM)
+    inputs, targets = synthetic_gen4_inputs(n_genes=N_GENES, gex_dim=GEX_DIM, image_dim=IMAGE_DIM, gex_context_dim=CONTEXT_DIM)
+    inputs = with_synthetic_uni2_features(inputs, IMAGE_DIM)
+    stpath_stub = Gen4STPathStub(n_genes=N_GENES, hidden_dim=IMAGE_DIM)
+    model = Gen5LatentFlowModel(
+        n_genes=N_GENES, gene_names=GENE_NAMES, gex_feature_dim=GEX_DIM, image_feature_dim=IMAGE_DIM,
+        autoencoder=autoencoder, gex_feature_source="hybrid_context", image_feature_source="hybrid_context",
+        gex_context_embedding_dim=CONTEXT_DIM, stpath_encoder=stpath_stub,
+        use_regional_he=False, global_context_source="none",
         n_flow_blocks=1, n_flow_samples=2, n_ode_steps=2, **GEN5_MODEL_KWARGS,
     )
     assert model.conditioner.stpath_encoder is stpath_stub

@@ -16,7 +16,7 @@ from gen3_multiscale.gen5.preflight import static_audit_gen5_config
 from gen3_multiscale.tests._gen5_fixtures import Gen4STPathStub, tiny_autoencoder
 
 _CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs" / "gen5"
-_ARMS = ["gen5a", "gen5b", "gen5c", "gen5d"]
+_ARMS = ["gen5a", "gen5b", "gen5c", "gen5d", "gen5e"]
 _SHARED_VELOCITY_KEYS = ("hidden_dim", "n_heads", "n_flow_blocks", "dense_threshold", "sparse_k", "chunk_size", "n_flow_samples", "n_ode_steps", "latent_dim")
 
 
@@ -74,7 +74,7 @@ def test_config_constructs_a_real_model_at_its_actual_dims(arm):
         kwargs["uni2_global_pool"] = MaskAwareCoordinateAttentionPool(
             tile_feature_dim=image_dim, output_dim=params["global_slide_dim"], hidden_dim=32, n_heads=2,
         )
-    if arm == "gen5d":
+    if arm in {"gen5d", "gen5e"}:
         kwargs["stpath_encoder"] = Gen4STPathStub(n_genes=n_genes, hidden_dim=image_dim)
     model = build_gen5_model(**kwargs)
     assert sum(p.numel() for p in model.parameters()) > 0

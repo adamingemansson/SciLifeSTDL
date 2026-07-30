@@ -17,11 +17,30 @@ from gen3_multiscale.models.gene_basis import GeneResidualBasis
 
 # arm -> (gex_feature_source, global_context_source, image_feature_source) --
 # GEN4_CONTRACT.md section 2.
+#
+# Intended-design arm mapping (Adam's original four-arm design; internal
+# gen4a-e keys below are unchanged for backward compatibility with existing
+# configs/tests, since a blanket key rename would touch every config/test
+# file for zero behavioral gain -- this table IS the canonical mapping):
+#   gen4c -> intended Arm 1 (UNI2 + scFoundation)
+#   gen4b -> intended Arm 2 (GigaPath + scFoundation)
+#   gen4d -> intended Arm 3 (STPath joint conditioner)
+#   gen4e -> intended Arm 4 (STPath + UNI2 + scFoundation hybrid -- NEW)
+#   gen4a -> optional baseline (UNI2 + trainable weighted-linear GEX), not
+#            one of the four primary long-run arms
+INTENDED_ARM_NAMES = {
+    "gen4c": "arm1_uni2_scfoundation",
+    "gen4b": "arm2_gigapath_scfoundation",
+    "gen4d": "arm3_stpath",
+    "gen4e": "arm4_hybrid_stpath_uni2_scfoundation",
+    "gen4a": "baseline_uni2_weighted_linear",
+}
 ARM_TABLE = {
     "gen4a": {"gex_feature_source": "weighted_linear", "global_context_source": "uni2_pool", "image_feature_source": "precomputed"},
     "gen4b": {"gex_feature_source": "frozen_context", "global_context_source": "gigapath", "image_feature_source": "precomputed"},
     "gen4c": {"gex_feature_source": "frozen_context", "global_context_source": "uni2_pool", "image_feature_source": "precomputed"},
     "gen4d": {"gex_feature_source": "stpath_joint", "global_context_source": "none", "image_feature_source": "stpath_context"},
+    "gen4e": {"gex_feature_source": "hybrid_context", "global_context_source": "none", "image_feature_source": "hybrid_context"},
 }
 
 _KNOWN_NON_CONSTRUCTOR_FIELDS = frozenset({"init_seed"})
@@ -78,7 +97,7 @@ def _resolve_kwargs(
     kwargs["n_genes"] = n_genes
     kwargs["gex_feature_dim"] = gex_feature_dim
     kwargs["image_feature_dim"] = image_feature_dim
-    if kwargs["gex_feature_source"] == "frozen_context":
+    if kwargs["gex_feature_source"] in ("frozen_context", "hybrid_context"):
         if not gex_context_embedding_dim:
             raise ValueError(f"arm {arm!r} requires gex_context_embedding_dim (frozen scFoundation cache width)")
         kwargs["gex_context_embedding_dim"] = gex_context_embedding_dim
@@ -91,7 +110,7 @@ def _resolve_kwargs(
         if uni2_global_pool is None:
             raise ValueError(f"arm {arm!r} requires a real uni2_global_pool module")
         kwargs["uni2_global_pool"] = uni2_global_pool
-    if kwargs["image_feature_source"] == "stpath_context":
+    if kwargs["image_feature_source"] in ("stpath_context", "hybrid_context"):
         if stpath_encoder is None:
             raise ValueError(f"arm {arm!r} requires a real stpath_encoder module")
         kwargs["stpath_encoder"] = stpath_encoder
