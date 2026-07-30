@@ -565,6 +565,13 @@ def test_load_configured_gene_panels_returns_empty_when_unconfigured():
     assert load_configured_gene_panels({"evaluation": {}}) == {}
 
 
+def test_load_configured_gene_panels_requires_manifest_for_train_derived_artifact(tmp_path):
+    with pytest.raises(ValueError, match="no dataset manifest"):
+        load_configured_gene_panels(
+            {"evaluation": {"train_gene_panel_artifact": str(tmp_path / "panels.json")}}
+        )
+
+
 def test_load_configured_gene_panels_raises_on_a_missing_file(tmp_path):
     with pytest.raises(FileNotFoundError, match="missing"):
         load_configured_gene_panels(

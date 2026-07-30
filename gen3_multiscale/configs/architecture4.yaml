@@ -119,6 +119,7 @@ data:
     split_seed: 0
 
 evaluation:
+  train_gene_panel_artifact: null
   gene_panels:
     CCRCC_var_50genes: resources/evaluation/hest_bench/CCRCC_var_50genes.json
   compute_st_fid_mmd: false

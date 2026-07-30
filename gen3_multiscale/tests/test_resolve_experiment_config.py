@@ -62,6 +62,19 @@ def test_resolve_experiment_config_overrides_checkpoint_dir_when_given():
     assert resolved["training"]["checkpoint_dir"] == "/tmp/my_ckpt_dir"
 
 
+def test_resolve_experiment_config_records_panels_and_manual_run_limits():
+    resolved = resolve_experiment_config(
+        _CONFIG_DIR / "architecture1.yaml",
+        gen3_manifest_path="/tmp/manifest.json", tile_encoder_revision=_A_REVISION,
+        synchronized_init_dir="/tmp/sync_init", train_gene_panel_artifact="/tmp/train_panels.json",
+        total_steps=1234, max_wall_clock_hours=2.5, seed=17,
+    )
+    assert resolved["evaluation"]["train_gene_panel_artifact"] == "/tmp/train_panels.json"
+    assert resolved["training"]["total_steps"] == 1234
+    assert resolved["training"]["max_wall_clock_hours"] == 2.5
+    assert resolved["training"]["seed"] == 17
+
+
 def test_resolve_experiment_config_requires_gigapath_checkpoint_when_use_global_slide():
     """architecture3.yaml has model.params.use_global_slide=true --
     resolving it without a gigapath checkpoint must fail closed, never
@@ -394,6 +407,7 @@ def test_resolve_experiment_config_cli_actually_writes_a_resolved_config_bundle(
             "--base-config", str(_CONFIG_DIR / "architecture1.yaml"), "--output-dir", str(output_dir),
             "--gen3-manifest-path", "/tmp/manifest.json", "--tile-encoder-revision", _A_REVISION,
             "--synchronized-init-dir", "/tmp/sync_init",
+            "--train-gene-panel-artifact", "/tmp/train_panels.json",
         ],
         cwd=repo_root, capture_output=True, text=True, timeout=60,
     )
@@ -410,7 +424,9 @@ def test_resolve_experiment_config_cli_exits_nonzero_on_a_missing_required_field
             sys.executable, "-m", "gen3_multiscale.scripts.resolve_experiment_config",
             "--base-config", str(_CONFIG_DIR / "architecture3.yaml"), "--output-dir", str(output_dir),
             "--gen3-manifest-path", "/tmp/manifest.json", "--tile-encoder-revision", _A_REVISION,
-            "--synchronized-init-dir", "/tmp/sync_init",  # missing --gigapath-checkpoint (use_global_slide=true)
+            "--synchronized-init-dir", "/tmp/sync_init",
+            "--train-gene-panel-artifact", "/tmp/train_panels.json",
+            # missing --gigapath-checkpoint (use_global_slide=true)
         ],
         cwd=repo_root, capture_output=True, text=True, timeout=60,
     )
@@ -430,7 +446,8 @@ def test_resolve_experiment_config_cli_has_no_force_flag(tmp_path):
             sys.executable, "-m", "gen3_multiscale.scripts.resolve_experiment_config",
             "--base-config", str(_CONFIG_DIR / "architecture1.yaml"), "--output-dir", str(output_dir),
             "--gen3-manifest-path", "/tmp/manifest.json", "--tile-encoder-revision", _A_REVISION,
-            "--synchronized-init-dir", "/tmp/sync_init", "--force",
+            "--synchronized-init-dir", "/tmp/sync_init",
+            "--train-gene-panel-artifact", "/tmp/train_panels.json", "--force",
         ],
         cwd=repo_root, capture_output=True, text=True, timeout=30,
     )

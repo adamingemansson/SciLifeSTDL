@@ -173,6 +173,10 @@ def resolve_experiment_config(
     gigapath_checkpoint: str | None = None,
     gene_residual_basis: str | None = None,
     architecture3_conditioner_checkpoint: str | None = None,
+    train_gene_panel_artifact: str | None = None,
+    total_steps: int | None = None,
+    max_wall_clock_hours: float | None = None,
+    seed: int | None = None,
 ) -> dict:
     """Load `base_config_path` (one of the committed `configs/
     architectureN.yaml` templates, or any config sharing its schema),
@@ -213,6 +217,16 @@ def resolve_experiment_config(
         architecture3_conditioner_checkpoint = _require_non_blank_string(
             architecture3_conditioner_checkpoint, "architecture3_conditioner_checkpoint",
         )
+    if train_gene_panel_artifact is not None:
+        train_gene_panel_artifact = _require_non_blank_string(
+            train_gene_panel_artifact, "train_gene_panel_artifact",
+        )
+    if total_steps is not None and (isinstance(total_steps, bool) or int(total_steps) <= 0):
+        raise ValueError(f"total_steps must be a positive integer, got {total_steps!r}")
+    if max_wall_clock_hours is not None and float(max_wall_clock_hours) <= 0:
+        raise ValueError(f"max_wall_clock_hours must be positive, got {max_wall_clock_hours!r}")
+    if seed is not None and isinstance(seed, bool):
+        raise ValueError("seed must be an integer, not bool")
 
     data_cfg = dict(config.get("data") or {})
     data_cfg["gen3_manifest_path"] = gen3_manifest_path
@@ -223,7 +237,18 @@ def resolve_experiment_config(
     training_cfg["synchronized_init_dir"] = synchronized_init_dir
     if checkpoint_dir is not None:
         training_cfg["checkpoint_dir"] = checkpoint_dir
+    if total_steps is not None:
+        training_cfg["total_steps"] = int(total_steps)
+    if max_wall_clock_hours is not None:
+        training_cfg["max_wall_clock_hours"] = float(max_wall_clock_hours)
+    if seed is not None:
+        training_cfg["seed"] = int(seed)
     config["training"] = training_cfg
+
+    evaluation_cfg = dict(config.get("evaluation") or {})
+    if train_gene_panel_artifact is not None:
+        evaluation_cfg["train_gene_panel_artifact"] = train_gene_panel_artifact
+    config["evaluation"] = evaluation_cfg
 
     model_params = dict((config.get("model") or {}).get("params") or {})
     for field in _DEAD_MODEL_PARAM_FIELDS:
@@ -400,6 +425,10 @@ def main() -> None:
     parser.add_argument("--gigapath-checkpoint", default=None, help="Required iff model.params.use_global_slide=true")
     parser.add_argument("--gene-residual-basis", default=None, help="Required iff model.architecture=4")
     parser.add_argument("--architecture3-conditioner-checkpoint", default=None, help="Required iff model.architecture=4")
+    parser.add_argument("--train-gene-panel-artifact", required=True, help="Immutable train-only top-50/top-200 panel JSON")
+    parser.add_argument("--total-steps", type=int, default=None)
+    parser.add_argument("--max-wall-clock-hours", type=float, default=None)
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
     try:
@@ -409,6 +438,8 @@ def main() -> None:
             synchronized_init_dir=args.synchronized_init_dir, checkpoint_dir=args.checkpoint_dir,
             gigapath_checkpoint=args.gigapath_checkpoint, gene_residual_basis=args.gene_residual_basis,
             architecture3_conditioner_checkpoint=args.architecture3_conditioner_checkpoint,
+            train_gene_panel_artifact=args.train_gene_panel_artifact,
+            total_steps=args.total_steps, max_wall_clock_hours=args.max_wall_clock_hours, seed=args.seed,
         )
     except Exception as exc:
         print(f"resolve_experiment_config failed: {exc}", file=sys.stderr)

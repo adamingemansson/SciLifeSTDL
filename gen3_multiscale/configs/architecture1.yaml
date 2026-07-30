@@ -122,6 +122,9 @@ data:
     split_seed: 0
 
 evaluation:
+  # Secondary views only; generated from TRAIN samples in the exact model
+  # target space. Full-gene PCC/RMSE remain primary.
+  train_gene_panel_artifact: null
   gene_panels:
     CCRCC_var_50genes: resources/evaluation/hest_bench/CCRCC_var_50genes.json
   compute_st_fid_mmd: false

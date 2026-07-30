@@ -73,6 +73,46 @@ from gen3_multiscale.data.slide_context import (
 _SUPPORTED_IMAGE_MODES = frozenset({"target_zero"})
 
 
+def load_expression_for_model_target_space(
+    manifest: dict, sample_id: str, hest_data_dir: str | Path | None = None,
+):
+    """Load one sample in the exact Gen3 target space without touching H&E.
+
+    This is the authoritative expression half of ``load_sample_for_examples``
+    and is also used for train-only variance panels.  Keeping it here avoids
+    either loading gigabytes of irrelevant patches or reimplementing the
+    normalization/QC transform in the evaluator.
+    """
+    hest_data_dir = Path(hest_data_dir) if hest_data_dir is not None else Path(manifest["hest_data_dir"])
+    record = manifest["samples"][sample_id]
+    args = manifest["build_args"]
+    import scanpy as sc
+
+    adata = loaders.load_hest_sample(hest_data_dir, sample_id, organ=record["organ"], tech=record["tech"])
+    if args["gene_min_genes_per_spot"] > 0:
+        sc.pp.filter_cells(adata, min_genes=args["gene_min_genes_per_spot"])
+    adata = loaders.basic_qc_and_normalize(
+        adata, min_genes=0, min_cells=0,
+        transform=args["expression_transform"], target_sum=args["expression_target_sum"],
+    )
+    missing_genes = [g for g in manifest["gene_panel"] if g not in adata.var_names]
+    if missing_genes:
+        raise ValueError(
+            f"{sample_id} is missing {len(missing_genes)} genes from the manifest's declared "
+            f"gene_panel (examples: {missing_genes[:5]}) -- rebuild the manifest"
+        )
+    adata = adata[:, manifest["gene_panel"]].copy()
+    expected_barcodes = set(map(str, record["barcodes"]))
+    actual_barcodes = set(map(str, adata.obs_names))
+    if actual_barcodes != expected_barcodes:
+        raise ValueError(
+            f"{sample_id}: expression spot identities differ from the immutable manifest "
+            f"(missing={sorted(expected_barcodes - actual_barcodes)[:5]}, "
+            f"unexpected={sorted(actual_barcodes - expected_barcodes)[:5]}); rebuild the manifest"
+        )
+    return adata
+
+
 def load_sample_for_examples(
     manifest: dict, sample_id: str, hest_data_dir: str | Path | None = None,
 ) -> tuple["ad.AnnData", np.ndarray, np.ndarray]:  # noqa: F821 -- anndata imported lazily below
@@ -106,30 +146,7 @@ def load_sample_for_examples(
     shrunk subset."""
     hest_data_dir = Path(hest_data_dir) if hest_data_dir is not None else Path(manifest["hest_data_dir"])
     record = manifest["samples"][sample_id]
-    args = manifest["build_args"]
-
-    import scanpy as sc
-
-    adata = loaders.load_hest_sample(hest_data_dir, sample_id, organ=record["organ"], tech=record["tech"])
-    if args["gene_min_genes_per_spot"] > 0:
-        sc.pp.filter_cells(adata, min_genes=args["gene_min_genes_per_spot"])
-    # min_genes=0/min_cells=0 here: per-spot QC was just applied above
-    # (matching dataset_manifest.py's identical filter exactly); gene-level
-    # QC is already baked into manifest["gene_panel"] -- basic_qc_and_normalize
-    # is called only for its normalize/log1p transform and raw-counts-layer
-    # bookkeeping, not to filter anything a second time.
-    adata = loaders.basic_qc_and_normalize(
-        adata, min_genes=0, min_cells=0,
-        transform=args["expression_transform"], target_sum=args["expression_target_sum"],
-    )
-    missing_genes = [g for g in manifest["gene_panel"] if g not in adata.var_names]
-    if missing_genes:
-        raise ValueError(
-            f"{sample_id} is missing {len(missing_genes)} genes from the manifest's declared "
-            f"gene_panel (examples: {missing_genes[:5]}) -- the real data changed since the "
-            "manifest was built; rebuild the manifest"
-        )
-    adata = adata[:, manifest["gene_panel"]].copy()
+    adata = load_expression_for_model_target_space(manifest, sample_id, hest_data_dir)
 
     patches, patch_barcodes = loaders.load_hest_patches(hest_data_dir, sample_id)
     adata, patches, image_source_available = loaders.align_patches_to_adata(adata, patches, patch_barcodes)

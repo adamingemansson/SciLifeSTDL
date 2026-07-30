@@ -46,6 +46,7 @@ from gen3_multiscale.evaluation.metrics import (
     aggregate_patient_metrics, embed_pca, gene_panel_metrics, nonzero_auc, pearson_per_gene, resolve_gene_panels,
     rmse, st_fid, st_mmd,
 )
+from gen3_multiscale.evaluation.train_gene_panels import load_train_derived_gene_panels
 from gen3_multiscale.models.harmonic import harmonic_interpolation
 from gen3_multiscale.training import checkpoint as checkpoint_module
 from gen3_multiscale.training.gen3_dataset import Gen3SpatialFieldDataset, build_gen3_mask_schedule
@@ -120,7 +121,9 @@ _BASELINE_PREDICTORS = {
 }
 
 
-def load_configured_gene_panels(config: dict) -> dict[str, list[str]]:
+def load_configured_gene_panels(
+    config: dict, dataset_manifest: dict | None = None,
+) -> dict[str, list[str]]:
     """Codex re-audit of commit 90f853e, launch blocker #9: "configured
     named panels" -- `evaluation.gene_panels` (every architectureN.yaml
     already declares one: `{panel_name: json_path}`) was never actually
@@ -143,6 +146,18 @@ def load_configured_gene_panels(config: dict) -> dict[str, list[str]]:
         if not isinstance(genes, list) or not genes:
             raise ValueError(f"evaluation gene panel {panel_name!r} must contain a non-empty gene list: {path}")
         panels[str(panel_name)] = list(dict.fromkeys(str(gene) for gene in genes))
+    derived_path = (config.get("evaluation") or {}).get("train_gene_panel_artifact")
+    if derived_path:
+        if dataset_manifest is None:
+            raise ValueError(
+                "evaluation.train_gene_panel_artifact is configured, but no dataset manifest was supplied "
+                "for its train-only provenance verification"
+            )
+        artifact = load_train_derived_gene_panels(derived_path, dataset_manifest)
+        for panel_name, genes in artifact["panels"].items():
+            if panel_name in panels:
+                raise ValueError(f"duplicate configured/train-derived evaluation panel name {panel_name!r}")
+            panels[panel_name] = list(genes)
     return panels
 
 
@@ -427,7 +442,17 @@ def evaluate_gen3_checkpoint(
         cache_content_by_sample=preflight_report.get("cache_content_by_sample"),
     )
 
-    gene_panels = load_configured_gene_panels(config)
+    gene_panels = load_configured_gene_panels(config, dataset_manifest)
+    train_panel_path = (config.get("evaluation") or {}).get("train_gene_panel_artifact")
+    train_panel_identity = None
+    if train_panel_path:
+        train_panel_artifact = load_train_derived_gene_panels(train_panel_path, dataset_manifest)
+        train_panel_identity = {
+            "path": str(train_panel_path),
+            "artifact_sha256": train_panel_artifact["artifact_sha256"],
+            "dataset_manifest_fingerprint": train_panel_artifact["dataset_manifest_fingerprint"],
+            "method": train_panel_artifact["method"],
+        }
     _panel_indices, panel_metadata = resolve_gene_panels(gene_names, gene_panels) if gene_panels else ({}, {})
 
     per_item_by_arm: dict[str, list[dict]] = {"model": []}
@@ -630,7 +655,7 @@ def evaluate_gen3_checkpoint(
     }
 
     report = {
-        "version": 5,
+        "version": 6,
         "kind": "gen3_step7_evaluation_report",
         "config_path": str(config_path),
         "checkpoint_dir": str(checkpoint_dir),
@@ -647,6 +672,7 @@ def evaluate_gen3_checkpoint(
         # Launch blocker #9.
         "per_stratum_patient_aggregated_metrics": per_stratum_aggregated_metrics,
         "gene_panel_metadata": panel_metadata,
+        "train_gene_panel_artifact": train_panel_identity,
         "per_panel_patient_aggregated_metrics": per_panel_patient_aggregated_metrics,
         "per_panel_paired_delta_vs_model": per_panel_paired_delta_vs_model,
         "architecture4_calibration": architecture4_calibration,

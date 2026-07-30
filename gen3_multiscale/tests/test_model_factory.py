@@ -642,6 +642,40 @@ def test_persist_four_architecture_initializations_synchronizes_persists_and_rou
         load_synchronized_initialization(fresh, tmp_path / name, manifest=manifest, architecture_name=name)
 
 
+def test_architecture4_synchronized_initialization_never_overwrites_the_later_fitted_basis(tmp_path):
+    """The fitted basis is produced after Architecture 3 training, so it
+    must remain outside the earlier shared-initialization artifact."""
+    models = _build_all_four()
+    manifest = persist_four_architecture_initializations(models, tmp_path)
+    entry = manifest["architectures"]["architecture4"]
+    assert entry["external_artifact_buffers"] == ["_gene_basis_matrix"]
+    assert "_gene_basis_matrix" not in entry["tensor_hashes"]
+
+    later_basis, gene_names = _gene_basis(n_genes=6, seed=991)
+    fresh = build_architecture(
+        _load("architecture4"), n_genes=6, gex_feature_dim=4,
+        gene_basis=later_basis, gene_names=gene_names, **_wsi_kwargs_for("architecture4"),
+    )
+    before = fresh._gene_basis_matrix.detach().clone()
+    load_synchronized_initialization(
+        fresh, tmp_path / "architecture4", manifest=manifest, architecture_name="architecture4",
+    )
+    assert torch.equal(fresh._gene_basis_matrix, before)
+
+
+def test_synchronized_initialization_rejects_unapproved_external_buffer_exclusions(tmp_path):
+    models = _build_all_four()
+    manifest = persist_four_architecture_initializations(models, tmp_path)
+    manifest["architectures"]["architecture1"]["external_artifact_buffers"] = [
+        "transport_head.target_gene_scale"
+    ]
+    fresh = build_architecture(_load("architecture1"), n_genes=6, gex_feature_dim=4)
+    with pytest.raises(ValueError, match="not an approved external artifact"):
+        load_synchronized_initialization(
+            fresh, tmp_path / "architecture1", manifest=manifest, architecture_name="architecture1",
+        )
+
+
 def test_persist_four_architecture_initializations_refuses_to_persist_an_inconsistent_state(tmp_path, monkeypatch):
     """Verifies the extra paranoia check actually does something: if
     synchronization somehow left a "shared" tensor genuinely unequal

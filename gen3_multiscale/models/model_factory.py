@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -319,6 +320,7 @@ def _tensor_hash(tensor: torch.Tensor) -> str:
 def persist_synchronized_initializations(
     models: dict[str, torch.nn.Module], output_dir: str | Path,
     synchronized: dict[str, dict[str, str]] | None = None,
+    external_artifact_buffers: dict[str, set[str]] | None = None,
 ) -> dict:
     """Persist each architecture's (already-synchronized, e.g. via
     `synchronize_four_architecture_initialization`) initial weights to
@@ -374,11 +376,42 @@ def persist_synchronized_initializations(
     doesn't exist yet would be worse than omitting them.
     """
     output_dir = Path(output_dir)
+    external_artifact_buffers = external_artifact_buffers or {}
     per_architecture = {}
     for name, model in models.items():
         arch_dir = output_dir / name
-        weights_path = checkpoint_module.save_trainable_state(model, arch_dir)
-        saved_keys = set(torch.load(weights_path, map_location="cpu").keys()) if weights_path is not None else set()
+        excluded = set(external_artifact_buffers.get(name, set()))
+        parameter_names = {tensor_name for tensor_name, _ in model.named_parameters()}
+        buffer_names = {tensor_name for tensor_name, _ in model.named_buffers()}
+        invalid_excluded = excluded - buffer_names
+        if invalid_excluded:
+            raise ValueError(
+                f"{name}: external_artifact_buffers contains names that are not registered buffers: "
+                f"{sorted(invalid_excluded)}"
+            )
+        if excluded & parameter_names:
+            raise ValueError(
+                f"{name}: trainable parameters may not be excluded as external artifacts: "
+                f"{sorted(excluded & parameter_names)}"
+            )
+
+        # Synchronized initialization is deliberately narrower than a
+        # training checkpoint. Architecture 4's `_gene_basis_matrix` is an
+        # immutable, externally fitted artifact that does not exist until
+        # AFTER Architecture 3 has trained; serializing it here would create
+        # a circular dependency and, worse, overwrite the real fitted basis
+        # when the initialization is loaded. Persist every ordinary
+        # trainable/non-frozen state entry, but leave explicitly declared
+        # external-artifact buffers on the freshly constructed model.
+        save_names = checkpoint_module._expected_trainable_state_names(model) - excluded
+        state = {k: v for k, v in model.state_dict().items() if k in save_names}
+        weights_path = arch_dir / "trainable_weights.pt" if state else None
+        if weights_path is not None:
+            weights_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = weights_path.with_name(f".{weights_path.name}.tmp.{os.getpid()}")
+            torch.save(state, tmp_path)
+            tmp_path.replace(weights_path)
+        saved_keys = set(state)
 
         all_tensors = dict(model.named_parameters())
         all_tensors.update(dict(model.named_buffers()))
@@ -395,6 +428,7 @@ def persist_synchronized_initializations(
             "weights_file_sha256": _sha256_file(weights_path) if weights_path is not None else None,
             "n_parameters": int(sum(p.numel() for p in model.parameters())),
             "tensor_hashes": tensor_hashes,
+            "external_artifact_buffers": sorted(excluded),
         }
         if gene_basis is not None:
             # Named precisely (not "gene_basis_hash") -- this is only the
@@ -472,7 +506,17 @@ def persist_four_architecture_initializations(models: dict[str, torch.nn.Module]
                     "synchronization -- refusing to persist an inconsistent initialization"
                 )
 
-    return persist_synchronized_initializations(models, output_dir, synchronized=synchronized)
+    return persist_synchronized_initializations(
+        models,
+        output_dir,
+        synchronized=synchronized,
+        # The numeric residual basis is fitted from Architecture 3's
+        # TRAINING-only residuals after Architecture 3 finishes. It is not
+        # shared initialization and must survive initialization loading
+        # unchanged. Its gene ordering is still checked below through
+        # gene_basis_gene_names_hash.
+        external_artifact_buffers={"architecture4": {"_gene_basis_matrix"}},
+    )
 
 
 def load_synchronized_initialization(
@@ -516,7 +560,41 @@ def load_synchronized_initialization(
                 "corrupted, or copied from a different architecture's directory"
             )
 
-    checkpoint_module.load_trainable_state(model, architecture_dir)
+    excluded = set(entry.get("external_artifact_buffers") or [])
+    allowed_external = {"_gene_basis_matrix"} if architecture_name == "architecture4" else set()
+    if excluded - allowed_external:
+        raise ValueError(
+            f"manifest for {architecture_name!r} attempts to exclude state that is not an approved "
+            f"external artifact: {sorted(excluded - allowed_external)}"
+        )
+    parameter_names = {tensor_name for tensor_name, _ in model.named_parameters()}
+    buffer_names = {tensor_name for tensor_name, _ in model.named_buffers()}
+    if excluded - buffer_names:
+        raise ValueError(
+            f"manifest for {architecture_name!r} excludes unknown/non-buffer state names "
+            f"{sorted(excluded - buffer_names)}"
+        )
+    if excluded & parameter_names:
+        raise ValueError(
+            f"manifest for {architecture_name!r} attempts to exclude trainable parameter(s) "
+            f"{sorted(excluded & parameter_names)}"
+        )
+
+    expected_names = checkpoint_module._expected_trainable_state_names(model) - excluded
+    if weights_path.is_file():
+        state = torch.load(weights_path, map_location="cpu")
+        if set(state) != expected_names:
+            raise ValueError(
+                f"synchronized initialization for {architecture_name!r} has state keys that do not "
+                f"match the model after its declared external-artifact exclusions; missing="
+                f"{sorted(expected_names - set(state))}, unexpected={sorted(set(state) - expected_names)}"
+            )
+        model.load_state_dict(state, strict=False)
+    elif expected_names:
+        raise ValueError(
+            f"manifest expects synchronized state for {architecture_name!r}, but "
+            f"{weights_path} is missing"
+        )
 
     all_tensors = dict(model.named_parameters())
     all_tensors.update(dict(model.named_buffers()))
@@ -562,16 +640,11 @@ def load_synchronized_initialization(
     # Real, confirmed gap (7th Codex re-audit of commit 2782ff0): the
     # manifest records gene_basis_gene_names_hash for Architecture 4, but
     # it was never actually compared against the freshly-constructed
-    # model's own gene_basis. The basis MATRIX's numeric content is
-    # already verified above (_gene_basis_matrix is a registered buffer,
-    # covered by the tensor_hashes loop) -- but the matrix's raw numbers
-    # carry no information about which genes, or which order, those
-    # numbers apply to. A checkpoint whose basis matrix happens to match
-    # byte-for-byte while the freshly-constructed model was built against
-    # a DIFFERENT gene panel/order (a real, plausible config-drift
-    # mistake -- e.g. an updated gene vocabulary file, same rank, same
-    # incidentally-identical values) would previously pass every check
-    # here despite predicting into the wrong genes entirely.
+    # model's own gene_basis. In the strict four-arm path the basis matrix
+    # is deliberately external to synchronized initialization (it is fit
+    # only after Architecture 3 training); its numeric content is verified
+    # by the fitted-basis provenance sidecar. This check binds the gene
+    # identity/order at the initialization boundary as well.
     # Real, confirmed gap (8th Codex re-audit of commit 7b5c267): the §27
     # check above only fired when BOTH sides had gene-basis metadata --
     # `if model_gene_basis is not None and expected_gene_basis_hash is not
