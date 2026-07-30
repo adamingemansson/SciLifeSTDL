@@ -631,3 +631,141 @@ def test_rollback_verifies_the_target_bundle_before_touching_the_pointer_or_root
         restored = _Tiny()
         load_trainable_state(restored, tmp)
         assert torch.allclose(restored.lin.weight, torch.full((4, 4), 2.0))
+
+
+# ---------------------------------------------------------------------------
+# Codex re-audit of commit 66d65f2, finding #2: "load_trainable_state()
+# rejects missing trainable parameters and unexpected keys, but not
+# missing expected buffers such as target_gene_scale, gene-basis buffers,
+# or coordinate frequencies. A damaged checkpoint could therefore
+# silently retain freshly initialized buffers." Exercises REAL
+# architectures (not the toy _Tiny fixture) so the deleted keys are real,
+# registered buffers (`GeneValueTransportHead.target_gene_scale`,
+# `Architecture4._gene_basis_matrix`), not synthetic stand-ins.
+# ---------------------------------------------------------------------------
+
+def _small_architecture1():
+    from gen3_multiscale.models import model_factory as mf
+
+    params = {
+        "image_feature_dim": 1536, "hidden_dim": 16, "n_heads": 2, "n_blocks": 1,
+        "dense_threshold": 256, "sparse_k": 10, "chunk_size": 1024, "max_boundary_size": None,
+        "transport_heads": 2, "transport_temperature": 1.0, "gene_gate_mode": "per_gene",
+        "use_query_gate": True, "use_residual": False, "residual_rank": 4,
+        "use_anchor_blend": False, "use_regional_he": False, "use_global_gex": False,
+        "use_global_slide": False, "global_slide_dim": 16, "n_gex_inducing": 4,
+        "harmonic_k_neighbors": 4, "gene_encoder_type": "weighted_linear", "init_seed": 0,
+    }
+    return mf.build_architecture(
+        {"model": {"architecture": "1", "params": params}}, n_genes=6, gex_feature_dim=8, seed=0,
+    )
+
+
+def test_load_trainable_state_rejects_a_checkpoint_missing_the_target_gene_scale_buffer():
+    """`target_gene_scale` is a real, non-frozen, non-trainable buffer
+    (`GeneValueTransportHead.register_buffer`) -- present in
+    `_expected_trainable_state_names` (buffers are included, not just
+    trainable parameters) but NOT in `named_parameters(requires_grad=True)`,
+    so the OLD `missing_trainable` check (trainable-parameters-only) could
+    never have caught its absence."""
+    model = _small_architecture1()
+    assert "transport_head.target_gene_scale" in dict(model.named_buffers())
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(model, {"name": "arch1"}, [f"g{i}" for i in range(6)], tmp, step=1)
+        identity = resolve_checkpoint_identity(tmp)
+        weights_path = identity.resolved_dir / "trainable_weights.pt"
+        state = torch.load(weights_path, map_location="cpu")
+        assert "transport_head.target_gene_scale" in state
+        del state["transport_head.target_gene_scale"]
+        torch.save(state, weights_path)
+        import hashlib
+        manifest_path = identity.resolved_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["files"]["trainable_weights.pt"] = hashlib.sha256(weights_path.read_bytes()).hexdigest()
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        pointer_path = Path(tmp) / "latest_bundle.json"
+        pointer = json.loads(pointer_path.read_text())
+        pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        pointer_path.write_text(json.dumps(pointer, indent=2))
+
+        reloaded = _small_architecture1()
+        with pytest.raises(RuntimeError, match="missing expected trainable parameter"):
+            load_trainable_state(reloaded, tmp)
+
+
+def test_load_trainable_state_rejects_a_checkpoint_missing_the_gene_basis_matrix_buffer():
+    """`_gene_basis_matrix` (Architecture4's own fixed low-rank gene-
+    residual-basis buffer) -- a second, structurally different real
+    buffer than `target_gene_scale`, confirming the fix generalizes."""
+    from gen3_multiscale.models import model_factory as mf
+    from gen3_multiscale.models.gene_basis import fit_gene_residual_basis
+    import numpy as np
+
+    gene_names = [f"g{i}" for i in range(6)]
+    residuals = np.random.default_rng(0).normal(size=(10, 6)).astype(np.float32)
+    basis = fit_gene_residual_basis(residuals, gene_names, rank=4)
+    params = {
+        "image_feature_dim": 1536, "hidden_dim": 16, "n_heads": 2, "n_blocks": 1,
+        "dense_threshold": 256, "sparse_k": 10, "chunk_size": 1024, "max_boundary_size": None,
+        "transport_heads": 2, "transport_temperature": 1.0, "gene_gate_mode": "per_gene",
+        "use_query_gate": True, "use_residual": False, "residual_rank": 4,
+        "use_regional_he": False, "use_global_slide": False, "global_slide_dim": 16,
+        "n_gex_inducing": 4, "harmonic_k_neighbors": 4, "gene_encoder_type": "weighted_linear",
+        "init_seed": 0, "n_flow_blocks": 1, "n_flow_samples": 2, "n_ode_steps": 2, "gene_basis_rank": 4,
+    }
+    model = mf.build_architecture(
+        {"model": {"architecture": "4", "params": params}}, n_genes=6, gex_feature_dim=8, seed=0,
+        gene_basis=basis, gene_names=gene_names,
+    )
+    assert "_gene_basis_matrix" in dict(model.named_buffers())
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(model, {"name": "arch4"}, gene_names, tmp, step=1)
+        identity = resolve_checkpoint_identity(tmp)
+        weights_path = identity.resolved_dir / "trainable_weights.pt"
+        state = torch.load(weights_path, map_location="cpu")
+        assert "_gene_basis_matrix" in state
+        del state["_gene_basis_matrix"]
+        torch.save(state, weights_path)
+        import hashlib
+        manifest_path = identity.resolved_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["files"]["trainable_weights.pt"] = hashlib.sha256(weights_path.read_bytes()).hexdigest()
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        pointer_path = Path(tmp) / "latest_bundle.json"
+        pointer = json.loads(pointer_path.read_text())
+        pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        pointer_path.write_text(json.dumps(pointer, indent=2))
+
+        reloaded = mf.build_architecture(
+            {"model": {"architecture": "4", "params": params}}, n_genes=6, gex_feature_dim=8, seed=1,
+            gene_basis=basis, gene_names=gene_names,
+        )
+        with pytest.raises(RuntimeError, match="missing expected trainable parameter"):
+            load_trainable_state(reloaded, tmp)
+
+
+# ---------------------------------------------------------------------------
+# Codex re-audit of commit 66d65f2, minor finding: the bundle-name regex
+# only accepted exactly eight step digits, while the configured safety
+# ceiling (training.total_steps: 100000000 in every committed config)
+# is itself nine digits; negative steps were never explicitly rejected
+# at save time either.
+# ---------------------------------------------------------------------------
+
+def test_save_checkpoint_accepts_a_nine_digit_step():
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=100_000_000, keep_last=1)
+        identity = resolve_checkpoint_identity(tmp)
+        assert identity.step == 100_000_000
+        m2 = _Tiny()
+        load_trainable_state(m2, tmp)  # must resolve/load without a bundle-name-regex rejection
+
+
+def test_save_checkpoint_rejects_a_negative_step_explicitly():
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(ValueError, match="non-negative"):
+            save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=-1)
+        # Nothing was written -- a failed save must leave no partial state.
+        assert list_checkpoint_history(tmp) == []

@@ -6952,3 +6952,268 @@ gen2_architectures + gen3_multiscale: 847 passed, 1 skipped
   failing identically before this round's changes; not touched by
   anything in this round)
 ```
+
+## 55. Response to the Codex re-audit of commit 66d65f2 -- 5 contained provenance/schema fixes finished (evaluation-report checkpoint binding, exact saved-state key equality, deferred/in-memory evaluation masks, basis-vs-conditioner-manifest cache cross-check, 9-digit-step/negative-step bundle-name handling), plus a first bounded piece of the deployment orchestrator (config-resolution CLI)
+
+Adam forwarded a re-audit of commit `66d65f2` (the previous round's own
+response to the `2162ff4` re-audit). Verdict: "Claude's summary is
+substantially accurate, but I found four contained issues before
+building the deployment orchestrator," plus one minor finding. All five
+were independently verified against real code before any fix was
+written (per this document's standing discipline) and confirmed real.
+Adam's instructions explicitly ordered these five fixes BEFORE building
+the orchestrator ("After those pass, stop the audit loop and build the
+real deployment-orchestration CLI/state machine") -- consistent with
+that ordering, this round finished the five contained fixes plus a
+FIRST bounded, independently-testable piece of the orchestrator (a
+config-resolution CLI, item #1 of the 8-step implementation order
+tracked as unbuilt since section 53); the full staged orchestrator
+(Stages A-D chaining Architecture 1-3 training through Architecture 3
+selection, basis fitting, and Architecture 4 launch; failure/recovery
+tests per stage; a generated run-plan JSON; progress/summary/resume
+commands) remains **unbuilt** and is reported honestly rather than
+attempted partially. **No 24-hour run, and no GPU training of any kind,
+has been started.** Only unit/CPU tests were run.
+
+**Finding #1 -- evaluation reports were not bound to the exact
+checkpoint.** Confirmed real: `evaluate_gen3_checkpoint` called
+`verify_full_checkpoint_identity(weights_dir, ...)` but discarded its
+return value (the checkpoint's own recorded `run_manifest.json`), and
+the report only ever recorded `checkpoint_dir`/`weights_dir` as PATHS --
+a real, mutable location, not a durable binding to the exact weights
+that produced the report's numbers. If `best/` was later re-saved (a
+genuinely different bundle, same or different weights), the OLD report
+could no longer prove which weights actually produced it. Fixed: the
+verifier's return value is now captured; immediately afterward,
+`checkpoint_module.resolve_checkpoint_identity(weights_dir)` (called
+only AFTER verification passed, so the weights are known-verified)
+resolves the exact bundle, and a new `report["checkpoint_identity"]`
+block records: `resolved_bundle_dir`, `step`, `bundle_manifest_sha256`,
+`weights_sha256`, `config_identity_fingerprint`,
+`dataset_manifest_fingerprint`, `gene_panel_hash`,
+`mask_schedule_fingerprint` (a fresh sha256 over the realized evaluation
+mask schedule's own reports), `use_best`, `n_masks_per_sample`,
+`code_drift_present`, and `code_drift_acknowledged` (mirroring
+`run_training`'s own `code_drift_acknowledged` semantics: true only when
+drift was BOTH present and explicitly allowed). Report schema version
+bumped 4 -> 5. A new adversarial test re-saves a genuinely different
+`best/` bundle AFTER a report was already generated and confirms the OLD
+report's recorded identity still points at the OLD (now superseded)
+bundle, never silently tracking whatever `best/` currently contains.
+
+**Finding #2 -- checkpoint loading still accepted missing non-parameter
+buffers.** Confirmed real: `load_trainable_state`'s prior check required
+every TRAINABLE parameter to be present in the loaded state and rejected
+UNEXPECTED keys, but never required every expected BUFFER (present in
+`_expected_trainable_state_names` -- trainable parameters + non-frozen
+buffers -- but not in `named_parameters(requires_grad=True)`) to be
+present. A saved blob silently missing a buffer such as
+`GeneValueTransportHead.target_gene_scale` or `Architecture4._gene_basis_
+matrix` passed both prior checks, and `model.load_state_dict(state,
+strict=False)` then left that buffer at whatever the freshly-constructed
+model happened to initialize it to -- a damaged checkpoint could
+silently retain a fresh, un-loaded buffer value with no error at all.
+Fixed: a single exact-set-equality check (`expected_names -
+set(state.keys())` must be empty, in addition to the existing `set(state
+.keys()) - expected_names` must be empty) replaces the old
+trainable-parameters-only subset check. Two new adversarial tests delete
+`transport_head.target_gene_scale` (a real buffer shared by every
+architecture's transport head) and `_gene_basis_matrix` (Architecture
+4's own fixed low-rank gene-residual-basis buffer) from real, trained
+checkpoints of two structurally different real architectures (built via
+`model_factory.build_architecture`, never the toy test fixture) and
+confirm both are now refused.
+
+**Finding #3 -- evaluation created mask-bank files before verifying the
+checkpoint, with a stale-filename collision across mask counts.**
+Confirmed real: `build_gen3_mask_schedule(..., mask_bank_dir=str(checkpoint_dir
+/ "evaluation_masks"))` ran and wrote real files to disk BEFORE
+`verify_full_checkpoint_identity` -- a checkpoint that turned out to be
+invalid/tampered still left real, persisted mask-bank files behind under
+`checkpoint_dir`. Separately, the per-sample mask-bank filename
+(`{sample_id}_stratified_mask_bank.json`) never embedded
+`n_masks_per_sample`, so `mask_schedule.py`'s own (correct)
+`strata_fingerprint` staleness check -- which DOES include split_counts
+-- refused a SECOND evaluation of the same checkpoint at a DIFFERENT
+mask count as "stale," even though nothing was actually wrong. Fixed
+per Adam's own explicitly stated preference ("Prefer deterministic
+in-memory evaluation mask banks"): checkpoint-identity verification now
+runs FIRST, and the mask schedule is built with NO `mask_bank_dir` at
+all -- `build_gen3_mask_schedule`/`build_stratified_mask_bank` already
+construct a fully deterministic, reproducible bank purely in memory (a
+pure function of coords/slice_ids/obs_names/strata/split_counts/
+split_seeds) and only ever persist to disk when explicitly given a
+directory to write into. Evaluation is a one-shot, comparatively cheap
+computation (unlike training's own incremental resumability need), so
+it never needed the on-disk cache at all -- this closes the ordering gap
+and the stale-filename collision simultaneously, and is simpler than
+either alternative Adam offered ("or use immutable fingerprinted paths
+outside the checkpoint directory"). Two new adversarial tests: one
+confirms zero new files appear anywhere under `checkpoint_dir` when a
+deliberately mismatched dataset manifest makes identity verification
+fail; the other evaluates the SAME checkpoint twice, back to back, with
+two DIFFERENT `n_masks_per_sample` values and confirms both succeed with
+different `n_items`, with no `evaluation_masks/` directory ever created.
+
+**Finding #4 -- Architecture 4 basis cache provenance needed one final
+cross-check.** Confirmed real: the basis sidecar's recorded, per-sample
+`cache_content_by_sample` (already required complete, per the prior
+round's finding #5 fix) was compared ONLY against the CALLER's own,
+currently-loaded mapping -- for a real Architecture 4 training run this
+happens to be that run's own preflight over `train_ids + validation_ids`,
+which coincidentally overlaps the basis-fitting scope but is never
+DEFINITIONALLY bound to what Architecture 3 was actually trained on (a
+caller that never supplies `cache_content_by_sample`, or one whose own
+preflight doesn't happen to cover the affected sample, would see nothing
+wrong). Fixed: `maybe_load_gene_basis` now additionally loads the exact
+comparison Adam asked for -- the conditioner checkpoint's OWN canonical
+`run_manifest.json` (already loaded, from the same verified-bundle path
+used everywhere else in this codebase, for the adjacent
+`architecture3_config_identity_fingerprint` cross-check) carries its OWN
+recorded `cache_preflight_report.cache_content_by_sample`, the actual
+ground truth for what Architecture 3 was trained against. Every training
+sample's recorded sidecar identity is now compared EXACTLY against this
+conditioner-canonical value (requiring the conditioner's own manifest to
+cover every training sample too, failing closed if it does not) -- in
+addition to, not instead of, the existing caller-comparison. A new
+adversarial test tampers with the basis sidecar's OWN recorded cache
+content for one training sample (the conditioner's canonical manifest is
+left completely untouched and correct) and confirms Architecture 4
+training now refuses, closing a gap the caller-comparison alone could
+not have caught in that specific scenario.
+
+**Minor finding -- bundle-name regex/negative-step handling.** Two real,
+confirmed sub-gaps: (a) `_BUNDLE_ID_RE`'s `\d{8}` (exactly 8 step digits)
+rejected a legitimately-produced 9-digit bundle name -- every committed
+config's own `training.total_steps: 100000000` safety cap is itself nine
+digits, and `_bundle_dir_name_prefix`'s `:08d` format grows beyond 8
+digits rather than truncating for a step that large, so a real long run
+reaching that step would have its own checkpoint bundle rejected as
+"not the canonical bundle-name schema." Fixed: `\d{8,}` (8 or more).
+(b) `save_checkpoint` never explicitly validated `step >= 0` -- a
+negative step silently produced a bundle name with a leading minus sign,
+which would only ever surface as a confusing, indirect "does not match
+the canonical bundle-name schema" error far downstream at LOAD time.
+Fixed: an explicit `ValueError` at the top of `save_checkpoint`, before
+any directory is created. Two new adversarial tests: one saves at step
+`100_000_000` and confirms it resolves/loads correctly; the other
+confirms a negative step is refused immediately, with no partial state
+written (`list_checkpoint_history` stays empty).
+
+**A first bounded piece of the deployment orchestrator: config
+resolution.** Per Adam's own explicit ordering, the five contained fixes
+above came first; this round then began (but does not complete) item
+#7/the orchestrator, starting with the single most independently useful,
+independently testable piece the 8-step implementation order names
+first: "a dedicated config-resolution CLI that refuses unresolved/null
+fields and records resolved-config hashes." New
+`gen3_multiscale/scripts/resolve_experiment_config.py`: takes one of the
+four committed `configs/architectureN.yaml` templates (deliberately
+`null` in several deployment-specific fields, since they describe a
+specific deployment rather than the architecture itself) plus explicit
+deployment overrides (`--gen3-manifest-path`, `--tile-encoder-revision`,
+`--synchronized-init-dir`, optionally `--checkpoint-dir`, conditionally
+`--gigapath-checkpoint`/`--gene-residual-basis`/`--architecture3-
+conditioner-checkpoint`), fails closed listing every field the SPECIFIC
+architecture/config combination still requires that was not supplied,
+and writes the fully-resolved config plus a durable
+`<output>.resolved_identity.json` sidecar (base config path, every
+override applied, `config_fingerprint`, `config_identity_fingerprint`)
+to an IMMUTABLE output path (refuses to overwrite an existing resolved
+config without an explicit `force=True`/`--force`, since other
+orchestration steps would hash-bind to its identity once it exists).
+Also confirmed and fixed, by direct inspection of `train.py`, two
+categories of genuinely DEAD fields the committed templates carry that
+the real trainer never reads: `model.params.n_genes`/`gex_feature_dim`
+(the trainer computes both directly from the dataset manifest/`data.
+gex_feature_dim` and passes them as explicit kwargs, never reading the
+config fields) and `required_fingerprints.gene_vocabulary`/
+`train_mask_bank`/`validation_mask_bank`/`test_mask_bank` (leftovers
+from before Step 6's real per-sample pipeline existed) -- both are
+DROPPED from the resolved output rather than left as always-unresolvable
+misleading nulls. Nine tests, including a real end-to-end integration
+proof (a config this script resolves and writes is genuinely loadable
+and runnable by the real `train.py::run_training`, not merely
+schema-valid YAML) and two real-subprocess CLI tests (proving `python -m
+gen3_multiscale.scripts.resolve_experiment_config ...` actually works,
+matching the same subprocess-testing discipline `gen3_evaluator.py`'s
+own CLI tests already established).
+
+**What remains honestly undone.** Everything the prior three CONTRACT.md
+rounds already listed as unbuilt remains unbuilt: a standalone
+synchronized-init verification/preparation command; one consolidated
+experiment-preflight command; the real staged orchestrator itself
+(Stages A-D, with the explicit "never let Architecture 4 use an
+older/pre-existing Architecture 3 path merely because it exists"
+requirement -- Adam's own restated "critical acceptance condition" from
+two rounds ago); dedicated failure/recovery tests for interruption
+during each stage; subprocess-based orchestration tests proving
+Architecture 4 cannot start before Architecture 3 selection and basis
+fitting; a generated run-plan JSON; progress/summary/resume/evaluation
+convenience commands; disk/RAM/GPU estimates. This remains a genuinely
+large, multi-day engineering effort in its own right. This round's
+config-resolution CLI is a real, tested, independently useful step
+toward it -- never claimed as more than that.
+
+**Adversarial tests added this round:** 17 new tests -- `test_checkpoint.py`
+(+4: missing-`target_gene_scale`-buffer refusal, missing-`_gene_basis_
+matrix`-buffer refusal, 9-digit-step acceptance, negative-step
+refusal), `test_gen3_evaluator.py` (+3: report-bound-to-exact-checkpoint-
+identity including a real `best/`-replacement scenario, no-files-written-
+on-failed-verification, different-mask-counts-without-stale-collision),
+`test_fit_architecture4_residual_basis.py` (+1: basis-sidecar-cache-
+content-vs-conditioner-canonical-manifest mismatch refusal), and a new
+`test_resolve_experiment_config.py` (+9: field resolution/dead-field
+dropping, conditional-requirement refusal for `use_global_slide`/
+Architecture 4, immutable-output-refuses-overwrite, real end-to-end
+trainer-runnability proof, 2 real-subprocess CLI tests). All exercise
+the real production code path against real, trained checkpoints/bases --
+no mocking of the identity-verification machinery itself.
+
+## Test status as of this document
+
+```
+gen3_multiscale/tests/: 713 passed (23 hest1k-catalog + 5 gene-panel-compat
+  + 4 query-overlap-report + 27 example-schema + 11 boundary-graph +
+  36 slide-context + 9 slide-encoder + 2 debug-plot + 18 transport-head +
+  10 tokens + 16 attention + 10 global-context + 7 harmonic +
+  7 geometry-utils + 9 backbone + 31 architectures + 9 gene-basis +
+  11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  36 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 21 dataset-manifest + 31 example-builder +
+  46 mask-fingerprint + 22 novae-graph + 4 loaders + 17 spot-feature-cache
+  + 12 tile-encoder-preflight + 15 gen3-dataset + 10 gen3-preflight +
+  33 train + 8 step6-scripts + 25 gen3-evaluator +
+  14 fit-architecture4-residual-basis + 16 a32051b-adversarial +
+  32 checkpoint + 9 resolve-experiment-config)
+gen2_architectures + gen3_multiscale: 886 passed, 1 skipped
+(repo-root tests/: 322 passed, 1 pre-existing unrelated failure --
+  tests/test_multi_sample.py::test_inject_multi_sample_n_genes, confirmed
+  failing identically before this round's changes; not touched by
+  anything in this round)
+```
+
+The block immediately below (pre-66d65f2-re-audit-response test counts)
+is kept for historical continuity rather than deleted, per this
+document's append-only discipline:
+
+```
+gen3_multiscale/tests/: 696 passed (23 hest1k-catalog + 5 gene-panel-compat
+  + 4 query-overlap-report + 27 example-schema + 11 boundary-graph +
+  36 slide-context + 9 slide-encoder + 2 debug-plot + 18 transport-head +
+  10 tokens + 16 attention + 10 global-context + 7 harmonic +
+  7 geometry-utils + 9 backbone + 31 architectures + 9 gene-basis +
+  11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  36 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 21 dataset-manifest + 31 example-builder +
+  46 mask-fingerprint + 22 novae-graph + 4 loaders + 17 spot-feature-cache
+  + 12 tile-encoder-preflight + 15 gen3-dataset + 10 gen3-preflight +
+  33 train + 8 step6-scripts + 22 gen3-evaluator +
+  13 fit-architecture4-residual-basis + 16 a32051b-adversarial +
+  28 checkpoint)
+gen2_architectures + gen3_multiscale: 869 passed, 1 skipped
+(repo-root tests/: 322 passed, 1 pre-existing unrelated failure --
+  tests/test_multi_sample.py::test_inject_multi_sample_n_genes, confirmed
+  failing identically before this round's changes; not touched by
+  anything in this round)
+```

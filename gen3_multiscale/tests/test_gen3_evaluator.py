@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 import yaml
 
 from gen3_multiscale.evaluation.gen3_evaluator import (
@@ -127,6 +128,50 @@ def _train_a_real_checkpoint(tmp_path, cfg, manifest, manifest_path):
     return config_path, checkpoint_dir
 
 
+def test_evaluate_gen3_checkpoint_writes_no_files_under_checkpoint_dir_when_identity_verification_fails(tmp_path, monkeypatch):
+    """Codex re-audit of commit 66d65f2, finding #3: 'Evaluation creates
+    mask-bank files before verifying the checkpoint... under
+    checkpoint_dir/evaluation_masks before identity verification.' Trains
+    a real checkpoint, then evaluates against a config whose dataset
+    manifest has been swapped for a mutated one (so
+    verify_full_checkpoint_identity fails on dataset_manifest_fingerprint)
+    -- proves NO new file appears anywhere under checkpoint_dir as a
+    side effect of the failed attempt."""
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    config_path, checkpoint_dir = _train_a_real_checkpoint(tmp_path, cfg, manifest, manifest_path)
+
+    from gen3_multiscale.data.dataset_manifest import load_dataset_manifest, save_dataset_manifest
+
+    mutated_manifest = dict(load_dataset_manifest(manifest_path))
+    mutated_manifest["gene_panel"] = list(mutated_manifest["gene_panel"])[::-1]
+    save_dataset_manifest(mutated_manifest, manifest_path)
+
+    files_before = sorted(p.relative_to(checkpoint_dir) for p in checkpoint_dir.rglob("*") if p.is_file())
+    with pytest.raises(ValueError, match="dataset_manifest_fingerprint"):
+        evaluate_gen3_checkpoint(str(config_path), checkpoint_dir, split="validation", n_masks_per_sample=2)
+    files_after = sorted(p.relative_to(checkpoint_dir) for p in checkpoint_dir.rglob("*") if p.is_file())
+    assert files_after == files_before
+    assert not (checkpoint_dir / "evaluation_masks").exists()
+
+
+def test_evaluate_gen3_checkpoint_supports_different_mask_counts_without_stale_bank_collisions(tmp_path, monkeypatch):
+    """Codex re-audit of commit 66d65f2, finding #3: '[evaluation] also
+    reuses the same filenames for different --n-masks-per-sample, so
+    later evaluations with another mask count can fail as stale.'
+    Evaluating the SAME checkpoint twice with two DIFFERENT
+    n_masks_per_sample values, back to back, must both succeed (in-memory
+    mask construction has no persisted filename to collide over)."""
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    config_path, checkpoint_dir = _train_a_real_checkpoint(tmp_path, cfg, manifest, manifest_path)
+
+    report_a = evaluate_gen3_checkpoint(str(config_path), checkpoint_dir, split="validation", n_masks_per_sample=2)
+    report_b = evaluate_gen3_checkpoint(str(config_path), checkpoint_dir, split="validation", n_masks_per_sample=4)
+    assert report_a["n_items"] != report_b["n_items"]
+    assert report_a["checkpoint_identity"]["n_masks_per_sample"] == 2
+    assert report_b["checkpoint_identity"]["n_masks_per_sample"] == 4
+    assert not (checkpoint_dir / "evaluation_masks").exists()
+
+
 def test_evaluate_gen3_checkpoint_refuses_test_split_by_default(tmp_path, monkeypatch):
     cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
     config_path, checkpoint_dir = _train_a_real_checkpoint(tmp_path, cfg, manifest, manifest_path)
@@ -151,6 +196,63 @@ def test_evaluate_gen3_checkpoint_reports_model_and_baseline_metrics_on_validati
 
     saved_path = save_evaluation_report(report, checkpoint_dir / "evaluation_validation.json")
     assert saved_path.is_file()
+
+
+def test_evaluate_gen3_checkpoint_report_is_bound_to_the_exact_checkpoint_identity(tmp_path, monkeypatch):
+    """Codex re-audit of commit 66d65f2, finding #1: 'Evaluation reports
+    are not bound to the exact checkpoint... records paths, not the
+    bundle ID, step, manifest SHA, or weights SHA. If best/ later
+    changes, the report no longer proves which weights produced it.'
+    Proves the report's `checkpoint_identity` block genuinely identifies
+    the exact bundle used -- and that it does NOT silently track whatever
+    `best/` happens to point at LATER, by re-saving a DIFFERENT best/
+    bundle after the report was already generated and confirming the
+    OLD report's recorded identity still matches the OLD bundle, not the
+    new one."""
+    from gen3_multiscale.training import checkpoint as checkpoint_module
+
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    config_path, checkpoint_dir = _train_a_real_checkpoint(tmp_path, cfg, manifest, manifest_path)
+
+    report = evaluate_gen3_checkpoint(str(config_path), checkpoint_dir, split="validation", n_masks_per_sample=2)
+    identity_record = report["checkpoint_identity"]
+    best_identity = checkpoint_module.resolve_checkpoint_identity(checkpoint_dir / "best")
+    assert identity_record["resolved_bundle_dir"] == best_identity.bundle_dir
+    assert identity_record["step"] == best_identity.step
+    assert identity_record["bundle_manifest_sha256"] == best_identity.manifest_sha256
+    assert identity_record["weights_sha256"] == best_identity.weights_sha256
+    assert identity_record["use_best"] is True
+    assert identity_record["n_masks_per_sample"] == 2
+    assert identity_record["code_drift_present"] is False
+    assert identity_record["code_drift_acknowledged"] is False
+    assert identity_record["config_identity_fingerprint"]
+    assert identity_record["dataset_manifest_fingerprint"]
+    assert identity_record["gene_panel_hash"]
+    assert identity_record["mask_schedule_fingerprint"]
+
+    # Re-save a genuinely DIFFERENT best/ bundle (same model, but a
+    # second, distinct save produces a distinct bundle_id/manifest_sha256
+    # -- see checkpoint.py's own "repeated save at the same step" test).
+    from gen3_multiscale.training.train import build_model_for_inference, resolved_config
+
+    config = resolved_config(str(config_path))
+    gene_names = list(manifest["gene_panel"])
+    model, _info = build_model_for_inference(
+        config, gene_names=gene_names, device=torch.device("cpu"), checkpoint_dir=str(checkpoint_dir),
+        smoke=False, dataset_manifest=manifest,
+    )
+    model_config_path = best_identity.resolved_dir / "model_config.json"
+    model_config = json.loads(model_config_path.read_text())
+    checkpoint_module.save_checkpoint(
+        model, model_config, gene_names, checkpoint_dir / "best", step=best_identity.step,
+    )
+    new_best_identity = checkpoint_module.resolve_checkpoint_identity(checkpoint_dir / "best")
+    assert new_best_identity.bundle_dir != best_identity.bundle_dir
+
+    # The OLD report's recorded identity is untouched -- it still proves
+    # exactly which (now-superseded) bundle it was computed from.
+    assert identity_record["resolved_bundle_dir"] == best_identity.bundle_dir
+    assert identity_record["resolved_bundle_dir"] != new_best_identity.bundle_dir
 
 
 def test_evaluate_gen3_checkpoint_allow_test_true_permits_test_split(tmp_path, monkeypatch):

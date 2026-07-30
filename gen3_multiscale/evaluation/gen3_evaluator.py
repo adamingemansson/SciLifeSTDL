@@ -31,6 +31,7 @@ the reported headline metric, matching "keep ST-FID/ST-MMD secondary."
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -40,17 +41,19 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from gen3_multiscale.data.dataset_manifest import load_dataset_manifest
+from gen3_multiscale.data.dataset_manifest import gene_panel_hash, load_dataset_manifest
 from gen3_multiscale.evaluation.metrics import (
     aggregate_patient_metrics, embed_pca, gene_panel_metrics, nonzero_auc, pearson_per_gene, resolve_gene_panels,
     rmse, st_fid, st_mmd,
 )
 from gen3_multiscale.models.harmonic import harmonic_interpolation
+from gen3_multiscale.training import checkpoint as checkpoint_module
 from gen3_multiscale.training.gen3_dataset import Gen3SpatialFieldDataset, build_gen3_mask_schedule
 from gen3_multiscale.training.gen3_preflight import load_and_preflight_samples
 from gen3_multiscale.training.train import (
-    build_model_for_inference, common_random_validation_seed, expected_tile_encoder_provenance, predict_for_metrics,
-    resolved_config, verify_full_checkpoint_identity,
+    _code_commit_hash, _worktree_diff_hash, build_model_for_inference, common_random_validation_seed,
+    config_identity_fingerprint, dataset_manifest_fingerprint, expected_tile_encoder_provenance,
+    predict_for_metrics, resolved_config, verify_full_checkpoint_identity,
 )
 
 
@@ -314,21 +317,6 @@ def evaluate_gen3_checkpoint(
     expected_provenance = expected_tile_encoder_provenance(config)
     samples, preflight_report = load_and_preflight_samples(cfg_om, dataset_manifest, split_ids, expected_provenance)
 
-    strata = config["masking"]["strata"]
-    # A DEDICATED subdirectory, never the raw checkpoint_dir -- train.py's
-    # own validation loop persists its own mask banks directly under
-    # checkpoint_dir with its own n_masks_per_sample; reusing that same
-    # path here with a possibly different n_masks_per_sample would
-    # collide with mask_schedule.py's own staleness check (a bank cached
-    # for different split_counts at the same path is correctly rejected,
-    # not silently regenerated).
-    schedule = build_gen3_mask_schedule(
-        dataset_manifest, samples, strata, role=split,
-        split_counts={split: n_masks_per_sample}, split_seeds={split: 700_000 if split == "validation" else 900_000},
-        mask_bank_dir=str(Path(checkpoint_dir) / "evaluation_masks"),
-    )
-    dataset = Gen3SpatialFieldDataset(dataset_manifest, samples, schedule, strata)
-
     gene_names = list(dataset_manifest["gene_panel"])
     device = torch.device(device_str)
     checkpoint_dir = Path(checkpoint_dir)
@@ -353,9 +341,66 @@ def evaluate_gen3_checkpoint(
             "use_best=False explicitly if evaluating the latest (not best-selected) checkpoint is "
             "genuinely intended."
         )
-    verify_full_checkpoint_identity(
+    # Codex re-audit of commit 66d65f2, finding #3: "Evaluation creates
+    # mask-bank files before verifying the checkpoint... under
+    # checkpoint_dir/evaluation_masks before identity verification. It
+    # also reuses the same filenames for different --n-masks-per-sample,
+    # so later evaluations with another mask count can fail as 'stale.'
+    # Evaluation should construct deterministic masks in memory or use
+    # fingerprinted immutable paths outside the checkpoint." Confirmed
+    # real on both counts: mask-bank construction/persistence previously
+    # ran BEFORE this checkpoint-identity verification (a checkpoint that
+    # turns out to be invalid still left real files behind under
+    # checkpoint_dir), and reused a FIXED per-sample filename
+    # (`{sample_id}_stratified_mask_bank.json`) regardless of
+    # `n_masks_per_sample` -- `mask_schedule.py::load_stratified_mask_
+    # bank`'s own strata_fingerprint (which DOES include split_counts)
+    # then correctly, but unhelpfully, refuses a second evaluation of the
+    # SAME checkpoint at a DIFFERENT mask count as "stale," when nothing
+    # is actually wrong. Fixed by verifying identity FIRST, below, then
+    # building the mask schedule with no `mask_bank_dir` at all --
+    # `build_gen3_mask_schedule` already builds a fully deterministic,
+    # reproducible bank in memory (`build_stratified_mask_bank`, a pure
+    # function of coords/slice_ids/obs_names/strata/split_counts/
+    # split_seeds) and only persists to disk when explicitly given a
+    # directory to write into. Evaluation is a one-shot, comparatively
+    # cheap computation (unlike training's incremental resumability
+    # need) -- Adam's own stated preference ("Prefer deterministic
+    # in-memory evaluation mask banks") -- so it never needs the on-disk
+    # cache at all, closing both the ordering gap and the stale-filename
+    # collision at once.
+    checkpoint_run_manifest = verify_full_checkpoint_identity(
         weights_dir, config=config, dataset_manifest=dataset_manifest, gene_names=gene_names,
         cache_content_by_sample=preflight_report.get("cache_content_by_sample"), allow_code_drift=allow_code_drift,
+    )
+    strata = config["masking"]["strata"]
+    schedule = build_gen3_mask_schedule(
+        dataset_manifest, samples, strata, role=split,
+        split_counts={split: n_masks_per_sample}, split_seeds={split: 700_000 if split == "validation" else 900_000},
+    )
+    dataset = Gen3SpatialFieldDataset(dataset_manifest, samples, schedule, strata)
+    # Codex re-audit of commit 66d65f2, finding #1: "Evaluation reports
+    # are not bound to the exact checkpoint... records paths, not the
+    # bundle ID, step, manifest SHA, or weights SHA. If best/ later
+    # changes, the report no longer proves which weights produced it."
+    # Confirmed real: `verify_full_checkpoint_identity`'s return value
+    # (the checkpoint's own recorded run_manifest.json) was discarded
+    # here, and the report only ever recorded `checkpoint_dir`/
+    # `weights_dir` as PATHS -- a real, mutable location, not a durable
+    # binding to the exact weights that produced this report's numbers.
+    # `resolve_checkpoint_identity` is called AFTER `verify_full_checkpoint_
+    # identity` already passed (weights are now known-verified), so this
+    # is the exact resolved bundle the loaded weights came from -- the
+    # SAME identity `checkpoint_module.resolve_checkpoint_identity` computes
+    # everywhere else in this codebase, never independently re-derived.
+    checkpoint_identity = checkpoint_module.resolve_checkpoint_identity(weights_dir)
+    recorded_commit = checkpoint_run_manifest.get("code_commit_hash")
+    current_commit = _code_commit_hash()
+    recorded_diff_hash = checkpoint_run_manifest.get("code_worktree_diff_hash")
+    current_diff_hash = _worktree_diff_hash()
+    code_drift_present = (
+        recorded_commit is None or current_commit is None
+        or recorded_commit != current_commit or recorded_diff_hash != current_diff_hash
     )
     model = _load_model_for_evaluation(
         config, weights_dir, gene_names, device, dataset_manifest=dataset_manifest,
@@ -541,12 +586,36 @@ def evaluate_gen3_checkpoint(
         for panel in gene_panels
     }
 
+    # Codex re-audit of commit 66d65f2, finding #1: a durable identity
+    # binding, independent of `checkpoint_dir`/`weights_dir` remaining
+    # whatever they currently point at -- a later `best/` replacement (or
+    # any other change to those paths) cannot silently invalidate what
+    # this ALREADY-COMPUTED report proves about which exact weights
+    # produced it.
+    checkpoint_identity_record = {
+        "resolved_bundle_dir": checkpoint_identity.bundle_dir,
+        "step": checkpoint_identity.step,
+        "bundle_manifest_sha256": checkpoint_identity.manifest_sha256,
+        "weights_sha256": checkpoint_identity.weights_sha256,
+        "config_identity_fingerprint": config_identity_fingerprint(config),
+        "dataset_manifest_fingerprint": dataset_manifest_fingerprint(dataset_manifest),
+        "gene_panel_hash": gene_panel_hash(gene_names),
+        "mask_schedule_fingerprint": hashlib.sha256(
+            json.dumps(schedule.reports, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest(),
+        "use_best": bool(use_best),
+        "n_masks_per_sample": int(n_masks_per_sample),
+        "code_drift_present": bool(code_drift_present),
+        "code_drift_acknowledged": bool(code_drift_present and allow_code_drift),
+    }
+
     report = {
-        "version": 4,
+        "version": 5,
         "kind": "gen3_step7_evaluation_report",
         "config_path": str(config_path),
         "checkpoint_dir": str(checkpoint_dir),
         "weights_dir": str(weights_dir),
+        "checkpoint_identity": checkpoint_identity_record,
         "split": split,
         "n_samples": len(split_ids),
         "n_items": len(dataset),

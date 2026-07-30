@@ -403,6 +403,47 @@ def maybe_load_gene_basis(
             f"identity for training sample(s) {missing_recorded} -- refusing to use a basis whose recorded "
             "cache identity does not cover every training sample it was fit on"
         )
+    # Codex re-audit of commit 66d65f2, finding #4: "the basis sidecar's
+    # training-sample cache identities are required, but they are not
+    # compared directly against the canonical Architecture 3 run
+    # manifest. That comparison is available and should be exact."
+    # Confirmed real: the ONLY comparison for the sidecar's recorded
+    # cache_content_by_sample was against the CALLER's own, currently-
+    # loaded mapping (below) -- for an Architecture 4 training run this
+    # happens to be that run's own preflight over train_ids+validation_ids,
+    # which coincidentally overlaps the basis-fitting scope but is never
+    # DEFINITIONALLY bound to what Architecture 3 was actually trained on.
+    # `conditioner_run_manifest` (already loaded above, from the SAME
+    # canonical, bundle-verified path `checkpoint_module.load_checkpoint_
+    # run_manifest` uses everywhere else in this codebase) carries the
+    # conditioner's OWN recorded `cache_preflight_report.cache_content_by_sample`
+    # -- the actual ground truth for what Architecture 3 was trained
+    # against -- and is now compared directly, exactly, for every training
+    # sample this basis was fit on.
+    conditioner_cache_content_by_sample = (
+        (conditioner_run_manifest.get("cache_preflight_report") or {}).get("cache_content_by_sample") or {}
+    )
+    missing_in_conditioner_manifest = sorted(
+        set(expected_train_sample_ids) - set(conditioner_cache_content_by_sample)
+    )
+    if missing_in_conditioner_manifest:
+        raise ValueError(
+            f"the configured Architecture 3 conditioner checkpoint's own canonical run_manifest.json is "
+            f"missing recorded cache content identity for training sample(s) {missing_in_conditioner_manifest} "
+            f"-- cannot verify the basis at {path} was fit against cache content that genuinely matches what "
+            "Architecture 3 was trained on"
+        )
+    for sample_id in expected_train_sample_ids:
+        recorded_content = recorded_cache_content_by_sample[sample_id]
+        conditioner_content = conditioner_cache_content_by_sample[sample_id]
+        if recorded_content != conditioner_content:
+            raise ValueError(
+                f"gene residual basis at {path} was fit using cache content for sample {sample_id!r} that "
+                "does not match the configured Architecture 3 conditioner checkpoint's own canonical "
+                "run_manifest.json recorded cache content for that same sample -- refusing to use a basis "
+                "whose recorded cache-content provenance disagrees with the conditioner it claims to have "
+                "been fit from (Codex re-audit of commit 66d65f2, finding #4)"
+            )
     if cache_content_by_sample:
         for sample_id in expected_train_sample_ids:
             current_content = cache_content_by_sample.get(sample_id)

@@ -110,7 +110,20 @@ _OPTIMIZER_RNG_STATE_KEYS = frozenset({
 # closing a real path-traversal-shaped gap (a tampered pointer naming
 # something like "../../etc" was previously joined onto the history
 # directory with no validation at all).
-_BUNDLE_ID_RE = re.compile(r"^step_\d{8}__\d{20}_\d+_\d{6}$")
+#
+# Codex re-audit of commit 66d65f2, minor finding: "the checkpoint bundle
+# regex only accepts exactly eight step digits, while the configured
+# ceiling can reach 100000000 -- nine digits." Confirmed real:
+# `_bundle_dir_name_prefix` formats `step` with Python's `:08d` -- a
+# MINIMUM width of 8, zero-padded, but it grows beyond 8 digits for a
+# larger step rather than truncating (`f"{100_000_000:08d}"` ==
+# "100000000", 9 digits) -- every config's own `training.total_steps:
+# 100000000` safety cap is itself a 9-digit value a real long run could
+# reach. The prior `\d{8}` (exactly 8) would have REJECTED that
+# legitimately-produced bundle name as if it were corrupted. `\d{8,}`
+# (8 or more) matches what `:08d` actually produces at any step count
+# while still requiring the same minimum width.
+_BUNDLE_ID_RE = re.compile(r"^step_\d{8,}__\d{20}_\d+_\d{6}$")
 _POINTER_SCHEMA_VERSION = 1
 _POINTER_KEYS = frozenset({"version", "step", "bundle_dir", "manifest_sha256"})
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -394,7 +407,18 @@ def save_checkpoint(
     name the bundle directory, a fresh unique id does, so two saves at
     the same step simply coexist as two bundles until pruning (which
     only ever removes bundles OLDER than the retained tail, and never
-    the one the pointer currently references)."""
+    the one the pointer currently references).
+
+    Codex re-audit of commit 66d65f2, minor finding: "explicitly reject
+    negative steps at save time." Confirmed real gap: a negative `step`
+    was never checked here -- `_bundle_dir_name_prefix`'s `:08d` format on
+    a negative int silently produces a bundle name with a leading minus
+    sign (e.g. `step_-0000001__...`), which `_BUNDLE_ID_RE` would then
+    reject with an opaque "does not match the canonical bundle-name
+    schema" error far downstream, at LOAD time, rather than a clear
+    failure right here at the point the bad `step` was actually supplied."""
+    if int(step) < 0:
+        raise ValueError(f"save_checkpoint: step must be non-negative, got {step!r}")
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     history_dir = _history_dir(checkpoint_dir)
@@ -829,23 +853,42 @@ def load_trainable_state(model: nn.Module, checkpoint_dir: str | Path) -> None:
     buffer for -- a saved blob carrying extra, unrecognized keys (a
     corrupted save, a checkpoint from a different/older architecture
     version with since-removed parameters, or tampering) previously
-    loaded without complaint. `strict=False` is kept (its OTHER job --
-    tolerating a model with fewer buffers than what was saved, which
-    `missing_trainable` below does not by itself need `strict=True` to
-    catch -- is unaffected), but the loaded blob's key set is now
-    explicitly required to be a SUBSET of `_expected_trainable_state_
-    names(model)` (trainable parameters + non-frozen buffers) first."""
+    loaded without complaint.
+
+    Codex re-audit of commit 66d65f2, finding #2: "load_trainable_state()
+    rejects missing trainable parameters and unexpected keys, but not
+    missing expected buffers such as target_gene_scale, gene-basis
+    buffers, or coordinate frequencies. A damaged checkpoint could
+    therefore silently retain freshly initialized buffers." Confirmed
+    real: the PRIOR check only required `state`'s keys to be a SUBSET of
+    `expected_names` (trainable parameters + non-frozen buffers) and that
+    every TRAINABLE parameter specifically was present -- a saved blob
+    missing a non-frozen BUFFER (present in `expected_names` but not
+    `trainable_names`) passed both checks silently, and
+    `model.load_state_dict(state, strict=False)` then left that buffer at
+    whatever the freshly-constructed model initialized it to, not the
+    checkpoint's own saved value. The check is now a single exact-set
+    equality: `state`'s keys must equal `expected_names` exactly, no more
+    (still refuses unexpected/tampered/stale keys) and no fewer (now also
+    refuses a checkpoint silently missing ANY expected buffer, not merely
+    a missing trainable parameter). `strict=False` is kept on the actual
+    `load_state_dict` call only because this exact-set check ALREADY
+    guarantees the loaded blob's keys are precisely what the model
+    expects -- `strict=True` would be equivalent given that guarantee,
+    but `strict=False` avoids a second, redundant internal key-set
+    comparison inside PyTorch's own implementation."""
     in_dir = _resolve_checkpoint_source(checkpoint_dir)
     weights_path = in_dir / "trainable_weights.pt"
     trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
     expected_names = _expected_trainable_state_names(model)
     if weights_path.is_file():
         state = torch.load(weights_path, map_location="cpu")
-        missing_trainable = trainable_names - set(state.keys())
-        if missing_trainable:
+        missing = expected_names - set(state.keys())
+        if missing:
             raise RuntimeError(
-                f"saved weights at {in_dir} are missing trainable parameters this "
-                f"model architecture expects: {missing_trainable} (config mismatch?)"
+                f"saved weights at {in_dir} are missing expected trainable parameter(s)/buffer(s) this "
+                f"model architecture expects: {sorted(missing)} (config mismatch, or a damaged/incomplete "
+                "checkpoint that would otherwise silently retain freshly initialized values for these)"
             )
         unexpected = set(state.keys()) - expected_names
         if unexpected:

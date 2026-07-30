@@ -8,6 +8,7 @@ inside a real Architecture 4 instance)."""
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -339,6 +340,39 @@ def test_maybe_load_gene_basis_rejects_a_conditioner_rolled_to_a_different_bundl
     assert identity_after.bundle_dir != identity_before.bundle_dir  # but a genuinely DIFFERENT bundle
 
     with pytest.raises(ValueError, match="different bundle"):
+        train_module.run_training(str(arch4_config_path), smoke=False)
+
+
+def test_maybe_load_gene_basis_rejects_a_basis_sidecar_whose_cache_content_disagrees_with_the_conditioners_own_canonical_run_manifest(tmp_path, monkeypatch):
+    """Codex re-audit of commit 66d65f2, finding #4: 'the basis sidecar's
+    training-sample cache identities are required, but they are not
+    compared directly against the canonical Architecture 3 run manifest.
+    That comparison is available and should be exact.' Tampers with the
+    BASIS SIDECAR's own recorded cache_content_by_sample directly (the
+    conditioner checkpoint's own canonical run_manifest.json -- and
+    therefore its bundle_id/manifest_sha256/weights identity, all
+    independently checked elsewhere -- is left completely untouched and
+    correct) -- proving the new check catches a sidecar whose recorded
+    cache-content provenance simply disagrees with the conditioner's own
+    ground truth, a disagreement the caller's-own-preflight-intersection
+    comparison alone cannot reliably catch (a caller that never supplies
+    cache_content_by_sample, or one whose own preflight coincidentally
+    doesn't cover the tampered sample, would previously see nothing wrong)."""
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    arch3_config_path, arch3_checkpoint_dir, basis_path, arch4_config_path, arch4_checkpoint_dir = (
+        _train_a_real_architecture4_checkpoint_with_basis(tmp_path, cfg, manifest, manifest_path)
+    )
+    provenance_path = f"{basis_path}.provenance.json"
+    with open(provenance_path) as f:
+        provenance = json.load(f)
+    a_train_sample_id = manifest["train_sample_ids"][0]
+    tampered_content = dict(provenance["cache_content_by_sample"][a_train_sample_id])
+    tampered_content["spot_features_content_sha256"] = "0" * 64
+    provenance["cache_content_by_sample"][a_train_sample_id] = tampered_content
+    with open(provenance_path, "w") as f:
+        json.dump(provenance, f, indent=2, sort_keys=True, default=str)
+
+    with pytest.raises(ValueError, match="does not match the configured Architecture 3 conditioner"):
         train_module.run_training(str(arch4_config_path), smoke=False)
 
 
