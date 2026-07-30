@@ -76,8 +76,17 @@ class GexContextProvider(Protocol):
     identity: EncoderIdentity
     gene_names: tuple[str, ...]
 
-    def encode_rows(self, expression: np.ndarray) -> np.ndarray:
-        """expression: [N, n_genes] raw observed expression, row order
-        arbitrary (row-independent). Returns [N, output_dim] float32,
-        finite."""
+    def encode_rows(self, expression: np.ndarray, raw_library_size: np.ndarray | None = None) -> np.ndarray:
+        """`expression`: [N, n_genes], row order arbitrary (row-
+        independent) -- this codebase's own normalize_log1p transform
+        (data/loaders.py::basic_qc_and_normalize, the pipeline default),
+        NOT raw counts; see `gen4.scfoundation_encoder`'s own docstring
+        for why a provider that needs the real raw per-row total count
+        (a read-depth token, e.g. scFoundation) cannot derive it from
+        this matrix by summing it. `raw_library_size`: optional [N] real,
+        PRE-normalization total count per row (data/loaders.py's own
+        `adata.obs['_scilifestdl_raw_library_size']`), row-aligned with
+        `expression` -- `None` for providers that do not need it; a
+        provider that does must raise if it is not given. Returns
+        [N, output_dim] float32, finite."""
         ...

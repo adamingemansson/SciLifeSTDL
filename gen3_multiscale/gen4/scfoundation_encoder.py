@@ -132,6 +132,12 @@ class FrozenSCFoundationEncoder(nn.Module):
         # class's own docstring for the HONEST LIMIT on this call's
         # verification status in this environment.
         self.model = scfoundation.load_model_frommmf(str(ckpt_path), key="cell")  # pragma: no cover
+        # Item 6 (six-launch-blocker audit): `device` was accepted here but
+        # never used anywhere in this class -- the model always stayed on
+        # whatever device `load_model_frommmf` itself defaulted to
+        # (typically CPU), silently ignoring a caller's `device="cuda"`.
+        self.device = torch.device(device)
+        self.model = self.model.to(self.device)
         for parameter in self.model.parameters():
             parameter.requires_grad_(False)
         self.model.eval()
@@ -150,29 +156,56 @@ class FrozenSCFoundationEncoder(nn.Module):
         self.model.eval()
         return self
 
-    def _to_scfoundation_input(self, expression: np.ndarray) -> np.ndarray:
+    def _to_scfoundation_input(self, expression: np.ndarray, raw_library_size: np.ndarray) -> np.ndarray:
         """Re-index `expression` (aligned to `self.gene_names`) into
         scFoundation's own fixed vocabulary order, then append the two
-        read-depth tokens. Each row's total count is that row's OWN sum
-        -- a row-local quantity, never a batch/dataset statistic."""
+        read-depth tokens.
+
+        Item 6 (six-launch-blocker audit), CONFIRMED real bug: the prior
+        version derived the "total count" token as
+        `log1p(expression.sum(axis=1))` -- but `expression` here is this
+        codebase's own normalize_log1p-transformed matrix (data/
+        loaders.py::basic_qc_and_normalize, the pipeline default; see
+        `gen4.providers.GexContextProvider.encode_rows`'s own docstring),
+        NOT raw counts. Summing already-log1p'd values is not a read
+        depth in any sense scFoundation's own read-depth token design
+        expects -- it conflates two different preprocessing stages'
+        outputs. The real, row-local raw total count BEFORE
+        normalization is `raw_library_size` (`adata.obs[
+        '_scilifestdl_raw_library_size']`, stashed by basic_qc_and_
+        normalize for exactly this kind of downstream need), passed in
+        explicitly by the caller (gen4/scfoundation_cache.py) rather than
+        rederived here from a matrix that can no longer recover it."""
         n_rows = expression.shape[0]
         vocab_input = np.zeros((n_rows, len(self.scfoundation_vocab)), dtype=np.float32)
         manifest_rows = [r for r, _v in self._manifest_to_vocab_pos]
         vocab_cols = [v for _r, v in self._manifest_to_vocab_pos]
         vocab_input[:, vocab_cols] = expression[:, manifest_rows]
-        total_count_token = np.log1p(expression.sum(axis=1, keepdims=True)).astype(np.float32)
+        total_count_token = np.log1p(raw_library_size).astype(np.float32).reshape(n_rows, 1)
         target_token = np.full((n_rows, 1), np.log1p(self.target_total_count), dtype=np.float32)
         return np.concatenate([vocab_input, total_count_token, target_token], axis=1)
 
     @torch.inference_mode()
-    def encode_rows(self, expression: np.ndarray) -> np.ndarray:
+    def encode_rows(self, expression: np.ndarray, raw_library_size: np.ndarray | None = None) -> np.ndarray:
         if expression.ndim != 2 or expression.shape[1] != len(self.gene_names):
             raise ValueError(
                 f"expression must be [N, {len(self.gene_names)}], got shape {expression.shape}"
             )
-        model_input = self._to_scfoundation_input(np.asarray(expression, dtype=np.float32))
-        tensor = torch.as_tensor(model_input, dtype=torch.float32)
-        out = self.model(tensor, output_type="cell").cpu().numpy().astype(np.float32)  # pragma: no cover
+        if raw_library_size is None:
+            raise ValueError(
+                "FrozenSCFoundationEncoder.encode_rows requires raw_library_size (the real, "
+                "pre-normalization total count per row, e.g. adata.obs['_scilifestdl_raw_library_size']) "
+                "-- it cannot be recovered from the already-normalized/log1p'd expression matrix"
+            )
+        raw_library_size = np.asarray(raw_library_size, dtype=np.float32).reshape(-1)
+        if raw_library_size.shape[0] != expression.shape[0]:
+            raise ValueError(
+                f"raw_library_size has {raw_library_size.shape[0]} rows, expected {expression.shape[0]} "
+                "(row-aligned with expression)"
+            )
+        model_input = self._to_scfoundation_input(np.asarray(expression, dtype=np.float32), raw_library_size)
+        tensor = torch.as_tensor(model_input, dtype=torch.float32, device=self.device)
+        out = self.model(tensor, output_type="cell").detach().to("cpu").numpy().astype(np.float32)  # pragma: no cover
         if out.shape != (expression.shape[0], self.output_dim):
             raise RuntimeError(f"scFoundation encoder returned shape {out.shape}, expected ({expression.shape[0]}, {self.output_dim})")
         if not np.isfinite(out).all():
