@@ -532,7 +532,15 @@ def build_spatial_field_example(
             # keeps the same spatial meaning regardless of which hole
             # this particular example carries (16th Codex re-audit).
             full_slide_level0 = tile_centers(slide_context).astype(np.float32)
-            full_slide_regional = (full_slide_level0 - reference) / scale
+            # Store bounds from the exact same float32 representation used
+            # for visible regional coordinates above.  Computing bounds in
+            # float64 and then casting only the visible subset to float32 can
+            # round a boundary tile a few ulps beyond its own complete-slide
+            # minimum/maximum, falsely reporting that a subset tile lies
+            # outside the full tile set (observed on a real validation WSI).
+            full_slide_regional = (
+                (full_slide_level0 - reference) / scale
+            ).astype(np.float32)
             full_slide_coord_bounds = (
                 float(full_slide_regional[:, 0].min()), float(full_slide_regional[:, 0].max()),
                 float(full_slide_regional[:, 1].min()), float(full_slide_regional[:, 1].max()),

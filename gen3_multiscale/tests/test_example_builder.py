@@ -606,6 +606,40 @@ def test_build_spatial_field_example_wires_wsi_context_with_separate_coordinate_
     assert inputs.provenance["wsi_context_available"] is True
 
 
+def test_wsi_bounds_use_the_same_float32_frame_as_visible_boundary_tiles():
+    """A complete-set boundary tile must remain inside its own bounds.
+
+    This reference/spacing combination deliberately produces
+    -39.441326115... in float64, which rounds downward to
+    -39.441326141... in float32.  The old implementation kept bounds in
+    float64 but visible coordinates in float32, so validation falsely
+    rejected the minimum tile as outside the complete slide.
+    """
+    adata = _square_grid_adata(n_side=6, spacing=100.0)
+    offset = 3694.132611562439
+    adata.obsm["spatial"] = np.asarray(adata.obsm["spatial"], dtype=np.float64) + offset
+    patches = _matching_patches(adata)
+    barcodes = list(adata.obs_names)
+    query = [barcodes[14]]
+    context = [barcode for barcode in barcodes if barcode not in query]
+    slide_context = _wsi_slide_context(
+        [(0.0, 0.0), (100.0, 100.0), (200.0, 200.0)], tile_size=20.0,
+    )
+
+    inputs, _ = build_spatial_field_example(
+        adata, patches, context, query, _stub_image_feature_fn,
+        sample_id="S0", patient_id="P0", patch_size_fullres=1.0,
+        full_sample_coords=adata.obsm["spatial"], slide_context=slide_context,
+    )
+
+    xmin, xmax, ymin, ymax = inputs.full_slide_coord_bounds
+    regional = inputs.wsi_tile_regional_coords
+    assert np.all(regional[:, 0] >= xmin)
+    assert np.all(regional[:, 0] <= xmax)
+    assert np.all(regional[:, 1] >= ymin)
+    assert np.all(regional[:, 1] <= ymax)
+
+
 def test_build_spatial_field_example_excludes_hole_overlapping_wsi_tiles_but_keeps_visible_ones():
     """Direct acceptance-criteria test: changing the content of a WSI
     tile whose footprint overlaps the query hole must NOT change any
