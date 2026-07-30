@@ -54,6 +54,8 @@ class Gen5LatentFlowModel(nn.Module):
         n_ode_steps: int = 20,
         gex_feature_source: str = "weighted_linear",
         gex_context_embedding_dim: int | None = None,
+        image_feature_source: str = "precomputed",
+        stpath_encoder: nn.Module | None = None,
         global_context_source: str = "none",
         global_slide_dim: int = 768,
         slide_encoder=None,
@@ -72,6 +74,7 @@ class Gen5LatentFlowModel(nn.Module):
         self.latent_dim = autoencoder.latent_dim
         self.n_flow_samples = n_flow_samples
         self.n_ode_steps = n_ode_steps
+        self._conditioner_frozen = False
 
         self.conditioner = Gen4Conditioner(
             n_genes=n_genes, gex_feature_dim=gex_feature_dim, image_feature_dim=image_feature_dim,
@@ -84,6 +87,7 @@ class Gen5LatentFlowModel(nn.Module):
             use_regional_he=use_regional_he, use_global_gex=use_global_gex, regional_grid_size=regional_grid_size,
             n_gex_inducing=n_gex_inducing, harmonic_k_neighbors=harmonic_k_neighbors,
             gex_feature_source=gex_feature_source, gex_context_embedding_dim=gex_context_embedding_dim,
+            image_feature_source=image_feature_source, stpath_encoder=stpath_encoder,
             global_context_source=global_context_source, global_slide_dim=global_slide_dim,
             slide_encoder=slide_encoder, gigapath_checkpoint_sha256=gigapath_checkpoint_sha256,
             uni2_global_pool=uni2_global_pool, model_architecture_version=model_architecture_version,
@@ -102,6 +106,27 @@ class Gen5LatentFlowModel(nn.Module):
         for parameter in self.conditioner.parameters():
             parameter.requires_grad_(False)
         self.conditioner.eval()
+        self._conditioner_frozen = True
+
+    def train(self, mode: bool = True):
+        """Codex audit finding, confirmed real (reproduced): calling
+        `model.train()` on the WHOLE Gen5LatentFlowModel -- the ordinary
+        start-of-epoch call any real training loop makes -- recursively
+        calls `.train(mode)` on every submodule, including
+        `self.conditioner`, silently RE-ENABLING dropout inside a
+        conditioner `freeze_conditioner()` had just pinned to eval. The
+        frozen conditioner must never leave eval mode once frozen,
+        regardless of what mode is requested for the rest of the model --
+        the same discipline `FrozenGigaPathSlideEncoder.train()` and
+        `Gen4STPathContextEncoder.train()` already use for their own
+        frozen backbones. The autoencoder is ALWAYS frozen (never
+        trainable, by construction above) and is pinned the same way
+        unconditionally."""
+        super().train(mode)
+        self.autoencoder.eval()
+        if self._conditioner_frozen:
+            self.conditioner.eval()
+        return self
 
     def _prepare_target_expression(self, target_expression, device: torch.device) -> torch.Tensor:
         target_expression = torch.as_tensor(target_expression, device=device, dtype=torch.float32)
