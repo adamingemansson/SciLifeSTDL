@@ -138,7 +138,7 @@ def test_scfoundation_cache_gene_panel_mismatch_fails_closed(tmp_path):
     expression = np.random.default_rng(0).normal(size=(2, 6)).astype(np.float32)
     build_scfoundation_spot_feature_cache(tmp_path, "s1", barcodes, expression, "panelhash123", encoder)
     with pytest.raises(ValueError, match="different gene panel"):
-        load_scfoundation_spot_features(tmp_path, "s1", barcodes, "a-different-panel-hash")
+        load_scfoundation_spot_features(tmp_path, "s1", barcodes, "a-different-panel-hash", expression)
 
 
 def test_scfoundation_cache_barcode_mismatch_fails_closed(tmp_path):
@@ -148,7 +148,23 @@ def test_scfoundation_cache_barcode_mismatch_fails_closed(tmp_path):
     expression = np.random.default_rng(0).normal(size=(2, 6)).astype(np.float32)
     build_scfoundation_spot_feature_cache(tmp_path, "s1", barcodes, expression, "panelhash123", encoder)
     with pytest.raises(ValueError, match="barcode identity/order"):
-        load_scfoundation_spot_features(tmp_path, "s1", np.array(["a", "c"]), "panelhash123")
+        load_scfoundation_spot_features(tmp_path, "s1", np.array(["a", "c"]), "panelhash123", expression)
+
+
+def test_scfoundation_cache_stale_expression_fails_closed(tmp_path):
+    """Codex audit finding: cache identity previously hashed neither the
+    expression VALUES nor the preprocessing that produced them, so a
+    changed expression matrix (same barcodes, same gene panel) could
+    silently reuse a stale cached embedding."""
+    gene_names = [f"g{i}" for i in range(6)]
+    encoder = StubSCFoundationEncoder(gene_names, output_dim=5)
+    barcodes = np.array(["a", "b"])
+    expression = np.random.default_rng(0).normal(size=(2, 6)).astype(np.float32)
+    build_scfoundation_spot_feature_cache(tmp_path, "s1", barcodes, expression, "panelhash123", encoder)
+    tampered_expression = expression.copy()
+    tampered_expression[0, 0] += 1.0
+    with pytest.raises(ValueError, match="different expression values"):
+        load_scfoundation_spot_features(tmp_path, "s1", barcodes, "panelhash123", tampered_expression)
 
 
 def test_scfoundation_encoder_is_row_independent():

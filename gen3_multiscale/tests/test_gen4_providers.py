@@ -54,7 +54,7 @@ def test_scfoundation_cache_round_trip(tmp_path):
     barcodes = np.array(["a", "b"])
     expression = np.random.default_rng(0).normal(size=(2, 4)).astype(np.float32)
     build_scfoundation_spot_feature_cache(tmp_path, "s1", barcodes, expression, "hash123", encoder)
-    loaded = load_scfoundation_spot_features(tmp_path, "s1", barcodes, "hash123")
+    loaded = load_scfoundation_spot_features(tmp_path, "s1", barcodes, "hash123", expression)
     assert loaded["features"].shape == (2, 7)
     assert np.allclose(loaded["features"], encoder.encode_rows(expression))
     lookup = barcode_embedding_lookup(loaded)
