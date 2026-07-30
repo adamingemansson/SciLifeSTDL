@@ -1,0 +1,25 @@
+# Shared full-expression autoencoder -- GEN5_CONTRACT.md section 3. One
+# frozen checkpoint, fit once from training-sample expression only, reused
+# unchanged by all four Gen5 arms.
+
+experiment_name: gen5_shared_expression_autoencoder_v1
+
+autoencoder:
+  latent_dim: 256
+  hidden_dim: 1024
+
+data:
+  gen3_manifest_path: null   # path to the SAME dataset manifest Gen3/Gen4 use
+
+training:
+  seed: 0
+  n_epochs: 50
+  batch_size: 64
+  lr: 1.0e-3
+  weight_decay: 0.0
+  device: cpu
+  checkpoint_path: gen3_multiscale/results/gen5_autoencoder/checkpoint.pt
+
+required_fingerprints:
+  dataset_manifest_fingerprint: null   # filled in at fit time from the real manifest
+  code_identity: null                  # the git commit this checkpoint was fit under
