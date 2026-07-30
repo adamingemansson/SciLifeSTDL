@@ -12,6 +12,8 @@ documented_divergences:
   - required_fingerprints.gigapath_checkpoint
   - required_fingerprints.scfoundation_checkpoint
   - required_fingerprints.scfoundation_vocab
+  - required_fingerprints.scfoundation_package_version
+  - required_fingerprints.scfoundation_preprocessing_spec
 
 model:
   arm: gen4b
@@ -91,6 +93,8 @@ required_fingerprints:
   gigapath_checkpoint: null
   scfoundation_checkpoint: null   # real local checkpoint path -- required before training (gen4/scfoundation_encoder.py::FrozenSCFoundationEncoder)
   scfoundation_vocab: null        # gene-vocabulary JSON path
+  scfoundation_package_version: null      # scFoundation package version at cache-build time
+  scfoundation_preprocessing_spec: null   # gen4/scfoundation_encoder.py::FrozenSCFoundationEncoder's exact preprocessing_spec string
   gene_vocabulary: null
   train_mask_bank: null
   validation_mask_bank: null

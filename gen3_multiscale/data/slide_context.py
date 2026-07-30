@@ -86,6 +86,104 @@ def validate_tile_encoder_provenance(source: str, tile_encoder_provenance: dict)
         )
 
 
+def validate_slide_context_arrays(
+    sample_id: str, features: np.ndarray, coords: np.ndarray, mask_coords: np.ndarray,
+    tile_size: float, mask_tile_size: float,
+) -> None:
+    """Shape/finiteness checks shared by every dense-tile slide-context
+    source (GigaPath's own dense_wsi_cache/spot_aligned branches below,
+    and any other real per-tile encoder's dense-WSI cache -- e.g. a UNI2
+    dense-WSI cache, gen4/uni2_dense_wsi_cache.py -- that produces this
+    exact features/coords/mask_coords/tile_size/mask_tile_size shape).
+    Factored out of load_slide_context's own tail (same precedent as
+    validate_tile_encoder_provenance's own extraction) so a second real
+    consumer never reimplements, and risks silently drifting from, these
+    checks."""
+    if features.ndim != 2:
+        raise ValueError(f"slide context features must be 2-D, got shape {features.shape} for {sample_id}")
+    if coords.shape != (features.shape[0], 2):
+        raise ValueError(
+            f"slide context coords must be [N,2] aligned with features, got {coords.shape}"
+        )
+    if mask_coords.shape != (features.shape[0], 2):
+        raise ValueError(
+            f"slide context level0_coords must be [N,2] aligned with features, got "
+            f"{mask_coords.shape}"
+        )
+    if features.shape[0] < 1 or tile_size <= 0:
+        raise ValueError(f"slide context for {sample_id} is empty or has invalid tile_size")
+    if mask_tile_size <= 0:
+        raise ValueError(f"slide context for {sample_id} has invalid level0_tile_size")
+    if not np.isfinite(features).all() or not np.isfinite(coords).all() or not np.isfinite(mask_coords).all():
+        raise ValueError(f"slide context for {sample_id} contains non-finite values")
+
+
+def validate_dense_wsi_tile_geometry(
+    sample_id: str, coords: np.ndarray, mask_coords: np.ndarray, mask_tile_size: float,
+    spot_coords: np.ndarray, wsi_dimensions: np.ndarray | None = None, cache_label: str = "dense WSI cache",
+) -> None:
+    """Duplicate-tile and ST-spot/WSI coordinate-frame-agreement checks
+    shared by every real dense_wsi_cache-style loader (see
+    validate_slide_context_arrays's docstring for why this is factored
+    out rather than duplicated). Identical logic to
+    load_slide_context's own pre-refactor dense_wsi_cache branch (16th/
+    18th Codex re-audits)."""
+    if np.unique(coords, axis=0).shape[0] != coords.shape[0]:
+        raise ValueError(
+            f"{cache_label} for {sample_id} contains duplicate tile coordinates -- refusing a "
+            "corrupted/malformed tile cache"
+        )
+    if np.unique(mask_coords, axis=0).shape[0] != mask_coords.shape[0]:
+        raise ValueError(
+            f"{cache_label} for {sample_id} contains duplicate level0_coords -- refusing a "
+            "corrupted/malformed tile cache"
+        )
+    spot_xy = np.asarray(spot_coords[:, :2], dtype=np.float64)
+    if wsi_dimensions is not None:
+        if wsi_dimensions.shape != (2,) or np.any(wsi_dimensions <= 0):
+            raise ValueError(f"{cache_label} for {sample_id} has invalid wsi_dimensions")
+        inside = (
+            (spot_xy[:, 0] >= 0) & (spot_xy[:, 0] < wsi_dimensions[0])
+            & (spot_xy[:, 1] >= 0) & (spot_xy[:, 1] < wsi_dimensions[1])
+        )
+        # A few HEST spot centres can sit just outside a cropped WSI by
+        # tens of level-0 pixels (for example, a Visium spot centred on
+        # the crop boundary).  That is not a coordinate-frame mismatch.
+        # Permit only a very small fraction of such points, and only when
+        # every one is within one cached level-0 tile of the slide.  The
+        # independent >=90% retained-tissue-tile check below remains
+        # unchanged and catches systematic crop/origin mismatches.
+        outside_fraction = float(np.mean(~inside))
+        x_edge_distance = np.maximum(np.maximum(-spot_xy[:, 0], spot_xy[:, 0] - wsi_dimensions[0]), 0.0)
+        y_edge_distance = np.maximum(np.maximum(-spot_xy[:, 1], spot_xy[:, 1] - wsi_dimensions[1]), 0.0)
+        max_outside_distance = float(np.max(np.maximum(x_edge_distance, y_edge_distance)))
+        if outside_fraction > 0.005 or max_outside_distance > mask_tile_size:
+            raise ValueError(
+                f"{(~inside).sum()}/{len(inside)} ST spots fall outside the cached WSI; "
+                f"maximum edge offset is {max_outside_distance:.1f} level-0 pixels "
+                f"(allowed: <=0.5% of spots and <=one {mask_tile_size:.1f}px tile); "
+                "the H5AD and WSI coordinate frames likely do not match"
+            )
+    # Most measured spots must fall in, or immediately beside, a retained
+    # tissue tile.  This catches the far more dangerous case where both
+    # arrays have plausible positive coordinates but refer to different
+    # crops/origins of the slide.
+    tile_bins = {
+        (int(np.floor(x / mask_tile_size)), int(np.floor(y / mask_tile_size)))
+        for x, y in mask_coords
+    }
+    covered = []
+    for x, y in spot_xy:
+        bx, by = int(np.floor(x / mask_tile_size)), int(np.floor(y / mask_tile_size))
+        covered.append(any((bx + dx, by + dy) in tile_bins for dx in (-1, 0, 1) for dy in (-1, 0, 1)))
+    coverage = float(np.mean(covered))
+    if coverage < 0.90:
+        raise ValueError(
+            f"only {coverage:.1%} of {sample_id} ST spots align near retained WSI tissue "
+            f"tiles in {cache_label}; refusing a likely mismatched WSI/H5AD coordinate frame"
+        )
+
+
 def _cache_path(cfg, sample_id: str) -> Path:
     configured = cfg.data.get("slide_context_cache_dir")
     if configured:
@@ -247,30 +345,9 @@ def load_slide_context(
         # order) so ANY provenance field changing changes context_id.
         content_digest.update(json.dumps(tile_encoder_provenance, sort_keys=True).encode())
         identity = f"{sample_id}:dense:{content_digest.hexdigest()}"
-        # 16th Codex re-audit (Step 5 Part 2), CONFIRMED: no check existed
-        # for duplicate tile coordinates -- a corrupted or badly-generated
-        # cache with two tiles at the identical position would silently
-        # double-count that region's contribution to both regional
-        # pooling and the LongNet global vector, and pool_regional_tokens
-        # would attribute it to one grid cell twice.
-        if np.unique(coords, axis=0).shape[0] != coords.shape[0]:
-            raise ValueError(
-                f"dense WSI cache {path} contains duplicate tile coordinates -- refusing a "
-                "corrupted/malformed tile cache"
-            )
-        # 18th Codex re-audit (Step 5 Part 2, "Other real gaps"),
-        # CONFIRMED real: only `coords` (the LongNet frame) was checked
-        # for duplicates -- `mask_coords` (the level-0/HEST-aligned
-        # frame the hole-overlap test actually runs in) is an
-        # independently-sourced field for a dense_wsi_cache with a
-        # separate level0_coords, and could contain duplicates of its
-        # own even when `coords` has none, silently double-counting a
-        # region's contribution to hole-overlap filtering.
-        if np.unique(mask_coords, axis=0).shape[0] != mask_coords.shape[0]:
-            raise ValueError(
-                f"dense WSI cache {path} contains duplicate level0_coords -- refusing a "
-                "corrupted/malformed tile cache"
-            )
+        # 16th/18th Codex re-audits (Step 5 Part 2): duplicate-tile-coordinate
+        # checks -- now in the shared validate_dense_wsi_tile_geometry, called
+        # below alongside the coverage check (same real checks, same order).
     else:
         raise ValueError(
             "data.slide_context_source must be disabled, spot_aligned, or dense_wsi_cache"
@@ -280,75 +357,12 @@ def load_slide_context(
         raise ValueError(
             f"slide context features must be [N,1536], got {features.shape} for {sample_id}"
         )
-    if coords.shape != (features.shape[0], 2):
-        raise ValueError(
-            f"slide context coords must be [N,2] aligned with features, got {coords.shape}"
-        )
-    if mask_coords.shape != (features.shape[0], 2):
-        raise ValueError(
-            f"slide context level0_coords must be [N,2] aligned with features, got "
-            f"{mask_coords.shape}"
-        )
-    if features.shape[0] < 1 or tile_size <= 0:
-        raise ValueError(f"slide context for {sample_id} is empty or has invalid tile_size")
-    if mask_tile_size <= 0:
-        raise ValueError(f"slide context for {sample_id} has invalid level0_tile_size")
-    if not np.isfinite(features).all() or not np.isfinite(coords).all() or not np.isfinite(mask_coords).all():
-        raise ValueError(f"slide context for {sample_id} contains non-finite values")
+    validate_slide_context_arrays(sample_id, features, coords, mask_coords, tile_size, mask_tile_size)
     if source == "dense_wsi_cache":
-        spot_xy = np.asarray(spot_coords[:, :2], dtype=np.float64)
-        if wsi_dimensions is not None:
-            if wsi_dimensions.shape != (2,) or np.any(wsi_dimensions <= 0):
-                raise ValueError(f"slide cache for {sample_id} has invalid wsi_dimensions")
-            inside = (
-                (spot_xy[:, 0] >= 0) & (spot_xy[:, 0] < wsi_dimensions[0])
-                & (spot_xy[:, 1] >= 0) & (spot_xy[:, 1] < wsi_dimensions[1])
-            )
-            # A few HEST spot centres can sit just outside a cropped WSI by
-            # tens of level-0 pixels (for example, a Visium spot centred on
-            # the crop boundary).  That is not a coordinate-frame mismatch.
-            # Permit only a very small fraction of such points, and only when
-            # every one is within one cached level-0 tile of the slide.  The
-            # independent >=90% retained-tissue-tile check below remains
-            # unchanged and catches systematic crop/origin mismatches.
-            outside_fraction = float(np.mean(~inside))
-            x_edge_distance = np.maximum(
-                np.maximum(-spot_xy[:, 0], spot_xy[:, 0] - wsi_dimensions[0]),
-                0.0,
-            )
-            y_edge_distance = np.maximum(
-                np.maximum(-spot_xy[:, 1], spot_xy[:, 1] - wsi_dimensions[1]),
-                0.0,
-            )
-            max_outside_distance = float(np.max(np.maximum(x_edge_distance, y_edge_distance)))
-            if outside_fraction > 0.005 or max_outside_distance > mask_tile_size:
-                raise ValueError(
-                    f"{(~inside).sum()}/{len(inside)} ST spots fall outside the cached WSI; "
-                    f"maximum edge offset is {max_outside_distance:.1f} level-0 pixels "
-                    f"(allowed: <=0.5% of spots and <=one {mask_tile_size:.1f}px tile); "
-                    "the H5AD and WSI coordinate frames likely do not match"
-                )
-        # Most measured spots must fall in, or immediately beside, a retained
-        # tissue tile.  This catches the far more dangerous case where both
-        # arrays have plausible positive coordinates but refer to different
-        # crops/origins of the slide.
-        tile_bins = {
-            (int(np.floor(x / mask_tile_size)), int(np.floor(y / mask_tile_size)))
-            for x, y in mask_coords
-        }
-        covered = []
-        for x, y in spot_xy:
-            bx, by = int(np.floor(x / mask_tile_size)), int(np.floor(y / mask_tile_size))
-            covered.append(any(
-                (bx + dx, by + dy) in tile_bins
-                for dx in (-1, 0, 1) for dy in (-1, 0, 1)
-            ))
-        coverage = float(np.mean(covered))
-        if coverage < 0.90:
-            raise ValueError(
-                f"only {coverage:.1%} of {sample_id} ST spots align near retained WSI tissue "
-                "tiles; refusing a likely mismatched WSI/H5AD coordinate frame"
-            )
+        validate_dense_wsi_tile_geometry(
+            sample_id, coords, mask_coords, mask_tile_size, spot_coords,
+            wsi_dimensions=wsi_dimensions, cache_label=f"dense WSI cache {path}",
+        )
     return {
         "features": features,
         "coords": coords,

@@ -21,7 +21,8 @@ import numpy as np
 _REQUIRED_FIELDS = {
     "features", "barcodes", "feature_available", "gene_panel_hash",
     "scfoundation_checkpoint_sha256", "scfoundation_vocab_sha256",
-    "scfoundation_package_version", "scfoundation_output_dim", "scfoundation_schema_version",
+    "scfoundation_package_version", "scfoundation_preprocessing_spec",
+    "scfoundation_output_dim", "scfoundation_schema_version",
     "expression_content_hash",
 }
 
@@ -93,8 +94,16 @@ def build_scfoundation_spot_feature_cache(
             scfoundation_checkpoint_sha256=np.asarray(encoder.identity.checkpoint_sha256),
             scfoundation_vocab_sha256=np.asarray(encoder.identity.pinned_revision),
             scfoundation_package_version=np.asarray(encoder.identity.package_version),
+            scfoundation_preprocessing_spec=np.asarray(encoder.identity.preprocessing_spec),
             scfoundation_output_dim=np.asarray(output_dim),
-            scfoundation_schema_version=np.asarray(1),
+            # Codex audit finding (Item 2): preprocessing_spec was
+            # previously never persisted to the cache at all, so a
+            # preprocessing change (e.g. a fixed read-depth-token
+            # derivation bug) could silently keep reusing a stale cache
+            # built under the old preprocessing. schema_version bumped so
+            # any pre-existing cache missing this field fails closed via
+            # _REQUIRED_FIELDS below, rather than silently loading.
+            scfoundation_schema_version=np.asarray(2),
             expression_content_hash=np.asarray(_expression_content_hash(expression)),
         )
     os.replace(tmp, path)
@@ -163,6 +172,7 @@ def load_scfoundation_spot_features(
             "checkpoint_sha256": str(cached["scfoundation_checkpoint_sha256"]),
             "vocab_sha256": str(cached["scfoundation_vocab_sha256"]),
             "package_version": str(cached["scfoundation_package_version"]),
+            "preprocessing_spec": str(cached["scfoundation_preprocessing_spec"]),
             "output_dim": output_dim,
             "schema_version": int(np.asarray(cached["scfoundation_schema_version"]).item()),
         },

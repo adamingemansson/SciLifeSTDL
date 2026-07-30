@@ -628,7 +628,23 @@ def build_model_for_inference(
     "before training" baseline. A real `checkpoint_dir` additionally
     verifies gene names and loads that checkpoint's trainable weights,
     failing closed on a mismatched gene panel or incomplete checkpoint,
-    exactly as every other checkpoint load in this package."""
+    exactly as every other checkpoint load in this package.
+
+    Item 5 (six-launch-blocker audit): a Gen4 config (`model.arm`
+    present, never set by a Gen3 config) dispatches to
+    `gen4.trainer_adapter.build_gen4_model_for_inference` instead of
+    everything below -- the ONE minimal adapter point that lets every
+    existing caller of THIS function (the trainer loop, the evaluator,
+    the overfit gate) construct a real Gen4 model with zero changes of
+    their own. See that module's docstring for exactly what is (Gen4
+    conditioner/flow) and is not yet (Gen5 latent_flow) wired here."""
+    if (config.get("model") or {}).get("arm") is not None:
+        from gen3_multiscale.gen4.trainer_adapter import build_gen4_model_for_inference
+
+        return build_gen4_model_for_inference(
+            config, gene_names=gene_names, device=device, checkpoint_dir=checkpoint_dir,
+            smoke=smoke, staged_smoke=staged_smoke,
+        )
     architecture_id = str((config.get("model") or {}).get("architecture", ""))
     training_cfg = config.get("training") or {}
     data_cfg = config.get("data") or {}

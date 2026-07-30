@@ -91,6 +91,59 @@ def test_build_gen4_spatial_field_example_real_pipeline(tmp_path, monkeypatch):
     assert inputs.context_gex_embedding_provenance["encoder_name"] == "scfoundation"
 
 
+def test_build_gen4_spatial_field_example_populates_uni2_features_provenance_and_organ(tmp_path, monkeypatch):
+    """Item 1 (audit finding: "the hybrid arm receives
+    observed_uni2_features=None") + Item 3 (real per-sample organ):
+    uni2_spot_embedding/wsi_tile_feature_provenance/sample_organ are real,
+    barcode-aligned, query/hole-excluded-by-construction inputs, not
+    synthetic-fixture-only fields."""
+    cfg, manifest, _manifest_path = prepare_step6_experiment(tmp_path, monkeypatch, n_side=6, n_genes=5)
+    train_sample_id = manifest["train_sample_ids"][0]
+    adata, patches, _availability = load_sample_for_examples(manifest, train_sample_id, cfg.data.hest_data_dir)
+    barcodes = list(adata.obs_names)
+    context_barcodes, query_barcodes = barcodes[: len(barcodes) // 2], barcodes[len(barcodes) // 2:]
+    image_features = np.random.default_rng(0).normal(size=(adata.n_obs, 6)).astype(np.float32)
+
+    uni2_lookup = {
+        str(barcode): row
+        for barcode, row in zip(adata.obs_names, np.random.default_rng(1).normal(size=(adata.n_obs, 6)).astype(np.float32))
+    }
+
+    inputs, _targets = build_gen4_spatial_field_example(
+        adata, patches, context_barcodes, query_barcodes,
+        sample_id=train_sample_id, patient_id=manifest["samples"][train_sample_id]["patient_id"],
+        precomputed_spot_features=image_features,
+        uni2_spot_embedding=uni2_lookup, wsi_tile_feature_provenance="uni2", sample_organ="Lung",
+        full_sample_coords=np.asarray(adata.obsm["spatial"]),
+    )
+    assert inputs.observed_uni2_features is not None
+    assert inputs.observed_uni2_features.shape == (inputs.observed_coords.shape[0], 6)
+    # Query/hole exclusion is inherited by construction -- every row
+    # corresponds exactly to a REALIZED observed_barcodes entry, and no
+    # query barcode ever appears there (validate_spatial_field_example's
+    # own disjointness check, delegated to unconditionally above).
+    expected = np.stack([uni2_lookup[str(b)] for b in inputs.observed_barcodes])
+    assert np.array_equal(inputs.observed_uni2_features, expected)
+    assert inputs.wsi_tile_feature_provenance == "uni2"
+    assert inputs.sample_organ == "Lung"
+
+
+def test_build_gen4_spatial_field_example_rejects_bad_wsi_tile_feature_provenance(tmp_path, monkeypatch):
+    cfg, manifest, _manifest_path = prepare_step6_experiment(tmp_path, monkeypatch, n_side=6, n_genes=5)
+    train_sample_id = manifest["train_sample_ids"][0]
+    adata, patches, _availability = load_sample_for_examples(manifest, train_sample_id, cfg.data.hest_data_dir)
+    barcodes = list(adata.obs_names)
+    context_barcodes, query_barcodes = barcodes[: len(barcodes) // 2], barcodes[len(barcodes) // 2:]
+    image_features = np.random.default_rng(0).normal(size=(adata.n_obs, 6)).astype(np.float32)
+    with pytest.raises(ValueError, match="wsi_tile_feature_provenance"):
+        build_gen4_spatial_field_example(
+            adata, patches, context_barcodes, query_barcodes,
+            sample_id=train_sample_id, patient_id=manifest["samples"][train_sample_id]["patient_id"],
+            precomputed_spot_features=image_features, wsi_tile_feature_provenance="gigapath",
+            full_sample_coords=np.asarray(adata.obsm["spatial"]),
+        )
+
+
 def test_build_gen4_spatial_field_example_missing_barcode_fails_closed(tmp_path, monkeypatch):
     cfg, manifest, _manifest_path = prepare_step6_experiment(tmp_path, monkeypatch, n_side=6, n_genes=5)
     train_sample_id = manifest["train_sample_ids"][0]

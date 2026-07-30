@@ -13,8 +13,12 @@ documented_divergences:
   - model.params.gene_basis_rank
   - required_fingerprints.uni2_checkpoint
   - required_fingerprints.uni2_revision
+  - required_fingerprints.uni2_package_version
+  - required_fingerprints.uni2_preprocessing_spec
   - required_fingerprints.scfoundation_checkpoint
   - required_fingerprints.scfoundation_vocab
+  - required_fingerprints.scfoundation_package_version
+  - required_fingerprints.scfoundation_preprocessing_spec
   - required_fingerprints.gene_residual_basis
   - required_fingerprints.gen4_conditioner_checkpoint
 
@@ -103,8 +107,12 @@ evaluation:
 required_fingerprints:
   uni2_checkpoint: null
   uni2_revision: null
+  uni2_package_version: null      # e.g. timm's __version__ at cache-build time
+  uni2_preprocessing_spec: null    # gen4/uni2_encoder.py::FrozenUNI2TileEncoder's exact preprocessing_spec string
   scfoundation_checkpoint: null
   scfoundation_vocab: null
+  scfoundation_package_version: null      # scFoundation package version at cache-build time
+  scfoundation_preprocessing_spec: null   # gen4/scfoundation_encoder.py::FrozenSCFoundationEncoder's exact preprocessing_spec string
   gene_vocabulary: null
   gene_residual_basis: null
   gen4_conditioner_checkpoint: null
