@@ -264,6 +264,12 @@ class Gen4Conditioner(Architecture3):
         `encode_context_only` (`gen4/stpath_context.py`), leaving its
         trainable `proj`/`embedding_norm` layers, and this method's own
         `gex_from_stpath_proj`, on the live autograd graph."""
+        if getattr(inputs, "sample_organ", None) is None:
+            raise ValueError(
+                "image_feature_source='stpath_context' requires Gen4SpatialFieldInputs.sample_organ to be "
+                "set -- the real per-sample manifest organ (STPath's organ token was previously fixed at "
+                "construction time, silently wrong for every non-default-organ sample)"
+            )
         n_observed = inputs.observed_coords.shape[0]
         full_ring = scatter_boundary_ring(
             n_observed, torch.as_tensor(inputs.boundary_idx, device=device), torch.as_tensor(inputs.boundary_ring, device=device),
@@ -275,6 +281,7 @@ class Gen4Conditioner(Architecture3):
 
         stpath_embedding = self.stpath_encoder.encode_context_only(
             context_coords, context_expression, context_image_features, context_image_available,
+            organ_type=inputs.sample_organ,
         )
         gex_features = self.gex_from_stpath_proj(stpath_embedding)
         # Every context row now has a real, defined STPath representation
@@ -311,6 +318,12 @@ class Gen4Conditioner(Architecture3):
                 "image_feature_source='hybrid_context' requires Gen4SpatialFieldInputs.context_gex_embedding "
                 "to be set -- a real, frozen scFoundation observed-GEX embedding"
             )
+        if getattr(inputs, "sample_organ", None) is None:
+            raise ValueError(
+                "image_feature_source='hybrid_context' requires Gen4SpatialFieldInputs.sample_organ to be "
+                "set -- the real per-sample manifest organ (STPath's organ token was previously fixed at "
+                "construction time, silently wrong for every non-default-organ sample)"
+            )
         n_observed = inputs.observed_coords.shape[0]
         full_ring = scatter_boundary_ring(
             n_observed, torch.as_tensor(inputs.boundary_idx, device=device), torch.as_tensor(inputs.boundary_ring, device=device),
@@ -322,6 +335,7 @@ class Gen4Conditioner(Architecture3):
 
         stpath_embedding = self.stpath_encoder.encode_context_only(
             context_coords, context_expression, context_image_features, context_image_available,
+            organ_type=inputs.sample_organ,
         )  # [n_observed, image_feature_dim] -- joint context token
         uni2_embedding = torch.as_tensor(inputs.observed_uni2_features, dtype=torch.float32, device=device)
         scf_embedding = self.hybrid_scf_proj(torch.as_tensor(context_embedding, dtype=torch.float32, device=device))

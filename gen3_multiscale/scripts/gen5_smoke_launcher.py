@@ -58,7 +58,7 @@ def _synthetic_example(seed: int = 0, gex_context_dim: int | None = None):
         observed_image_available=np.ones(n_observed, dtype=bool),
         query_local_neighbor_idx=result.query_local_neighbor_idx, boundary_idx=result.boundary_idx,
         boundary_ring=result.boundary_ring, query_depth_to_boundary=result.query_depth_to_boundary,
-        context_gex_embedding=context_embedding,
+        context_gex_embedding=context_embedding, sample_organ="Kidney",
     )
     targets = SpatialFieldTargets(query_expression=rng.normal(size=(n_query, N_GENES)).astype(np.float32))
     validate_gen4_spatial_field_example(inputs, targets)
@@ -85,7 +85,7 @@ class _StubSTPathEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.proj = nn.Linear(2 + n_genes + 1, hidden_dim)
 
-    def encode_context_only(self, context_coords, context_expression, context_image_features, context_image_available=None):
+    def encode_context_only(self, context_coords, context_expression, context_image_features, context_image_available=None, organ_type=None):
         image_summary = context_image_features.mean(dim=-1, keepdim=True)
         combined = torch.cat([context_coords, context_expression, image_summary], dim=-1)
         return self.proj(combined)

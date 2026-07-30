@@ -66,6 +66,7 @@ class Gen4STPathContextEncoder(nn.Module):
         context_expression: torch.Tensor,
         context_image_features: torch.Tensor,
         context_image_available: torch.Tensor | None = None,
+        organ_type: str | None = None,
     ) -> torch.Tensor:
         """context_coords: [n_context, 2]. context_expression: [n_context,
         n_genes], REAL observed values (every row here is context -- unlike
@@ -74,7 +75,19 @@ class Gen4STPathContextEncoder(nn.Module):
         GigaPath tile features (STPath's own image tokenizer input, see
         base class docstring) -- never raw pixels, never a query row.
         Returns [n_context, hidden_dim]. There is no query_* parameter
-        anywhere in this signature."""
+        anywhere in this signature.
+
+        `organ_type` (audit finding: a fixed construction-time organ_type
+        silently applied "Kidney" to every sample regardless of the real
+        manifest organ, which is biologically wrong for a multi-organ QC2
+        dataset -- Lung/Liver/Bowel samples would all get the Kidney
+        token) is the CALLER-supplied real per-sample organ, resolved from
+        the dataset manifest -- one call is always exactly one sample, so
+        one organ. When given, it is validated against STPath's own
+        `organ_tokenizer` vocabulary and used instead of this encoder's
+        construction-time default; omitting it (the old behavior) is only
+        acceptable for tests/smoke scripts that don't have a real manifest
+        organ available."""
         n_context = context_coords.shape[0]
         if context_expression.shape[0] != n_context or context_image_features.shape[0] != n_context:
             raise ValueError("context_coords/context_expression/context_image_features must be row-aligned")
@@ -98,7 +111,14 @@ class Gen4STPathContextEncoder(nn.Module):
             base.tokenizer.ge_tokenizer.n_tokens, expr, base._context_gene_ids.to(device),
         )
 
-        organ = base.tokenizer.organ_tokenizer.encode(base.organ_type, align_first=True)
+        effective_organ = organ_type if organ_type is not None else base.organ_type
+        try:
+            organ = base.tokenizer.organ_tokenizer.encode(effective_organ, align_first=True)
+        except Exception as exc:
+            raise ValueError(
+                f"organ_type={effective_organ!r} is not a valid STPath organ token -- check the manifest's "
+                "organ label against STPath's own organ_tokenizer vocabulary"
+            ) from exc
         organ_ids = torch.full((n_context,), organ, dtype=torch.long, device=device)
         tech = base.tokenizer.tech_tokenizer.encode(base.tech_type, align_first=True)
         tech_ids = torch.full((n_context,), tech, dtype=torch.long, device=device)

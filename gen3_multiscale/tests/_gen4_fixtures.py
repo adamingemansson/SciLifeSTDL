@@ -23,6 +23,7 @@ GEN4_MODEL_KWARGS = dict(hidden_dim=32, n_heads=4, n_blocks=2, dense_threshold=1
 
 def synthetic_gen4_inputs(
     *, n_genes: int = 6, gex_dim: int = 4, image_dim: int = 8, gex_context_dim: int | None = None, seed: int = 0,
+    sample_organ: str | None = "Kidney",
 ) -> tuple[Gen4SpatialFieldInputs, SpatialFieldTargets]:
     """Hand-built square-grid example -- same construction
     test_architectures.py's own `_synthetic_inputs` uses, wrapped into a
@@ -57,6 +58,7 @@ def synthetic_gen4_inputs(
         boundary_ring=result.boundary_ring,
         query_depth_to_boundary=result.query_depth_to_boundary,
         context_gex_embedding=context_embedding,
+        sample_organ=sample_organ,
     )
     targets = SpatialFieldTargets(query_expression=rng.normal(size=(n_query, n_genes)).astype(np.float32))
     validate_gen4_spatial_field_example(inputs, targets)
@@ -142,11 +144,14 @@ class Gen4STPathStub(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.proj = nn.Linear(2 + n_genes + 1, hidden_dim)
+        self.last_organ_type: str | None = None  # recorded for tests to assert the real per-sample organ was passed
 
     def encode_context_only(
         self, context_coords: torch.Tensor, context_expression: torch.Tensor,
         context_image_features: torch.Tensor, context_image_available: torch.Tensor | None = None,
+        organ_type: str | None = None,
     ) -> torch.Tensor:
+        self.last_organ_type = organ_type
         image_summary = context_image_features.mean(dim=-1, keepdim=True)
         combined = torch.cat([context_coords, context_expression, image_summary], dim=-1)
         return self.proj(combined)
