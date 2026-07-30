@@ -211,6 +211,137 @@ def test_fit_and_save_architecture4_basis_rejects_a_non_architecture3_config(tmp
         fit_and_save_architecture4_basis(str(config_path), str(tmp_path / "ckpt"), str(tmp_path / "basis.pt"))
 
 
+# ---------------------------------------------------------------------------
+# Codex re-audit of commit 2162ff4, finding #5: close basis-sidecar
+# provenance fail-open gaps -- train_sample_ids mismatch, self-inconsistent
+# mask-schedule fingerprint, conditioner bundle_id/manifest_sha256
+# mismatch, architecture3 config identity vs the conditioner's own bound
+# run_manifest, and numerical basis-content sha256 mismatch.
+# ---------------------------------------------------------------------------
+
+def _train_a_real_architecture4_checkpoint_with_basis(tmp_path, cfg, manifest, manifest_path):
+    """A real, trained Architecture 4 checkpoint plus the real basis it
+    was loaded with -- shared setup for several of the maybe_load_gene_basis
+    adversarial tests below."""
+    arch3_config_path, arch3_checkpoint_dir = _train_a_real_architecture3_checkpoint(tmp_path, cfg, manifest, manifest_path)
+    basis_path = tmp_path / "arch4_basis.pt"
+    fit_and_save_architecture4_basis(
+        str(arch3_config_path), str(arch3_checkpoint_dir), str(basis_path), n_masks_per_sample=2, rank=4,
+    )
+    arch4_config_path = tmp_path / "arch4_config.yaml"
+    arch4_checkpoint_dir = tmp_path / "arch4_ckpt"
+    write_step6_train_config(
+        cfg, manifest_path, arch4_config_path, architecture="4", checkpoint_dir=arch4_checkpoint_dir,
+        model_param_overrides={"use_regional_he": True},
+        synchronized_init_dir=str((tmp_path / "sync")), gene_residual_basis_path=str(basis_path),
+    )
+    config = yaml.safe_load(arch4_config_path.read_text())
+    config["training"]["total_steps"] = 1
+    config["required_fingerprints"]["architecture3_conditioner_checkpoint"] = str(arch3_checkpoint_dir)
+    arch4_config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    return arch3_config_path, arch3_checkpoint_dir, basis_path, arch4_config_path, arch4_checkpoint_dir
+
+
+def test_fit_and_save_architecture4_basis_records_train_sample_ids_and_maybe_load_gene_basis_rejects_a_mismatch(tmp_path, monkeypatch):
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    _arch3_cfg, _arch3_ckpt, basis_path, arch4_config_path, arch4_checkpoint_dir = (
+        _train_a_real_architecture4_checkpoint_with_basis(tmp_path, cfg, manifest, manifest_path)
+    )
+    provenance_path = f"{basis_path}.provenance.json"
+    with open(provenance_path) as f:
+        provenance = json.load(f)
+    assert provenance["train_sample_ids"] == sorted(manifest["train_sample_ids"])
+
+    provenance["train_sample_ids"] = sorted(manifest["train_sample_ids"])[:-1]  # drop one -- a genuine mismatch
+    with open(provenance_path, "w") as f:
+        json.dump(provenance, f, indent=2, sort_keys=True, default=str)
+
+    with pytest.raises(ValueError, match="different training sample set"):
+        train_module.run_training(str(arch4_config_path), smoke=False)
+
+
+def test_maybe_load_gene_basis_rejects_a_sidecar_whose_recomputed_mask_schedule_fingerprint_disagrees(tmp_path, monkeypatch):
+    """Codex re-audit of commit 2162ff4, finding #5: 'recompute
+    training_mask_schedule_fingerprint from the recorded reports.' A
+    sidecar whose two identity records (the fingerprint field and the
+    reports it is supposed to describe) disagree with each other must be
+    refused, even though there is still no external 'current' value for
+    either to be checked against."""
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    _arch3_cfg, _arch3_ckpt, basis_path, arch4_config_path, arch4_checkpoint_dir = (
+        _train_a_real_architecture4_checkpoint_with_basis(tmp_path, cfg, manifest, manifest_path)
+    )
+    provenance_path = f"{basis_path}.provenance.json"
+    with open(provenance_path) as f:
+        provenance = json.load(f)
+    provenance["training_mask_schedule_fingerprint"] = "0" * 64  # self-inconsistent with mask_schedule_reports
+    with open(provenance_path, "w") as f:
+        json.dump(provenance, f, indent=2, sort_keys=True, default=str)
+
+    with pytest.raises(ValueError, match="disagree with each other"):
+        train_module.run_training(str(arch4_config_path), smoke=False)
+
+
+def test_maybe_load_gene_basis_rejects_a_basis_file_whose_numerical_content_does_not_match_its_sidecar(tmp_path, monkeypatch):
+    """Codex re-audit of commit 2162ff4, finding #5: 'record the
+    numerical basis SHA256 and verify it when loading.' A basis file
+    whose ACTUAL numeric content has been changed (e.g. re-fit differently
+    or hand-edited) while its provenance sidecar's recorded
+    gene_residual_basis_sha256 was left untouched must be refused."""
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    _arch3_cfg, _arch3_ckpt, basis_path, arch4_config_path, arch4_checkpoint_dir = (
+        _train_a_real_architecture4_checkpoint_with_basis(tmp_path, cfg, manifest, manifest_path)
+    )
+    from gen3_multiscale.models.gene_basis import load_gene_residual_basis, save_gene_residual_basis
+
+    basis = load_gene_residual_basis(basis_path)
+    with torch.no_grad():
+        basis.basis.add_(1.0)  # change the numeric content without touching the sidecar
+    save_gene_residual_basis(basis, basis_path)
+
+    with pytest.raises(ValueError, match="does not match its provenance sidecar"):
+        train_module.run_training(str(arch4_config_path), smoke=False)
+
+
+def test_maybe_load_gene_basis_rejects_a_conditioner_rolled_to_a_different_bundle_at_the_same_step_and_weights(tmp_path, monkeypatch):
+    """Codex re-audit of commit 2162ff4, finding #5: 'record and validate
+    canonical conditioner bundle_id/manifest SHA/step.' weights_sha256 +
+    step alone cannot distinguish two DIFFERENT bundles that happen to
+    save byte-identical weights at the same step (e.g. a duplicate save
+    with unchanged content) -- re-saves the SAME Architecture 3 weights a
+    second time at the SAME step, producing a new, distinct bundle_id/
+    manifest_sha256 with an IDENTICAL weights_sha256 and step, then
+    checks that resuming Architecture 4 from its recorded basis sidecar
+    (bound to the ORIGINAL bundle) refuses to proceed against the new one."""
+    from gen3_multiscale.training import checkpoint as checkpoint_module
+
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    arch3_config_path, arch3_checkpoint_dir, basis_path, arch4_config_path, arch4_checkpoint_dir = (
+        _train_a_real_architecture4_checkpoint_with_basis(tmp_path, cfg, manifest, manifest_path)
+    )
+    identity_before = checkpoint_module.resolve_checkpoint_identity(arch3_checkpoint_dir)
+
+    from gen3_multiscale.training.train import build_model_for_inference, resolved_config
+
+    arch3_config = resolved_config(str(arch3_config_path))
+    gene_names = list(manifest["gene_panel"])
+    model, _info = build_model_for_inference(
+        arch3_config, gene_names=gene_names, device=torch.device("cpu"), checkpoint_dir=arch3_checkpoint_dir,
+        smoke=False, dataset_manifest=manifest,
+    )
+    model_config_path = identity_before.resolved_dir / "model_config.json"
+    model_config = json.loads(model_config_path.read_text())
+    checkpoint_module.save_checkpoint(model, model_config, gene_names, arch3_checkpoint_dir, step=identity_before.step)
+
+    identity_after = checkpoint_module.resolve_checkpoint_identity(arch3_checkpoint_dir)
+    assert identity_after.step == identity_before.step
+    assert identity_after.weights_sha256 == identity_before.weights_sha256  # unchanged content
+    assert identity_after.bundle_dir != identity_before.bundle_dir  # but a genuinely DIFFERENT bundle
+
+    with pytest.raises(ValueError, match="different bundle"):
+        train_module.run_training(str(arch4_config_path), smoke=False)
+
+
 def test_maybe_load_pretrained_conditioner_requires_a_real_architecture3_checkpoint_for_non_smoke(tmp_path, monkeypatch):
     cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
     gene_names = list(manifest["gene_panel"])

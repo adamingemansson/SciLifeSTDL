@@ -30,8 +30,10 @@ the reported headline metric, matching "keep ST-FID/ST-MMD secondary."
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -248,7 +250,7 @@ def evaluate_gen3_checkpoint(
     config_path: str, checkpoint_dir: str | Path, *, split: str = "validation",
     n_masks_per_sample: int = 8, use_best: bool = True, compute_st_fid_mmd: bool = False,
     allow_test: bool = False, device_str: str = "cpu", evaluation_seed: int = 0,
-    calibration_n_samples: int | None = None,
+    calibration_n_samples: int | None = None, allow_code_drift: bool = False,
 ) -> dict:
     """The real Step 7 evaluation entrypoint. Runs a REAL, already-trained
     checkpoint over the FIXED, deterministic held-out mask schedule for
@@ -353,7 +355,7 @@ def evaluate_gen3_checkpoint(
         )
     verify_full_checkpoint_identity(
         weights_dir, config=config, dataset_manifest=dataset_manifest, gene_names=gene_names,
-        cache_content_by_sample=preflight_report.get("cache_content_by_sample"),
+        cache_content_by_sample=preflight_report.get("cache_content_by_sample"), allow_code_drift=allow_code_drift,
     )
     model = _load_model_for_evaluation(
         config, weights_dir, gene_names, device, dataset_manifest=dataset_manifest,
@@ -589,3 +591,103 @@ def save_evaluation_report(report: dict, path: str | Path) -> Path:
     tmp.write_text(json.dumps(report, indent=2, sort_keys=True, default=str))
     os.replace(tmp, path)
     return path
+
+
+def _print_evaluation_summary(report: dict) -> None:
+    """A concise, human-readable stdout summary -- never a replacement
+    for the persisted report itself, which already carries every number
+    in full detail. Codex re-audit of commit 2162ff4, finding #1: "print
+    a concise summary" as part of a real CLI."""
+    model_metrics = report["per_arm_patient_aggregated_metrics"]["model"]
+    lines = [
+        f"split={report['split']} n_items={report['n_items']} n_samples={report['n_samples']}",
+        f"model pcc: patient_mean={model_metrics['pcc']['patient_mean']:.4f} "
+        f"(n_patients={model_metrics['pcc']['n_patients']})",
+        f"model rmse: patient_mean={model_metrics['rmse']['patient_mean']:.4f}",
+    ]
+    for name, delta in report["per_arm_paired_delta_vs_model"].items():
+        lines.append(f"model vs {name}: pcc_delta patient_mean={delta['pcc_delta']['patient_mean']:.4f}")
+    calibration = report.get("architecture4_calibration") or {}
+    if calibration.get("n_values", 0):
+        lines.append(
+            f"architecture4 calibration ({calibration['method']}): "
+            f"coverage_68={calibration['coverage_68']:.3f} coverage_90={calibration['coverage_90']:.3f} "
+            f"coverage_95={calibration['coverage_95']:.3f}"
+        )
+    print("\n".join(lines))
+
+
+def main() -> None:
+    """The real, runnable Step 7 evaluation CLI. Codex re-audit of commit
+    2162ff4, finding #1 (confirmed real): this module had `evaluate_gen3_
+    checkpoint`/`save_evaluation_report` as importable functions, but no
+    `main()` or `__main__` block at all -- "python -m
+    gen3_multiscale.evaluation.gen3_evaluator ... silently exits without
+    evaluating or saving a report" was literally true, since there was no
+    code path for it to run at all. Every parameter `evaluate_gen3_
+    checkpoint` accepts is exposed here; the report is always atomically
+    persisted (`save_evaluation_report`, tmp-then-`os.replace`, matching
+    every other artifact write in this package); a raised exception
+    (fail-closed identity/provenance checks, a missing checkpoint, an
+    explicit test-split lock, ...) is reported on stderr and exits
+    non-zero rather than propagating a raw traceback as the only signal."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True, help="A real gen3 architectureN.yaml (data.gen3_manifest_path must be set)")
+    parser.add_argument("--checkpoint-dir", required=True, help="A real, already-trained checkpoint_dir")
+    parser.add_argument("--output", required=True, help="Path to atomically write the evaluation report JSON to")
+    parser.add_argument("--split", default="validation", choices=["validation", "test"])
+    parser.add_argument("--n-masks-per-sample", type=int, default=8)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--evaluation-seed", type=int, default=0,
+        help="Combines with each item's content-derived identity to seed Architecture 4's stochastic "
+             "sampling -- two calls with the same seed against the same checkpoint reproduce bit-identical "
+             "per-item predictions.",
+    )
+    parser.add_argument(
+        "--calibration-n-samples", type=int, default=None,
+        help="Architecture 4 only: draw this many flow samples per item (instead of the trained "
+             "n_flow_samples) and report a higher-fidelity empirical-quantile calibration alongside the "
+             "default Gaussian-std approximation.",
+    )
+    parser.add_argument("--compute-st-fid-mmd", action="store_true", help="Secondary, distributional diagnostic -- never gates selection.")
+    parser.add_argument(
+        "--allow-test", action="store_true",
+        help="Explicit unlock required for --split test -- 'Never select using test samples.' Test-split "
+             "evaluation is a final, one-time report, never a model-selection or development-time input.",
+    )
+    parser.add_argument(
+        "--allow-code-drift", action="store_true",
+        help="Explicit override to evaluate a checkpoint under a different git commit or dirty worktree "
+             "than the one it was trained under. Codex re-audit of commit 2162ff4, finding #4. Never a "
+             "silent bypass -- required whenever code state changed (or is unverifiable) since training.",
+    )
+    use_best = parser.add_mutually_exclusive_group()
+    use_best.add_argument(
+        "--use-best", dest="use_best", action="store_true", default=True,
+        help="Evaluate the best/ bundle (default).",
+    )
+    use_best.add_argument(
+        "--no-use-best", dest="use_best", action="store_false",
+        help="Evaluate the latest checkpoint instead of best/.",
+    )
+    args = parser.parse_args()
+
+    try:
+        report = evaluate_gen3_checkpoint(
+            args.config, args.checkpoint_dir, split=args.split, n_masks_per_sample=args.n_masks_per_sample,
+            use_best=args.use_best, compute_st_fid_mmd=args.compute_st_fid_mmd, allow_test=args.allow_test,
+            device_str=args.device, evaluation_seed=args.evaluation_seed,
+            calibration_n_samples=args.calibration_n_samples, allow_code_drift=args.allow_code_drift,
+        )
+    except Exception as exc:
+        print(f"gen3_evaluator: evaluation FAILED: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+    saved_path = save_evaluation_report(report, args.output)
+    print(f"evaluation report saved to {saved_path}")
+    _print_evaluation_summary(report)
+
+
+if __name__ == "__main__":
+    main()

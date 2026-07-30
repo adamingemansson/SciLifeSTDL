@@ -74,6 +74,7 @@ import itertools
 import json
 import os
 import random
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -100,6 +101,22 @@ _OPTIMIZER_RNG_STATE_KEYS = frozenset({
     "optimizer", "python_random", "numpy_random", "torch_random", "loop_random", "torch_cuda_random",
 })
 
+# Codex re-audit of commit 2162ff4, finding #3: "constrain bundle_dir to
+# the canonical bundle-name regex... validate pointer schema/version and
+# exact keys." Matches EXACTLY what `_bundle_dir_name_prefix`/
+# `_new_bundle_id` produce (`step_00000042__00000000000000000001_1234_000000`)
+# -- a bundle_dir sourced from an on-disk pointer or rollback target is
+# never used to build a filesystem path until it has passed this check,
+# closing a real path-traversal-shaped gap (a tampered pointer naming
+# something like "../../etc" was previously joined onto the history
+# directory with no validation at all).
+_BUNDLE_ID_RE = re.compile(r"^step_\d{8}__\d{20}_\d+_\d{6}$")
+_POINTER_SCHEMA_VERSION = 1
+_POINTER_KEYS = frozenset({"version", "step", "bundle_dir", "manifest_sha256"})
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+_BUNDLE_MANIFEST_VERSION = 2
+_BUNDLE_MANIFEST_KIND = "gen3_checkpoint_step_manifest"
+
 _bundle_id_sequence = itertools.count()
 
 
@@ -122,13 +139,14 @@ def _is_frozen_backbone_module(module: nn.Module) -> bool:
     return bool(params) and all(not p.requires_grad for p in params)
 
 
-def save_trainable_state(model: nn.Module, checkpoint_dir: str | Path) -> Path | None:
-    """Save trainable parameters and non-frozen buffers only. Returns the
-    weights file path, or None if there was nothing trainable to save
-    (e.g. Architecture 4 with its STPath backbone fully frozen and no
-    scFoundation residual enabled — an edge case, but handled the same
-    way the original codebase's zero-trainable-parameter bug taught us
-    to: absence of a weights file is a valid, real state, not an error)."""
+def _expected_trainable_state_names(model: nn.Module) -> set[str]:
+    """The exact set of state_dict keys `save_trainable_state` saves --
+    every trainable parameter plus every buffer NOT owned by a frozen
+    backbone module. Shared by `save_trainable_state` (to build the saved
+    blob) and `load_trainable_state` (to validate a loaded blob has no
+    unexpected keys -- Codex re-audit of commit 2162ff4, finding #3:
+    "reject unexpected model-state keys, not only optimizer blob keys")
+    so the two can never silently drift apart."""
     trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
     frozen_module_names = {name for name, m in model.named_modules() if _is_frozen_backbone_module(m)}
 
@@ -136,10 +154,21 @@ def save_trainable_state(model: nn.Module, checkpoint_dir: str | Path) -> Path |
         parts = buf_name.split(".")
         return any(".".join(parts[:i]) in frozen_module_names for i in range(1, len(parts)))
 
-    save_names = set(trainable_names)
+    names = set(trainable_names)
     for buf_name, _ in model.named_buffers():
         if not _under_frozen_module(buf_name):
-            save_names.add(buf_name)
+            names.add(buf_name)
+    return names
+
+
+def save_trainable_state(model: nn.Module, checkpoint_dir: str | Path) -> Path | None:
+    """Save trainable parameters and non-frozen buffers only. Returns the
+    weights file path, or None if there was nothing trainable to save
+    (e.g. Architecture 4 with its STPath backbone fully frozen and no
+    scFoundation residual enabled — an edge case, but handled the same
+    way the original codebase's zero-trainable-parameter bug taught us
+    to: absence of a weights file is a valid, real state, not an error)."""
+    save_names = _expected_trainable_state_names(model)
     if not save_names:
         return None
     state = {k: v for k, v in model.state_dict().items() if k in save_names}
@@ -268,9 +297,25 @@ def rollback_checkpoint(checkpoint_dir: str | Path, step: int) -> None:
     actual available steps if the requested one isn't present (a typo'd
     step should fail loudly, not silently no-op). If more than one
     bundle exists for `step` (a repeated save at that step), rolls back
-    to the most recently written one."""
+    to the most recently written one.
+
+    Codex re-audit of commit 2162ff4, finding #3: "verify rollback target
+    completely before changing the pointer." The prior version picked a
+    bundle purely by directory-NAME pattern (`_latest_bundle_for_step`,
+    which only parses `list_checkpoint_bundles`' directory listing -- no
+    content verification at all) and copied its files to root BEFORE any
+    integrity check ran; a corrupted or tampered history bundle would
+    only ever be caught LATER, on the next resume/load, by which point
+    `latest_bundle.json` had already been pointed at it and root files
+    already overwritten. `_verify_bundle` (the same full manifest/file-
+    hash/step-consistency chain `_resolve_checkpoint_source` runs for the
+    CURRENT pointer's target) now runs FIRST, before any root file is
+    touched or the pointer is rewritten -- a bad rollback target raises
+    here, leaving the existing checkpoint state completely untouched."""
     bundle_name = _latest_bundle_for_step(checkpoint_dir, step)
+    _verify_bundle(checkpoint_dir, bundle_name, expected_step=step, expected_manifest_sha256=None)
     bundle_dir = _history_dir(checkpoint_dir) / bundle_name
+    manifest_sha256 = _file_sha256(bundle_dir / "manifest.json")
     out_dir = Path(checkpoint_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     # Root previously may have had a trainable_weights.pt that this bundle
@@ -291,10 +336,9 @@ def rollback_checkpoint(checkpoint_dir: str | Path, step: int) -> None:
     # files directly -- rolling back must move that pointer too, or the
     # next resume would silently ignore the rollback and keep resolving
     # to the newer (rolled-back-FROM) bundle.
-    manifest_path = bundle_dir / "manifest.json"
     pointer = {
-        "step": int(step), "bundle_dir": bundle_name,
-        "manifest_sha256": _file_sha256(manifest_path) if manifest_path.is_file() else None,
+        "version": _POINTER_SCHEMA_VERSION, "step": int(step), "bundle_dir": bundle_name,
+        "manifest_sha256": manifest_sha256,
     }
     pointer_tmp = out_dir / f".latest_bundle.json.tmp{os.getpid()}"
     pointer_tmp.write_text(json.dumps(pointer, indent=2))
@@ -403,7 +447,7 @@ def save_checkpoint(
         name: _file_sha256(staging_dir / name) for name in _CHECKPOINT_FILENAMES if (staging_dir / name).is_file()
     }
     step_manifest = {
-        "version": 2, "kind": "gen3_checkpoint_step_manifest", "step": int(step),
+        "version": _BUNDLE_MANIFEST_VERSION, "kind": _BUNDLE_MANIFEST_KIND, "step": int(step),
         "bundle_id": bundle_name, "files": file_hashes,
     }
     # Written LAST inside the staging directory -- a loader can treat its
@@ -423,7 +467,10 @@ def save_checkpoint(
     # bundle's own manifest sha256 (Codex's requested CheckpointIdentity
     # payload) -- written BEFORE pruning, so pruning can never remove the
     # bundle the pointer now references.
-    pointer = {"step": int(step), "bundle_dir": bundle_name, "manifest_sha256": manifest_sha256}
+    pointer = {
+        "version": _POINTER_SCHEMA_VERSION, "step": int(step), "bundle_dir": bundle_name,
+        "manifest_sha256": manifest_sha256,
+    }
     pointer_tmp = checkpoint_dir / f".latest_bundle.json.tmp{os.getpid()}"
     pointer_tmp.write_text(json.dumps(pointer, indent=2))
     _fsync_path(pointer_tmp)
@@ -471,78 +518,116 @@ def save_checkpoint(
     )
 
 
-def _resolve_checkpoint_source(checkpoint_dir: str | Path) -> Path:
-    """Fail-closed transactional load resolution. If `checkpoint_dir/
-    latest_bundle.json` exists, resolves to the bundle it names and
-    verifies (a) the bundle's OWN manifest.json still matches the sha256
-    the pointer recorded for it, and (b) every file the bundle's
-    manifest itself records still matches its sha256 on disk right now --
-    a crash between individual file writes (or the checkpoint being
-    altered after being written) can therefore no longer silently
-    produce a load built from files belonging to different steps or
-    bundles; the whole bundle is rejected instead. Falls back to
-    `checkpoint_dir` itself when there is no pointer AND no history/
-    bundles exist -- a `best/` bundle (predating this fix) or an
-    arbitrary non-transactional checkpoint directory. A missing pointer
-    with a NON-EMPTY history/ is refused instead (Codex re-audit of
-    commit f7bb8a1, launch blocker #4: "reject a missing pointer when
-    canonical history/training artifacts exist") -- that combination can
-    only mean the pointer was lost/deleted after real bundles were
-    already written, not "nothing has been saved here yet."
-
-    Additional launch-blocker-#4 hardening on the pointer/manifest/bundle
-    chain itself:
-    - `manifest_sha256` is now REQUIRED on the pointer, never silently
-      skipped when absent ("accepts a pointer without manifest_sha256").
-    - the pointer's own `step`, the bundle manifest's own `step`, and
-      (when present) `training_state.json`'s own `step` must all agree
-      ("does not cross-check pointer step, manifest step and
-      training-state step").
-    - the manifest's file list must be a SUBSET of the known checkpoint
-      filenames (no unexpected names) and a SUPERSET of the mandatory
-      core (`model_config.json`/`gene_names.json`/`training_state.json`)
-      ("does not require the exact mandatory file set")."""
-    checkpoint_dir = Path(checkpoint_dir)
-    pointer_path = checkpoint_dir / "latest_bundle.json"
-    if not pointer_path.is_file():
-        if list_checkpoint_bundles(checkpoint_dir):
-            raise RuntimeError(
-                f"checkpoint at {checkpoint_dir} has real history bundles but no latest_bundle.json "
-                "pointer -- refusing to silently fall back to (possibly stale or hand-edited) root "
-                "mirror files. The pointer was lost or deleted after bundles were already written; "
-                "this checkpoint_dir cannot be safely resolved without it"
-            )
-        return checkpoint_dir
+def _load_and_validate_pointer(pointer_path: Path) -> dict:
+    """Parse `latest_bundle.json` and validate its FULL schema before any
+    field is trusted -- Codex re-audit of commit 2162ff4, finding #3:
+    "validate exact pointer keys/types/SHA format." Requires EXACTLY the
+    keys this codebase ever writes (no more, no fewer), `version` to
+    match the schema this module currently produces, `step` to be a
+    non-negative int, `bundle_dir` a non-empty string, and
+    `manifest_sha256` to look like a real 64-hex-character sha256 digest
+    -- strictly stronger than the prior "truthy" check, which accepted
+    any non-empty string (including garbage) as a valid hash."""
     pointer = json.loads(pointer_path.read_text())
-    step = int(pointer["step"])
-    bundle_name = pointer["bundle_dir"]
-    expected_manifest_sha256 = pointer.get("manifest_sha256")
-    if not expected_manifest_sha256:
+    if set(pointer.keys()) != _POINTER_KEYS:
         raise RuntimeError(
-            f"checkpoint at {checkpoint_dir}: latest_bundle.json has no manifest_sha256 -- refusing to "
-            "resolve an unverifiable pointer (every pointer this codebase writes always includes one; "
-            "a pointer missing it is corrupted, hand-edited, or from an unsupported older schema)"
+            f"{pointer_path}: pointer has keys {sorted(pointer.keys())}, expected exactly "
+            f"{sorted(_POINTER_KEYS)} -- refusing to resolve a pointer with an unrecognized schema"
+        )
+    if pointer.get("version") != _POINTER_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"{pointer_path}: pointer version {pointer.get('version')!r} != expected "
+            f"{_POINTER_SCHEMA_VERSION} -- refusing to resolve a pointer from an unsupported schema version"
+        )
+    step = pointer.get("step")
+    if not isinstance(step, int) or isinstance(step, bool) or step < 0:
+        raise RuntimeError(f"{pointer_path}: pointer step {step!r} is not a non-negative integer")
+    bundle_dir_name = pointer.get("bundle_dir")
+    if not isinstance(bundle_dir_name, str) or not bundle_dir_name:
+        raise RuntimeError(f"{pointer_path}: pointer bundle_dir {bundle_dir_name!r} is not a non-empty string")
+    manifest_sha256 = pointer.get("manifest_sha256")
+    if not isinstance(manifest_sha256, str) or not _SHA256_HEX_RE.match(manifest_sha256):
+        raise RuntimeError(
+            f"{pointer_path}: pointer manifest_sha256 {manifest_sha256!r} is not a 64-hex-character "
+            "sha256 digest -- refusing to resolve an unverifiable or malformed pointer"
+        )
+    return pointer
+
+
+def _verify_bundle(
+    checkpoint_dir: Path, bundle_name: str, *, expected_step: int, expected_manifest_sha256: str | None,
+) -> dict:
+    """Full content-integrity verification for ONE history bundle --
+    shared by `_resolve_checkpoint_source` (verifying the CURRENT
+    pointer's target before ever loading from it) and `rollback_checkpoint`
+    (verifying a ROLLBACK target completely BEFORE changing the pointer
+    to reference it -- Codex re-audit of commit 2162ff4, finding #3).
+    Returns the bundle's own parsed manifest.json. `expected_manifest_
+    sha256=None` skips that one specific comparison (rollback has no
+    prior pointer recording what this target's hash SHOULD be -- it is
+    choosing a fresh target by step number, not verifying an existing
+    pointer), every other check still runs.
+
+    Verifies (a) `bundle_name` matches the canonical bundle-name schema
+    (`_BUNDLE_ID_RE`) BEFORE it is ever used to build a filesystem path --
+    Codex re-audit of commit 2162ff4, finding #3: "constrain bundle_dir
+    to the canonical bundle-name regex" -- a tampered pointer/rollback
+    target naming e.g. `../../etc` is rejected here, never joined onto
+    the history directory; (b) the bundle's OWN manifest.json matches the
+    expected sha256 (when given); (c) the manifest's `version`/`kind`/
+    `bundle_id` fields (Codex re-audit of commit 2162ff4, finding #3:
+    "validate manifest version/kind/bundle_id/step" -- these fields were
+    WRITTEN since `save_checkpoint` was first transactionalized but never
+    independently READ/validated by any loader); (d) the manifest's `step`
+    matches `expected_step`; (e) the manifest's file list is a SUBSET of
+    the known checkpoint filenames and a SUPERSET of the mandatory core;
+    (f) the real bundle directory contents match the manifest's file list
+    exactly (no unlisted extra files); (g) every listed file's real sha256
+    matches; (h) `training_state.json`'s own `step` also agrees."""
+    if not _BUNDLE_ID_RE.match(bundle_name):
+        raise RuntimeError(
+            f"checkpoint at {checkpoint_dir}: bundle_dir {bundle_name!r} does not match the canonical "
+            f"bundle-name schema ({_BUNDLE_ID_RE.pattern}) -- refusing to resolve a path built from an "
+            "unrecognized or potentially unsafe bundle name"
         )
     bundle_dir = _history_dir(checkpoint_dir) / bundle_name
     manifest_path = bundle_dir / "manifest.json"
     if not manifest_path.is_file():
         raise RuntimeError(
-            f"checkpoint at {checkpoint_dir} points (via latest_bundle.json) at bundle {bundle_name!r} "
-            f"(step {step}) but its manifest is missing at {manifest_path} -- refusing to load a "
-            "possibly-partial or corrupted checkpoint"
+            f"checkpoint at {checkpoint_dir} references bundle {bundle_name!r} (step {expected_step}) but "
+            f"its manifest is missing at {manifest_path} -- refusing to load a possibly-partial or "
+            "corrupted checkpoint"
         )
-    if _file_sha256(manifest_path) != expected_manifest_sha256:
+    actual_manifest_sha256 = _file_sha256(manifest_path)
+    if expected_manifest_sha256 is not None and actual_manifest_sha256 != expected_manifest_sha256:
         raise RuntimeError(
             f"checkpoint at {checkpoint_dir}: bundle {bundle_name!r}'s manifest.json does not match "
-            "the sha256 recorded in latest_bundle.json -- corrupted or tampered checkpoint, refusing to load"
+            "the expected sha256 -- corrupted or tampered checkpoint, refusing to load"
         )
     step_manifest = json.loads(manifest_path.read_text())
-    manifest_step = step_manifest.get("step")
-    if manifest_step is None or int(manifest_step) != step:
+    if step_manifest.get("version") != _BUNDLE_MANIFEST_VERSION:
         raise RuntimeError(
-            f"checkpoint at {checkpoint_dir}: latest_bundle.json records step={step} but bundle "
-            f"{bundle_name!r}'s own manifest.json records step={manifest_step!r} -- refusing to load a "
-            "checkpoint whose pointer and bundle disagree about which step this is"
+            f"checkpoint bundle {bundle_name!r}: manifest version {step_manifest.get('version')!r} != "
+            f"expected {_BUNDLE_MANIFEST_VERSION} -- refusing to load a bundle from an unsupported "
+            "manifest schema"
+        )
+    if step_manifest.get("kind") != _BUNDLE_MANIFEST_KIND:
+        raise RuntimeError(
+            f"checkpoint bundle {bundle_name!r}: manifest kind {step_manifest.get('kind')!r} != "
+            f"expected {_BUNDLE_MANIFEST_KIND!r} -- refusing to load a bundle with an unrecognized kind"
+        )
+    if step_manifest.get("bundle_id") != bundle_name:
+        raise RuntimeError(
+            f"checkpoint bundle {bundle_name!r}: manifest bundle_id {step_manifest.get('bundle_id')!r} "
+            f"does not match its own directory name {bundle_name!r} -- refusing to load a bundle whose "
+            "manifest disagrees about its own identity"
+        )
+    manifest_step = step_manifest.get("step")
+    if manifest_step is None or int(manifest_step) != int(expected_step):
+        raise RuntimeError(
+            f"checkpoint at {checkpoint_dir}: expected step={expected_step} but bundle {bundle_name!r}'s "
+            f"own manifest.json records step={manifest_step!r} -- refusing to load a checkpoint whose "
+            "pointer/rollback-target and bundle disagree about which step this is"
         )
     manifest_files = step_manifest.get("files") or {}
     # Codex re-audit of commit 90f853e, adversarial coverage for launch
@@ -557,9 +642,9 @@ def _resolve_checkpoint_source(checkpoint_dir: str | Path) -> Path:
     unlisted = actual_files - set(manifest_files.keys())
     if unlisted:
         raise RuntimeError(
-            f"checkpoint bundle {bundle_name!r} (step {step}) contains file(s) {sorted(unlisted)} that "
-            "are not listed in its own manifest.json -- refusing to load a bundle whose manifest does "
-            "not fully account for its real contents"
+            f"checkpoint bundle {bundle_name!r} (step {expected_step}) contains file(s) {sorted(unlisted)} "
+            "that are not listed in its own manifest.json -- refusing to load a bundle whose manifest "
+            "does not fully account for its real contents"
         )
     # Codex re-audit of commit f7bb8a1, launch blocker #4: "require the
     # exact mandatory file set." Every name the manifest lists must be
@@ -567,43 +652,113 @@ def _resolve_checkpoint_source(checkpoint_dir: str | Path) -> Path:
     # extra state smuggled into a bundle), and every mandatory-core name
     # must be present (removing BOTH a required file and its manifest
     # entry -- the exact adversarial scenario Codex names -- is caught
-    # here even though `_resolve_checkpoint_source` itself has nothing
-    # left on disk to hash-check against).
+    # here even though this function itself has nothing left on disk to
+    # hash-check against).
     manifest_file_names = set(manifest_files.keys())
     unexpected = manifest_file_names - set(_CHECKPOINT_FILENAMES)
     if unexpected:
         raise RuntimeError(
-            f"checkpoint bundle {bundle_name!r} (step {step}) manifest lists unexpected file name(s) "
-            f"{sorted(unexpected)} -- refusing to load a bundle with unrecognized saved state"
+            f"checkpoint bundle {bundle_name!r} (step {expected_step}) manifest lists unexpected file "
+            f"name(s) {sorted(unexpected)} -- refusing to load a bundle with unrecognized saved state"
         )
     missing_mandatory = _MANDATORY_BUNDLE_FILENAMES - manifest_file_names
     if missing_mandatory:
         raise RuntimeError(
-            f"checkpoint bundle {bundle_name!r} (step {step}) manifest is missing mandatory file(s) "
-            f"{sorted(missing_mandatory)} -- refusing to load an incomplete bundle"
+            f"checkpoint bundle {bundle_name!r} (step {expected_step}) manifest is missing mandatory "
+            f"file(s) {sorted(missing_mandatory)} -- refusing to load an incomplete bundle"
         )
     for name, expected_hash in manifest_files.items():
         file_path = bundle_dir / name
         if not file_path.is_file():
             raise RuntimeError(
-                f"checkpoint bundle {bundle_name!r} (step {step}) manifest references {name} but it is "
-                f"missing from {bundle_dir} -- refusing to load a corrupted checkpoint"
+                f"checkpoint bundle {bundle_name!r} (step {expected_step}) manifest references {name} but "
+                f"it is missing from {bundle_dir} -- refusing to load a corrupted checkpoint"
             )
         if _file_sha256(file_path) != expected_hash:
             raise RuntimeError(
-                f"checkpoint bundle {bundle_name!r} (step {step}) file {name} does not match the sha256 "
-                "recorded in its own bundle manifest -- corrupted or partially-written checkpoint, "
+                f"checkpoint bundle {bundle_name!r} (step {expected_step}) file {name} does not match the "
+                "sha256 recorded in its own bundle manifest -- corrupted or partially-written checkpoint, "
                 "refusing to load"
             )
     training_state_path = bundle_dir / "training_state.json"
     training_state_step = json.loads(training_state_path.read_text()).get("step")
-    if training_state_step is None or int(training_state_step) != step:
+    if training_state_step is None or int(training_state_step) != int(expected_step):
         raise RuntimeError(
-            f"checkpoint bundle {bundle_name!r}: latest_bundle.json/manifest.json record step={step} "
-            f"but training_state.json records step={training_state_step!r} -- refusing to load a "
-            "checkpoint whose own files disagree about which step this is"
+            f"checkpoint bundle {bundle_name!r}: expected step={expected_step} but training_state.json "
+            f"records step={training_state_step!r} -- refusing to load a checkpoint whose own files "
+            "disagree about which step this is"
         )
-    return bundle_dir
+    return step_manifest
+
+
+def _resolve_checkpoint_source(checkpoint_dir: str | Path) -> Path:
+    """Fail-closed transactional load resolution. If `checkpoint_dir/
+    latest_bundle.json` exists, resolves to the bundle it names and runs
+    `_verify_bundle`'s full content-integrity chain against it. Falls
+    back to `checkpoint_dir` itself only when there is NO pointer, NO
+    history bundles, AND no orphaned root-level checkpoint files -- a
+    genuinely fresh, never-saved-to directory. A missing pointer with a
+    NON-EMPTY history/ is refused (Codex re-audit of commit f7bb8a1,
+    launch blocker #4: "reject a missing pointer when canonical
+    history/training artifacts exist") -- that combination can only mean
+    the pointer was lost/deleted after real bundles were already written,
+    not "nothing has been saved here yet."
+
+    Codex re-audit of commit 2162ff4, finding #3: "Root checkpoint files
+    can still be accepted when history was removed and the pointer is
+    missing." Confirmed real: root-level `_CHECKPOINT_FILENAMES` are
+    ONLY EVER written by `save_checkpoint`'s mirror step, which ALWAYS
+    also writes `latest_bundle.json` first (see that function) -- there
+    is no legitimate code path that produces root files without a
+    pointer for a live `checkpoint_dir`. A missing pointer alongside
+    EXISTING root files therefore normally means the pointer (and
+    possibly the whole history/ directory) was lost or deleted after a
+    real save; those orphaned root files are now refused too, not
+    silently trusted as "nothing has ever been saved here." The one
+    legitimate exception -- callers directly resolving a HISTORY BUNDLE'S
+    OWN path (e.g. `checkpoint.py`'s own tests load a specific past
+    snapshot by `history/<bundle_name>/`), which genuinely has no pointer
+    OF ITS OWN by design -- is distinguished by the presence of that
+    bundle's own `manifest.json`, a file `save_checkpoint`'s root-mirror
+    step never copies to a live checkpoint_dir's root; only a real bundle
+    directory ever has one."""
+    checkpoint_dir = Path(checkpoint_dir)
+    pointer_path = checkpoint_dir / "latest_bundle.json"
+    if not pointer_path.is_file():
+        if list_checkpoint_bundles(checkpoint_dir):
+            raise RuntimeError(
+                f"checkpoint at {checkpoint_dir} has real history bundles but no latest_bundle.json "
+                "pointer -- refusing to silently fall back to (possibly stale or hand-edited) root "
+                "mirror files. The pointer was lost or deleted after bundles were already written; "
+                "this checkpoint_dir cannot be safely resolved without it"
+            )
+        # `save_checkpoint` ALWAYS writes this exact mandatory triple
+        # together, unconditionally, every single call -- their combined
+        # presence is a much stronger, more specific signal that a real
+        # save_checkpoint call once ran here (and its pointer/history was
+        # later lost) than any ONE checkpoint-shaped file existing alone,
+        # which could just as easily be a partially/hand-constructed
+        # directory (e.g. a test fixture deliberately writing only some
+        # metadata files to simulate an incomplete checkpoint) that never
+        # went through this module's save path at all.
+        existing_root_files = [name for name in _CHECKPOINT_FILENAMES if (checkpoint_dir / name).is_file()]
+        has_mandatory_root_triple = _MANDATORY_BUNDLE_FILENAMES.issubset(set(existing_root_files))
+        if has_mandatory_root_triple and not (checkpoint_dir / "manifest.json").is_file():
+            raise RuntimeError(
+                f"checkpoint at {checkpoint_dir} has root-level file(s) {existing_root_files} but no "
+                "latest_bundle.json pointer and no history bundles -- root files are only ever written "
+                "as a mirror alongside a real transactional save (which always writes the pointer "
+                "first), so their presence without a pointer means the pointer (and possibly the whole "
+                "history/ directory) was lost or deleted after a real save. Refusing to silently trust "
+                "orphaned root files as if nothing had ever been saved here"
+            )
+        return checkpoint_dir
+    pointer = _load_and_validate_pointer(pointer_path)
+    _verify_bundle(
+        checkpoint_dir, pointer["bundle_dir"], expected_step=pointer["step"],
+        expected_manifest_sha256=pointer["manifest_sha256"],
+    )
+    return _history_dir(checkpoint_dir) / pointer["bundle_dir"]
 
 
 @dataclass(frozen=True)
@@ -630,10 +785,15 @@ def resolve_checkpoint_identity(checkpoint_dir: str | Path) -> CheckpointIdentit
     pointer_path = checkpoint_dir / "latest_bundle.json"
     step = bundle_dir = manifest_sha256 = None
     if pointer_path.is_file():
-        pointer = json.loads(pointer_path.read_text())
-        step = int(pointer["step"])
-        bundle_dir = pointer.get("bundle_dir")
-        manifest_sha256 = pointer.get("manifest_sha256")
+        # `_resolve_checkpoint_source` above already validated this exact
+        # pointer via `_load_and_validate_pointer` -- re-validating here
+        # (rather than a raw, unvalidated `json.loads`) keeps this
+        # function's own reading consistent with everything else that
+        # touches a pointer file.
+        pointer = _load_and_validate_pointer(pointer_path)
+        step = pointer["step"]
+        bundle_dir = pointer["bundle_dir"]
+        manifest_sha256 = pointer["manifest_sha256"]
     weights_path = resolved_dir / "trainable_weights.pt"
     weights_sha256 = _file_sha256(weights_path) if weights_path.is_file() else None
     return CheckpointIdentity(
@@ -660,10 +820,25 @@ def load_trainable_state(model: nn.Module, checkpoint_dir: str | Path) -> None:
     copy-provenance discipline. Resolves through `_resolve_checkpoint_source`
     first -- for a transactional checkpoint_dir this loads from the
     verified, immutable history bundle, never directly from the (merely
-    a convenience mirror) root files."""
+    a convenience mirror) root files.
+
+    Codex re-audit of commit 2162ff4, finding #3: "reject unexpected
+    model-state keys, not only optimizer blob keys." Confirmed real:
+    `model.load_state_dict(state, strict=False)` silently DROPS any key
+    in `state` that the current model doesn't have a matching parameter/
+    buffer for -- a saved blob carrying extra, unrecognized keys (a
+    corrupted save, a checkpoint from a different/older architecture
+    version with since-removed parameters, or tampering) previously
+    loaded without complaint. `strict=False` is kept (its OTHER job --
+    tolerating a model with fewer buffers than what was saved, which
+    `missing_trainable` below does not by itself need `strict=True` to
+    catch -- is unaffected), but the loaded blob's key set is now
+    explicitly required to be a SUBSET of `_expected_trainable_state_
+    names(model)` (trainable parameters + non-frozen buffers) first."""
     in_dir = _resolve_checkpoint_source(checkpoint_dir)
     weights_path = in_dir / "trainable_weights.pt"
     trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
+    expected_names = _expected_trainable_state_names(model)
     if weights_path.is_file():
         state = torch.load(weights_path, map_location="cpu")
         missing_trainable = trainable_names - set(state.keys())
@@ -671,6 +846,13 @@ def load_trainable_state(model: nn.Module, checkpoint_dir: str | Path) -> None:
             raise RuntimeError(
                 f"saved weights at {in_dir} are missing trainable parameters this "
                 f"model architecture expects: {missing_trainable} (config mismatch?)"
+            )
+        unexpected = set(state.keys()) - expected_names
+        if unexpected:
+            raise RuntimeError(
+                f"saved weights at {in_dir} contain unexpected key(s) {sorted(unexpected)} that this "
+                "model architecture's trainable parameters/non-frozen buffers do not expect -- refusing "
+                "to load a checkpoint with unrecognized saved state"
             )
         model.load_state_dict(state, strict=False)
     else:

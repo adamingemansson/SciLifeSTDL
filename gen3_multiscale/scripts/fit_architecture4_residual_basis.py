@@ -115,7 +115,7 @@ def compute_training_residuals(
 
 def fit_and_save_architecture4_basis(
     architecture3_config_path: str, architecture3_checkpoint_dir: str, output_basis_path: str,
-    *, n_masks_per_sample: int = 20, rank: int = 64, device_str: str = "cpu",
+    *, n_masks_per_sample: int = 20, rank: int = 64, device_str: str = "cpu", allow_code_drift: bool = False,
 ) -> dict:
     """The full pipeline. Returns (and persists alongside the basis file,
     as `<output_basis_path>.provenance.json`) a provenance record binding
@@ -163,7 +163,7 @@ def fit_and_save_architecture4_basis(
     # checkpoint that turns out not to describe the current run.
     verify_full_checkpoint_identity(
         architecture3_checkpoint_dir, config=config, dataset_manifest=dataset_manifest, gene_names=gene_names,
-        cache_content_by_sample=preflight_report.get("cache_content_by_sample"),
+        cache_content_by_sample=preflight_report.get("cache_content_by_sample"), allow_code_drift=allow_code_drift,
     )
 
     strata = config["masking"]["strata"]
@@ -199,6 +199,16 @@ def fit_and_save_architecture4_basis(
         del residuals  # drop the memmap reference before unlinking its backing file
     finally:
         memmap_path.unlink(missing_ok=True)
+    # Launch blocker #5 / Codex re-audit of commit 2162ff4, finding #5:
+    # "write basis + provenance transactionally." `save_gene_residual_
+    # basis` is already an atomic tmp-then-`os.replace` write; the
+    # provenance sidecar below is written the SAME way, and only AFTER
+    # the basis file is fully durable -- a crash can therefore never
+    # leave a provenance sidecar referencing a basis file that does not
+    # yet exist (or a stale basis with no sidecar at all, since a caller
+    # that sees `output_basis_path` exist but `<path>.provenance.json`
+    # missing already knows -- and `maybe_load_gene_basis` already
+    # enforces -- that the sidecar is mandatory for a non-smoke run).
     saved_basis_path = save_gene_residual_basis(basis, output_basis_path)
 
     # Codex re-audit of commit 90f853e, launch blocker #2: resolve
@@ -216,8 +226,19 @@ def fit_and_save_architecture4_basis(
     training_mask_schedule_fingerprint = hashlib.sha256(
         json.dumps(train_schedule.reports, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
+    # Codex re-audit of commit 2162ff4, finding #5: "record the numerical
+    # basis SHA256 and verify it when loading" -- the sidecar previously
+    # recorded shape (`n_genes`/`rank`) but nothing binding it to the
+    # basis's own NUMERICAL content, so a valid sidecar could be copied
+    # beside a DIFFERENT, same-shape basis (a hand-edited or re-fit-
+    # differently file) without detection. Same hash construction
+    # `verify_full_checkpoint_identity` already uses for this exact
+    # purpose elsewhere.
+    gene_residual_basis_sha256 = hashlib.sha256(
+        np.ascontiguousarray(basis.basis.detach().cpu().numpy()).tobytes()
+    ).hexdigest()
     provenance = {
-        "version": 2,
+        "version": 3,
         "kind": "gen3_architecture4_residual_basis_provenance",
         "architecture3_config_path": str(architecture3_config_path),
         "architecture3_config_fingerprint": config_fingerprint(config),
@@ -225,6 +246,10 @@ def fit_and_save_architecture4_basis(
         "architecture3_checkpoint_dir": str(architecture3_checkpoint_dir),
         "architecture3_checkpoint_trainable_weights_sha256": resolved_identity.weights_sha256,
         "architecture3_checkpoint_step": resolved_identity.step,
+        # Codex re-audit of commit 2162ff4, finding #5: "record and
+        # validate canonical conditioner bundle_id/manifest SHA/step."
+        "architecture3_checkpoint_bundle_id": resolved_identity.bundle_dir,
+        "architecture3_checkpoint_manifest_sha256": resolved_identity.manifest_sha256,
         "dataset_manifest_fingerprint": dataset_manifest_fingerprint(dataset_manifest),
         "gene_panel_hash": gene_panel_hash(gene_names),
         "n_genes": len(gene_names),
@@ -232,13 +257,16 @@ def fit_and_save_architecture4_basis(
         "n_masks_per_sample": int(n_masks_per_sample),
         "n_residual_rows": n_residual_rows,
         "rank": basis.rank,
+        "gene_residual_basis_sha256": gene_residual_basis_sha256,
         "mask_schedule_reports": train_schedule.reports,
         "training_mask_schedule_fingerprint": training_mask_schedule_fingerprint,
         "cache_content_by_sample": preflight_report.get("cache_content_by_sample"),
         "output_basis_path": str(saved_basis_path),
     }
     provenance_path = Path(f"{saved_basis_path}.provenance.json")
-    provenance_path.write_text(json.dumps(provenance, indent=2, sort_keys=True, default=str))
+    provenance_tmp = provenance_path.with_name(f"{provenance_path.name}.tmp.{os.getpid()}")
+    provenance_tmp.write_text(json.dumps(provenance, indent=2, sort_keys=True, default=str))
+    os.replace(provenance_tmp, provenance_path)
     return provenance
 
 
@@ -250,10 +278,17 @@ def main() -> None:
     parser.add_argument("--n-masks-per-sample", type=int, default=20)
     parser.add_argument("--rank", type=int, default=64)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--allow-code-drift", action="store_true",
+        help="Explicit override to fit a basis from an Architecture 3 checkpoint trained under a "
+             "different git commit or dirty worktree than the current one. Codex re-audit of commit "
+             "2162ff4, finding #4. Never a silent bypass.",
+    )
     args = parser.parse_args()
     provenance = fit_and_save_architecture4_basis(
         args.config, args.architecture3_checkpoint_dir, args.output_basis_path,
         n_masks_per_sample=args.n_masks_per_sample, rank=args.rank, device_str=args.device,
+        allow_code_drift=args.allow_code_drift,
     )
     print(f"gene residual basis fit and saved: {json.dumps(provenance, indent=2, default=str)}")
 

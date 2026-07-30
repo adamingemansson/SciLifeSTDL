@@ -427,3 +427,207 @@ def test_root_mirror_disagreeing_with_the_canonical_bundle_is_ignored_by_every_r
         # BUNDLE's file, never the corrupted root mirror.
         import hashlib
         assert identity.weights_sha256 == hashlib.sha256((identity.resolved_dir / "trainable_weights.pt").read_bytes()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Codex re-audit of commit 2162ff4, finding #3: "checkpoint schema
+# validation remains partial" -- pointer schema/version/keys, bundle_dir
+# constrained to the canonical bundle-name regex, bundle manifest
+# version/kind/bundle_id, unexpected model-state keys, and verify-before-
+# pointer-change on rollback. Each of these was a real gap: the fields
+# existed on disk (written since the transactional scheme was first
+# built) but were never independently READ/validated by any loader.
+# ---------------------------------------------------------------------------
+
+def _pointer_path(tmp: str) -> Path:
+    return Path(tmp) / "latest_bundle.json"
+
+
+def _read_pointer(tmp: str) -> dict:
+    return json.loads(_pointer_path(tmp).read_text())
+
+
+def _write_pointer(tmp: str, pointer: dict) -> None:
+    _pointer_path(tmp).write_text(json.dumps(pointer, indent=2))
+
+
+def test_pointer_with_an_extra_key_is_rejected():
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=1)
+        pointer = _read_pointer(tmp)
+        pointer["unexpected_extra_field"] = "surprise"
+        _write_pointer(tmp, pointer)
+        with pytest.raises(RuntimeError, match="unrecognized schema"):
+            load_trainable_state(_Tiny(), tmp)
+
+
+def test_pointer_with_a_missing_key_is_rejected():
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=1)
+        pointer = _read_pointer(tmp)
+        del pointer["manifest_sha256"]
+        _write_pointer(tmp, pointer)
+        with pytest.raises(RuntimeError, match="unrecognized schema"):
+            load_trainable_state(_Tiny(), tmp)
+
+
+def test_pointer_with_an_unsupported_schema_version_is_rejected():
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=1)
+        pointer = _read_pointer(tmp)
+        pointer["version"] = 999
+        _write_pointer(tmp, pointer)
+        with pytest.raises(RuntimeError, match="unsupported schema version"):
+            load_trainable_state(_Tiny(), tmp)
+
+
+def test_pointer_with_a_malformed_manifest_sha256_is_rejected():
+    """Not merely "truthy" -- a garbage string that happens to be
+    non-empty must still be refused (the old check only tested for
+    truthiness, accepting any non-empty string as a "valid" hash)."""
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=1)
+        pointer = _read_pointer(tmp)
+        pointer["manifest_sha256"] = "not-a-real-sha256"
+        _write_pointer(tmp, pointer)
+        with pytest.raises(RuntimeError, match="not a 64-hex-character"):
+            load_trainable_state(_Tiny(), tmp)
+
+
+def test_pointer_bundle_dir_naming_a_path_traversal_shaped_target_is_rejected():
+    """A tampered pointer's `bundle_dir` must be validated against the
+    canonical bundle-name schema BEFORE it is ever joined onto the
+    history directory to build a filesystem path -- real path-traversal-
+    shaped input like `../../etc` must never reach `Path.__truediv__`
+    unchecked."""
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=1)
+        pointer = _read_pointer(tmp)
+        pointer["bundle_dir"] = "../../etc"
+        _write_pointer(tmp, pointer)
+        with pytest.raises(RuntimeError, match="canonical bundle-name schema"):
+            load_trainable_state(_Tiny(), tmp)
+
+
+def test_bundle_manifest_with_wrong_version_is_rejected():
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        import hashlib
+
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=1)
+        identity = resolve_checkpoint_identity(tmp)
+        manifest_path = identity.resolved_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["version"] = 999
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        pointer = _read_pointer(tmp)
+        pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        _write_pointer(tmp, pointer)
+        with pytest.raises(RuntimeError, match="unsupported manifest schema"):
+            load_trainable_state(_Tiny(), tmp)
+
+
+def test_bundle_manifest_with_wrong_kind_is_rejected():
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        import hashlib
+
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=1)
+        identity = resolve_checkpoint_identity(tmp)
+        manifest_path = identity.resolved_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["kind"] = "some_other_kind"
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        pointer = _read_pointer(tmp)
+        pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        _write_pointer(tmp, pointer)
+        with pytest.raises(RuntimeError, match="unrecognized kind"):
+            load_trainable_state(_Tiny(), tmp)
+
+
+def test_bundle_manifest_with_a_bundle_id_disagreeing_with_its_own_directory_name_is_rejected():
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        import hashlib
+
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=1)
+        identity = resolve_checkpoint_identity(tmp)
+        manifest_path = identity.resolved_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["bundle_id"] = "step_00000001__99999999999999999999_1_000000"
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        pointer = _read_pointer(tmp)
+        pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        _write_pointer(tmp, pointer)
+        with pytest.raises(RuntimeError, match="disagrees about its own identity"):
+            load_trainable_state(_Tiny(), tmp)
+
+
+def test_load_trainable_state_rejects_a_weights_blob_with_an_unexpected_extra_key():
+    """`strict=False` in `model.load_state_dict` silently DROPS any key
+    the current model has no matching parameter/buffer for -- a saved
+    blob carrying an extra, unrecognized key (corrupted save, or a
+    checkpoint from a since-changed architecture) must now be refused
+    explicitly instead of loading with the extra key silently ignored."""
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=1)
+        identity = resolve_checkpoint_identity(tmp)
+        weights_path = identity.resolved_dir / "trainable_weights.pt"
+        state = torch.load(weights_path, map_location="cpu")
+        state["lin.some_key_this_architecture_never_had"] = torch.zeros(2, 2)
+        torch.save(state, weights_path)  # tamper the bundle file directly (bypasses the hash check on purpose)
+        # Re-sign the manifest/pointer so the tampered CONTENT is the
+        # thing under test, not merely the (already-covered) hash-mismatch
+        # check -- mirrors test_a32051b_adversarial.py's _resign_bundle_file pattern.
+        import hashlib
+
+        manifest_path = identity.resolved_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["files"]["trainable_weights.pt"] = hashlib.sha256(weights_path.read_bytes()).hexdigest()
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        pointer = _read_pointer(tmp)
+        pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        _write_pointer(tmp, pointer)
+
+        with pytest.raises(RuntimeError, match="unexpected key"):
+            load_trainable_state(_Tiny(), tmp)
+
+
+def test_rollback_verifies_the_target_bundle_before_touching_the_pointer_or_root_files():
+    """Codex re-audit of commit 2162ff4, finding #3: "verify rollback
+    target completely before changing the pointer." A corrupted rollback
+    target must raise BEFORE root files are overwritten and BEFORE
+    latest_bundle.json is repointed -- the currently-active checkpoint
+    must remain exactly as loadable as before the failed rollback
+    attempt."""
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        import hashlib
+
+        with torch.no_grad():
+            m.lin.weight.fill_(1.0)
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=100, keep_last=3)
+        with torch.no_grad():
+            m.lin.weight.fill_(2.0)
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=200, keep_last=3)
+        pointer_before = _read_pointer(tmp)
+
+        bundle_name_100 = next(name for step, name in list_checkpoint_bundles(tmp) if step == 100)
+        target_weights = Path(tmp) / "history" / bundle_name_100 / "trainable_weights.pt"
+        target_weights.write_bytes(b"corrupted, not a real torch checkpoint")
+
+        with pytest.raises(RuntimeError, match="does not match the sha256 recorded"):
+            rollback_checkpoint(tmp, step=100)
+
+        # Untouched: still points at step 200, still loads step 200's weights.
+        assert _read_pointer(tmp) == pointer_before
+        assert load_training_state(tmp)["step"] == 200
+        restored = _Tiny()
+        load_trainable_state(restored, tmp)
+        assert torch.allclose(restored.lin.weight, torch.full((4, 4), 2.0))

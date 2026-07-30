@@ -64,6 +64,45 @@ def _build_synchronized_init_dir(tmp_path: Path, manifest: dict) -> Path:
     return sync_dir
 
 
+def _mutate_canonical_run_manifest(checkpoint_dir: Path, **field_updates) -> None:
+    """Test helper: apply `field_updates` to the CANONICAL, bundle-bound
+    run_manifest.json (re-signing the bundle's own manifest.json and its
+    pointer's manifest_sha256, exactly like `test_a32051b_adversarial.py`'s
+    `_resign_bundle_file`) AND mirror the identical updated content to the
+    checkpoint_dir's root run_manifest.json.
+
+    Codex re-audit of commit 2162ff4, finding #2: resume now trusts the
+    CANONICAL bundle-bound run_manifest.json, never the root mirror
+    directly -- mutating only the root file (the OLD way these tests
+    simulated code-state drift) no longer has any effect on what
+    `run_training` actually verifies against, and mutating only the
+    bundle copy would (correctly) be caught by the NEW root-vs-canonical
+    consistency check as an inconsistency of its own. Updating both
+    together simulates "this field's value was wrong when originally
+    saved," the same class of scenario `_resign_bundle_file` documents."""
+    import hashlib
+    from gen3_multiscale.training import checkpoint as checkpoint_module
+
+    checkpoint_dir = Path(checkpoint_dir)
+    bundle_dir = checkpoint_module.resolve_checkpoint_identity(checkpoint_dir).resolved_dir
+    run_manifest = json.loads((bundle_dir / "run_manifest.json").read_text())
+    run_manifest.update(field_updates)
+    new_content = json.dumps(run_manifest, indent=2, sort_keys=True, default=str).encode()
+
+    (bundle_dir / "run_manifest.json").write_bytes(new_content)
+    manifest_path = bundle_dir / "manifest.json"
+    bundle_manifest = json.loads(manifest_path.read_text())
+    bundle_manifest["files"]["run_manifest.json"] = hashlib.sha256(new_content).hexdigest()
+    manifest_path.write_text(json.dumps(bundle_manifest, indent=2, sort_keys=True))
+    new_manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    pointer_path = checkpoint_dir / "latest_bundle.json"
+    pointer = json.loads(pointer_path.read_text())
+    pointer["manifest_sha256"] = new_manifest_sha256
+    pointer_path.write_text(json.dumps(pointer, indent=2))
+
+    (checkpoint_dir / "run_manifest.json").write_bytes(new_content)
+
+
 @pytest.mark.parametrize("architecture", ["1", "2"])
 def test_run_training_smoke_runs_one_step_for_architecture1_and_2(tmp_path, monkeypatch, architecture):
     cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
@@ -350,8 +389,11 @@ def test_run_training_refuses_resume_when_code_state_drifted_unless_explicitly_a
     persisted = json.loads(manifest_path_on_disk.read_text())
     assert persisted["code_commit_hash"] is not None  # this repo IS a real git checkout
     assert persisted["code_drift_acknowledged"] is False
-    persisted["code_commit_hash"] = "deadbeef" * 5
-    manifest_path_on_disk.write_text(json.dumps(persisted, indent=2, sort_keys=True, default=str))
+    # Codex re-audit of commit 2162ff4, finding #2: resume now verifies
+    # against the CANONICAL, bundle-bound run_manifest.json, so the
+    # simulated drift must be applied there (mirrored to root too, to
+    # avoid tripping the new root-vs-canonical consistency check).
+    _mutate_canonical_run_manifest(checkpoint_dir, code_commit_hash="deadbeef" * 5)
 
     config["training"]["total_steps"] = 2
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
@@ -390,8 +432,10 @@ def test_run_training_refuses_resume_when_code_identity_is_unknown_unless_explic
     manifest_path_on_disk = checkpoint_dir / "run_manifest.json"
     persisted = json.loads(manifest_path_on_disk.read_text())
     assert persisted["code_commit_hash"] is not None  # this repo IS a real git checkout
-    persisted["code_commit_hash"] = None  # simulate a checkpoint from outside git / predating this field
-    manifest_path_on_disk.write_text(json.dumps(persisted, indent=2, sort_keys=True, default=str))
+    # Codex re-audit of commit 2162ff4, finding #2: simulate against the
+    # CANONICAL, bundle-bound run_manifest.json -- see
+    # _mutate_canonical_run_manifest's own docstring.
+    _mutate_canonical_run_manifest(checkpoint_dir, code_commit_hash=None)
 
     config["training"]["total_steps"] = 2
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
@@ -402,6 +446,75 @@ def test_run_training_refuses_resume_when_code_identity_is_unknown_unless_explic
     assert summary["ok"] is True
     resumed_manifest = json.loads(manifest_path_on_disk.read_text())
     assert resumed_manifest["code_drift_acknowledged"] is True
+
+
+def test_run_training_refuses_resume_when_root_run_manifest_disagrees_with_the_canonical_bundle(tmp_path, monkeypatch):
+    """Codex re-audit of commit 2162ff4, finding #2: "Resume still trusts
+    the loose root run_manifest.json... does not require the bundle-bound
+    run manifest to equal the root manifest." A root mirror that has been
+    hand-edited (or left stale by a crash between a bundle write and its
+    root-mirror refresh) so it now disagrees with the CANONICAL, bundle-
+    bound copy on an identity-bearing field must be refused -- resuming
+    must never trust the root file's own claim about what the checkpoint
+    is, only the verified bundle."""
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
+    config_path = tmp_path / "config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_root_canonical_disagreement"
+    _write_config(
+        cfg, manifest_path, config_path, architecture="1", checkpoint_dir=checkpoint_dir,
+        synchronized_init_dir=str(sync_dir),
+    )
+    config = yaml.safe_load(config_path.read_text())
+    config["training"]["total_steps"] = 1
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    train_module.run_training(str(config_path), smoke=False)
+
+    # Mutate ONLY the root mirror -- the canonical bundle-bound copy is
+    # left untouched, simulating a stale/hand-edited root file.
+    manifest_path_on_disk = checkpoint_dir / "run_manifest.json"
+    root_manifest = json.loads(manifest_path_on_disk.read_text())
+    assert root_manifest["gene_panel_hash"]  # a real _RESUME_CONSISTENCY_FIELDS member
+    root_manifest["gene_panel_hash"] = "tampered_" + root_manifest["gene_panel_hash"]
+    manifest_path_on_disk.write_text(json.dumps(root_manifest, indent=2, sort_keys=True, default=str))
+
+    config["training"]["total_steps"] = 2
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    with pytest.raises(ValueError, match="root run_manifest.json disagrees with the canonical"):
+        train_module.run_training(str(config_path), smoke=False)
+
+
+def test_run_training_tolerates_root_run_manifest_bookkeeping_drift_across_a_no_op_resume(tmp_path, monkeypatch):
+    """The root mirror is legitimately refreshed on EVERY run_training
+    call (including a no-op resume that saves no new checkpoint bundle),
+    while the canonical bundle-bound copy only updates on a real save --
+    so non-identity bookkeeping fields (e.g. environment_versions) can
+    genuinely diverge between them without representing real drift. Only
+    `_RESUME_CONSISTENCY_FIELDS` disagreement must raise; a difference
+    confined to a non-identity field must resume cleanly."""
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
+    config_path = tmp_path / "config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_root_bookkeeping_drift"
+    _write_config(
+        cfg, manifest_path, config_path, architecture="1", checkpoint_dir=checkpoint_dir,
+        synchronized_init_dir=str(sync_dir),
+    )
+    config = yaml.safe_load(config_path.read_text())
+    config["training"]["total_steps"] = 1
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    train_module.run_training(str(config_path), smoke=False)
+
+    manifest_path_on_disk = checkpoint_dir / "run_manifest.json"
+    root_manifest = json.loads(manifest_path_on_disk.read_text())
+    root_manifest["environment_versions"] = {"torch": "some-other-version-string"}
+    manifest_path_on_disk.write_text(json.dumps(root_manifest, indent=2, sort_keys=True, default=str))
+
+    # A no-op resume (resume_step already >= total_steps) still refreshes
+    # the root mirror at the end of run_training -- must not raise.
+    summary = train_module.run_training(str(config_path), smoke=False)
+    assert summary["ok"] is True
+    assert summary["final_step"] == 1
 
 
 def test_worktree_diff_hash_hashes_untracked_content_and_ignores_generated_directories(tmp_path):
@@ -469,6 +582,52 @@ def test_worktree_diff_hash_hashes_untracked_content_and_ignores_generated_direc
             os.rmdir(cache_probe_dir)
         if not cache_dir_preexisting and (package_dir / "cache").is_dir():
             os.rmdir(package_dir / "cache")
+
+
+def test_worktree_diff_hash_hashes_files_inside_a_brand_new_untracked_directory(tmp_path):
+    """Codex re-audit of commit 2162ff4, finding #6: "Plain `git status
+    --porcelain` commonly reports `?? new_directory/`, not its files.
+    Editing `new_directory/module.py` would then leave the worktree hash
+    unchanged." Confirmed real and reproduced directly (`git status
+    --porcelain` collapses a wholly-untracked directory into one summary
+    line, never descending into it) -- distinct from the PRIOR
+    `test_worktree_diff_hash_hashes_untracked_content_and_ignores_
+    generated_directories` test above, whose probe file sits directly
+    under `gen3_multiscale/` (an already-tracked parent directory), which
+    `git status --porcelain` reports per-file even in the old
+    implementation and therefore could not have caught this bug. This
+    test's probe file lives inside a FRESH, entirely-untracked
+    subdirectory instead -- the exact scenario Codex names."""
+    import os
+    import uuid
+
+    from gen3_multiscale.training.train import _code_commit_hash, _worktree_diff_hash
+
+    if _code_commit_hash() is None:
+        pytest.skip("not a real git checkout in this environment")
+
+    package_dir = Path(__file__).resolve().parent.parent  # gen3_multiscale/
+    marker = uuid.uuid4().hex[:12]
+    new_dir = package_dir / f"_codestate_new_dir_probe_{marker}"
+    probe_file = new_dir / "module.py"
+    try:
+        baseline = _worktree_diff_hash()
+        assert baseline is not None
+
+        new_dir.mkdir()
+        probe_file.write_text("x = 1\n")
+        after_add = _worktree_diff_hash()
+        assert after_add != baseline  # a file inside a brand-new untracked directory changes the hash
+
+        probe_file.write_text("x = 2\n")
+        after_edit = _worktree_diff_hash()
+        assert after_edit != after_add  # editing that file's content must ALSO change the hash
+        assert after_edit != baseline
+    finally:
+        if probe_file.exists():
+            probe_file.unlink()
+        if new_dir.exists():
+            os.rmdir(new_dir)
 
 
 def test_run_training_validation_selection_metric_is_deterministic_across_repeated_calls(tmp_path, monkeypatch):
