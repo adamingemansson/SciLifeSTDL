@@ -140,10 +140,30 @@ def test_manifest_exclusions_reject_unknown_or_duplicate_ids(tmp_path):
         min_samples_per_organ=3, n_validation_per_organ=0,
         n_test_per_organ=0, split_seed=0, **_SMALL_BUILD_KWARGS,
     )
-    with pytest.raises(ValueError, match="absent from the resolved selection"):
+    with pytest.raises(ValueError, match="absent from the usable resolved candidate catalog"):
         build_dataset_manifest(**kwargs, excluded_sample_ids=["NOT_SELECTED"])
     with pytest.raises(ValueError, match="duplicate"):
         build_dataset_manifest(**kwargs, excluded_sample_ids=["L0", "L0"])
+
+
+def test_manifest_exclusions_happen_before_patient_split_and_keep_quotas(tmp_path):
+    hest_dir, meta_path, _ = _make_synthetic_hest1k(
+        tmp_path, {"Lung": [f"L{i}" for i in range(6)]},
+    )
+    kwargs = dict(
+        hest_data_dir=hest_dir, metadata_csv=str(meta_path), organs="all",
+        min_samples_per_organ=3, n_validation_per_organ=1,
+        n_test_per_organ=1, split_seed=0, **_SMALL_BUILD_KWARGS,
+    )
+    initial = build_dataset_manifest(**kwargs)
+    excluded_validation_id = initial["validation_sample_ids"][0]
+    rebuilt = build_dataset_manifest(
+        **kwargs, excluded_sample_ids=[excluded_validation_id],
+    )
+    assert excluded_validation_id not in rebuilt["samples"]
+    assert len(rebuilt["validation_sample_ids"]) == 1
+    assert len(rebuilt["test_sample_ids"]) == 1
+    assert len(rebuilt["train_sample_ids"]) == 3
 
 
 def test_composite_spot_ids_are_unique_even_when_raw_barcodes_collide_across_samples(tmp_path):

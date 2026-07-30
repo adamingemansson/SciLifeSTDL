@@ -278,6 +278,7 @@ def resolve_sample_selection(
     min_sample_coverage: float = 0.9,
     min_panel_size: int = 5000,
     split_by_patient: bool = True,
+    excluded_sample_ids: list[str] | tuple[str, ...] | None = None,
 ) -> dict:
     """Deterministically resolve train/validation/test sample IDs from the
     real HEST-1k Visium catalog, restricted to what's ACTUALLY downloaded
@@ -375,6 +376,26 @@ def resolve_sample_selection(
                 "to see real local coverage before requesting an organ"
             )
         visium = visium[visium["organ"].isin(requested)]
+
+    # Gen3 dataset-level QC exclusions are applied to the candidate
+    # catalog BEFORE the patient split and per-organ cap. This lets the
+    # deterministic splitter select a valid replacement patient instead
+    # of deleting an already-selected validation/test patient afterward
+    # and silently breaking the requested quotas.
+    excluded_ids = [str(sample_id).strip() for sample_id in (excluded_sample_ids or [])]
+    if any(not sample_id for sample_id in excluded_ids):
+        raise ValueError("excluded_sample_ids must contain only non-empty sample IDs")
+    if len(set(excluded_ids)) != len(excluded_ids):
+        raise ValueError("excluded_sample_ids contains duplicate sample IDs")
+    candidate_ids = set(visium["id"].astype(str))
+    unknown_exclusions = sorted(set(excluded_ids) - candidate_ids)
+    if unknown_exclusions:
+        raise ValueError(
+            "excluded_sample_ids contains samples absent from the usable resolved candidate "
+            f"catalog: {unknown_exclusions}"
+        )
+    if excluded_ids:
+        visium = visium[~visium["id"].isin(excluded_ids)]
 
     rng = random.Random(split_seed)
     train_ids, validation_ids, test_ids = [], [], []

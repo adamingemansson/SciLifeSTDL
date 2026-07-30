@@ -360,6 +360,13 @@ def build_dataset_manifest(
     digest_cache_path = Path(digest_cache_path) if digest_cache_path is not None else hest_cache_dir / "content_digest_cache.json"
     digest_cache = load_digest_cache(digest_cache_path)
 
+    excluded_ids = [str(sample_id).strip() for sample_id in (excluded_sample_ids or [])]
+    if any(not sample_id for sample_id in excluded_ids):
+        raise ValueError("excluded_sample_ids must contain only non-empty sample IDs")
+    if len(set(excluded_ids)) != len(excluded_ids):
+        raise ValueError("excluded_sample_ids contains duplicate sample IDs")
+    excluded_set = set(excluded_ids)
+
     split = resolve_sample_selection(
         hest_data_dir, metadata_csv, organs=organs, species=species, min_nb_genes=min_nb_genes,
         min_samples_per_organ=min_samples_per_organ, max_samples_per_organ=max_samples_per_organ,
@@ -367,6 +374,7 @@ def build_dataset_manifest(
         split_seed=split_seed, check_gene_panel_compatibility=check_gene_panel_compatibility,
         min_gene_coverage=min_gene_coverage, min_sample_coverage=min_sample_coverage,
         min_panel_size=min_panel_size, split_by_patient=split_by_patient,
+        excluded_sample_ids=excluded_ids,
     )
     train_ids = list(split["train_sample_ids"])
     validation_ids = list(split["validation_sample_ids"])
@@ -376,22 +384,13 @@ def build_dataset_manifest(
     # gene panel is frozen.  Silently deleting a bad WSI only from a later
     # model arm would make the arms incomparable; deriving the panel first
     # would also let an excluded training slide influence the vocabulary.
-    excluded_ids = [str(sample_id).strip() for sample_id in (excluded_sample_ids or [])]
-    if any(not sample_id for sample_id in excluded_ids):
-        raise ValueError("excluded_sample_ids must contain only non-empty sample IDs")
-    if len(set(excluded_ids)) != len(excluded_ids):
-        raise ValueError("excluded_sample_ids contains duplicate sample IDs")
     selected_ids = set(train_ids) | set(validation_ids) | set(test_ids)
-    unknown_exclusions = sorted(set(excluded_ids) - selected_ids)
-    if unknown_exclusions:
-        raise ValueError(
-            "excluded_sample_ids contains samples absent from the resolved selection: "
-            f"{unknown_exclusions}"
+    leaked_exclusions = sorted(excluded_set & selected_ids)
+    if leaked_exclusions:
+        raise RuntimeError(
+            "resolve_sample_selection returned explicitly excluded samples: "
+            f"{leaked_exclusions}"
         )
-    excluded_set = set(excluded_ids)
-    train_ids = [sample_id for sample_id in train_ids if sample_id not in excluded_set]
-    validation_ids = [sample_id for sample_id in validation_ids if sample_id not in excluded_set]
-    test_ids = [sample_id for sample_id in test_ids if sample_id not in excluded_set]
     if not train_ids:
         raise ValueError("excluded_sample_ids removed every training sample")
 
