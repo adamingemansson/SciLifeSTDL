@@ -13,6 +13,8 @@ documented_divergences:
   - required_fingerprints.gigapath_checkpoint
   - required_fingerprints.scfoundation_checkpoint
   - required_fingerprints.scfoundation_vocab
+  - required_fingerprints.scfoundation_package_version
+  - required_fingerprints.scfoundation_preprocessing_spec
   - required_fingerprints.gene_residual_basis
   - required_fingerprints.gen4_conditioner_checkpoint
 
@@ -103,6 +105,8 @@ required_fingerprints:
   gigapath_checkpoint: null
   scfoundation_checkpoint: null
   scfoundation_vocab: null
+  scfoundation_package_version: null      # scFoundation package version at cache-build time
+  scfoundation_preprocessing_spec: null   # gen4/scfoundation_encoder.py::FrozenSCFoundationEncoder's exact preprocessing_spec string
   gene_vocabulary: null
   gene_residual_basis: null
   gen4_conditioner_checkpoint: null

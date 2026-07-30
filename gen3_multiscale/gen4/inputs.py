@@ -127,6 +127,9 @@ def build_gen4_spatial_field_example(
     expected_feature_width: int | None = None,
     slide_context: dict | None = None,
     image_source_available: np.ndarray | None = None,
+    uni2_spot_embedding: dict[str, np.ndarray] | None = None,
+    wsi_tile_feature_provenance: str | None = None,
+    sample_organ: str | None = None,
 ) -> tuple[Gen4SpatialFieldInputs, SpatialFieldTargets]:
     """Build one Gen4 example. `precomputed_spot_features` is exactly the
     Gen3 contract (a `[adata.n_obs, image_feature_dim]` array aligned to
@@ -138,8 +141,48 @@ def build_gen4_spatial_field_example(
     cached["features"]))`) covering at least every barcode this example's
     realized mask will place in `context_barcodes` -- arms without a frozen
     GEX-context provider (A, D) simply omit it, and `context_gex_embedding`
-    on the returned object stays `None`.
+    on the returned object stays `None`. This is also where a real
+    scFoundation cache's output belongs (frozen_context/hybrid_context
+    arms B/C/4) -- scFoundation has no separate parameter because its
+    output is context_gex_embedding, exactly like every other frozen
+    GEX-context provider.
+
+    `uni2_spot_embedding` (audit finding #1: "the hybrid arm receives
+    observed_uni2_features=None"), when given, is a `{barcode: row}`
+    mapping (same shape/contract as `gex_context_embedding`, e.g. a real
+    `gen4.uni2_spot_cache.load_uni2_spot_features` record turned into a
+    dict) covering every realized context barcode -- used ONLY by arm 4
+    (`image_feature_source="hybrid_context"`). Selected via the SAME
+    `_select_by_barcode` helper against this call's OWN realized
+    `observed_barcodes`, so it inherits the identical query/hole
+    exclusion `precomputed_spot_features`/`context_gex_embedding` already
+    get here: query rows are structurally absent from
+    `inputs.observed_barcodes` (this function delegates realization
+    entirely to `build_spatial_field_example`), and any context row whose
+    H&E physically overlaps the hole was already excluded from
+    `precomputed_spot_features`/`context_image_available` upstream -- no
+    exclusion logic is reimplemented for this field, it is inherited by
+    construction. `None` for every other arm, leaving
+    `observed_uni2_features` `None` on the returned object.
+
+    `wsi_tile_feature_provenance` (audit finding #1) tags which encoder
+    produced `slide_context`'s tiles -- pass `"uni2"` when `slide_context`
+    came from `gen4.uni2_dense_wsi_cache.load_uni2_dense_wsi_context`,
+    `None` (the default) for GigaPath's own `data.slide_context.
+    load_slide_context` or when no dense-WSI context is used at all. See
+    `Gen4SpatialFieldInputs.wsi_tile_feature_provenance`'s own docstring
+    for why this field exists (arm A/C's `global_context_source=
+    "uni2_pool"` must never silently consume GigaPath-encoded tiles).
+
+    `sample_organ` (audit finding #3) is this sample's real manifest
+    organ (e.g. `manifest["samples"][sample_id]["organ"]") -- required
+    (fails closed in `Gen4Conditioner`) whenever arm D/3 or arm 4's
+    STPath-consuming path is used; `None` for every other arm.
     """
+    if wsi_tile_feature_provenance is not None and wsi_tile_feature_provenance != "uni2":
+        raise ValueError(
+            f"wsi_tile_feature_provenance must be 'uni2' or None, got {wsi_tile_feature_provenance!r}"
+        )
     inputs, targets = build_spatial_field_example(
         adata, patches, context_barcodes, query_barcodes,
         image_feature_fn=None,
@@ -156,12 +199,20 @@ def build_gen4_spatial_field_example(
         context_embedding = _select_by_barcode(
             gex_context_embedding, inputs.observed_barcodes, field_name="context_gex_embedding",
         )
+    uni2_features = None
+    if uni2_spot_embedding is not None:
+        uni2_features = _select_by_barcode(
+            uni2_spot_embedding, inputs.observed_barcodes, field_name="observed_uni2_features",
+        )
 
     base_fields = {field: getattr(inputs, field) for field in inputs.__dataclass_fields__}
     gen4_inputs = Gen4SpatialFieldInputs(
         **base_fields,
         context_gex_embedding=context_embedding,
         context_gex_embedding_provenance=gex_context_provenance,
+        observed_uni2_features=uni2_features,
+        wsi_tile_feature_provenance=wsi_tile_feature_provenance,
+        sample_organ=sample_organ,
     )
     validate_gen4_spatial_field_example(gen4_inputs, targets)
     return gen4_inputs, targets

@@ -12,6 +12,8 @@ documented_divergences:
   - model.params.image_feature_dim   # UNI2's own native output width, not GigaPath's 1536 (placeholder here until real weights confirm it)
   - required_fingerprints.uni2_checkpoint
   - required_fingerprints.uni2_revision
+  - required_fingerprints.uni2_package_version
+  - required_fingerprints.uni2_preprocessing_spec
 
 model:
   arm: gen4a
@@ -88,6 +90,8 @@ evaluation:
 required_fingerprints:
   uni2_checkpoint: null      # real local checkpoint path -- required before training (gen4/uni2_encoder.py::FrozenUNI2TileEncoder)
   uni2_revision: null        # pinned, immutable 40-hex HF commit SHA
+  uni2_package_version: null      # e.g. timm's __version__ at cache-build time
+  uni2_preprocessing_spec: null    # gen4/uni2_encoder.py::FrozenUNI2TileEncoder's exact preprocessing_spec string
   gene_vocabulary: null
   train_mask_bank: null
   validation_mask_bank: null
