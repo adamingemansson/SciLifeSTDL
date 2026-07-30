@@ -7452,3 +7452,239 @@ gen2_architectures + gen3_multiscale: 886 passed, 1 skipped
   failing identically before this round's changes; not touched by
   anything in this round)
 ```
+
+## 57. Response to the Codex re-audit of commit 57f0e3c -- the last artifact-identity launch blocker closed (fit_and_save_architecture4_basis's own TOCTOU, build_model_for_inference hardened), config fingerprint/loading utilities moved to a neutral module, and the first real version of the Stages A-D deployment orchestrator
+
+Adam forwarded a re-audit of commit `57f0e3c` (the previous round's own
+response to the `7a2d819` re-audit). Verdict: "One remaining launch
+blocker... `fit_and_save_architecture4_basis()` still independently
+uses/resolves the mutable `architecture3_checkpoint_dir` at least three
+times." Confirmed real against the actual code before any fix was
+written, fixed with the same resolve-once-and-pin discipline every prior
+TOCTOU fix in this series has used. Per Adam's explicit instruction
+("Then proceed directly to the orchestrator... Build Stages A-D... Stop
+before launching GPU training for Codex audit"), this round then built
+the first real, tested version of the staged deployment orchestrator.
+**No 24-hour run, and no GPU training of any kind, has been started.**
+Every test below runs on CPU against tiny synthetic fixtures, exactly
+like every other test in this package.
+
+**The last remaining launch blocker.** Confirmed real: `fit_and_save_
+architecture4_basis()` resolved `architecture3_checkpoint_dir` (mutable
+-- Architecture 3 may still be checkpointing concurrently) three separate
+times: `verify_full_checkpoint_identity(architecture3_checkpoint_dir, ...)`,
+`build_model_for_inference(..., checkpoint_dir=architecture3_checkpoint_dir, ...)`
+(which itself resolved it AGAIN internally, twice, for gene-name
+verification and weight loading -- see below), and a final `checkpoint_
+module.resolve_checkpoint_identity(architecture3_checkpoint_dir)` call
+AFTER residual computation, for the provenance record. The exact scenario
+Adam described -- residuals computed against bundle B while provenance
+records bundle C -- was real. Fixed: `pinned_arch3_identity = checkpoint_
+module.resolve_checkpoint_identity(architecture3_checkpoint_dir)` now
+runs EXACTLY ONCE, at function entry, before verification even starts;
+`verify_full_checkpoint_identity`, `build_model_for_inference`, and the
+provenance record now all use `pinned_arch3_identity`/`pinned_arch3_
+identity.resolved_dir` exclusively, never a fresh re-resolve.
+
+**`build_model_for_inference` hardened, per Adam's explicit second ask.**
+Confirmed the same gap existed HERE too, independent of any single
+caller: when `checkpoint_dir` is supplied, `verify_gene_names`/`load_
+trainable_state` each independently resolved it through `checkpoint.py::
+_resolve_checkpoint_source` -- two separate resolutions within one
+function call. Fixed: `checkpoint_dir` (whether a raw mutable path or an
+already-pinned bundle directory -- resolving an already-pinned one is a
+safe, idempotent no-op) is now resolved once via `resolve_checkpoint_
+identity`, and that SAME resolved directory is used for both gene-name
+verification and weight loading. The resulting identity is now also
+returned in `build_model_for_inference`'s own `info["checkpoint_identity"]`
+-- available to every caller, not just this one.
+
+**A real, confirmed second-order bug surfaced while wiring the fix:**
+`checkpoint.py::resolve_checkpoint_identity`, when given an ALREADY-
+RESOLVED bundle directory directly (no `latest_bundle.json` pointer AT
+that level -- `_resolve_checkpoint_source`'s own documented "caller
+directly resolves a HISTORY BUNDLE'S OWN path" exception, exactly what
+every resolve-once fix in this series now passes downstream), always
+returned `step`/`bundle_dir`/`manifest_sha256` as `None`, even though the
+bundle's own `manifest.json` (written by `save_checkpoint`, present in
+every real bundle) already records `step`/`bundle_id` directly and
+`manifest_sha256` is trivially that same file's own hash. This
+previously-latent gap became a concrete, observable failure the moment
+the orchestrator's Stage C passed an already-resolved bundle directory
+into `fit_and_save_architecture4_basis`: the persisted provenance sidecar
+recorded a `null` step, and the very next load (`maybe_load_gene_basis`'s
+own "missing fields must fail" check) correctly refused it. Fixed:
+`resolve_checkpoint_identity` now falls back to reading `step`/`bundle_id`
+directly from the resolved bundle's own `manifest.json` (and hashes that
+file for `manifest_sha256`) whenever there is no pointer to read from --
+strictly additive information, never a behavior change for the
+pointer-based path. A new adversarial test proves resolving a bundle
+directly (post-save, no pointer at that level) recovers the identical
+identity resolving through its own live `checkpoint_dir`/pointer does.
+
+**Config fingerprint/loading utilities moved to a neutral module.** Per
+Adam's explicit ask ("Prefer moving config fingerprint/loading utilities
+into a neutral module to avoid a circular import between the trainer and
+resolver"): `resolved_config`/`config_fingerprint`/`config_identity_
+fingerprint` (plus the `RESUME_EXCLUDED_TRAINING_FIELDS` frozenset
+`config_identity_fingerprint` needs) moved out of `training/train.py`
+into a new `gen3_multiscale/config_identity.py` -- a module with no
+dependency on anything in `train.py`, importable by both the trainer and
+the resolver (and now the orchestrator) without either ever depending on
+the other. `training/train.py` re-exports all three names unchanged, so
+every existing `from gen3_multiscale.training.train import config_
+fingerprint, ...` caller across this codebase (the evaluator, the basis
+fitter, several test files) keeps working without modification --
+confirmed by an explicit test asserting the re-exported names are the
+SAME function objects, not reimplementations that could silently drift
+apart. `scripts/resolve_experiment_config.py` now imports from the
+neutral module directly; a static AST-based test confirms it no longer
+imports anything from `training.train` at all, closing the circular-
+import risk the moment a future caller needs both the resolver's `load_
+verified_resolved_config` and the trainer's real training machinery in
+the same module (which the new orchestrator, below, is exactly that).
+
+**The first real version of the Stages A-D deployment orchestrator --
+`gen3_multiscale/training/orchestrator.py`.** Implements the four stages
+Adam specified, as library functions (no CLI entrypoint yet -- honestly
+documented as future work in the module's own docstring, along with
+everything else this round deliberately does not attempt: no automatic
+"run every stage in order" driver, no disk/RAM/GPU capacity estimation,
+no run-plan JSON, no integration with `launch_four_gpu_suite.py`'s own
+static-config-audit/staged-smoke-gate machinery):
+
+  - **Stage A** (`run_stage_train_architecture`): trains ONE architecture
+    from an already-resolved config BUNDLE DIRECTORY, consumed exclusively
+    through `load_verified_resolved_config()` -- per Adam's explicit
+    first orchestrator integration requirement, "production commands must
+    consume resolved-config bundle directories through load_verified_
+    resolved_config(). They must not bypass verification by passing the
+    loose bundle/config.yaml path directly" -- every stage below follows
+    the same discipline. One function serves all three of Architecture
+    1/2/3's training runs (`stage_name` distinguishes them in the
+    persisted state).
+  - **Stage B** (`run_stage_select_architecture3`): evaluates the trained
+    Architecture 3 checkpoint on the VALIDATION split -- `split` is not
+    even a parameter of this function, so there is no way to point Stage
+    B at the test split, structurally, not merely by convention. Reads
+    Stage A's OWN recorded checkpoint path from state; there is no
+    parameter through which a caller could point selection at a different
+    checkpoint. Pins the selected bundle's exact identity, with an
+    explicit consistency check against what evaluation itself already
+    pinned (a deliberate, FAIL-CLOSED cross-check -- not a repeat of the
+    audited bug, which was "verify against A, silently load/use B").
+  - **Stage C** (`run_stage_fit_basis`): fits the residual basis against
+    the EXACT bundle Stage B selected -- the checkpoint path comes from
+    Stage B's recorded state, never a parameter of this function at all.
+  - **Stage D** (`run_stage_train_architecture4`): requires BOTH Stage B
+    and Stage C completed, and explicitly CROSS-CHECKS the Architecture 4
+    config bundle's OWN configured `required_fingerprints.architecture3_
+    conditioner_checkpoint`/`gene_residual_basis` against those stages'
+    recorded outputs, raising before any training starts on any mismatch
+    -- the central "never let Architecture 4 use an older/pre-existing
+    Architecture 3 path merely because it exists" guarantee, now enforced
+    structurally rather than by operator discipline alone.
+
+Every stage shares one bookkeeping core (`_run_stage`): state is
+persisted to one JSON file, written atomically (staging-temp-file-then-
+`os.replace`, this codebase's standard discipline throughout);
+**resumable** (re-invoking an already-completed stage with the SAME
+inputs returns the existing result without redoing any work -- proven by
+a test asserting the SECOND call's `completed_at` timestamp is identical
+to the first, meaning training genuinely did not re-run); **immutable**
+(re-invoking an already-completed stage with DIFFERENT inputs raises
+rather than silently overwriting what a later stage may already trust);
+and a **failure gate** for whatever depends on it (a stage whose
+precondition is not `"completed"` raises immediately, before doing any
+work -- and a FAILED stage, unlike a completed one, is NOT immutable and
+can be retried with corrected inputs, proven by a dedicated test).
+
+Six new tests exercise the real production code path end to end: a
+complete Stage A->B->C->D run succeeding and Architecture 4's recorded
+output matching Stage B's selected identity exactly; the audit's
+explicit ask -- Architecture 4 refuses to run before Stage B/Stage C
+each individually complete; Architecture 4 refuses a config bundle whose
+OWN configured conditioner path points at a real, validly-trained, but
+DIFFERENT Architecture 3 checkpoint than the one this orchestration
+actually selected; resumability; immutability; and failure-then-retry.
+
+**What remains honestly undone.** The orchestrator's core state machine
+and Stages A-D now exist and are tested, but this is still not a
+complete deployment system: no CLI entrypoint, no "run everything in
+order" driver (a human decision -- or a human-authored top-level script
+-- must still sit between every stage, especially before the one stage
+that starts real, hours-long GPU training), no capacity/disk/RAM/GPU
+estimation, no run-plan JSON, no static-config-audit/staged-smoke-gate
+integration with `launch_four_gpu_suite.py`, no evaluation of Architecture
+4 or baselines wired into a stage, and no automatic test-split unlock
+mechanism has been built (there is currently no mechanism to unlock it
+AT ALL from this module -- Stage B is hard-coded to validation only, and
+nothing else in this module ever touches the test split). The
+implementation order Adam has restated across several rounds (static
+audit -> construction smoke -> staged A100 smoke -> short diagnostic ->
+inspect learning/baseline deltas -> only then the 24-hour experiment)
+has not been executed against real hardware or real HEST-1k data by
+anything in this round.
+
+**Adversarial/regression tests added this round:** 12 new tests --
+`test_checkpoint.py` (+1: `resolve_checkpoint_identity` recovers step/
+bundle_id/manifest_sha256 from an already-resolved bundle directory),
+`test_fit_architecture4_residual_basis.py` (+1: never-mixes-identities-
+if-architecture3-checkpoints-mid-fit, replacing the checkpoint
+immediately after the function's own pinning call resolves it), a new
+`test_config_identity.py` (+4: re-export identity, fingerprint
+determinism/content-sensitivity, resume-field exclusion, and a static
+AST check that the resolver never imports from `training.train`), and a
+new `test_orchestrator.py` (+6, described above). All exercise the real
+production code path against real, trained checkpoints/bases/configs --
+no mocking of the identity-verification or orchestration machinery
+itself.
+
+## Test status as of this document
+
+```
+gen3_multiscale/tests/: 739 passed (23 hest1k-catalog + 5 gene-panel-compat
+  + 4 query-overlap-report + 27 example-schema + 11 boundary-graph +
+  36 slide-context + 9 slide-encoder + 2 debug-plot + 18 transport-head +
+  10 tokens + 16 attention + 10 global-context + 7 harmonic +
+  7 geometry-utils + 9 backbone + 31 architectures + 9 gene-basis +
+  11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  36 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 21 dataset-manifest + 31 example-builder +
+  46 mask-fingerprint + 22 novae-graph + 4 loaders + 17 spot-feature-cache
+  + 12 tile-encoder-preflight + 15 gen3-dataset + 10 gen3-preflight +
+  33 train + 8 step6-scripts + 26 gen3-evaluator +
+  16 fit-architecture4-residual-basis + 16 a32051b-adversarial +
+  34 checkpoint + 20 resolve-experiment-config + 4 config-identity +
+  6 orchestrator)
+gen2_architectures + gen3_multiscale: 912 passed, 1 skipped
+(repo-root tests/: 322 passed, 1 pre-existing unrelated failure --
+  tests/test_multi_sample.py::test_inject_multi_sample_n_genes, confirmed
+  failing identically before this round's changes; not touched by
+  anything in this round)
+```
+
+The block immediately below (pre-57f0e3c-re-audit-response test counts)
+is kept for historical continuity rather than deleted, per this
+document's append-only discipline:
+
+```
+gen3_multiscale/tests/: 727 passed (23 hest1k-catalog + 5 gene-panel-compat
+  + 4 query-overlap-report + 27 example-schema + 11 boundary-graph +
+  36 slide-context + 9 slide-encoder + 2 debug-plot + 18 transport-head +
+  10 tokens + 16 attention + 10 global-context + 7 harmonic +
+  7 geometry-utils + 9 backbone + 31 architectures + 9 gene-basis +
+  11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  36 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 21 dataset-manifest + 31 example-builder +
+  46 mask-fingerprint + 22 novae-graph + 4 loaders + 17 spot-feature-cache
+  + 12 tile-encoder-preflight + 15 gen3-dataset + 10 gen3-preflight +
+  33 train + 8 step6-scripts + 25 gen3-evaluator +
+  15 fit-architecture4-residual-basis + 16 a32051b-adversarial +
+  33 checkpoint + 20 resolve-experiment-config)
+gen2_architectures + gen3_multiscale: 900 passed, 1 skipped
+(repo-root tests/: 322 passed, 1 pre-existing unrelated failure --
+  tests/test_multi_sample.py::test_inject_multi_sample_n_genes, confirmed
+  failing identically before this round's changes; not touched by
+  anything in this round)
+```

@@ -785,6 +785,38 @@ def test_save_checkpoint_rejects_a_negative_step_explicitly():
         assert list_checkpoint_history(tmp) == []
 
 
+def test_resolve_checkpoint_identity_recovers_step_and_bundle_id_from_an_already_resolved_bundle_dir():
+    """Codex re-audit of commit 57f0e3c (surfaced while wiring the
+    orchestrator's resolve-once-and-pin discipline across stage
+    boundaries): resolving an ALREADY-RESOLVED bundle directory directly
+    (no `latest_bundle.json` pointer AT that level -- `checkpoint.py`'s
+    own documented "caller directly resolves a HISTORY BUNDLE'S OWN
+    path" exception) previously always returned `step`/`bundle_dir`/
+    `manifest_sha256` as None, even though the bundle's own `manifest
+    .json` already records `step`/`bundle_id` directly and `manifest_
+    sha256` is trivially that file's own hash. Confirmed real, concrete
+    consequence: `fit_architecture4_residual_basis.py`'s resolve-once fix
+    passes an already-resolved bundle dir downstream, and a provenance
+    sidecar recording a `null` step then failed `maybe_load_gene_basis`'s
+    own 'missing fields must fail' check on the very next load."""
+    m = _Tiny()
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=5)
+        identity_via_pointer = resolve_checkpoint_identity(tmp)
+        assert identity_via_pointer.step == 5
+        assert identity_via_pointer.bundle_dir is not None
+        assert identity_via_pointer.manifest_sha256 is not None
+
+        # Resolving the ALREADY-RESOLVED bundle directory directly (no
+        # pointer at that level) must recover the SAME identity, not None.
+        identity_direct = resolve_checkpoint_identity(identity_via_pointer.resolved_dir)
+        assert identity_direct.resolved_dir == identity_via_pointer.resolved_dir
+        assert identity_direct.step == identity_via_pointer.step
+        assert identity_direct.bundle_dir == identity_via_pointer.bundle_dir
+        assert identity_direct.manifest_sha256 == identity_via_pointer.manifest_sha256
+        assert identity_direct.weights_sha256 == identity_via_pointer.weights_sha256
+
+
 def test_load_trainable_state_rejects_a_fully_frozen_model_missing_its_entire_weights_file():
     """Codex re-audit of commit 7a2d819, finding #1: 'if trainable_
     weights.pt is absent, load_trainable_state() only checks whether

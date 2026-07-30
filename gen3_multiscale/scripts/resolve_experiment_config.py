@@ -124,7 +124,15 @@ from pathlib import Path
 
 import yaml
 
-from gen3_multiscale.training.train import config_fingerprint, config_identity_fingerprint
+# Codex re-audit of commit 57f0e3c: "Prefer moving config fingerprint/
+# loading utilities into a neutral module to avoid a circular import
+# between the trainer and resolver." Imported from the neutral
+# `gen3_multiscale.config_identity` module, never from `training.train`
+# -- the future orchestrator needs BOTH this resolver's own `load_
+# verified_resolved_config` AND `training.train`'s real training
+# machinery, which would otherwise force training -> orchestrator ->
+# resolver -> training, a real circular import.
+from gen3_multiscale.config_identity import config_fingerprint, config_identity_fingerprint
 
 # Confirmed dead by direct inspection of train.py -- see this module's
 # own docstring for the full explanation of why each is never read.

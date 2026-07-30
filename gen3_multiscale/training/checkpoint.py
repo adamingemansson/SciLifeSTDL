@@ -818,6 +818,30 @@ def resolve_checkpoint_identity(checkpoint_dir: str | Path) -> CheckpointIdentit
         step = pointer["step"]
         bundle_dir = pointer["bundle_dir"]
         manifest_sha256 = pointer["manifest_sha256"]
+    else:
+        # Codex re-audit of commit 57f0e3c (surfaced while wiring the
+        # orchestrator's resolve-once-and-pin discipline across stage
+        # boundaries): a caller resolving an ALREADY-RESOLVED bundle
+        # directory directly (`checkpoint.py`'s own documented "caller
+        # directly resolves a HISTORY BUNDLE'S OWN path" exception --
+        # exactly what every resolve-once fix in this codebase now
+        # passes downstream) has no `latest_bundle.json` pointer to read
+        # step/bundle_dir/manifest_sha256 from -- but the bundle's OWN
+        # `manifest.json` (written by `save_checkpoint`, present in
+        # every real bundle) already records `step` and `bundle_id`
+        # directly, and `manifest_sha256` is trivially the hash of that
+        # exact file. Previously these three fields silently came back
+        # `None` for this case even though the information was sitting
+        # right there in the bundle itself -- a real, confirmed gap that
+        # broke a provenance sidecar (`fit_architecture4_residual_
+        # basis.py`) recording a `null` step once resolve-once-and-pin
+        # started passing it an already-resolved bundle directory.
+        bundle_manifest_path = resolved_dir / "manifest.json"
+        if bundle_manifest_path.is_file():
+            bundle_manifest = json.loads(bundle_manifest_path.read_text())
+            step = bundle_manifest.get("step")
+            bundle_dir = bundle_manifest.get("bundle_id")
+            manifest_sha256 = _file_sha256(bundle_manifest_path)
     weights_path = resolved_dir / "trainable_weights.pt"
     weights_sha256 = _file_sha256(weights_path) if weights_path.is_file() else None
     return CheckpointIdentity(

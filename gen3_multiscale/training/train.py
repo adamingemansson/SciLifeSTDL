@@ -46,6 +46,15 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
+# Codex re-audit of commit 57f0e3c: "Prefer moving config fingerprint/
+# loading utilities into a neutral module to avoid a circular import
+# between the trainer and resolver." `resolved_config`/`config_
+# fingerprint`/`config_identity_fingerprint` now live in
+# `gen3_multiscale/config_identity.py` (no dependency on anything in
+# this module) and are re-exported here so every existing `from
+# gen3_multiscale.training.train import config_fingerprint, ...` caller
+# across this codebase keeps working unchanged.
+from gen3_multiscale.config_identity import config_fingerprint, config_identity_fingerprint, resolved_config
 from gen3_multiscale.data.dataset_manifest import gene_panel_hash, load_dataset_manifest
 from gen3_multiscale.models import model_factory
 from gen3_multiscale.models.losses import combined_reconstruction_loss
@@ -54,10 +63,6 @@ from gen3_multiscale.training.gen3_dataset import (
     Gen3SpatialFieldDataset, build_gen3_mask_schedule, gen3_identity_collate,
 )
 from gen3_multiscale.training.gen3_preflight import load_and_preflight_samples, save_gen3_preflight_report
-
-
-def resolved_config(config_path: str | Path) -> dict:
-    return OmegaConf.to_container(OmegaConf.load(config_path), resolve=True)
 
 
 def expected_tile_encoder_provenance(config: dict) -> dict:
@@ -690,9 +695,29 @@ def build_model_for_inference(
         conditioner_identity=pinned_conditioner_identity,
     )
 
+    # Codex re-audit of commit 57f0e3c: "harden build_model_for_inference()
+    # itself: whenever checkpoint_dir is supplied, resolve it once
+    # internally and use the resulting immutable directory for both
+    # gene-name verification and weight loading. Return that identity in
+    # its info object." Confirmed real: `verify_gene_names`/`load_
+    # trainable_state` each independently resolved `checkpoint_dir` (a
+    # caller-supplied path that may itself still be mutable, e.g. a raw
+    # `checkpoint_dir` rather than an already-pinned bundle) through
+    # `checkpoint.py::_resolve_checkpoint_source` -- two SEPARATE
+    # resolutions of the same path within this one function call, each
+    # of which could in principle observe a different bundle if the
+    # checkpoint were rewritten in between. Resolving once here and
+    # reusing `.resolved_dir` for both closes that gap regardless of
+    # whether the caller passed a raw mutable path or an already-pinned
+    # one (resolving an already-pinned bundle directory is a safe,
+    # idempotent no-op -- `checkpoint.py::_resolve_checkpoint_source`'s
+    # own documented "caller directly resolves a HISTORY BUNDLE'S OWN
+    # path" exception).
+    resolved_checkpoint_identity = None
     if checkpoint_dir is not None:
-        checkpoint_module.verify_gene_names(checkpoint_dir, gene_names)
-        checkpoint_module.load_trainable_state(model, checkpoint_dir)
+        resolved_checkpoint_identity = checkpoint_module.resolve_checkpoint_identity(checkpoint_dir)
+        checkpoint_module.verify_gene_names(resolved_checkpoint_identity.resolved_dir, gene_names)
+        checkpoint_module.load_trainable_state(model, resolved_checkpoint_identity.resolved_dir)
 
     info = {
         "architecture_id": architecture_id,
@@ -700,6 +725,7 @@ def build_model_for_inference(
         "gigapath_checkpoint_sha256": gigapath_checkpoint_sha256,
         "synchronized_init_manifest_path": synchronized_init_manifest_path,
         "architecture3_conditioner": conditioner_info,
+        "checkpoint_identity": resolved_checkpoint_identity,
     }
     return model, info
 
@@ -971,51 +997,9 @@ def dataset_manifest_fingerprint(manifest: dict) -> str:
     return hashlib.sha256(json.dumps(manifest, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
-def config_fingerprint(config: dict) -> str:
-    return hashlib.sha256(json.dumps(config, sort_keys=True, default=str).encode("utf-8")).hexdigest()
-
-
-# Purely operational/scheduling training fields that a legitimate resume
-# workflow ("bump total_steps and keep training", "raise checkpoint
-# cadence", ...) must be free to change without verify_resume_consistency
-# refusing to continue -- everything else in `training` (seed, lr,
-# optimizer hyperparameters, synchronized_init_dir, device, ...) still
-# counts toward the run's SCIENTIFIC identity and must stay fixed.
-_RESUME_EXCLUDED_TRAINING_FIELDS = frozenset({
-    "total_steps", "checkpoint_every_n_steps", "log_every_n_steps", "eval_every_n_steps",
-    "max_wall_clock_hours", "checkpoint_dir", "checkpoint_keep_last",
-})
-
-
-def config_identity_fingerprint(config: dict) -> str:
-    """Same content as `config_fingerprint`, minus
-    `_RESUME_EXCLUDED_TRAINING_FIELDS` and the entire `evaluation` section
-    -- the fingerprint `verify_resume_consistency`/
-    `verify_full_checkpoint_identity` actually compare. Adam's Step 6
-    audit #5: "Verify the existing run manifest/config/dataset/cache/
-    LongNet/init/basis fingerprints before loading anything. Refuse
-    changed configs or artifacts" -- but a resumed run legitimately needs
-    to be able to ask for MORE steps, a different checkpoint cadence, or
-    a raised wall-clock budget without that being treated as "a changed
-    config" in the sense this check is meant to catch.
-
-    The `evaluation` section (Codex re-audit of commit f7bb8a1, confirmed
-    real gap surfaced while wiring `verify_full_checkpoint_identity` into
-    BOTH best/ and latest-checkpoint evaluation): named gene panels,
-    `n_masks_per_sample`, `compute_st_fid_mmd`, and similar
-    evaluation-only settings never affect what was actually TRAINED --
-    only how an already-trained checkpoint is LATER measured. Binding
-    them into the checkpoint's scientific identity would mean adding a
-    new named evaluation gene panel, or raising an evaluation sample
-    count, retroactively "invalidates" every already-trained checkpoint
-    for evaluation purposes, which is not a real identity change."""
-    identity_config = json.loads(json.dumps(config, default=str))  # deep copy, same serialization the hash itself uses
-    training_section = dict(identity_config.get("training") or {})
-    for field in _RESUME_EXCLUDED_TRAINING_FIELDS:
-        training_section.pop(field, None)
-    identity_config["training"] = training_section
-    identity_config.pop("evaluation", None)
-    return hashlib.sha256(json.dumps(identity_config, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+# `resolved_config`/`config_fingerprint`/`config_identity_fingerprint`
+# moved to `gen3_multiscale/config_identity.py` (Codex re-audit of
+# commit 57f0e3c) and are imported/re-exported at the top of this file.
 
 
 def file_sha256(path: str | Path) -> str:

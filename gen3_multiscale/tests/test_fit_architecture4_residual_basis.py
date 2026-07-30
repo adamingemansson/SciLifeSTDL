@@ -91,6 +91,72 @@ def test_fit_and_save_architecture4_basis_produces_a_real_basis_with_provenance(
     assert basis.n_genes == len(manifest["gene_panel"])
 
 
+def test_fit_and_save_architecture4_basis_never_mixes_identities_if_architecture3_checkpoints_mid_fit(tmp_path, monkeypatch):
+    """Codex re-audit of commit 57f0e3c: 'fit_and_save_architecture4_
+    basis() still independently uses/resolves the mutable architecture3_
+    checkpoint_dir at least three times: during verify_full_checkpoint_
+    identity, during build_model_for_inference, and again when writing
+    provenance. Architecture 3 could checkpoint between those operations.
+    The basis could be computed using bundle B while its provenance
+    records bundle C.' Replaces the Architecture 3 checkpoint with a
+    genuinely DIFFERENT bundle (freshly re-initialized weights, different
+    bundle_id) IMMEDIATELY AFTER the function's own identity-pinning call
+    resolves it -- i.e. inside fitting itself, before verification/model-
+    loading/residual-computation run -- by monkeypatching `checkpoint_
+    module.resolve_checkpoint_identity` to perform the replacement as a
+    side effect the ONE time it's called against the mutable path (the
+    fix resolves exactly once). Proves the persisted provenance describes
+    the ORIGINAL (pre-replacement) bundle throughout -- never mixing in
+    the bundle that appeared mid-fit -- and that the model residuals were
+    actually computed against the pinned bundle (verification, which
+    would fail closed on any real identity mismatch, still passed)."""
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    arch3_config_path, arch3_checkpoint_dir = _train_a_real_architecture3_checkpoint(tmp_path, cfg, manifest, manifest_path)
+
+    from gen3_multiscale.training import checkpoint as checkpoint_module
+    from gen3_multiscale.training.train import build_model_for_inference, resolved_config
+    import gen3_multiscale.scripts.fit_architecture4_residual_basis as fit_basis_module
+
+    original_identity = checkpoint_module.resolve_checkpoint_identity(arch3_checkpoint_dir)
+    gene_names = list(manifest["gene_panel"])
+
+    real_resolve = checkpoint_module.resolve_checkpoint_identity
+    replaced = {"done": False}
+
+    def _resolve_and_then_replace(path):
+        result = real_resolve(path)
+        if not replaced["done"] and Path(path) == Path(arch3_checkpoint_dir):
+            replaced["done"] = True
+            arch3_config = resolved_config(str(arch3_config_path))
+            fresh_model, _info = build_model_for_inference(
+                arch3_config, gene_names=gene_names, device=torch.device("cpu"), checkpoint_dir=None,
+                smoke=False, dataset_manifest=manifest,
+            )
+            model_config_path = original_identity.resolved_dir / "model_config.json"
+            model_config = json.loads(model_config_path.read_text())
+            checkpoint_module.save_checkpoint(
+                fresh_model, model_config, gene_names, arch3_checkpoint_dir, step=original_identity.step,
+            )
+        return result
+
+    monkeypatch.setattr(fit_basis_module.checkpoint_module, "resolve_checkpoint_identity", _resolve_and_then_replace)
+
+    output_basis_path = tmp_path / "gene_residual_basis.pt"
+    provenance = fit_and_save_architecture4_basis(
+        str(arch3_config_path), str(arch3_checkpoint_dir), str(output_basis_path),
+        n_masks_per_sample=2, rank=4,
+    )
+
+    assert replaced["done"] is True  # confirm the mid-fit replacement actually ran
+    new_identity = checkpoint_module.resolve_checkpoint_identity(arch3_checkpoint_dir)
+    assert new_identity.bundle_dir != original_identity.bundle_dir
+    assert new_identity.weights_sha256 != original_identity.weights_sha256
+
+    assert provenance["architecture3_checkpoint_bundle_id"] == original_identity.bundle_dir
+    assert provenance["architecture3_checkpoint_trainable_weights_sha256"] == original_identity.weights_sha256
+    assert provenance["architecture3_checkpoint_manifest_sha256"] == original_identity.manifest_sha256
+
+
 # ---------------------------------------------------------------------------
 # Codex re-audit of commit f7bb8a1, launch blocker #5: "Before residual
 # fitting, verify Architecture 3 through the same complete best/latest

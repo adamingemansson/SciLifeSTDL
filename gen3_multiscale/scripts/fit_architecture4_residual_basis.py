@@ -158,11 +158,26 @@ def fit_and_save_architecture4_basis(
     expected_provenance = expected_tile_encoder_provenance(config)
     samples, preflight_report = load_and_preflight_samples(cfg_om, dataset_manifest, train_ids, expected_provenance)
 
+    # Codex re-audit of commit 57f0e3c: "fit_and_save_architecture4_basis()
+    # still independently uses/resolves the mutable architecture3_
+    # checkpoint_dir at least three times: during verify_full_checkpoint_
+    # identity, during build_model_for_inference, and again when writing
+    # provenance. Architecture 3 could checkpoint between those
+    # operations. The basis could be computed using bundle B while its
+    # provenance records bundle C." Confirmed real -- fixed by resolving
+    # `architecture3_checkpoint_dir` to an immutable bundle identity
+    # EXACTLY ONCE, here, before verification even runs. Every subsequent
+    # step -- identity verification, model construction/weight loading,
+    # and the provenance record itself -- now uses THIS SAME
+    # `pinned_arch3_identity`, never a fresh, independently re-resolved
+    # one, so residual computation and the provenance describing it are
+    # structurally guaranteed to describe one bundle.
+    pinned_arch3_identity = checkpoint_module.resolve_checkpoint_identity(architecture3_checkpoint_dir)
     # Launch blocker #5: fail closed BEFORE any residual computation --
     # never spend the (potentially expensive) residual pass against a
     # checkpoint that turns out not to describe the current run.
     verify_full_checkpoint_identity(
-        architecture3_checkpoint_dir, config=config, dataset_manifest=dataset_manifest, gene_names=gene_names,
+        pinned_arch3_identity.resolved_dir, config=config, dataset_manifest=dataset_manifest, gene_names=gene_names,
         cache_content_by_sample=preflight_report.get("cache_content_by_sample"), allow_code_drift=allow_code_drift,
     )
 
@@ -180,9 +195,12 @@ def fit_and_save_architecture4_basis(
     # structural no-op here, but this call site now shares the exact
     # same construction + synchronized-init + checkpoint-loading logic
     # every other caller uses, rather than its own fourth independent
-    # inline duplicate.
+    # inline duplicate. `checkpoint_dir=pinned_arch3_identity.resolved_dir`
+    # -- the SAME immutable bundle already verified above, never the raw
+    # mutable `architecture3_checkpoint_dir` again (Codex re-audit of
+    # commit 57f0e3c).
     architecture3_model, _info = build_model_for_inference(
-        config, gene_names=gene_names, device=device, checkpoint_dir=architecture3_checkpoint_dir, smoke=False,
+        config, gene_names=gene_names, device=device, checkpoint_dir=pinned_arch3_identity.resolved_dir, smoke=False,
         dataset_manifest=dataset_manifest, cache_content_by_sample=preflight_report.get("cache_content_by_sample"),
     )
 
@@ -211,12 +229,14 @@ def fit_and_save_architecture4_basis(
     # enforces -- that the sidecar is mandatory for a non-smoke run).
     saved_basis_path = save_gene_residual_basis(basis, output_basis_path)
 
-    # Codex re-audit of commit 90f853e, launch blocker #2: resolve
-    # through the SAME verified-bundle path `build_model_for_inference`
-    # above just loaded weights from -- never hash `architecture3_checkpoint_dir`'s
-    # root convenience-mirror file directly, which could disagree with
-    # the real bundle after a crash between the two.
-    resolved_identity = checkpoint_module.resolve_checkpoint_identity(architecture3_checkpoint_dir)
+    # Codex re-audit of commit 90f853e, launch blocker #2 (and re-audit of
+    # commit 57f0e3c): the SAME `pinned_arch3_identity` resolved ONCE at
+    # function entry, above -- never a fresh `resolve_checkpoint_identity
+    # (architecture3_checkpoint_dir)` call here, which would re-resolve
+    # the mutable path a second time and could observe a DIFFERENT bundle
+    # than the one verification/residual computation actually used if
+    # Architecture 3 checkpointed again during residual computation.
+    resolved_identity = pinned_arch3_identity
     # Launch blocker #5: a real, deterministic fingerprint over the
     # complete REALIZED training-mask schedule this basis was fit
     # against -- bound (recorded), though (per `maybe_load_gene_basis`'s
