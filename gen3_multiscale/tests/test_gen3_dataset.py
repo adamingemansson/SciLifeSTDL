@@ -171,6 +171,10 @@ def test_gen3_dataset_held_out_role_is_deterministic_across_epochs(tmp_path, mon
         split_counts={"validation": 3}, split_seeds={"validation": 700_000},
     )
     dataset = Gen3SpatialFieldDataset(manifest, samples, schedule, _STRATA)
+    boundary_report = dataset.validate_boundary_schedule()
+    assert boundary_report == {
+        "role": "validation", "n_items_checked": len(dataset), "passed": True,
+    }
     inputs_a, _ = dataset[0]
     inputs_b, _ = dataset[0]
     assert np.array_equal(inputs_a.query_barcodes, inputs_b.query_barcodes)

@@ -24,13 +24,39 @@ def _split_by_circular_hole(grid, radius):
     return grid[~query_mask], grid[query_mask]
 
 
-def test_build_knn_adjacency_returns_k_neighbors_and_no_self_loops():
+def test_build_knn_adjacency_is_symmetric_and_has_no_self_loops():
     grid = _square_grid(n=11)
     adjacency = build_knn_adjacency(grid, k_neighbors=6)
     assert len(adjacency) == grid.shape[0]
     for i, neighbors in enumerate(adjacency):
         assert i not in neighbors
-        assert len(neighbors) <= 6
+        assert len(neighbors) >= 6
+        for neighbor in neighbors:
+            assert i in adjacency[int(neighbor)]
+
+
+def test_symmetric_knn_recovers_boundary_hidden_by_directed_query_edges():
+    """Regression for the real validation crash: every query's outgoing
+    nearest-neighbour edge stays inside the dense query cluster, while the
+    nearby observed spot selects a query.  Directed traversal found an
+    empty boundary; the symmetric union correctly exposes the observed
+    neighbour."""
+    query = np.stack([np.arange(7, dtype=np.float64) * 0.01, np.zeros(7)], axis=1)
+    observed = np.array([[1.0, 0.0], [10.0, 0.0]], dtype=np.float64)
+    result = extract_boundary_and_local_context(
+        observed, query, k_neighbors=1, local_k=1, max_rings=1,
+    )
+    assert result.boundary_idx.tolist() == [0]
+    assert result.boundary_ring.tolist() == [1]
+
+
+def test_mask_covering_a_disconnected_fragment_is_rejected():
+    query = np.stack([np.arange(7, dtype=np.float64) * 0.01, np.zeros(7)], axis=1)
+    observed = np.stack([10.0 + np.arange(7, dtype=np.float64) * 0.01, np.zeros(7)], axis=1)
+    with pytest.raises(ValueError, match="no observed boundary"):
+        extract_boundary_and_local_context(
+            observed, query, k_neighbors=6, local_k=2, max_rings=3,
+        )
 
 
 def test_opposite_sides_of_a_synthetic_hole_are_both_reachable_in_boundary():

@@ -24,17 +24,25 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 
-def build_knn_adjacency(coords: np.ndarray, k_neighbors: int = 6) -> list[np.ndarray]:
-    """Geometry-only adjacency: up to k_neighbors nearest OTHER spots for
-    every spot in `coords`. Default k_neighbors=6 matches Visium's
-    hexagonal spot lattice (every interior spot has exactly 6 equidistant
-    neighbors) -- edge/corner spots on the tissue boundary still get up to
-    6 candidates from cKDTree, some of which may be considerably farther
-    than a true hex neighbor; this is the real geometry of a tissue
-    boundary, not something to special-case away here.
+class EmptyBoundaryError(ValueError):
+    """A realized query mask has no observed boundary in the geometry graph."""
 
-    Returns a list of length len(coords); adjacency[i] is an int array of
-    neighbor positions (never includes i itself)."""
+
+def build_knn_adjacency(coords: np.ndarray, k_neighbors: int = 6) -> list[np.ndarray]:
+    """Symmetric geometry-only k-NN union graph.
+
+    First find up to ``k_neighbors`` nearest OTHER spots for every spot,
+    then add each selected edge in both directions.  Symmetrization is
+    essential for boundary extraction: a dense query region can otherwise
+    choose only other query spots even when a nearby observed spot chooses
+    that query as one of its nearest neighbours.  The old directed graph
+    therefore produced a false empty boundary for valid holes during real
+    validation.
+
+    Default ``k_neighbors=6`` matches Visium's hexagonal spot lattice.
+    Because this is the undirected UNION of directed neighbour selections,
+    a node may have more than ``k_neighbors`` neighbours.  No self-loop is
+    ever returned, and each adjacency array is sorted for determinism."""
     n = coords.shape[0]
     if n < 2:
         return [np.array([], dtype=int) for _ in range(n)]
@@ -43,12 +51,19 @@ def build_knn_adjacency(coords: np.ndarray, k_neighbors: int = 6) -> list[np.nda
     k = min(k_neighbors + 1, n)  # +1: a point is always its own nearest neighbor
     _, idx = tree.query(coords64, k=k)
     idx = np.atleast_2d(idx)
-    adjacency = []
+    directed = []
     for i in range(n):
         neighbors = idx[i]
         neighbors = neighbors[neighbors != i]
-        adjacency.append(neighbors.astype(int))
-    return adjacency
+        directed.append(neighbors.astype(int))
+
+    adjacency_sets: list[set[int]] = [set() for _ in range(n)]
+    for i, neighbors in enumerate(directed):
+        for neighbor in neighbors:
+            j = int(neighbor)
+            adjacency_sets[i].add(j)
+            adjacency_sets[j].add(i)
+    return [np.asarray(sorted(neighbors), dtype=int) for neighbors in adjacency_sets]
 
 
 @dataclass(frozen=True)
@@ -154,6 +169,13 @@ def extract_boundary_and_local_context(
 
     boundary_idx = np.flatnonzero(ring_of_observed >= 1)
     boundary_ring = ring_of_observed[boundary_idx]
+    if boundary_idx.shape[0] == 0:
+        raise EmptyBoundaryError(
+            "realized query mask has no observed boundary in the symmetric geometry graph "
+            f"(n_observed={n_observed}, n_query={n_query}, k_neighbors={k_neighbors}); "
+            "the mask likely covers an entire disconnected tissue fragment and is not a valid "
+            "missing-tissue hole"
+        )
     if max_boundary_size is not None and boundary_idx.shape[0] > max_boundary_size:
         raise ValueError(
             f"boundary size {boundary_idx.shape[0]} exceeds max_boundary_size={max_boundary_size} "

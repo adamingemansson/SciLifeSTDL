@@ -79,6 +79,17 @@ def test_rejects_boundary_idx_outside_observed_range():
         validate_spatial_field_example(bad_inputs, targets)
 
 
+def test_rejects_empty_boundary_before_model_attention():
+    inputs, targets = _valid_example()
+    bad_inputs = _replace(
+        inputs,
+        boundary_idx=np.array([], dtype=int),
+        boundary_ring=np.array([], dtype=int),
+    )
+    with pytest.raises(ValueError, match="boundary_idx is empty"):
+        validate_spatial_field_example(bad_inputs, targets)
+
+
 def test_rejects_boundary_ring_outside_1_2_3():
     inputs, targets = _valid_example()
     bad_inputs = _replace(inputs, boundary_ring=np.array([1, 1, 7]))

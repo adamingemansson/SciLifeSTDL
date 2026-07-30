@@ -66,6 +66,7 @@ import torch
 
 from gen3_multiscale.data import example_builder, novae_graph, slide_context, spot_feature_cache
 from gen3_multiscale.data import mask_fingerprint
+from gen3_multiscale.data.boundary_graph import EmptyBoundaryError, extract_boundary_and_local_context
 from gen3_multiscale.data.dataset_manifest import verify_content_provenance
 from gen3_multiscale.data.mask_schedule import ensure_stratified_mask_bank, stratum_to_masking_cfg
 
@@ -402,6 +403,43 @@ class Gen3SpatialFieldDataset(torch.utils.data.Dataset):
             return record["context_obs_names"], record["query_obs_names"]
         return list(item.context_obs_names), list(item.query_obs_names)
 
+    def validate_boundary_schedule(self) -> dict:
+        """Validate every fixed item geometrically before model construction.
+
+        Validation is intentionally geometry-only: it does not build image
+        tensors or run either GigaPath encoder.  Its purpose is to guarantee
+        that a fixed validation/test schedule cannot train successfully for
+        hours and only then discover an unusable empty boundary at the first
+        evaluation pass.
+        """
+        for idx, item in enumerate(self._items):
+            sample = self.samples[item.sample_id]
+            context_barcodes, query_barcodes = self._resolve_barcodes(item)
+            obs_names = np.asarray(sample.adata.obs_names, dtype=str)
+            position_by_barcode = {barcode: pos for pos, barcode in enumerate(obs_names)}
+            try:
+                context_pos = np.asarray([position_by_barcode[str(b)] for b in context_barcodes], dtype=int)
+                query_pos = np.asarray([position_by_barcode[str(b)] for b in query_barcodes], dtype=int)
+            except KeyError as exc:
+                raise ValueError(
+                    f"{item.sample_id}: boundary preflight mask references barcode {exc.args[0]!r} "
+                    "that is absent from the loaded sample"
+                ) from exc
+            try:
+                extract_boundary_and_local_context(
+                    sample.full_sample_coords[context_pos], sample.full_sample_coords[query_pos],
+                    k_neighbors=self.k_neighbors, local_k=self.local_k,
+                    max_rings=self.max_rings, max_boundary_size=self.max_boundary_size,
+                )
+            except EmptyBoundaryError as exc:
+                identity = self.item_identity(idx)
+                raise EmptyBoundaryError(
+                    f"{item.sample_id}: {self.schedule.role} mask has no usable observed boundary "
+                    f"(stratum={identity['stratum']!r}, "
+                    f"query_fingerprint={identity['query_fingerprint']}); {exc}"
+                ) from exc
+        return {"role": self.schedule.role, "n_items_checked": len(self._items), "passed": True}
+
     def __getitem__(self, idx: int):
         item = self._items[idx % len(self._items)]
         sample_id = item.sample_id
@@ -410,18 +448,26 @@ class Gen3SpatialFieldDataset(torch.utils.data.Dataset):
 
         # Mandatory requirement #5: precomputed_spot_features only, never
         # image_feature_fn -- no tile encoder is ever invoked here.
-        inputs, targets = example_builder.build_spatial_field_example(
-            sample.adata, sample.patches, context_barcodes, query_barcodes,
-            None,
-            sample_id=sample_id, patient_id=sample.patient_id,
-            full_sample_coords=sample.full_sample_coords, require_full_sample_coords=True,
-            patch_size_fullres=self.patch_size_fullres, k_neighbors=self.k_neighbors,
-            local_k=self.local_k, max_rings=self.max_rings, max_boundary_size=self.max_boundary_size,
-            expected_feature_width=int(sample.precomputed_spot_features.shape[1]),
-            slide_context=sample.slide_context_record, image_mode="target_zero",
-            image_source_available=sample.image_source_available,
-            precomputed_spot_features=sample.precomputed_spot_features,
-        )
+        try:
+            inputs, targets = example_builder.build_spatial_field_example(
+                sample.adata, sample.patches, context_barcodes, query_barcodes,
+                None,
+                sample_id=sample_id, patient_id=sample.patient_id,
+                full_sample_coords=sample.full_sample_coords, require_full_sample_coords=True,
+                patch_size_fullres=self.patch_size_fullres, k_neighbors=self.k_neighbors,
+                local_k=self.local_k, max_rings=self.max_rings, max_boundary_size=self.max_boundary_size,
+                expected_feature_width=int(sample.precomputed_spot_features.shape[1]),
+                slide_context=sample.slide_context_record, image_mode="target_zero",
+                image_source_available=sample.image_source_available,
+                precomputed_spot_features=sample.precomputed_spot_features,
+            )
+        except EmptyBoundaryError as exc:
+            identity = self.item_identity(idx)
+            raise EmptyBoundaryError(
+                f"{sample_id}: {self.schedule.role} mask has no usable observed boundary "
+                f"(stratum={identity['stratum']!r}, "
+                f"query_fingerprint={identity['query_fingerprint']}); {exc}"
+            ) from exc
 
         novae_diagnostic = None
         if self.novae_enabled:

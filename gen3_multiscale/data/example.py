@@ -277,6 +277,11 @@ def validate_spatial_field_example(inputs: SpatialFieldInputs, targets: SpatialF
         )
 
     n_boundary = inputs.boundary_idx.shape[0]
+    if n_boundary == 0:
+        raise ValueError(
+            "boundary_idx is empty -- every spatial-field example must have at least one "
+            "observed boundary spot"
+        )
     if inputs.boundary_ring.shape[0] != n_boundary:
         raise ValueError("boundary_idx and boundary_ring must have the same length")
     if n_boundary and (inputs.boundary_idx.min() < 0 or inputs.boundary_idx.max() >= n_observed):

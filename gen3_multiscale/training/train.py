@@ -1767,6 +1767,12 @@ def run_training(
         val_dataset = Gen3SpatialFieldDataset(
             dataset_manifest, val_samples, val_schedule, strata, novae_enabled=novae_enabled,
         )
+        boundary_preflight = val_dataset.validate_boundary_schedule()
+        print(
+            f"validation boundary preflight: PASS "
+            f"({boundary_preflight['n_items_checked']} fixed masks checked)",
+            flush=True,
+        )
         # requirement #9: deterministic FIXED-mask validation -- never shuffled.
         val_loader = torch.utils.data.DataLoader(
             val_dataset, batch_size=1, shuffle=False, collate_fn=gen3_identity_collate,
