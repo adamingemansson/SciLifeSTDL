@@ -28,6 +28,10 @@ _ARM_REQUIRED_FINGERPRINTS = {
     "gen4b": {"gigapath_checkpoint", "scfoundation_checkpoint", "scfoundation_vocab"},
     "gen4c": {"uni2_checkpoint", "uni2_revision", "scfoundation_checkpoint", "scfoundation_vocab"},
     "gen4d": {"stpath_checkpoint", "stpath_gene_vocab", "gigapath_checkpoint"},
+    "gen4e": {
+        "stpath_checkpoint", "stpath_gene_vocab", "gigapath_checkpoint",
+        "uni2_checkpoint", "uni2_revision", "scfoundation_checkpoint", "scfoundation_vocab",
+    },
 }
 
 
@@ -52,7 +56,7 @@ def static_audit_gen4_config(config: dict) -> dict:
     image_feature_dim = params.get("image_feature_dim")
     if image_feature_dim is not None and int(image_feature_dim) <= 0:
         raise ValueError("model.params.image_feature_dim must be positive")
-    if arm in {"gen4b", "gen4c"}:
+    if arm in {"gen4b", "gen4c", "gen4e"}:
         context_dim = params.get("gex_context_embedding_dim")
         if not context_dim or int(context_dim) <= 0:
             raise ValueError(f"arm {arm!r} requires a positive model.params.gex_context_embedding_dim")

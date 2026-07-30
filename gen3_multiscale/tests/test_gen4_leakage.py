@@ -16,7 +16,9 @@ from gen3_multiscale.gen4.scfoundation_cache import build_scfoundation_spot_feat
 from gen3_multiscale.gen4.stpath_context import Gen4STPathContextEncoder
 from gen3_multiscale.gen4.uni2_spot_cache import build_uni2_spot_feature_cache, load_uni2_spot_features
 from gen3_multiscale.models.architectures import Architecture3
-from gen3_multiscale.tests._gen4_fixtures import GEN4_MODEL_KWARGS, StubSCFoundationEncoder, StubUNI2Encoder, synthetic_gen4_inputs
+from gen3_multiscale.tests._gen4_fixtures import (
+    GEN4_MODEL_KWARGS, Gen4STPathStub, StubSCFoundationEncoder, StubUNI2Encoder, synthetic_gen4_inputs,
+)
 
 
 def _tiny_model():
@@ -93,6 +95,33 @@ def test_scfoundation_encoder_interface_has_no_query_parameter():
 def test_stpath_encode_context_only_has_no_query_parameter():
     params = set(inspect.signature(Gen4STPathContextEncoder.encode_context_only).parameters) - {"self"}
     assert not any("query" in p for p in params)
+
+
+def test_stpath_arm_query_gex_mutation_cannot_change_conditioning_output():
+    """Behavioral regression, not just the structural signature check
+    above: mutating `targets.query_expression` (never even passed to
+    forward()) and `query_barcodes` between two identical-context calls
+    through the REAL STPath arm (image_feature_source='stpath_context',
+    gex_feature_source='stpath_joint') produces byte-identical output --
+    STPath's own context-only encoding depends only on the observed/
+    context set, never on anything query-indexed."""
+    n_genes, gex_dim, image_dim = 6, 4, 8
+    inputs, targets = synthetic_gen4_inputs(n_genes=n_genes, gex_dim=gex_dim, image_dim=image_dim)
+    stpath_stub = Gen4STPathStub(n_genes=n_genes, hidden_dim=image_dim)
+    model = Gen4Conditioner(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        gex_feature_source="stpath_joint", image_feature_source="stpath_context", stpath_encoder=stpath_stub,
+        use_regional_he=False, global_context_source="none", **GEN4_MODEL_KWARGS,
+    )
+    torch.manual_seed(0)
+    out1 = model(inputs)
+    mutated = dataclasses.replace(
+        inputs, query_barcodes=np.array([f"different-{i}" for i in range(inputs.query_barcodes.shape[0])]),
+    )
+    _mutated_targets = dataclasses.replace(targets, query_expression=targets.query_expression * 0.0 + 999.0)
+    torch.manual_seed(0)
+    out2 = model(mutated)  # targets never passed at all
+    assert torch.equal(out1["expression"], out2["expression"])
     # And the base pilot-study forward() (which DOES take query images) is
     # never called from this method's own body -- none of its real
     # query-shaped argument names are referenced as an actual code token

@@ -1,0 +1,128 @@
+# Gen4 arm 4 (intended-design hybrid): STPath's joint context token fused
+# with UNI2's own per-spot morphology token (image slot) and frozen
+# scFoundation observed-GEX context embeddings (GEX slot) via small
+# trainable fusion layers, then fed through the existing spatial
+# conditioner (reused unmodified) -- no separate global/regional branch,
+# no GigaPath. `image_feature_dim` is set to UNI2's real per-spot output
+# width (1536) -- the STPath encoder instance used for THIS arm must be
+# constructed with `hidden_dim=1536` (not 256, unlike arm D/gen4d's own
+# dedicated config) so its joint token can be concatenated directly with
+# UNI2's real embedding before fusion. See GEN4_CONTRACT.md sections 2, 4,
+# 6, 7, 8 and this arm's own reasoning in gen4/conditioner.py.
+
+experiment_name: gen4_arm4_hybrid_stpath_uni2_scfoundation_v1
+
+documented_divergences:
+  - model.arm
+  - model.params.image_feature_dim
+  - model.params.gex_context_embedding_dim
+  - model.params.use_regional_he
+  - required_fingerprints.stpath_checkpoint
+  - required_fingerprints.stpath_gene_vocab
+  - required_fingerprints.gigapath_checkpoint
+  - required_fingerprints.uni2_checkpoint
+  - required_fingerprints.uni2_revision
+  - required_fingerprints.scfoundation_checkpoint
+  - required_fingerprints.scfoundation_vocab
+
+model:
+  arm: gen4e
+  kind: conditioner
+  params:
+    n_genes: null
+    gex_feature_dim: 256
+    image_feature_dim: 1536
+    gex_context_embedding_dim: 3072
+    hidden_dim: 512
+    n_heads: 8
+    n_blocks: 4
+    dense_threshold: 256
+    sparse_k: 10
+    chunk_size: 1024
+    max_boundary_size: null
+    transport_heads: 8
+    transport_temperature: 1.0
+    gene_gate_mode: per_gene
+    use_query_gate: true
+    use_residual: false
+    residual_rank: 32
+    use_regional_he: false
+    n_gex_inducing: 16
+    harmonic_k_neighbors: 6
+    init_seed: 0
+
+masking:
+  strata:
+    - name: small_compact
+      radius_range: [3.0, 5.0]
+      radius_unit: spot_spacing
+      shape: circle
+    - name: medium_compact
+      radius_range: [5.0, 8.0]
+      radius_unit: spot_spacing
+      shape: circle
+    - name: large_compact
+      radius_range: [8.0, 12.0]
+      radius_unit: spot_spacing
+      shape: circle
+    - name: medium_irregular
+      radius_range: [5.0, 8.0]
+      radius_unit: spot_spacing
+      shape: mixed
+
+data:
+  hest_data_dir: data/raw/hest1k
+  hest_cache_dir: data/cache/hest1k
+  slide_context_source: dense_wsi_cache   # only used for STPath's own image-token GigaPath cache (STPath encoding itself runs live inside Gen4Conditioner, not precomputed)
+  gen3_manifest_path: null
+  tile_encoder_revision: null   # GigaPath revision pinning STPath's own image tokenizer's input features
+  gex_feature_dim: 256
+  n_training_masks_per_sample: 500
+  n_validation_masks: 4
+  novae:
+    enabled: false
+  sample_selection:
+    organs: all
+    metadata_csv: hf://datasets/MahmoodLab/hest/HEST_v1_3_0.csv
+    min_samples_per_organ: 5
+    max_samples_per_organ: 30
+    n_validation_per_organ: 2
+    n_test_per_organ: 2
+    split_seed: 0
+
+evaluation:
+  train_gene_panel_artifact: null
+  gene_panels:
+    CCRCC_var_50genes: resources/evaluation/hest_bench/CCRCC_var_50genes.json
+  compute_st_fid_mmd: false
+  patient_level_aggregation: true
+
+required_fingerprints:
+  stpath_checkpoint: null       # real local STPath weight path -- required before training (gen4/stpath_context.py::Gen4STPathContextEncoder, hidden_dim=1536 for this arm)
+  stpath_gene_vocab: null       # STPath's own symbol2ensembl.json path
+  gigapath_checkpoint: null     # STPath's own image tokenizer input encoder -- unchanged from Gen3
+  uni2_checkpoint: null         # real local checkpoint path -- required before training (gen4/uni2_encoder.py::FrozenUNI2TileEncoder)
+  uni2_revision: null           # pinned, immutable 40-hex HF commit SHA
+  scfoundation_checkpoint: null # real local checkpoint path -- required before training (gen4/scfoundation_encoder.py::FrozenSCFoundationEncoder)
+  scfoundation_vocab: null      # gene-vocabulary JSON path
+  gene_vocabulary: null
+  train_mask_bank: null
+  validation_mask_bank: null
+  test_mask_bank: null
+
+training:
+  device: cuda
+  seed: 0
+  lr: 1.0e-4
+  total_steps: 10000
+  max_wall_clock_hours: 2
+  gradient_clip_val: 1.0
+  log_every_n_steps: 50
+  checkpoint_every_n_steps: 2000
+  checkpoint_dir: gen3_multiscale/results/gen4e_conditioner
+  eval_every_n_steps: 2000
+  synchronized_init_dir: null
+  optimizer:
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    eps: 1.0e-8

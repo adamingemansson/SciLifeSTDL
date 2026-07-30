@@ -53,9 +53,9 @@ import torch.nn as nn
 from gen3_multiscale.models.architectures import Architecture3
 from gen3_multiscale.models.geometry_utils import scatter_boundary_ring
 
-_GEX_SOURCES = frozenset({"weighted_linear", "frozen_context", "stpath_joint"})
+_GEX_SOURCES = frozenset({"weighted_linear", "frozen_context", "stpath_joint", "hybrid_context"})
 _GLOBAL_SOURCES = frozenset({"none", "gigapath", "uni2_pool"})
-_IMAGE_SOURCES = frozenset({"precomputed", "stpath_context"})
+_IMAGE_SOURCES = frozenset({"precomputed", "stpath_context", "hybrid_context"})
 
 # Sentinel identity string used ONLY to satisfy _SharedFieldArchitecture's
 # own constructor-time "gigapath_checkpoint_sha256 must match
@@ -120,8 +120,22 @@ class Gen4Conditioner(Architecture3):
                 "together -- STPath's single joint representation stands in for both per-spot encoders, "
                 "never just one of them"
             )
+        if (image_feature_source == "hybrid_context") != (gex_feature_source == "hybrid_context"):
+            raise ValueError(
+                "image_feature_source='hybrid_context' and gex_feature_source='hybrid_context' must be used "
+                "together -- the hybrid arm fuses STPath+UNI2+scFoundation into both per-spot slots at once"
+            )
         if image_feature_source == "stpath_context" and stpath_encoder is None:
             raise ValueError("image_feature_source='stpath_context' requires a real stpath_encoder module")
+        if image_feature_source == "hybrid_context":
+            if stpath_encoder is None:
+                raise ValueError("image_feature_source='hybrid_context' requires a real stpath_encoder module")
+            if not gex_context_embedding_dim:
+                raise ValueError(
+                    "image_feature_source='hybrid_context' requires a positive gex_context_embedding_dim "
+                    "(the frozen scFoundation cache width) -- the hybrid arm's GEX slot fuses scFoundation "
+                    "context embeddings with STPath's joint token"
+                )
 
         effective_slide_encoder = None
         effective_checkpoint_sha256 = None
@@ -155,7 +169,7 @@ class Gen4Conditioner(Architecture3):
         self.global_context_source = global_context_source
         self.image_feature_source = image_feature_source
 
-        if gex_feature_source in ("frozen_context", "stpath_joint"):
+        if gex_feature_source in ("frozen_context", "stpath_joint", "hybrid_context"):
             # self.gene_encoder is still constructed by Architecture3's own
             # __init__ (reused unmodified -- see this module's docstring)
             # but is never called in _observed_tokens below for these arms.
@@ -184,7 +198,33 @@ class Gen4Conditioner(Architecture3):
             self.stpath_encoder = None
             self.gex_from_stpath_proj = None
 
+        if image_feature_source == "hybrid_context":
+            # Arm 4 (intended-design hybrid): STPath's joint context token,
+            # UNI2's own per-spot morphology token (the same precomputed
+            # `observed_gigapath_features` field arm C/1 already reuses for
+            # real UNI2 features), and scFoundation's observed-GEX context
+            # embedding are each projected to a shared width and fused with
+            # small trainable Linear layers -- no new transformer, no extra
+            # loss, just fusion adapters feeding the SAME `spot_token`/
+            # boundary-transformer path every other arm uses.
+            self.stpath_encoder = stpath_encoder  # real trainable submodule -- see forward-time call below
+            self.hybrid_scf_proj = nn.Sequential(
+                nn.LayerNorm(gex_context_embedding_dim), nn.Linear(gex_context_embedding_dim, image_feature_dim),
+            )
+            self.hybrid_image_fusion = nn.Sequential(
+                nn.LayerNorm(2 * image_feature_dim), nn.Linear(2 * image_feature_dim, image_feature_dim),
+            )
+            self.hybrid_gex_fusion = nn.Sequential(
+                nn.LayerNorm(2 * image_feature_dim), nn.Linear(2 * image_feature_dim, gex_feature_dim),
+            )
+        else:
+            self.hybrid_scf_proj = None
+            self.hybrid_image_fusion = None
+            self.hybrid_gex_fusion = None
+
     def _observed_tokens(self, inputs, device: torch.device) -> torch.Tensor:
+        if self.image_feature_source == "hybrid_context":
+            return self._hybrid_observed_tokens(inputs, device)
         if self.image_feature_source == "stpath_context":
             return self._stpath_observed_tokens(inputs, device)
         if self.gex_feature_source == "weighted_linear":
@@ -247,6 +287,53 @@ class Gen4Conditioner(Architecture3):
         modality_flags = torch.ones(n_observed, 1, dtype=torch.float32, device=device)
         return self.spot_token(
             image_features=stpath_embedding, gex_features=gex_features, coords=context_coords,
+            boundary_ring=full_ring, modality_flags=modality_flags,
+        )
+
+    def _hybrid_observed_tokens(self, inputs, device: torch.device) -> torch.Tensor:
+        """Arm 4 (intended-design hybrid): STPath's joint context token
+        fused with UNI2's own per-spot morphology token (image slot) and
+        with scFoundation's observed-GEX context embedding (GEX slot).
+        STPath's `encode_context_only` runs LIVE here, exactly as arm D/3
+        does -- never precomputed, never wrapped in `torch.no_grad()`.
+        `observed_uni2_features` (a genuinely separate per-spot source from
+        whatever feeds STPath's own tokenizer) must be present; this arm
+        raises rather than silently falling back to a missing modality."""
+        if inputs.observed_uni2_features is None:
+            raise ValueError(
+                "image_feature_source='hybrid_context' requires Gen4SpatialFieldInputs.observed_uni2_features "
+                "to be set -- a real, genuinely UNI2-encoded per-spot array, separate from whatever feeds "
+                "STPath's own image tokenizer"
+            )
+        context_embedding = getattr(inputs, "context_gex_embedding", None)
+        if context_embedding is None:
+            raise ValueError(
+                "image_feature_source='hybrid_context' requires Gen4SpatialFieldInputs.context_gex_embedding "
+                "to be set -- a real, frozen scFoundation observed-GEX embedding"
+            )
+        n_observed = inputs.observed_coords.shape[0]
+        full_ring = scatter_boundary_ring(
+            n_observed, torch.as_tensor(inputs.boundary_idx, device=device), torch.as_tensor(inputs.boundary_ring, device=device),
+        )
+        context_coords = torch.as_tensor(inputs.observed_coords, dtype=torch.float32, device=device)
+        context_expression = torch.as_tensor(inputs.observed_full_gene_expression, dtype=torch.float32, device=device)
+        context_image_features = torch.as_tensor(inputs.observed_gigapath_features, dtype=torch.float32, device=device)
+        context_image_available = torch.as_tensor(inputs.observed_image_available, dtype=torch.bool, device=device)
+
+        stpath_embedding = self.stpath_encoder.encode_context_only(
+            context_coords, context_expression, context_image_features, context_image_available,
+        )  # [n_observed, image_feature_dim] -- joint context token
+        uni2_embedding = torch.as_tensor(inputs.observed_uni2_features, dtype=torch.float32, device=device)
+        scf_embedding = self.hybrid_scf_proj(torch.as_tensor(context_embedding, dtype=torch.float32, device=device))
+
+        image_features = self.hybrid_image_fusion(torch.cat([stpath_embedding, uni2_embedding], dim=-1))
+        gex_features = self.hybrid_gex_fusion(torch.cat([stpath_embedding, scf_embedding], dim=-1))
+        # STPath's own missing_image_token already stands in for a spot
+        # with no real H&E patch (matching arm D/3's identical reasoning);
+        # every context row therefore has a real, defined representation.
+        modality_flags = torch.ones(n_observed, 1, dtype=torch.float32, device=device)
+        return self.spot_token(
+            image_features=image_features, gex_features=gex_features, coords=context_coords,
             boundary_ring=full_ring, modality_flags=modality_flags,
         )
 

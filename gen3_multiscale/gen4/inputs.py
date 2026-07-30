@@ -50,25 +50,43 @@ class Gen4SpatialFieldInputs(SpatialFieldInputs):
     # pathway fails closed until a real, provenance-tagged UNI2 dense-WSI
     # cache exists.
     wsi_tile_feature_provenance: str | None = None
+    # Arm 4 (intended-design hybrid, GEN4_CONTRACT.md-adjacent scope
+    # extension): `observed_gigapath_features` (inherited) already serves
+    # arm D/3's STPath image-tokenizer input (GigaPath-shaped, per its own
+    # convention) and arm C/1's per-spot UNI2 cache when THAT arm alone
+    # owns the field. The hybrid arm needs BOTH a GigaPath-shaped array to
+    # feed STPath's own tokenizer AND a genuinely separate UNI2-shaped
+    # per-spot morphology token at once -- one generic field cannot hold
+    # both simultaneously. This field is that second, UNI2-specific
+    # source, used ONLY by `image_feature_source="hybrid_context"`;
+    # `None` for every other arm.
+    observed_uni2_features: np.ndarray | None = None
 
 
 def validate_gen4_spatial_field_example(inputs: Gen4SpatialFieldInputs, targets: SpatialFieldTargets) -> None:
-    """Structural checks specific to the one new field; the entire base
+    """Structural checks specific to the new fields; the entire base
     contract is re-verified by delegating to the existing, unmodified
     `data.example.validate_spatial_field_example` first."""
     from gen3_multiscale.data.example import validate_spatial_field_example
 
     validate_spatial_field_example(inputs, targets)
-    if inputs.context_gex_embedding is None:
-        return
     n_observed = inputs.observed_coords.shape[0]
-    embedding = np.asarray(inputs.context_gex_embedding)
-    if embedding.ndim != 2 or embedding.shape[0] != n_observed:
-        raise ValueError(
-            f"context_gex_embedding must be [n_observed={n_observed}, D], got shape {embedding.shape}"
-        )
-    if not np.all(np.isfinite(embedding)):
-        raise ValueError("context_gex_embedding contains non-finite values")
+    if inputs.context_gex_embedding is not None:
+        embedding = np.asarray(inputs.context_gex_embedding)
+        if embedding.ndim != 2 or embedding.shape[0] != n_observed:
+            raise ValueError(
+                f"context_gex_embedding must be [n_observed={n_observed}, D], got shape {embedding.shape}"
+            )
+        if not np.all(np.isfinite(embedding)):
+            raise ValueError("context_gex_embedding contains non-finite values")
+    if inputs.observed_uni2_features is not None:
+        uni2_features = np.asarray(inputs.observed_uni2_features)
+        if uni2_features.ndim != 2 or uni2_features.shape[0] != n_observed:
+            raise ValueError(
+                f"observed_uni2_features must be [n_observed={n_observed}, D], got shape {uni2_features.shape}"
+            )
+        if not np.all(np.isfinite(uni2_features)):
+            raise ValueError("observed_uni2_features contains non-finite values")
 
 
 def _select_by_barcode(barcode_to_row: dict[str, np.ndarray], barcodes: np.ndarray, *, field_name: str) -> np.ndarray:

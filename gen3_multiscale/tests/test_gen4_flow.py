@@ -10,7 +10,9 @@ import torch
 
 from gen3_multiscale.gen4.flow import Gen4ResidualFlowModel
 from gen3_multiscale.models.gene_basis import fit_gene_residual_basis
-from gen3_multiscale.tests._gen4_fixtures import GEN4_MODEL_KWARGS, Gen4STPathStub, synthetic_gen4_inputs
+from gen3_multiscale.tests._gen4_fixtures import (
+    GEN4_MODEL_KWARGS, Gen4STPathStub, synthetic_gen4_inputs, with_synthetic_uni2_features,
+)
 
 
 def _gene_basis_for(n_genes, rank=4, seed=99):
@@ -151,6 +153,35 @@ def test_arm_d_flow_forward_and_stpath_wiring():
         n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
         gene_basis=gene_basis, gene_names=gene_names,
         gex_feature_source="stpath_joint", image_feature_source="stpath_context", stpath_encoder=stpath_stub,
+        use_regional_he=False, global_context_source="none",
+        n_flow_blocks=1, n_flow_samples=2, n_ode_steps=2, **GEN4_MODEL_KWARGS,
+    )
+    assert model.conditioner.stpath_encoder is stpath_stub
+    assert any(p is stpath_stub.proj.weight for p in model.parameters())
+    target = torch.as_tensor(targets.query_expression, dtype=torch.float32)
+    out = model.compute_losses(inputs, target, generator=torch.Generator().manual_seed(0))
+    assert torch.isfinite(out["flow_loss"])
+    out["flow_loss"].backward()
+    assert stpath_stub.proj.weight.grad is None  # detached-conditioner discipline: no flow-stage gradient reaches it
+
+
+def test_arm4_hybrid_flow_forward_and_wiring():
+    """Arm 4 (intended-design hybrid), end to end through
+    Gen4ResidualFlowModel. Same detached-conditioner discipline as arm
+    D/3's own flow test above -- flow_loss.backward() correctly produces
+    no gradient on the conditioner side; this test checks the flow model
+    constructs/forwards correctly with the hybrid's wiring and that its
+    submodules are real registered parameters."""
+    n_genes, gex_dim, image_dim, context_dim = 6, 4, 8, 5
+    inputs, targets = synthetic_gen4_inputs(n_genes=n_genes, gex_dim=gex_dim, image_dim=image_dim, gex_context_dim=context_dim)
+    inputs = with_synthetic_uni2_features(inputs, image_dim)
+    gene_basis, gene_names = _gene_basis_for(n_genes)
+    stpath_stub = Gen4STPathStub(n_genes=n_genes, hidden_dim=image_dim)
+    model = Gen4ResidualFlowModel(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        gene_basis=gene_basis, gene_names=gene_names,
+        gex_feature_source="hybrid_context", image_feature_source="hybrid_context",
+        gex_context_embedding_dim=context_dim, stpath_encoder=stpath_stub,
         use_regional_he=False, global_context_source="none",
         n_flow_blocks=1, n_flow_samples=2, n_ode_steps=2, **GEN4_MODEL_KWARGS,
     )

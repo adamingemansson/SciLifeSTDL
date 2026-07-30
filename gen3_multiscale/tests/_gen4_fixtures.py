@@ -84,6 +84,18 @@ def with_synthetic_wsi_context(
     )
 
 
+def with_synthetic_uni2_features(inputs: Gen4SpatialFieldInputs, image_dim: int, seed: int = 3):
+    """Arm 4 (hybrid): a genuinely separate per-spot UNI2 array from
+    whatever `observed_gigapath_features` holds for this arm (STPath's own
+    GigaPath-shaped tokenizer input) -- see
+    `Gen4SpatialFieldInputs.observed_uni2_features`'s docstring."""
+    n_observed = inputs.observed_coords.shape[0]
+    rng = np.random.default_rng(seed)
+    return dataclasses.replace(
+        inputs, observed_uni2_features=rng.normal(size=(n_observed, image_dim)).astype(np.float32),
+    )
+
+
 class StubUNI2Encoder:
     """Deterministic ImageContextProvider stand-in -- no real UNI2/timm
     dependency. `encode_available_patches` is a fixed linear function of
