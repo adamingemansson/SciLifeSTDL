@@ -23,12 +23,17 @@ Verifies the user's own per-arm wiring spec against the real
     + scFoundation gex_context_embedding + organ."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 from omegaconf import OmegaConf
 
 from gen3_multiscale.gen4 import scfoundation_cache, uni2_spot_cache
-from gen3_multiscale.gen4.dataset_adapter import Gen4SpatialFieldDataset
+from gen3_multiscale.gen4.dataset_adapter import (
+    Gen4SpatialFieldDataset,
+    load_and_preflight_gen4_samples,
+)
 from gen3_multiscale.tests._gen4_fixtures import StubSCFoundationEncoder, StubUNI2Encoder
 from gen3_multiscale.tests._step6_fixtures import build_synthetic_gen3_experiment
 from gen3_multiscale.training.gen3_dataset import build_gen3_mask_schedule, load_gen3_sample_data
@@ -172,3 +177,44 @@ def test_gen4_dataset_adapter_rejects_an_unknown_arm(tmp_path, monkeypatch):
     cfg, manifest, samples = _build_experiment(tmp_path, monkeypatch)
     with pytest.raises(ValueError):
         _dataset({"model": {"arm": "not_a_real_arm", "kind": "conditioner"}}, cfg, manifest, samples)
+
+
+def test_uni2_primary_preflight_does_not_require_an_unconsumed_gigapath_cache(
+    tmp_path, monkeypatch,
+):
+    cfg, manifest, samples = _build_experiment(tmp_path, monkeypatch)
+    _write_uni2_caches(cfg, samples, output_dim=8)
+    for sample_id in manifest["train_sample_ids"]:
+        path = Path(cfg.data.hest_cache_dir) / "gigapath_gen3_spot_cache" / f"{sample_id}.npz"
+        path.unlink()
+
+    config = {
+        "model": {"arm": "gen4a", "kind": "conditioner", "params": {"image_feature_dim": 8}},
+        "masking": {"strata": _STRATA},
+        "data": {
+            "hest_data_dir": str(cfg.data.hest_data_dir),
+            "hest_cache_dir": str(cfg.data.hest_cache_dir),
+        },
+        "evaluation": {},
+        "required_fingerprints": {
+            "uni2_checkpoint": None,
+            "uni2_revision": None,
+            "uni2_package_version": None,
+            "uni2_preprocessing_spec": None,
+        },
+        "training": {},
+    }
+    config_om = OmegaConf.create(config)
+    loaded, report = load_and_preflight_gen4_samples(
+        config_om,
+        manifest,
+        list(manifest["train_sample_ids"]),
+        config,
+        require_resolved_artifacts=False,
+    )
+    assert set(loaded) == set(manifest["train_sample_ids"])
+    assert report["passed"] is True
+    assert all(
+        identity["primary_modality"] == "uni2"
+        for identity in report["cache_content_by_sample"].values()
+    )

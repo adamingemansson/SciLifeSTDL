@@ -38,9 +38,14 @@ _ARM_REQUIRED_FINGERPRINTS = {
         "uni2_checkpoint", "uni2_revision", "uni2_package_version", "uni2_preprocessing_spec",
         "scfoundation_checkpoint", "scfoundation_vocab", "scfoundation_package_version", "scfoundation_preprocessing_spec",
     },
-    "gen4d": {"stpath_checkpoint", "stpath_gene_vocab", "gigapath_checkpoint"},
+    # Arms D/E consume cached GigaPath *spot* embeddings inside STPath,
+    # but never construct the GigaPath LongNet slide encoder.  Their tile
+    # encoder identity is pinned by data.tile_encoder_revision and checked
+    # against the cache; requiring an unrelated LongNet checkpoint here
+    # would be both misleading and unnecessary.
+    "gen4d": {"stpath_checkpoint", "stpath_gene_vocab"},
     "gen4e": {
-        "stpath_checkpoint", "stpath_gene_vocab", "gigapath_checkpoint",
+        "stpath_checkpoint", "stpath_gene_vocab",
         "uni2_checkpoint", "uni2_revision", "uni2_package_version", "uni2_preprocessing_spec",
         "scfoundation_checkpoint", "scfoundation_vocab", "scfoundation_package_version", "scfoundation_preprocessing_spec",
     },
@@ -60,7 +65,9 @@ _ARM_CACHE_MODALITIES = {
     "gen4a": {"uni2", "uni2_dense"},
     "gen4b": {"scfoundation"},
     "gen4c": {"uni2", "uni2_dense", "scfoundation"},
-    "gen4d": set(),  # STPath/GigaPath consumed live inside the conditioner -- no per-sample spot cache to audit here
+    # No additional Gen4 cache. The combined real-data loader separately
+    # verifies the provenance-bound GigaPath spot cache used by STPath.
+    "gen4d": set(),
     "gen4e": {"uni2", "scfoundation"},
 }
 
@@ -81,12 +88,15 @@ def static_audit_gen4_config(config: dict) -> dict:
         raise ValueError(f"config is missing required top-level section(s): {sorted(missing_top)}")
 
     model_cfg = config["model"]
-    arm = str(model_cfg.get("arm", ""))
+    declared_arm = str(model_cfg.get("arm", ""))
+    from gen3_multiscale.gen4.trainer_adapter import _resolve_gen4_arm
+
+    arm = _resolve_gen4_arm(config)
     if arm not in ARM_TABLE:
-        raise ValueError(f"model.arm must be one of {sorted(ARM_TABLE)}, got {arm!r}")
+        raise ValueError(f"model.arm must resolve to one of {sorted(ARM_TABLE)}, got {declared_arm!r}")
     kind = str(model_cfg.get("kind", ""))
-    if kind not in {"conditioner", "flow"}:
-        raise ValueError(f"model.kind must be 'conditioner' or 'flow', got {kind!r}")
+    if kind not in {"conditioner", "flow", "latent_flow"}:
+        raise ValueError(f"model.kind must be 'conditioner', 'flow', or 'latent_flow', got {kind!r}")
 
     params = model_cfg.get("params") or {}
     if not params.get("n_genes") is None and int(params["n_genes"]) <= 0:
@@ -115,9 +125,21 @@ def static_audit_gen4_config(config: dict) -> dict:
                 raise ValueError(f"a flow config is missing required_fingerprints.{key}")
             if not fingerprints.get(key):
                 unset.append(key)
+    elif kind == "latent_flow":
+        for key in ("expression_autoencoder_checkpoint", "gen4_conditioner_checkpoint"):
+            if key not in fingerprints:
+                raise ValueError(f"a latent-flow config is missing required_fingerprints.{key}")
+            if not fingerprints.get(key):
+                unset.append(key)
+
+    if arm in {"gen4b", "gen4d", "gen4e"}:
+        tile_revision = str((config.get("data") or {}).get("tile_encoder_revision") or "")
+        if len(tile_revision) != 40 or any(char not in "0123456789abcdef" for char in tile_revision):
+            unset.append("data.tile_encoder_revision")
 
     return {
-        "arm": arm, "kind": kind, "checked_required_fingerprints": sorted(expected),
+        "arm": declared_arm, "resolved_gen4_arm": arm, "kind": kind,
+        "checked_required_fingerprints": sorted(expected),
         "unset_required_fingerprints": sorted(set(unset)),
         "ready_for_real_training": len(unset) == 0,
     }
@@ -267,7 +289,12 @@ def audit_uni2_dense_cache_matches_config(cache_root: str | Path, sample_id: str
     not the mandatory-gate default."""
     from gen3_multiscale.gen4.uni2_dense_wsi_cache import _REQUIRED_FIELDS
 
-    path = Path(cache_root) / "uni2_dense_wsi_cache" / f"{sample_id}.npz"
+    configured_root = (config.get("data") or {}).get("uni2_slide_context_cache_dir")
+    path = (
+        Path(str(configured_root)) / f"{sample_id}.npz"
+        if configured_root
+        else Path(cache_root) / "uni2_dense_wsi_cache" / f"{sample_id}.npz"
+    )
     if not path.is_file():
         if require_exists:
             raise FileNotFoundError(
@@ -333,11 +360,9 @@ def audit_gen4_manifest_cache_coverage(cache_root: str | Path, sample_ids: list[
     (`gen5.model_factory.GEN5_TO_GEN4_ARM`), which `_ARM_CACHE_MODALITIES`
     (keyed by Gen4 arm names) would otherwise never recognize, silently
     raising "unknown model.arm" for every real Gen5 experiment. This
-    function is additive to, never a replacement for, Gen3's own
-    tile-encoder-provenance preflight (`training.train.
-    expected_tile_encoder_provenance`/`load_and_preflight_samples`) --
-    a caller must run BOTH; this one only ever adds Gen4/5-specific
-    per-modality checks on top."""
+    This helper verifies the additional Gen4/5 caches. The combined
+    `load_and_preflight_gen4_samples` entry point separately verifies the
+    existing GigaPath inputs for arms that consume them."""
     if not sample_ids:
         raise ValueError("audit_gen4_manifest_cache_coverage requires at least one resolved manifest sample_id")
     from gen3_multiscale.gen4.trainer_adapter import _resolve_gen4_arm

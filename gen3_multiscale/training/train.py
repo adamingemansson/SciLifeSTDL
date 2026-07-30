@@ -643,6 +643,7 @@ def build_model_for_inference(
         return build_gen4_or_gen5_model_for_inference(
             config, gene_names=gene_names, device=device, checkpoint_dir=checkpoint_dir,
             smoke=smoke, staged_smoke=staged_smoke, dataset_manifest=dataset_manifest,
+            cache_content_by_sample=cache_content_by_sample,
         )
     architecture_id = str((config.get("model") or {}).get("architecture", ""))
     training_cfg = config.get("training") or {}
@@ -768,6 +769,49 @@ def model_kind_for_architecture_id(architecture_id: str) -> str:
     no `forward()` at all, so it would have raised `NotImplementedError`
     outright."""
     return "flow" if str(architecture_id) == "4" else "conditioner"
+
+
+def model_identifier_for_config(config: dict) -> str:
+    """Stable model identity shared by Gen3, Gen4, and Gen5 artifacts."""
+    model_cfg = config.get("model") or {}
+    identifier = model_cfg.get("architecture")
+    if identifier is None:
+        identifier = model_cfg.get("arm")
+    if identifier is None or str(identifier) == "":
+        raise ValueError("model must declare either architecture (Gen3) or arm (Gen4/Gen5)")
+    return str(identifier)
+
+
+def model_kind_for_config(config: dict) -> str:
+    """Return the generic execution kind for any supported generation."""
+    model_cfg = config.get("model") or {}
+    kind = model_cfg.get("kind")
+    if kind is not None:
+        kind = str(kind)
+        if kind not in {"conditioner", "flow", "latent_flow"}:
+            raise ValueError(f"unsupported model.kind {kind!r}")
+        return kind
+    return model_kind_for_architecture_id(str(model_cfg.get("architecture", "")))
+
+
+def required_artifact_file_sha256(config: dict) -> dict[str, str]:
+    """Hash every configured regular-file model artifact.
+
+    Cache content is bound separately by preflight, and transactional
+    conditioner checkpoints are bound by their verified bundle identity.
+    This map covers the remaining mutable file paths (UNI2,
+    scFoundation, STPath, LongNet, residual bases, and Gen5's
+    autoencoder) so resume/evaluation cannot silently use replaced
+    bytes at the same path.
+    """
+    hashes: dict[str, str] = {}
+    for name, value in sorted((config.get("required_fingerprints") or {}).items()):
+        if not value:
+            continue
+        path = Path(str(value))
+        if path.is_file():
+            hashes[str(name)] = file_sha256(path)
+    return hashes
 
 
 def predict_for_metrics(
@@ -1229,6 +1273,7 @@ def build_run_manifest(
     gigapath_checkpoint_sha256: str | None = None, gene_residual_basis_gene_names_hash: str | None = None,
     gene_residual_basis_sha256: str | None = None, gene_scale_sha256: str | None = None,
     architecture3_conditioner_info: dict | None = None,
+    staged_conditioner_info: dict | None = None,
 ) -> dict:
     """Requirement #8: one artifact binding dataset, gene panel, split,
     mask, cache, model/checkpoint, configuration, and seed fingerprints
@@ -1250,6 +1295,9 @@ def build_run_manifest(
         if synchronized_init_manifest_path is not None and Path(synchronized_init_manifest_path).is_file()
         else None
     )
+    model_identifier = model_identifier_for_config(config)
+    model_kind = model_kind_for_config(config)
+    staged_info = staged_conditioner_info or architecture3_conditioner_info or {}
     return {
         "version": 2,
         "kind": "gen3_step6_run_manifest",
@@ -1276,7 +1324,10 @@ def build_run_manifest(
             "train": train_schedule.reports,
             "validation": val_schedule.reports if val_schedule is not None else {},
         },
-        "model_architecture": architecture_id,
+        "model_architecture": model_identifier,
+        "model_kind": model_kind,
+        "model_arm": (config.get("model") or {}).get("arm"),
+        "required_artifact_file_sha256": required_artifact_file_sha256(config),
         "checkpoint_dir": str(checkpoint_dir),
         "synchronized_init_manifest_path": (
             str(synchronized_init_manifest_path) if synchronized_init_manifest_path is not None else None
@@ -1300,6 +1351,16 @@ def build_run_manifest(
         "architecture3_conditioner_checkpoint_manifest_sha256": (
             (architecture3_conditioner_info or {}).get("checkpoint_manifest_sha256")
         ),
+        # Gen4/Gen5 use the same staged-conditioner discipline as Gen3
+        # Architecture 4, but their artifact is named
+        # gen4_conditioner_checkpoint. Bind it through one generic set
+        # of fields so resume and evaluation share the same checks.
+        "staged_conditioner_checkpoint_sha256": staged_info.get("checkpoint_sha256"),
+        "staged_conditioner_checkpoint_step": staged_info.get("checkpoint_step"),
+        "staged_conditioner_checkpoint_bundle_id": staged_info.get("checkpoint_bundle_id"),
+        "staged_conditioner_checkpoint_manifest_sha256": staged_info.get(
+            "checkpoint_manifest_sha256"
+        ),
         # Audit #9: informational-only (never part of resume-consistency
         # verification -- a different torch/CUDA patch version resuming
         # the same run is not itself a scientific-identity change).
@@ -1315,7 +1376,8 @@ def build_run_manifest(
 
 
 _RESUME_CONSISTENCY_FIELDS = (
-    "config_identity_fingerprint", "dataset_manifest_fingerprint", "gene_panel_hash", "model_architecture",
+    "config_identity_fingerprint", "dataset_manifest_fingerprint", "gene_panel_hash",
+    "model_architecture", "model_kind", "model_arm", "required_artifact_file_sha256",
     "synchronized_init_manifest_sha256", "gigapath_checkpoint_sha256",
     "gene_residual_basis_gene_names_hash", "gene_residual_basis_sha256", "gene_scale_sha256",
     # Launch blocker #5: real per-sample cache CONTENT identity -- catches
@@ -1332,6 +1394,8 @@ _RESUME_CONSISTENCY_FIELDS = (
     # sha256 + step alone cannot distinguish two DIFFERENT bundles that
     # happen to save byte-identical weights at the same step.
     "architecture3_conditioner_checkpoint_bundle_id", "architecture3_conditioner_checkpoint_manifest_sha256",
+    "staged_conditioner_checkpoint_sha256", "staged_conditioner_checkpoint_step",
+    "staged_conditioner_checkpoint_bundle_id", "staged_conditioner_checkpoint_manifest_sha256",
 )
 
 
@@ -1479,7 +1543,8 @@ def save_best_checkpoint_bundle(
 # BOTH `best/` and a live checkpoint_dir's latest state -- one complete
 # check, not two partial ones.
 _FULL_CHECKPOINT_IDENTITY_FIELDS = (
-    "model_architecture", "config_identity_fingerprint", "dataset_manifest_fingerprint", "gene_panel_hash",
+    "model_architecture", "model_kind", "model_arm", "required_artifact_file_sha256",
+    "config_identity_fingerprint", "dataset_manifest_fingerprint", "gene_panel_hash",
     "synchronized_init_manifest_sha256", "gigapath_checkpoint_sha256",
     "gene_residual_basis_gene_names_hash", "gene_residual_basis_sha256",
     # Codex re-audit of commit 2162ff4, finding #4: "gene_scale_sha256 is
@@ -1506,6 +1571,8 @@ _FULL_CHECKPOINT_IDENTITY_FIELDS = (
     # Codex re-audit of commit 2162ff4, finding #4: "bind conditioner
     # bundle_id + manifest_sha256 as well as weights/step."
     "architecture3_conditioner_checkpoint_bundle_id", "architecture3_conditioner_checkpoint_manifest_sha256",
+    "staged_conditioner_checkpoint_sha256", "staged_conditioner_checkpoint_step",
+    "staged_conditioner_checkpoint_bundle_id", "staged_conditioner_checkpoint_manifest_sha256",
 )
 
 
@@ -1608,11 +1675,15 @@ def verify_full_checkpoint_identity(
 
     architecture_id = str((config.get("model") or {}).get("architecture", ""))
     expected_values = {
-        "model_architecture": architecture_id,
+        "model_architecture": model_identifier_for_config(config),
+        "model_kind": model_kind_for_config(config),
+        "required_artifact_file_sha256": required_artifact_file_sha256(config),
         "config_identity_fingerprint": config_identity_fingerprint(config),
         "dataset_manifest_fingerprint": dataset_manifest_fingerprint(dataset_manifest),
         "gene_panel_hash": gene_panel_hash(gene_names),
     }
+    if (config.get("model") or {}).get("arm") is not None:
+        expected_values["model_arm"] = str((config.get("model") or {})["arm"])
 
     training_cfg = config.get("training") or {}
     synchronized_init_dir = training_cfg.get("synchronized_init_dir")
@@ -1651,6 +1722,20 @@ def verify_full_checkpoint_identity(
             expected_values["architecture3_conditioner_checkpoint_manifest_sha256"] = (
                 conditioner_identity.manifest_sha256
             )
+
+    staged_checkpoint_dir = (
+        required_fingerprints.get("architecture3_conditioner_checkpoint")
+        if architecture_id == "4"
+        else required_fingerprints.get("gen4_conditioner_checkpoint")
+    )
+    if staged_checkpoint_dir:
+        staged_identity = checkpoint_module.resolve_checkpoint_identity(staged_checkpoint_dir)
+        expected_values.update({
+            "staged_conditioner_checkpoint_sha256": staged_identity.weights_sha256,
+            "staged_conditioner_checkpoint_step": staged_identity.step,
+            "staged_conditioner_checkpoint_bundle_id": staged_identity.bundle_dir,
+            "staged_conditioner_checkpoint_manifest_sha256": staged_identity.manifest_sha256,
+        })
 
     for field in _FULL_CHECKPOINT_IDENTITY_FIELDS:
         if field not in expected_values:
@@ -1760,6 +1845,8 @@ def run_training(
     # already-`.get`-based read of the identical field (both sides must
     # compute the same value for resume verification to be meaningful).
     architecture_id = str((config.get("model") or {}).get("architecture", ""))
+    model_identifier = model_identifier_for_config(config)
+    is_gen4_or_gen5 = (config.get("model") or {}).get("arm") is not None
 
     manifest_path = data_cfg.get("gen3_manifest_path")
     if not manifest_path:
@@ -1770,23 +1857,60 @@ def run_training(
 
     # Requirement #1: sample selection and the train/validation/test
     # split are read EXCLUSIVELY from the manifest -- never re-derived.
-    train_ids = list(dataset_manifest["train_sample_ids"])
-    validation_ids = list(dataset_manifest["validation_sample_ids"])
+    declared_train_ids = list(dataset_manifest["train_sample_ids"])
+    declared_validation_ids = list(dataset_manifest["validation_sample_ids"])
+
+    def _resolved_split_ids(field: str, declared: list[str], *, allow_empty: bool) -> list[str]:
+        if field not in data_cfg:
+            return declared
+        selected = [str(sample_id) for sample_id in data_cfg[field]]
+        if len(selected) != len(set(selected)):
+            raise ValueError(f"data.{field} contains duplicate sample ids")
+        unknown = sorted(set(selected) - set(declared))
+        if unknown:
+            raise ValueError(
+                f"data.{field} contains samples outside the manifest-declared split: {unknown}"
+            )
+        if not selected and not allow_empty:
+            raise ValueError(f"data.{field} must select at least one manifest training sample")
+        return selected
+
+    # Used by the fixed-mask capacity gate: preserve the immutable full
+    # manifest identity required by staged conditioners/autoencoders, but
+    # deliberately restrict which declared samples this short diagnostic
+    # iterates. The override is part of the config fingerprint/run
+    # manifest and cannot silently affect a normal resolved config.
+    train_ids = _resolved_split_ids(
+        "train_sample_ids_override", declared_train_ids, allow_empty=False,
+    )
+    validation_ids = _resolved_split_ids(
+        "validation_sample_ids_override", declared_validation_ids, allow_empty=True,
+    )
     if not train_ids:
         raise ValueError("dataset manifest has zero train_sample_ids -- nothing to train on")
 
     checkpoint_dir = Path(training_cfg["checkpoint_dir"])
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # Requirements #3/#4: cache coverage + tile-encoder provenance
     # consistency, BEFORE any model/optimizer/DataLoader is constructed.
     # Preflighted over train+validation samples -- the only manifest
     # roles this trainer touches (test-split evaluation is Step 7's job).
     cfg_om = OmegaConf.create(config)
-    expected_provenance = expected_tile_encoder_provenance(config)
-    samples, preflight_report = load_and_preflight_samples(
-        cfg_om, dataset_manifest, train_ids + validation_ids, expected_provenance,
-    )
+    if is_gen4_or_gen5:
+        from gen3_multiscale.gen4.dataset_adapter import load_and_preflight_gen4_samples
+
+        samples, preflight_report = load_and_preflight_gen4_samples(
+            cfg_om,
+            dataset_manifest,
+            train_ids + validation_ids,
+            config,
+            require_resolved_artifacts=not (smoke and not staged_smoke),
+        )
+    else:
+        expected_provenance = expected_tile_encoder_provenance(config)
+        samples, preflight_report = load_and_preflight_samples(
+            cfg_om, dataset_manifest, train_ids + validation_ids, expected_provenance,
+        )
     # Codex re-audit of commit f7bb8a1, launch blocker #6: "Perform all
     # resume verification before writing preflight reports, mask banks,
     # gene scale, validation history or other checkpoint-directory
@@ -1844,7 +1968,6 @@ def run_training(
     # (`load_and_preflight_samples`/`build_gen3_mask_schedule`), only the
     # per-arm cache wiring (`__getitem__`) differs. See that class's own
     # docstring for exactly which caches each arm consumes.
-    is_gen4_or_gen5 = (config.get("model") or {}).get("arm") is not None
     if is_gen4_or_gen5:
         from gen3_multiscale.gen4.dataset_adapter import Gen4SpatialFieldDataset
 
@@ -1911,6 +2034,7 @@ def run_training(
     gigapath_checkpoint_sha256 = model_info.get("gigapath_checkpoint_sha256")
     synchronized_init_manifest_path = model_info.get("synchronized_init_manifest_path")
     architecture3_conditioner_info = model_info.get("architecture3_conditioner")
+    staged_conditioner_info = model_info.get("conditioner_info") or architecture3_conditioner_info
 
     # Requirement #9: real, TRAINING-ONLY per-gene standardization scale
     # for the spatial-gradient loss -- computed here (train_samples are
@@ -1955,6 +2079,7 @@ def run_training(
         gene_residual_basis_sha256=gene_residual_basis_sha256,
         gene_scale_sha256=gene_scale_sha256,
         architecture3_conditioner_info=architecture3_conditioner_info,
+        staged_conditioner_info=staged_conditioner_info,
     )
     existing_run_manifest_path = checkpoint_dir / "run_manifest.json"
     # Codex re-audit of commit 2162ff4, finding #2: "Resume still trusts
@@ -2118,11 +2243,6 @@ def run_training(
         json.loads(validation_history_path.read_text()) if validation_history_path.is_file() else []
     )
     best_val_loss = min((entry["total"] for entry in validation_history), default=float("inf"))
-    # Fixed, run-stable generator for Architecture 4's validation-only
-    # flow-loss LOGGING (requirement #8: "log flow loss separately with a
-    # fixed generator") -- never used for the selection metric itself.
-    flow_val_generator = torch.Generator(device=device).manual_seed(seed)
-
     def _run_validation(current_step: int) -> dict | None:
         if val_loader is None:
             return None
@@ -2163,6 +2283,14 @@ def run_training(
                 predictive_val_generator = torch.Generator(device=device).manual_seed(
                     common_random_validation_seed(seed, stable_key)
                 )
+                # The secondary flow-loss diagnostic must use common
+                # random numbers too. A single generator created outside
+                # this loop advanced across validation calls, making that
+                # value change between checkpoints solely because it was
+                # evaluated later. Use a separate stable per-item stream.
+                flow_loss_generator = torch.Generator(device=device).manual_seed(
+                    common_random_validation_seed(seed, f"flow_loss:{stable_key}")
+                )
                 val_target_expression = torch.as_tensor(val_targets.query_expression, dtype=torch.float32, device=device)
                 val_query_coords = torch.as_tensor(val_inputs.query_coords, dtype=torch.float32, device=device)
                 # Requirement #8/audit #1: model selection ALWAYS uses the
@@ -2184,12 +2312,12 @@ def run_training(
                     # latent_flow does not (see the `latent_flow` branch
                     # below), only the combined compute_losses() contract.
                     flow_loss = model.compute_flow_matching_loss(
-                        val_inputs, val_target_expression, generator=flow_val_generator,
+                        val_inputs, val_target_expression, generator=flow_loss_generator,
                     )
                     val_flow_losses.append(float(flow_loss))
                 elif kind == "latent_flow":
                     flow_loss = model.compute_losses(
-                        val_inputs, val_target_expression, generator=flow_val_generator,
+                        val_inputs, val_target_expression, generator=flow_loss_generator,
                     )["flow_loss"]
                     val_flow_losses.append(float(flow_loss))
                 if smoke:
@@ -2360,7 +2488,8 @@ def run_training(
 
     elapsed = time.time() - start_time
     summary = {
-        "ok": True, "smoke": smoke, "architecture": architecture_id, "final_step": step,
+        "ok": True, "smoke": smoke, "architecture": model_identifier, "kind": kind,
+        "final_step": step,
         "n_skipped_nonfinite": n_skipped_nonfinite, "elapsed_seconds": elapsed,
         "completion_reason": completion_reason, "checkpoint_dir": str(checkpoint_dir),
     }

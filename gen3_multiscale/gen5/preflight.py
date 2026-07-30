@@ -49,10 +49,15 @@ def static_audit_gen5_config(config: dict) -> dict:
     if missing_keys:
         raise ValueError(f"arm {arm!r} config is missing required_fingerprints key(s): {sorted(missing_keys)}")
     unset = sorted(key for key in expected if not fingerprints.get(key))
+    if arm in {"gen5b", "gen5d", "gen5e"}:
+        tile_revision = str((config.get("data") or {}).get("tile_encoder_revision") or "")
+        if len(tile_revision) != 40 or any(char not in "0123456789abcdef" for char in tile_revision):
+            unset.append("data.tile_encoder_revision")
 
     return {
         "arm": arm, "kind": "latent_flow", "checked_required_fingerprints": sorted(expected),
-        "unset_required_fingerprints": unset, "ready_for_real_training": len(unset) == 0,
+        "unset_required_fingerprints": sorted(set(unset)),
+        "ready_for_real_training": len(unset) == 0,
     }
 
 

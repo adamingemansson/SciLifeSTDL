@@ -3,9 +3,9 @@
 
 Takes a real architectureN.yaml (with data.gen3_manifest_path already set
 to a real, on-disk dataset manifest) and one manifest sample id, builds a
-DERIVED manifest restricted to exactly that one training sample and ZERO
-validation/test samples (written to a fresh temp file -- the original,
-immutable manifest on disk is never modified), then runs
+derived config that selects exactly that one declared training sample and
+zero validation samples while preserving the immutable full manifest
+identity, then runs
 training/train.py's real `run_training` for a small, explicit number of
 real (non-smoke) optimizer steps with no held-out masking at all.
 
@@ -45,7 +45,7 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from gen3_multiscale.data.dataset_manifest import load_dataset_manifest, save_dataset_manifest
+from gen3_multiscale.data.dataset_manifest import load_dataset_manifest
 from gen3_multiscale.evaluation.gen3_evaluator import per_item_reconstruction_metrics
 from gen3_multiscale.training.gen3_dataset import Gen3SpatialFieldDataset, build_gen3_mask_schedule
 from gen3_multiscale.training.gen3_preflight import load_and_preflight_samples
@@ -56,9 +56,8 @@ from gen3_multiscale.training.train import (
 
 
 def build_single_sample_config(config_path: str | Path, sample_id: str, n_steps: int, checkpoint_dir: str | Path) -> Path:
-    """Derive a temp config + temp manifest restricted to one training
-    sample and zero validation/test samples. Returns the temp config's
-    path (the temp manifest it references lives alongside it)."""
+    """Derive a temp config restricted to one training sample and zero
+    validation samples while keeping the original manifest identity."""
     config = OmegaConf.to_container(OmegaConf.load(config_path), resolve=True)
     manifest_path = (config.get("data") or {}).get("gen3_manifest_path")
     if not manifest_path:
@@ -69,15 +68,9 @@ def build_single_sample_config(config_path: str | Path, sample_id: str, n_steps:
     if int(n_steps) < 1:
         raise ValueError(f"--n-steps must be positive, got {n_steps}")
 
-    overfit_manifest = dict(manifest)
-    overfit_manifest["train_sample_ids"] = [sample_id]
-    overfit_manifest["validation_sample_ids"] = []
-    overfit_manifest["test_sample_ids"] = []
-
     tmp_dir = Path(tempfile.mkdtemp(prefix="gen3_step6_overfit_"))
-    overfit_manifest_path = save_dataset_manifest(overfit_manifest, tmp_dir / "overfit_manifest.json")
-
-    config["data"]["gen3_manifest_path"] = str(overfit_manifest_path)
+    config["data"]["train_sample_ids_override"] = [sample_id]
+    config["data"]["validation_sample_ids_override"] = []
     config["training"]["total_steps"] = int(n_steps)
     config["training"]["checkpoint_dir"] = str(checkpoint_dir)
     # No held-out samples exist in this derived manifest, so there is
@@ -98,12 +91,35 @@ def _build_fixed_eval_item(config: dict, manifest: dict, sample_id: str):
     never re-sampled, so "before" and "after" genuinely evaluate the same
     hole."""
     cfg_om = OmegaConf.create(config)
-    expected_provenance = expected_tile_encoder_provenance(config)
-    samples, _preflight_report = load_and_preflight_samples(cfg_om, manifest, [sample_id], expected_provenance)
+    is_gen4_or_gen5 = (config.get("model") or {}).get("arm") is not None
+    if is_gen4_or_gen5:
+        from gen3_multiscale.gen4.dataset_adapter import (
+            Gen4SpatialFieldDataset,
+            load_and_preflight_gen4_samples,
+        )
+
+        samples, preflight_report = load_and_preflight_gen4_samples(
+            cfg_om, manifest, [sample_id], config, require_resolved_artifacts=True,
+        )
+        dataset_cls = Gen4SpatialFieldDataset
+        dataset_extra_args = (cfg_om, list(manifest["gene_panel"]))
+    else:
+        expected_provenance = expected_tile_encoder_provenance(config)
+        samples, preflight_report = load_and_preflight_samples(
+            cfg_om, manifest, [sample_id], expected_provenance,
+        )
+        dataset_cls = Gen3SpatialFieldDataset
+        dataset_extra_args = ()
     strata = config["masking"]["strata"]
-    schedule = build_gen3_mask_schedule(manifest, samples, strata, role="train", n_training_masks_per_sample=1)
-    dataset = Gen3SpatialFieldDataset(manifest, samples, schedule, strata)
-    return dataset[0]
+    schedule = build_gen3_mask_schedule(
+        manifest,
+        samples,
+        strata,
+        role="train",
+        n_training_masks_per_sample=max(1, len(strata)),
+    )
+    dataset = dataset_cls(manifest, samples, schedule, strata, *dataset_extra_args)
+    return dataset[0], preflight_report.get("cache_content_by_sample")
 
 
 def _evaluate_fixed_item(kind: str, model: torch.nn.Module, item, *, generator=None) -> dict:
@@ -158,10 +174,13 @@ def run_overfit_gate(
     overfit_config_path = build_single_sample_config(config_path, sample_id, n_steps, checkpoint_dir)
     config = OmegaConf.to_container(OmegaConf.load(overfit_config_path), resolve=True)
     overfit_manifest = load_dataset_manifest(config["data"]["gen3_manifest_path"])
-    fixed_item = _build_fixed_eval_item(config, overfit_manifest, sample_id)
+    fixed_item, cache_content_by_sample = _build_fixed_eval_item(
+        config, overfit_manifest, sample_id,
+    )
 
-    architecture_id = str(config["model"]["architecture"])
-    kind = model_kind_for_architecture_id(architecture_id)
+    from gen3_multiscale.training.train import model_kind_for_config
+
+    kind = model_kind_for_config(config)
     gene_names = list(overfit_manifest["gene_panel"])
     seed = int(config["training"].get("seed", 0))
     device = torch.device(config["training"].get("device", "cpu") if torch.cuda.is_available() else "cpu")
@@ -169,6 +188,7 @@ def run_overfit_gate(
     before_model, _before_info = build_model_for_inference(
         config, gene_names=gene_names, device=device, checkpoint_dir=None, smoke=False,
         dataset_manifest=overfit_manifest,
+        cache_content_by_sample=cache_content_by_sample,
     )
     before_generator = torch.Generator(device=device).manual_seed(seed)
     before_metrics = _evaluate_fixed_item(kind, before_model, fixed_item, generator=before_generator)
@@ -178,6 +198,7 @@ def run_overfit_gate(
     after_model, _after_info = build_model_for_inference(
         config, gene_names=gene_names, device=device, checkpoint_dir=checkpoint_dir, smoke=False,
         dataset_manifest=overfit_manifest,
+        cache_content_by_sample=cache_content_by_sample,
     )
     after_generator = torch.Generator(device=device).manual_seed(seed)
     after_metrics = _evaluate_fixed_item(kind, after_model, fixed_item, generator=after_generator)

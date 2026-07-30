@@ -38,12 +38,13 @@ def train_expression_autoencoder(
         raise ValueError("need at least 2 training rows to fit an autoencoder")
     if not np.all(np.isfinite(train_expression)):
         raise ValueError("train_expression contains non-finite values")
+    if latent_dim <= 0 or hidden_dim <= 0 or n_epochs <= 0 or batch_size <= 0:
+        raise ValueError("latent_dim, hidden_dim, n_epochs, and batch_size must all be positive")
 
     torch.manual_seed(seed)
     autoencoder = ExpressionAutoencoder(n_genes, gene_names, latent_dim=latent_dim, hidden_dim=hidden_dim).to(device)
     optimizer = torch.optim.Adam(autoencoder.parameters(), lr=lr, weight_decay=weight_decay)
     generator = torch.Generator().manual_seed(seed)
-    data = torch.as_tensor(train_expression, device=device)
 
     autoencoder.train()
     loss_per_epoch = []
@@ -51,7 +52,16 @@ def train_expression_autoencoder(
         perm = torch.randperm(n_rows, generator=generator)
         epoch_loss, n_batches = 0.0, 0
         for start in range(0, n_rows, batch_size):
-            batch = data[perm[start:start + batch_size]]
+            # Slice on CPU first, then transfer only one batch. A real
+            # HEST manifest can contain several GB of full-gene
+            # expression; moving the complete matrix to CUDA defeated
+            # the purpose of batching and could OOM before epoch 1.
+            rows = perm[start:start + batch_size].numpy()
+            batch = torch.as_tensor(
+                np.asarray(train_expression[rows], dtype=np.float32),
+                dtype=torch.float32,
+                device=device,
+            )
             reconstructed = autoencoder(batch)
             loss = torch.nn.functional.mse_loss(reconstructed, batch)
             optimizer.zero_grad()

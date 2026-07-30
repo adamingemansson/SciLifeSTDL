@@ -37,11 +37,11 @@ def test_build_single_sample_config_restricts_to_one_train_sample_and_zero_held_
     assert overfit_config["training"]["total_steps"] == 5
     assert overfit_config["training"]["checkpoint_dir"] == str(overfit_checkpoint_dir)
 
-    overfit_manifest = load_dataset_manifest(overfit_config["data"]["gen3_manifest_path"])
-    assert overfit_manifest["train_sample_ids"] == [sample_id]
-    assert overfit_manifest["validation_sample_ids"] == []
-    assert overfit_manifest["test_sample_ids"] == []
-    # The ORIGINAL manifest on disk must be untouched.
+    assert overfit_config["data"]["gen3_manifest_path"] == str(manifest_path)
+    assert overfit_config["data"]["train_sample_ids_override"] == [sample_id]
+    assert overfit_config["data"]["validation_sample_ids_override"] == []
+    # The immutable full manifest stays untouched so staged conditioner
+    # and autoencoder identities remain valid during flow capacity gates.
     assert load_dataset_manifest(manifest_path)["train_sample_ids"] == manifest["train_sample_ids"]
 
 

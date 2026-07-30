@@ -22,6 +22,24 @@ def test_autoencoder_trains_and_reduces_loss():
     assert report.loss_per_epoch[-1] < report.loss_per_epoch[0]
 
 
+def test_autoencoder_trains_from_disk_backed_expression(tmp_path):
+    path = tmp_path / "expression.npy"
+    expression = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=(32, 6))
+    expression[:] = synthetic_expression(n_rows=32, n_genes=6)
+    expression.flush()
+    _autoencoder, report = train_expression_autoencoder(
+        expression,
+        [f"g{i}" for i in range(6)],
+        latent_dim=4,
+        hidden_dim=8,
+        n_epochs=2,
+        batch_size=8,
+        device="cpu",
+    )
+    assert report.n_rows == 32
+    assert np.isfinite(report.final_train_loss)
+
+
 def test_autoencoder_overfits_a_single_batch():
     """Gate 2: a single small batch, trained long enough, should be
     reconstructed almost exactly -- a real capacity sanity check."""
@@ -140,3 +158,22 @@ def test_no_top_hvg_restriction_full_gene_panel_is_used():
     autoencoder = ExpressionAutoencoder(n_genes, [f"g{i}" for i in range(n_genes)], latent_dim=8, hidden_dim=16)
     assert autoencoder.encoder.net[0].in_features == n_genes
     assert autoencoder.decoder.net[-1].out_features == n_genes
+
+
+def test_streaming_reconstruction_metrics_match_in_memory_metrics():
+    from gen3_multiscale.scripts.train_gen5_autoencoder import _stream_reconstruction_metrics
+
+    rng = np.random.default_rng(17)
+    first = rng.normal(size=(7, 6)).astype(np.float32)
+    second = rng.normal(size=(5, 6)).astype(np.float32)
+    autoencoder = tiny_autoencoder(n_genes=6, latent_dim=4)
+    streaming = _stream_reconstruction_metrics(
+        autoencoder, iter([first, second]), batch_size=3,
+    )
+    direct = evaluate_autoencoder_reconstruction(
+        autoencoder, np.concatenate([first, second]), [f"g{i}" for i in range(6)],
+    )
+    assert streaming["n_rows"] == 12
+    assert streaming["n_valid_pcc_genes"] == 6
+    assert streaming["rmse"] == pytest.approx(direct.rmse, rel=1e-6)
+    assert streaming["pcc_mean"] == pytest.approx(direct.pcc_mean, rel=1e-6)

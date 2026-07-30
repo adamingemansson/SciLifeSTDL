@@ -336,8 +336,17 @@ def evaluate_gen3_checkpoint(
         raise ValueError(f"dataset manifest has zero {split}_sample_ids -- nothing to evaluate")
 
     cfg_om = OmegaConf.create(config)
-    expected_provenance = expected_tile_encoder_provenance(config)
-    samples, preflight_report = load_and_preflight_samples(cfg_om, dataset_manifest, split_ids, expected_provenance)
+    if is_gen4_or_gen5:
+        from gen3_multiscale.gen4.dataset_adapter import load_and_preflight_gen4_samples
+
+        samples, preflight_report = load_and_preflight_gen4_samples(
+            cfg_om, dataset_manifest, split_ids, config, require_resolved_artifacts=True,
+        )
+    else:
+        expected_provenance = expected_tile_encoder_provenance(config)
+        samples, preflight_report = load_and_preflight_samples(
+            cfg_om, dataset_manifest, split_ids, expected_provenance,
+        )
 
     gene_names = list(dataset_manifest["gene_panel"])
     device = torch.device(device_str)

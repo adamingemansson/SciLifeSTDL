@@ -1,80 +1,97 @@
 # Gen5 runbook
 
-See `GEN5_CONTRACT.md` for the full design; `gen3_multiscale/gen4/RUNBOOK.md`
-for the shared conditioning/cache dependency order (unchanged, reused).
+Gen5 uses the same four conditioning systems as Gen4, but the flow
+generates a complete gene-expression vector in the latent space of one
+shared expression autoencoder:
 
-## 1. Dependency order
+| Scientific arm | Config key | Conditioning |
+|---|---|---|
+| 1 | `gen5c` | UNI2 + scFoundation |
+| 2 | `gen5b` | GigaPath + scFoundation |
+| 3 | `gen5d` | STPath joint conditioner |
+| 4 | `gen5e` | STPath + UNI2 + scFoundation |
 
-```
-1. Complete Gen4's own dependency order (gen4/RUNBOOK.md section 1) for
-   each arm through step 5: a real, validation-selected, frozen Gen4
-   conditioner checkpoint per arm.
+`gen5a` is the optional UNI2 + weighted-linear-GEX baseline.
 
-2. Fit the shared expression autoencoder (ONCE, training samples only):
-   gen5/autoencoder_training.py::train_expression_autoencoder(
-       train_expression, gene_names, latent_dim=256, ...)
-   gen5/autoencoder.py::save_expression_autoencoder_checkpoint(...)
+## Real run order
 
-3. Run the autoencoder capacity gate (gen5/autoencoder.py::
-   evaluate_autoencoder_reconstruction) on held-out training spots AND
-   real validation spots. Report the reconstruction ceiling before
-   proceeding -- no flow arm's decoded output can exceed it.
+1. Build and validate the caches described in
+   `gen3_multiscale/gen4/RUNBOOK.md`.
 
-4. Per arm, train the latent flow:
-   gen5/model_factory.py::build_gen5_model(config, ..., autoencoder=<step 2's
-   frozen checkpoint>) -- load the arm's frozen Gen4 conditioner checkpoint
-   into model.conditioner, call model.freeze_conditioner(), then train
-   model.velocity_network only (Adam over
-   [p for p in model.parameters() if p.requires_grad]).
+2. Train the shared autoencoder once, from training-split expression only:
 
-5. Evaluate (validation, then test exactly once):
-   gen5/evaluator.py::compare_gen5_arm(...) against the matched Gen4
-   residual-flow arm, the deterministic conditioner, and the
-   mean/nearest-neighbor/harmonic baselines.
-```
+   ```bash
+   python -m gen3_multiscale.scripts.train_gen5_autoencoder \
+     --manifest <manifest.json> \
+     --output-checkpoint <run>/shared_autoencoder.pt \
+     --latent-dim 256 --hidden-dim 1024 \
+     --epochs 50 --batch-size 64 --device cuda
+   ```
 
-## 2. Smoke check (run this first, always)
+   The implementation uses a disk-backed expression matrix and transfers
+   only one mini-batch to the GPU. Inspect the emitted reconstruction
+   report before proceeding; this is the ceiling imposed on every Gen5
+   arm by the shared decoder.
 
-```bash
-python -m gen3_multiscale.scripts.gen5_smoke_launcher
-```
+3. Train and validation-select the matching Gen4 deterministic conditioner
+   for each arm. Gen5 must consume that exact verified immutable bundle,
+   not a freshly initialized or differently selected conditioner.
 
-Trains a tiny autoencoder on synthetic data, then constructs and runs one
-real optimizer step + one real sampling call for all four arms. No GPU,
-no real weights, no full training loop. Reports peak CPU RSS as a
-stand-in for the CUDA memory smoke test (§4).
+4. Resolve each Gen5 config with the manifest, frozen Gen4 conditioner,
+   shared encoder checkpoint, shared decoder checkpoint, and arm-specific
+   encoder/cache identities:
 
-## 3. Static preflight
+   ```bash
+   python -m gen3_multiscale.scripts.resolve_gen45_config \
+     --base-config gen3_multiscale/configs/gen5/gen5c.yaml \
+     --output-config <run>/gen5c.yaml \
+     --manifest <manifest.json> \
+     --checkpoint-dir <run>/gen5c_checkpoints \
+     --fingerprint gen4_conditioner_checkpoint=<selected-gen4-bundle> \
+     --fingerprint expression_autoencoder_checkpoint=<run>/shared_autoencoder.pt \
+     <arm-specific --fingerprint arguments>
+   ```
 
-```bash
-python -m gen3_multiscale.gen5.preflight --config configs/gen5/gen5a.yaml
-```
+5. Run a real-artifact staged smoke and fixed-mask capacity gate, then the
+   full latent-flow run:
 
-Every committed config currently reports `ready_for_real_training: false`
--- correct, no real checkpoint paths have been filled in yet.
+   ```bash
+   python -m gen3_multiscale.training.train \
+     --config <resolved_gen5.yaml> --smoke --staged-smoke
 
-## 4. Honest gaps -- what still needs real weights/GPU validation
+   python -m gen3_multiscale.scripts.step6_overfit_test \
+     --config <resolved_gen5.yaml> \
+     --sample-id <training-sample> \
+     --checkpoint-dir <overfit-output>
 
-Everything already listed in `gen4/RUNBOOK.md` section 4 (UNI2/scFoundation/
-STPath real weights, dense-WSI UNI2 cache, full manifest-driven mask
-iterator, real HEST-1k run) applies identically to Gen5's conditioning
-side, plus:
+   python -m gen3_multiscale.training.train \
+     --config <resolved_gen5.yaml>
+   ```
 
-- **No real Gen4 conditioner checkpoint exists.** Gen5's own tests and
-  smoke launcher only ever construct fresh (random-init) `Gen4Conditioner`
-  instances -- the "matched conditioning systems" guarantee (loading the
-  SAME trained weights Gen4 used) has never been exercised end-to-end.
-- **CUDA memory smoke test (required gate 9) has not run on real
-  hardware.** This environment has no GPU. The smoke launcher's peak-RSS
-  report is a CPU proxy only, not a substitute for
-  `torch.cuda.max_memory_allocated()` under a real batch/hole size.
-- **`gen5/evaluator.py::compare_gen5_arm` has never run against real
-  model outputs** -- only against hand-constructed synthetic arrays in
-  its own (implicit, via the metrics module's existing tests) numerical
-  correctness; no test in this round calls it with genuine Gen4/Gen5
-  model predictions end to end, since no trained checkpoint exists to
-  produce them.
-- **Autoencoder latent_dim=256 is untested at that width** -- every test
-  and the smoke launcher use tiny latent dims (8-12) for CPU speed; the
-  real 256-dim configuration has been constructed (`configs/gen5/*.yaml`
-  parse and pass the static audit) but never trained or evaluated.
+6. Evaluate on validation using the common evaluator. Compare the Gen5
+   latent flow with its matched Gen4 residual flow, its deterministic
+   conditioner, and the same mean/nearest-neighbor/harmonic baselines.
+   Use the test split once only after selection is frozen.
+
+## Reliability gates
+
+- Gen5 reuses the same arm-specific real-data adapter, query exclusion,
+  cache coverage/provenance checks, mask schedule, and metric pipeline as
+  Gen4/Gen3.
+- The autoencoder checkpoint is bound to the frozen gene order, dataset,
+  code state, and numeric checkpoint SHA256.
+- The frozen Gen4 conditioner is resolved once, identity-verified, and
+  pinned for the run.
+- Only the latent velocity network trains; both conditioner and
+  autoencoder remain frozen and in evaluation mode.
+- Validation predictions use stable per-item generators. Reports retain
+  exact checkpoint identity and full-gene, train-derived top-50/top-200,
+  per-stratum, nonzero-AUC, paired-baseline, and uncertainty metrics where
+  applicable.
+
+## Required hardware validation
+
+Before long training, run the staged smoke with the real external weights,
+then verify autoencoder reconstruction, one real optimizer step, finite
+gradients, memory use, and a fixed-mask overfit improvement. The local
+test suite cannot replace this target-GPU real-weight gate.

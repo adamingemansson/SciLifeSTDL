@@ -321,7 +321,11 @@ class FrozenSCFoundationEncoder(nn.Module):
         value_labels = pretrain_gene_x > 0
         x, x_padding = gather_scfoundation_data(pretrain_gene_x, value_labels, self.pad_token_id)
         position_gene_ids, _ = gather_scfoundation_data(data_gene_ids.float(), value_labels, self.pad_token_id)
-        assert not bool(x_padding.any())  # batch of 1: max_num == this row's own count, by construction
+        if bool(x_padding.any()):
+            raise RuntimeError(
+                "single-row scFoundation gather unexpectedly produced padding; "
+                "the installed scFoundation API does not match the supported contract"
+            )
 
         x = self.model.token_emb(torch.unsqueeze(x, 2).float(), output_weight=0)
         position_emb = self.model.pos_emb(position_gene_ids.long())

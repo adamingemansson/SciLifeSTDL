@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Iterable
+from typing import Sequence
 
 import numpy as np
 import torch
@@ -28,7 +28,7 @@ from gen3_multiscale.models.gene_basis import GeneResidualBasis, fit_gene_residu
 
 
 def compute_gen4_training_residuals(
-    conditioner, train_examples: list, device: torch.device, *, memmap_path: str | Path,
+    conditioner, train_examples: Sequence, device: torch.device, *, memmap_path: str | Path,
 ) -> np.memmap:
     """`conditioner` is a frozen (eval-mode) `Gen4Conditioner` for one arm.
     `train_examples` is a real, materialized list of `(inputs, targets)`
@@ -67,7 +67,7 @@ def compute_gen4_training_residuals(
 
 
 def fit_gen4_residual_basis(
-    conditioner, train_examples: list, gene_names: list[str], *, rank: int = 64,
+    conditioner, train_examples: Sequence, gene_names: list[str], *, rank: int = 64,
     device: torch.device | None = None, output_basis_path: str | Path,
 ) -> GeneResidualBasis:
     device = device or torch.device("cpu")

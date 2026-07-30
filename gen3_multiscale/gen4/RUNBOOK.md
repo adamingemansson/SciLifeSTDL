@@ -1,147 +1,124 @@
 # Gen4 runbook
 
-See `GEN4_CONTRACT.md` for the full design. This is the operational
-dependency order and an honest list of what still needs real weights/GPU
-validation before any real run.
+Gen4 compares four conditioning systems under the same deterministic
+conditioner and residual-flow training/evaluation pipeline:
 
-## 0. Scope reminder
+| Scientific arm | Config key | Conditioning |
+|---|---|---|
+| 1 | `gen4c` | UNI2 + scFoundation |
+| 2 | `gen4b` | GigaPath + scFoundation |
+| 3 | `gen4d` | STPath joint conditioner |
+| 4 | `gen4e` | STPath + UNI2 + scFoundation |
 
-Nothing in this suite has downloaded a checkpoint, loaded real UNI2/
-scFoundation/STPath weights, or started a training run. Every test in
-`tests/test_gen4_*.py` and the smoke launcher below run on tiny synthetic
-CPU data with deterministic stub encoders
-(`tests/_gen4_fixtures.py::StubUNI2Encoder`/`StubSCFoundationEncoder`/
-`Gen4STPathStub`).
+`gen4a` (UNI2 + weighted-linear GEX) is an optional baseline, not one of
+the four primary arms.
 
-## 1. Dependency order, per arm
+## Real run order
 
-```
-1. Precompute caches (skip for arm D's image slot -- see step 3):
-   - Arm A: gen4/uni2_spot_cache.py (UNI2 features)
-   - Arm B: existing GigaPath spot cache (unchanged) + gen4/scfoundation_cache.py
-   - Arm C: gen4/uni2_spot_cache.py + gen4/scfoundation_cache.py
-   - Arm D: existing GigaPath spot cache only (STPath's own image tokenizer input)
+Use one immutable dataset manifest and the same mask bank, gene panel,
+split, optimizer settings, and evaluation protocol for all arms.
 
-2. gen4/preflight.py --config configs/gen4/<arm>_conditioner.yaml
-   (static schema/provenance checks; also run audit_uni2_cache_matches_config /
-   audit_scfoundation_cache_matches_config against the caches built in step 1)
+1. Precompute the required frozen features once:
 
-3. Build Gen4SpatialFieldInputs per training/validation/test mask:
-   - Arms A-C: gen4/inputs.py::build_gen4_spatial_field_example
-     (precomputed_spot_features from step 1's image cache;
-      gex_context_embedding from step 1's scFoundation cache, arms B/C only)
-   - Arm D: gen4/inputs.py::build_gen4_spatial_field_example (same builder
-     as arm B -- raw observed coords/expression/GigaPath-tokenizer-input
-     features pass through unchanged). STPath's own trainable
-     `encode_context_only` call happens LIVE inside
-     `Gen4Conditioner._observed_tokens` on every forward pass, not at data-
-     build time -- construct the arm with
-     `image_feature_source="stpath_context"`,
-     `gex_feature_source="stpath_joint"`, `stpath_encoder=<real Gen4STPathContextEncoder>`
-     so gradients reach STPath's trainable projection (Codex audit finding
-     #3: a prior version ran this encoding under `torch.no_grad()` at data-
-     build time, which permanently froze that projection at its random
-     init). See GEN4_CONTRACT.md section 8 for why the encoding cannot be
-     precomputed once independent of the mask.
+   ```bash
+   python -m gen3_multiscale.scripts.precompute_gen45_features \
+     --manifest <manifest.json> \
+     --modalities both \
+     --uni2-checkpoint <UNI2-h.bin> \
+     --uni2-revision <40-hex-commit> \
+     --scfoundation-checkpoint <scfoundation.ckpt> \
+     --scfoundation-vocab <vocab.json> \
+     --device cuda
+   ```
 
-4. Train the deterministic conditioner:
-   gen4/model_factory.py::build_gen4_conditioner(config, ...) + an ordinary
-   training loop reusing training/checkpoint.py's save_checkpoint/
-   load_trainable_state directly (both are already architecture-agnostic).
+   Use `--shard-index I --n-shards N` to split cache construction across
+   GPUs. The command loads each encoder once and writes provenance-bound
+   caches. Arms using GigaPath/STPath additionally consume the existing
+   provenance-bound GigaPath spot caches.
 
-5. Select the conditioner's best checkpoint using VALIDATION ONLY.
+2. Resolve each conditioner config. Supply only the artifacts required by
+   that arm; resolution fails if required values remain unset:
 
-6. Freeze that checkpoint; fit the rank-64 residual basis:
-   gen4/basis_fit.py::fit_gen4_residual_basis(frozen_conditioner,
-   TRAINING-only examples, gene_names, rank=64, output_basis_path=...)
+   ```bash
+   python -m gen3_multiscale.scripts.resolve_gen45_config \
+     --base-config gen3_multiscale/configs/gen4/gen4c_conditioner.yaml \
+     --output-config <run>/gen4c_conditioner.yaml \
+     --manifest <manifest.json> \
+     --checkpoint-dir <run>/gen4c_conditioner_checkpoints \
+     --fingerprint uni2_checkpoint=<UNI2-h.bin> \
+     --fingerprint uni2_revision=<40-hex-commit> \
+     --fingerprint scfoundation_checkpoint=<scfoundation.ckpt> \
+     --fingerprint scfoundation_vocab=<vocab.json> \
+     --fingerprint uni2_package_version=<timm-version> \
+     --fingerprint uni2_preprocessing_spec=<spec> \
+     --fingerprint scfoundation_package_version=<package-version> \
+     --fingerprint scfoundation_preprocessing_spec=<spec>
+   ```
 
-7. Train the flow model:
-   gen4/model_factory.py::build_gen4_flow(config, ..., gene_basis=<step 6>,
-   gene_names=...) -- load the frozen conditioner checkpoint's weights
-   into model.conditioner before training, matching Gen3 Architecture 4's
-   own "freeze_conditioner_initially" discipline.
+3. Run the real-artifact staged smoke, then the fixed-mask capacity gate:
 
-8. Evaluate (validation, then test exactly once) -- see section 4 below
-   for the current evaluator-reuse boundary.
-```
+   ```bash
+   python -m gen3_multiscale.training.train \
+     --config <resolved_conditioner.yaml> --smoke --staged-smoke
 
-## 2. Smoke check (run this first, always)
+   python -m gen3_multiscale.scripts.step6_overfit_test \
+     --config <resolved_conditioner.yaml> \
+     --sample-id <training-sample> \
+     --checkpoint-dir <overfit-output>
+   ```
 
-```bash
-python -m gen3_multiscale.scripts.gen4_smoke_launcher
-```
+4. Train the conditioner and select its best checkpoint using validation
+   only:
 
-Constructs all four arms' conditioner + flow model at tiny dims with stub
-encoders, runs one real optimizer step each, and one
-`sample_predictive_distribution` call. No GPU, no real weights. Exits
-non-zero on any exception; prints one report dict per arm on success.
+   ```bash
+   python -m gen3_multiscale.training.train \
+     --config <resolved_conditioner.yaml>
 
-## 3. Parameter counts / frozen vs. trainable
+   python -m gen3_multiscale.evaluation.gen3_evaluator \
+     --config <resolved_conditioner.yaml> \
+     --checkpoint-dir <conditioner-checkpoints> \
+     --output <validation-report.json> \
+     --split validation
+   ```
 
-Run `gen4/param_report.py::report_parameters(model)` on any constructed
-model for a live table (per GEN4_CONTRACT.md section 3's summary). Example
-from the smoke launcher's tiny dims (real deployment dims will differ, but
-the frozen-vs-trainable SHAPE per arm is the same):
+5. Fit the rank-64 residual basis from training masks only:
 
-| Arm | Conditioner params | Flow params | `gene_encoder` (WeightedGeneExpressionEncoder) | `slide_encoder` |
-|---|---|---|---|---|
-| A (`gen4a`) | 146,888 | 167,763 | trainable | trainable (`MaskAwareCoordinateAttentionPool`) |
-| B (`gen4b`) | 138,474 | 159,349 | constructed, frozen (never called) | frozen (`FrozenGigaPathSlideEncoder`) |
-| C (`gen4c`) | 146,922 | 167,797 | constructed, frozen (never called) | trainable (`MaskAwareCoordinateAttentionPool`) |
-| D (`gen4d`) | 126,782 | 147,657 | trainable | n/a (no global branch) |
+   ```bash
+   python -m gen3_multiscale.scripts.fit_gen4_residual_basis \
+     --config <resolved_conditioner.yaml> \
+     --conditioner-checkpoint-dir <selected-conditioner-bundle> \
+     --output-basis-path <run>/basis.pt \
+     --n-masks-per-sample 20 --rank 64 --device cuda
+   ```
 
-(`gex_context_proj`, present only for arms B/C, is always trainable.)
+6. Resolve the matching flow config with the exact selected conditioner
+   bundle and basis (`gen4_conditioner_checkpoint` and
+   `gene_residual_basis`), then repeat staged smoke, capacity gate, full
+   training, and validation evaluation.
 
-## 4. Honest gaps -- what still needs real weights/GPU validation
+7. Compare arms on validation. Touch the test split once, only after the
+   model-selection rule is frozen.
 
-- **UNI2**: `gen4/uni2_encoder.py::FrozenUNI2TileEncoder` has never run
-  against a real UNI2 checkpoint in this environment. Its `timm.create_model`
-  call, `load_state_dict` strictness, and real `output_dim` (assumed 1536
-  as a placeholder in `configs/gen4/gen4a_conditioner.yaml`/`gen4c_conditioner.yaml`
-  -- verify against the real checkpoint) are all unverified against the
-  actual pretrained weights.
-- **scFoundation**: `gen4/scfoundation_encoder.py::FrozenSCFoundationEncoder`
-  depends on an `import scfoundation` package and a
-  `scfoundation.build_model_from_state_dict` call that has never been
-  exercised against a real installation -- the real package's public API
-  was not available to verify in this environment. `output_dim` (assumed
-  3072 as a placeholder in `configs/gen4/gen4b_conditioner.yaml`/
-  `gen4c_conditioner.yaml`) must be confirmed against the real checkpoint.
-- **STPath**: `gen4/stpath_context.py::Gen4STPathContextEncoder.encode_context_only`
-  has never run against the real `stpath` package/weights. It is built by
-  close reading of the already-verified `src/models/stpath_encoder.py`
-  (same repo, same tokenizer/model call shape) but the context-only token
-  assembly (all rows real, no query concatenation) has not been run
-  end-to-end against `stpath.model.model.STFM.prediction_head`.
-- **Full manifest-driven mask-schedule integration for basis fitting**:
-  `gen4/basis_fit.py` takes an already-materialized list of
-  `(inputs, targets)` pairs, not a manifest + mask-schedule spec. Wiring a
-  real training-mask iterator (mirroring
-  `training.gen3_dataset.Gen3SpatialFieldDataset`/`build_gen3_mask_schedule`,
-  extended to attach each arm's `context_gex_embedding`/STPath per-mask
-  step) is real-data-dependent integration work not attempted this round.
-- **No full trainer/evaluator CLI**: this suite reuses
-  `training/checkpoint.py` directly (architecture-agnostic, verified) but
-  does not wire Gen4 arms into `training/train.py`'s or
-  `evaluation/gen3_evaluator.py`'s own CLIs (both are coupled to
-  `models/model_factory.py`'s "1"-"4" architecture dispatch, which this
-  suite deliberately never modifies -- GEN4_CONTRACT.md section 13).
-- **Dense-WSI UNI2 tile cache**: arms A/C's regional/global branches
-  assume a UNI2-encoded dense-WSI tile cache analogous to
-  `data/slide_context.py`'s existing GigaPath one; no such cache builder
-  exists yet (the per-spot cache in `gen4/uni2_spot_cache.py` is built,
-  the dense-tile analog is not).
-- **Real HEST-1k end-to-end run for any arm**: every test and the smoke
-  launcher use tiny synthetic (non-HEST) or synthetic-HEST-shaped data;
-  no arm has been run against real HEST-1k samples.
+## Reliability gates
 
-## 5. Static preflight/audit
+- The real trainer/evaluator run arm-specific cache coverage and provenance
+  checks before constructing a model, optimizer, or DataLoader.
+- Query spots and H&E-overlapping rows are absent/zeroed in every context
+  modality.
+- Flow runs verify and freeze the exact selected conditioner bundle and
+  verify the residual-basis sidecar against its dataset, gene panel,
+  conditioner, mask schedule, and numeric basis content.
+- Run manifests and checkpoints bind code state, dataset/gene/mask
+  fingerprints, per-sample cache contents, and every configured model
+  artifact SHA256.
+- Validation model selection uses deterministic reconstruction; flow
+  diagnostic sampling uses stable per-item common random numbers.
 
-```bash
-python -m gen3_multiscale.gen4.preflight --config configs/gen4/gen4a_conditioner.yaml
-```
+## Required hardware validation
 
-Prints a JSON report (arm, kind, which `required_fingerprints` are still
-unset, `ready_for_real_training`). Every committed config in
-`configs/gen4/` currently reports `ready_for_real_training: false` --
-correct, since no real checkpoint paths have been filled in.
+Before a long run, execute one staged smoke with the real UNI2,
+scFoundation, and STPath installations/checkpoints on the target GPU.
+This repository's automated tests use faithful stubs because those gated
+weights/packages are not available in the local development environment.
+Do not start a long run if any real-weight construction, cache provenance,
+capacity, finiteness, or memory gate fails.

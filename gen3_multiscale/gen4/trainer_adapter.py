@@ -31,6 +31,8 @@ extra config field is needed to know its dimensions ahead of time.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import torch
@@ -46,6 +48,140 @@ _UNLOADED_CONDITIONER_INFO = {
     "loaded": False, "checkpoint_dir": None, "checkpoint_sha256": None, "checkpoint_step": None,
     "checkpoint_bundle_id": None, "checkpoint_manifest_sha256": None,
 }
+
+
+def _numeric_basis_sha256(gene_basis) -> str:
+    import numpy as np
+
+    return hashlib.sha256(
+        np.ascontiguousarray(gene_basis.basis.detach().cpu().numpy()).tobytes()
+    ).hexdigest()
+
+
+def _pin_and_verify_conditioner(
+    checkpoint_dir: str | Path,
+    *,
+    expected_arm: str,
+    dataset_manifest: dict,
+    gene_names: list[str],
+    cache_content_by_sample: dict[str, dict] | None,
+):
+    """Resolve once and verify the staged conditioner in its own config.
+
+    A flow config is intentionally not config-identical to its
+    conditioner config, so checkpoint verification must use the
+    conditioner bundle's own model_config.json while still requiring the
+    current dataset, gene panel, and per-sample cache content to match.
+    """
+    identity = checkpoint_module.resolve_checkpoint_identity(checkpoint_dir)
+    bundled_config_path = identity.resolved_dir / "model_config.json"
+    if not bundled_config_path.is_file():
+        raise ValueError(f"{identity.resolved_dir}: staged conditioner has no model_config.json")
+    conditioner_config = json.loads(bundled_config_path.read_text())
+    if str((conditioner_config.get("model") or {}).get("kind")) != "conditioner":
+        raise ValueError(
+            f"{identity.resolved_dir}: staged checkpoint is not a deterministic conditioner"
+        )
+    actual_arm = _resolve_gen4_arm(conditioner_config)
+    if actual_arm != expected_arm:
+        raise ValueError(
+            f"staged conditioner arm {actual_arm!r} does not match requested flow arm {expected_arm!r}"
+        )
+    from gen3_multiscale.training.train import verify_full_checkpoint_identity
+
+    verify_full_checkpoint_identity(
+        identity.resolved_dir,
+        config=conditioner_config,
+        dataset_manifest=dataset_manifest,
+        gene_names=gene_names,
+        cache_content_by_sample=cache_content_by_sample,
+    )
+    return identity
+
+
+def _verify_gen4_basis_provenance(
+    basis_path: str | Path,
+    gene_basis,
+    *,
+    dataset_manifest: dict,
+    gene_names: list[str],
+    conditioner_identity,
+    cache_content_by_sample: dict[str, dict] | None,
+) -> dict:
+    """Require the residual basis to describe this exact staged run."""
+    from gen3_multiscale.data.dataset_manifest import gene_panel_hash
+    from gen3_multiscale.training.train import dataset_manifest_fingerprint
+
+    conditioner_run_manifest = checkpoint_module.load_checkpoint_run_manifest(
+        conditioner_identity.resolved_dir
+    )
+    if not conditioner_run_manifest:
+        raise ValueError(
+            f"{conditioner_identity.resolved_dir}: staged conditioner has no bound run manifest"
+        )
+    provenance_path = Path(f"{basis_path}.provenance.json")
+    if not provenance_path.is_file():
+        raise ValueError(
+            f"Gen4 residual basis provenance is missing at {provenance_path}; "
+            "fit it with scripts.fit_gen4_residual_basis"
+        )
+    provenance = json.loads(provenance_path.read_text())
+    expected = {
+        "kind": "gen4_residual_basis_provenance",
+        "conditioner_config_identity_fingerprint": conditioner_run_manifest.get(
+            "config_identity_fingerprint"
+        ),
+        "dataset_manifest_fingerprint": dataset_manifest_fingerprint(dataset_manifest),
+        "gene_panel_hash": gene_panel_hash(gene_names),
+        "conditioner_checkpoint_sha256": conditioner_identity.weights_sha256,
+        "conditioner_checkpoint_step": conditioner_identity.step,
+        "conditioner_checkpoint_bundle_id": conditioner_identity.bundle_dir,
+        "conditioner_checkpoint_manifest_sha256": conditioner_identity.manifest_sha256,
+        "gene_residual_basis_sha256": _numeric_basis_sha256(gene_basis),
+    }
+    mismatches = {
+        field: (provenance.get(field), value)
+        for field, value in expected.items()
+        if provenance.get(field) != value
+    }
+    if mismatches:
+        raise ValueError(
+            f"Gen4 residual basis {basis_path} provenance does not match this run: {mismatches}"
+        )
+    train_ids = sorted(dataset_manifest.get("train_sample_ids") or [])
+    if sorted(provenance.get("train_sample_ids") or []) != train_ids:
+        raise ValueError(
+            f"Gen4 residual basis {basis_path} was not fit on the manifest's exact training sample set"
+        )
+    reports = provenance.get("mask_schedule_reports")
+    recorded_schedule_fingerprint = provenance.get("training_mask_schedule_fingerprint")
+    if not reports or not recorded_schedule_fingerprint:
+        raise ValueError(
+            f"Gen4 residual basis {basis_path} does not bind its realized training-mask schedule"
+        )
+    recomputed_schedule_fingerprint = hashlib.sha256(
+        json.dumps(reports, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    if recorded_schedule_fingerprint != recomputed_schedule_fingerprint:
+        raise ValueError(
+            f"Gen4 residual basis {basis_path} has an inconsistent training-mask schedule fingerprint"
+        )
+    recorded_cache = provenance.get("cache_content_by_sample")
+    if not isinstance(recorded_cache, dict):
+        raise ValueError(f"Gen4 residual basis {basis_path} has no per-sample cache provenance")
+    missing_recorded = sorted(set(train_ids) - set(recorded_cache))
+    if missing_recorded:
+        raise ValueError(
+            f"Gen4 residual basis {basis_path} omitted training cache identities for {missing_recorded}"
+        )
+    live_cache = cache_content_by_sample or {}
+    for sample_id in sorted(set(train_ids) & set(live_cache)):
+        if recorded_cache[sample_id] != live_cache[sample_id]:
+            raise ValueError(
+                f"Gen4 residual basis {basis_path} cache identity for {sample_id!r} "
+                "does not match the live preflight"
+            )
+    return provenance
 
 
 def is_gen4_config(config: dict) -> bool:
@@ -122,6 +258,8 @@ def _maybe_build_stpath_encoder(config: dict, gen4_arm: str, gene_names: list[st
 def build_gen4_model_for_inference(
     config: dict, *, gene_names: list[str], device: torch.device,
     checkpoint_dir: str | Path | None = None, smoke: bool = False, staged_smoke: bool = False,
+    dataset_manifest: dict | None = None,
+    cache_content_by_sample: dict[str, dict] | None = None,
 ) -> tuple[nn.Module, dict]:
     """Gen4 equivalent of `train.py::build_model_for_inference` (called
     from that same function once it detects `is_gen4_config(config)`) --
@@ -158,6 +296,7 @@ def build_gen4_model_for_inference(
     slide_encoder, gigapath_checkpoint_sha256 = _maybe_build_gigapath_slide_encoder(config, gen4_arm)
 
     torch.manual_seed(seed)
+    basis_info = None
     if kind == "conditioner":
         model = gen4_model_factory.build_gen4_conditioner(
             config, n_genes=n_genes, gex_feature_dim=gex_feature_dim, image_feature_dim=image_feature_dim,
@@ -172,11 +311,49 @@ def build_gen4_model_for_inference(
             if not smoke:
                 raise ValueError(
                     "a Gen4 flow config requires required_fingerprints.gene_residual_basis -- fit one "
-                    "offline (gen4/basis_fit.py) from the matching, already-trained gen4 conditioner first"
+                    "offline from the matching, already-trained Gen4 conditioner first"
                 )
             gene_basis = None
         else:
             gene_basis = load_gene_residual_basis(basis_path)
+
+        conditioner_checkpoint_dir = fingerprints.get("gen4_conditioner_checkpoint")
+        needs_conditioner = not (smoke and not staged_smoke)
+        pinned_conditioner_identity = None
+        if needs_conditioner:
+            if not conditioner_checkpoint_dir:
+                raise ValueError(
+                    "a Gen4 flow config requires required_fingerprints.gen4_conditioner_checkpoint -- "
+                    "train and validation-select the matching conditioner first"
+                )
+            if dataset_manifest is not None:
+                pinned_conditioner_identity = _pin_and_verify_conditioner(
+                    conditioner_checkpoint_dir,
+                    expected_arm=gen4_arm,
+                    dataset_manifest=dataset_manifest,
+                    gene_names=gene_names,
+                    cache_content_by_sample=cache_content_by_sample,
+                )
+            else:
+                # Backward-compatible low-level construction path used
+                # by isolated model tests. The real trainer/evaluator/
+                # overfit adapters always supply a manifest and take the
+                # complete identity-verification branch above.
+                pinned_conditioner_identity = checkpoint_module.resolve_checkpoint_identity(
+                    conditioner_checkpoint_dir
+                )
+                checkpoint_module.verify_gene_names(
+                    pinned_conditioner_identity.resolved_dir, gene_names,
+                )
+        if basis_path and pinned_conditioner_identity is not None and dataset_manifest is not None:
+            basis_info = _verify_gen4_basis_provenance(
+                basis_path,
+                gene_basis,
+                dataset_manifest=dataset_manifest,
+                gene_names=gene_names,
+                conditioner_identity=pinned_conditioner_identity,
+                cache_content_by_sample=cache_content_by_sample,
+            )
         if gene_basis is None:
             # Construction-only smoke with no real basis configured yet --
             # never reachable for a real (non-smoke) run per the check above.
@@ -194,18 +371,9 @@ def build_gen4_model_for_inference(
             gene_basis=gene_basis, gene_names=gene_names, stpath_encoder=stpath_encoder, seed=seed,
         ).to(device)
 
-        conditioner_checkpoint_dir = (config.get("required_fingerprints") or {}).get("gen4_conditioner_checkpoint")
-        needs_conditioner = not (smoke and not staged_smoke)
-        if conditioner_checkpoint_dir and needs_conditioner:
+        if pinned_conditioner_identity is not None:
             conditioner_info = gen4_staged_loader.load_and_freeze_deterministic_conditioner(
-                model, str(conditioner_checkpoint_dir), gene_names,
-            )
-        elif needs_conditioner:
-            raise ValueError(
-                "a Gen4 flow config requires required_fingerprints.gen4_conditioner_checkpoint -- a real, "
-                "already-trained, validation-selected gen4 conditioner checkpoint_dir. Train the matching "
-                "conditioner arm to completion first; a Gen4 flow model must never start training from a "
-                "random or unstaged conditioner"
+                model, str(pinned_conditioner_identity.resolved_dir), gene_names,
             )
         else:
             conditioner_info = dict(_UNLOADED_CONDITIONER_INFO)
@@ -219,6 +387,7 @@ def build_gen4_model_for_inference(
     return model, {
         "kind": kind,
         "conditioner_info": conditioner_info,
+        "gene_basis_info": basis_info,
         "autoencoder_info": None,
         "checkpoint_bundle_id": resolved_checkpoint_identity.bundle_dir if resolved_checkpoint_identity else None,
         "checkpoint_manifest_sha256": resolved_checkpoint_identity.manifest_sha256 if resolved_checkpoint_identity else None,
@@ -230,6 +399,7 @@ def build_gen5_model_for_inference(
     config: dict, *, gene_names: list[str], device: torch.device,
     checkpoint_dir: str | Path | None = None, smoke: bool = False, staged_smoke: bool = False,
     dataset_manifest: dict | None = None,
+    cache_content_by_sample: dict[str, dict] | None = None,
 ) -> tuple[nn.Module, dict]:
     """Gen5 equivalent of `build_gen4_model_for_inference` -- construct a
     `Gen5LatentFlowModel` (kind == "latent_flow"): load the exact shared
@@ -237,7 +407,6 @@ def build_gen5_model_for_inference(
     `gen5.autoencoder.load_expression_autoencoder_checkpoint`, the real,
     already-complete standalone-checkpoint loader -- see
     `gen4/staged_loader.py`'s own docstring for why this module does not
-    define a second, transactional-bundle-shaped loader of its own),
     stage-load+freeze the flow's conditioner from `required_fingerprints.
     gen4_conditioner_checkpoint`, then optionally load `checkpoint_dir`'s
     trainable weights on top -- the same checkpoint_dir=None/real-path
@@ -306,8 +475,23 @@ def build_gen5_model_for_inference(
 
     conditioner_checkpoint_dir = fingerprints.get("gen4_conditioner_checkpoint")
     if conditioner_checkpoint_dir and needs_staged:
+        if dataset_manifest is not None:
+            pinned_conditioner_identity = _pin_and_verify_conditioner(
+                conditioner_checkpoint_dir,
+                expected_arm=gen4_arm,
+                dataset_manifest=dataset_manifest,
+                gene_names=gene_names,
+                cache_content_by_sample=cache_content_by_sample,
+            )
+        else:
+            pinned_conditioner_identity = checkpoint_module.resolve_checkpoint_identity(
+                conditioner_checkpoint_dir
+            )
+            checkpoint_module.verify_gene_names(
+                pinned_conditioner_identity.resolved_dir, gene_names,
+            )
         conditioner_info = gen4_staged_loader.load_and_freeze_deterministic_conditioner(
-            model, str(conditioner_checkpoint_dir), gene_names,
+            model, str(pinned_conditioner_identity.resolved_dir), gene_names,
         )
     elif needs_staged:
         raise ValueError(
@@ -338,6 +522,7 @@ def build_gen4_or_gen5_model_for_inference(
     config: dict, *, gene_names: list[str], device: torch.device,
     checkpoint_dir: str | Path | None = None, smoke: bool = False, staged_smoke: bool = False,
     dataset_manifest: dict | None = None,
+    cache_content_by_sample: dict[str, dict] | None = None,
 ) -> tuple[nn.Module, dict]:
     """The single dispatch point `training/train.py::build_model_for_
     inference` calls whenever `is_gen4_config(config)` is true --
@@ -351,8 +536,10 @@ def build_gen4_or_gen5_model_for_inference(
         return build_gen5_model_for_inference(
             config, gene_names=gene_names, device=device, checkpoint_dir=checkpoint_dir,
             smoke=smoke, staged_smoke=staged_smoke, dataset_manifest=dataset_manifest,
+            cache_content_by_sample=cache_content_by_sample,
         )
     return build_gen4_model_for_inference(
         config, gene_names=gene_names, device=device, checkpoint_dir=checkpoint_dir,
-        smoke=smoke, staged_smoke=staged_smoke,
+        smoke=smoke, staged_smoke=staged_smoke, dataset_manifest=dataset_manifest,
+        cache_content_by_sample=cache_content_by_sample,
     )
