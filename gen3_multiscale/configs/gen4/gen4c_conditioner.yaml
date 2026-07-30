@@ -1,0 +1,115 @@
+# Gen4 arm C conditioner: UNI2 (frozen, precomputed per spot) + frozen
+# scFoundation context embeddings + the spatial conditioner (reused
+# unmodified) + MaskAwareCoordinateAttentionPool for global UNI2 context.
+# See GEN4_CONTRACT.md sections 2, 4, 6, 7.
+
+experiment_name: gen4_arm_c_uni2_scfoundation_v1
+
+documented_divergences:
+  - model.arm
+  - model.params.image_feature_dim
+  - model.params.gex_context_embedding_dim
+  - required_fingerprints.uni2_checkpoint
+  - required_fingerprints.uni2_revision
+  - required_fingerprints.scfoundation_checkpoint
+  - required_fingerprints.scfoundation_vocab
+
+model:
+  arm: gen4c
+  kind: conditioner
+  params:
+    n_genes: null
+    gex_feature_dim: 256
+    image_feature_dim: 1536
+    gex_context_embedding_dim: 3072
+    hidden_dim: 512
+    n_heads: 8
+    n_blocks: 4
+    dense_threshold: 256
+    sparse_k: 10
+    chunk_size: 1024
+    max_boundary_size: null
+    transport_heads: 8
+    transport_temperature: 1.0
+    gene_gate_mode: per_gene
+    use_query_gate: true
+    use_residual: false
+    residual_rank: 32
+    use_regional_he: true
+    regional_grid_size: 4
+    global_slide_dim: 768
+    n_gex_inducing: 16
+    harmonic_k_neighbors: 6
+    init_seed: 0
+
+masking:
+  strata:
+    - name: small_compact
+      radius_range: [3.0, 5.0]
+      radius_unit: spot_spacing
+      shape: circle
+    - name: medium_compact
+      radius_range: [5.0, 8.0]
+      radius_unit: spot_spacing
+      shape: circle
+    - name: large_compact
+      radius_range: [8.0, 12.0]
+      radius_unit: spot_spacing
+      shape: circle
+    - name: medium_irregular
+      radius_range: [5.0, 8.0]
+      radius_unit: spot_spacing
+      shape: mixed
+
+data:
+  hest_data_dir: data/raw/hest1k
+  hest_cache_dir: data/cache/hest1k
+  slide_context_source: dense_wsi_cache
+  gen3_manifest_path: null
+  gex_feature_dim: 256
+  n_training_masks_per_sample: 500
+  n_validation_masks: 4
+  novae:
+    enabled: false
+  sample_selection:
+    organs: all
+    metadata_csv: hf://datasets/MahmoodLab/hest/HEST_v1_3_0.csv
+    min_samples_per_organ: 5
+    max_samples_per_organ: 30
+    n_validation_per_organ: 2
+    n_test_per_organ: 2
+    split_seed: 0
+
+evaluation:
+  train_gene_panel_artifact: null
+  gene_panels:
+    CCRCC_var_50genes: resources/evaluation/hest_bench/CCRCC_var_50genes.json
+  compute_st_fid_mmd: false
+  patient_level_aggregation: true
+
+required_fingerprints:
+  uni2_checkpoint: null
+  uni2_revision: null
+  scfoundation_checkpoint: null
+  scfoundation_vocab: null
+  gene_vocabulary: null
+  train_mask_bank: null
+  validation_mask_bank: null
+  test_mask_bank: null
+
+training:
+  device: cuda
+  seed: 0
+  lr: 1.0e-4
+  total_steps: 10000
+  max_wall_clock_hours: 2
+  gradient_clip_val: 1.0
+  log_every_n_steps: 50
+  checkpoint_every_n_steps: 2000
+  checkpoint_dir: gen3_multiscale/results/gen4c_conditioner
+  eval_every_n_steps: 2000
+  synchronized_init_dir: null
+  optimizer:
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
