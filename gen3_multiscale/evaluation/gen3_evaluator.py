@@ -54,7 +54,7 @@ from gen3_multiscale.training.gen3_preflight import load_and_preflight_samples
 from gen3_multiscale.training.train import (
     _code_commit_hash, _worktree_diff_hash, build_model_for_inference, common_random_validation_seed,
     config_identity_fingerprint, dataset_manifest_fingerprint, expected_tile_encoder_provenance,
-    model_kind_for_architecture_id, predict_for_metrics, resolved_config, verify_full_checkpoint_identity,
+    predict_for_metrics, resolved_config, verify_full_checkpoint_identity,
 )
 
 
@@ -256,12 +256,12 @@ def _load_model_for_evaluation(
     at all, so Architecture 4 evaluation was silently evaluating a
     conditioner that was never correctly loaded/frozen from the real
     Architecture 3 checkpoint the way training did."""
-    model, _info = build_model_for_inference(
+    model, info = build_model_for_inference(
         config, gene_names=gene_names, device=device, checkpoint_dir=checkpoint_dir, smoke=False,
         dataset_manifest=dataset_manifest, cache_content_by_sample=cache_content_by_sample,
     )
     model.eval()
-    return model
+    return model, info
 
 
 def evaluate_gen3_checkpoint(
@@ -321,8 +321,14 @@ def evaluate_gen3_checkpoint(
         raise ValueError(f"split must be 'validation' or 'test', got {split!r}")
 
     config = resolved_config(config_path)
-    architecture_id = str(config["model"]["architecture"])
-    kind = model_kind_for_architecture_id(architecture_id)
+    # Integration audit item 9: a Gen4/Gen5 config never sets
+    # model.architecture -- `.get(..., "")` avoids a KeyError; `kind` is
+    # derived from the real model_info `_load_model_for_evaluation`
+    # returns below (works uniformly for Gen3 numeric architectures AND
+    # Gen4/5's own model.kind, since build_model_for_inference's Gen3
+    # branch also now returns a normalized "kind").
+    architecture_id = str((config.get("model") or {}).get("architecture", ""))
+    is_gen4_or_gen5 = (config.get("model") or {}).get("arm") is not None
     data_cfg = config["data"]
     dataset_manifest = load_dataset_manifest(data_cfg["gen3_manifest_path"])
     split_ids = list(dataset_manifest[f"{split}_sample_ids"])
@@ -421,7 +427,12 @@ def evaluate_gen3_checkpoint(
         dataset_manifest, samples, strata, role=split,
         split_counts={split: n_masks_per_sample}, split_seeds={split: 700_000 if split == "validation" else 900_000},
     )
-    dataset = Gen3SpatialFieldDataset(dataset_manifest, samples, schedule, strata)
+    if is_gen4_or_gen5:
+        from gen3_multiscale.gen4.dataset_adapter import Gen4SpatialFieldDataset
+
+        dataset = Gen4SpatialFieldDataset(dataset_manifest, samples, schedule, strata, cfg_om, gene_names)
+    else:
+        dataset = Gen3SpatialFieldDataset(dataset_manifest, samples, schedule, strata)
     # Codex re-audit of commit 66d65f2, finding #1: "Evaluation reports
     # are not bound to the exact checkpoint... records paths, not the
     # bundle ID, step, manifest SHA, or weights SHA. If best/ later
@@ -438,10 +449,11 @@ def evaluate_gen3_checkpoint(
         recorded_commit is None or current_commit is None
         or recorded_commit != current_commit or recorded_diff_hash != current_diff_hash
     )
-    model = _load_model_for_evaluation(
+    model, model_info = _load_model_for_evaluation(
         config, pinned_identity.resolved_dir, gene_names, device, dataset_manifest=dataset_manifest,
         cache_content_by_sample=preflight_report.get("cache_content_by_sample"),
     )
+    kind = model_info["kind"]
 
     gene_panels = load_configured_gene_panels(config, dataset_manifest)
     train_panel_path = (config.get("evaluation") or {}).get("train_gene_panel_artifact")

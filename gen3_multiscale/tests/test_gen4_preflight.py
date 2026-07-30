@@ -131,10 +131,27 @@ def test_scfoundation_cache_audit_fails_closed_on_preprocessing_spec_mismatch(tm
         audit_scfoundation_cache_matches_config(tmp_path, "s1", config)
 
 
+def _write_uni2_dense_cache(cache_root: Path, sample_id: str, uni2: StubUNI2Encoder, output_dim: int) -> None:
+    cache_dir = Path(cache_root) / "uni2_dense_wsi_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    coords = np.asarray([[0.0, 0.0], [256.0, 0.0]], dtype=np.float32)
+    np.savez(
+        cache_dir / f"{sample_id}.npz",
+        features=np.ones((2, output_dim), dtype=np.float32), coords=coords, level0_coords=coords,
+        tile_size=np.asarray(256.0, dtype=np.float32), level0_tile_size=np.asarray(256.0, dtype=np.float32),
+        coords_are_centers=np.asarray(True), wsi_dimensions=np.asarray([1024.0, 1024.0], dtype=np.float64),
+        uni2_checkpoint_sha256=np.asarray(uni2.identity.checkpoint_sha256),
+        uni2_pinned_revision=np.asarray(uni2.identity.pinned_revision),
+        uni2_package_version=np.asarray(uni2.identity.package_version),
+        uni2_preprocessing_spec=np.asarray(uni2.identity.preprocessing_spec),
+        uni2_output_dim=np.asarray(output_dim), uni2_schema_version=np.asarray(1),
+    )
+
+
 def test_audit_gen4_manifest_cache_coverage_requires_every_resolved_sample(tmp_path):
-    """gen4c needs BOTH uni2 and scfoundation caches for EVERY resolved
-    sample -- one sample missing one modality is a hard failure, never a
-    silently-incomplete "mostly covered" success."""
+    """gen4c needs uni2, uni2_dense, AND scfoundation caches for EVERY
+    resolved sample -- one sample missing one modality is a hard
+    failure, never a silently-incomplete "mostly covered" success."""
     config = yaml.safe_load((_CONFIG_DIR / "gen4c_conditioner.yaml").read_text())
     config["model"]["params"]["image_feature_dim"] = 6
     config["model"]["params"]["gex_context_embedding_dim"] = 7
@@ -147,12 +164,13 @@ def test_audit_gen4_manifest_cache_coverage_requires_every_resolved_sample(tmp_p
     expression = np.zeros((2, 4), dtype=np.float32)
     for sample_id in ("s1", "s2"):
         build_uni2_spot_feature_cache(tmp_path, sample_id, barcodes, patches, availability, uni2)
+        _write_uni2_dense_cache(tmp_path, sample_id, uni2, output_dim=6)
         build_scfoundation_spot_feature_cache(tmp_path, sample_id, barcodes, expression, "hash123", scfoundation)
     # Full coverage -- succeeds.
     report = audit_gen4_manifest_cache_coverage(tmp_path, ["s1", "s2"], config)
     assert report["n_samples"] == 2
     assert set(report["samples"]) == {"s1", "s2"}
-    assert set(report["modalities"]) == {"uni2", "scfoundation"}
+    assert set(report["modalities"]) == {"uni2", "uni2_dense", "scfoundation"}
     # A third resolved sample with NO cache at all -- must hard-fail, not
     # silently report partial coverage as success.
     with pytest.raises(FileNotFoundError):
@@ -167,3 +185,22 @@ def test_audit_gen4_manifest_cache_coverage_only_checks_modalities_the_arm_needs
     report = audit_gen4_manifest_cache_coverage(tmp_path, ["s1"], config)
     assert report["modalities"] == []
     assert report["samples"] == {"s1": {}}
+
+
+def test_audit_gen4_manifest_cache_coverage_resolves_a_gen5_style_arm(tmp_path):
+    """Integration audit item 7 ("generalize cache preflight by arm"):
+    a Gen5 config's model.arm is a Gen5-style key (e.g. "gen5a"), never
+    one of ARM_TABLE's own Gen4 keys directly -- this must resolve
+    through GEN5_TO_GEN4_ARM (gen5a -> gen4a) rather than raising
+    "unknown model.arm"."""
+    config = {"model": {"arm": "gen5a", "kind": "latent_flow"}}
+    uni2 = StubUNI2Encoder(output_dim=6)
+    barcodes = np.array(["a", "b"])
+    patches = np.zeros((2, 4, 4, 3), dtype=np.uint8)
+    availability = np.array([True, True])
+    build_uni2_spot_feature_cache(tmp_path, "s1", barcodes, patches, availability, uni2)
+    _write_uni2_dense_cache(tmp_path, "s1", uni2, output_dim=6)
+
+    report = audit_gen4_manifest_cache_coverage(tmp_path, ["s1"], config)
+    assert report["arm"] == "gen4a"
+    assert set(report["modalities"]) == {"uni2", "uni2_dense"}

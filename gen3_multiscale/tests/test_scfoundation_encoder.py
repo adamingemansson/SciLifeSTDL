@@ -202,6 +202,44 @@ def test_encode_rows_max_pooling_matches_all_gene_positions():
     assert np.isfinite(out).all()
 
 
+def test_encode_rows_is_row_independent_across_batch_composition_and_size():
+    """CONFIRMED real, user-reported bug: the prior batched implementation
+    computed gatherData's max_num from the WHOLE batch, so any row with
+    fewer expressed genes than a batch-mate got right-padded -- and both
+    the fixed geneemb[:, -1, :]/geneemb[:, -2, :] resolution-token reads
+    and the max/mean gene pooling silently included those padding
+    positions. A row's embedding must be IDENTICAL whether encoded
+    alone, beside a row with strictly more nonzero genes, beside a row
+    with strictly fewer nonzero genes, or in a larger batch -- since the
+    official script only ever encodes one cell/spot at a time, no batch
+    composition may ever influence a single row's own result."""
+    gene_names = ["g0", "g1", "g2", "g3", "g4"]
+    vocab = ["g0", "g1", "g2", "g3", "g4"]
+    hidden_dim = 4
+    encoder = _wired_bare_encoder(gene_names, vocab, output_dim=hidden_dim * 4, pool_type="all")
+
+    target_row = np.array([1.0, 0.0, 2.0, 0.0, 0.0], dtype=np.float32)  # 2 nonzero genes
+    more_genes_row = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32)  # 5 nonzero genes
+    fewer_genes_row = np.array([0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)  # 1 nonzero gene
+    lib = 1000.0
+
+    alone = encoder.encode_rows(target_row[None, :], raw_library_size=np.array([lib], dtype=np.float32))
+    beside_more = encoder.encode_rows(
+        np.stack([target_row, more_genes_row]), raw_library_size=np.array([lib, lib], dtype=np.float32),
+    )
+    beside_fewer = encoder.encode_rows(
+        np.stack([target_row, fewer_genes_row]), raw_library_size=np.array([lib, lib], dtype=np.float32),
+    )
+    batch_of_three = encoder.encode_rows(
+        np.stack([more_genes_row, target_row, fewer_genes_row]),
+        raw_library_size=np.array([lib, lib, lib], dtype=np.float32),
+    )
+
+    np.testing.assert_array_equal(alone[0], beside_more[0])
+    np.testing.assert_array_equal(alone[0], beside_fewer[0])
+    np.testing.assert_array_equal(alone[0], batch_of_three[1])
+
+
 def test_encode_rows_zero_expression_genes_excluded_from_gathered_input():
     """A gene with zero expression must not appear in the compacted,
     strictly-positive-only sequence the official gatherData routine

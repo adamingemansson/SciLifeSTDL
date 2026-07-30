@@ -134,7 +134,7 @@ class FrozenUNI2TileEncoder(nn.Module):
             checkpoint_sha256=self.checkpoint_sha256,
             pinned_revision=revision,
             package_version=str(getattr(timm, "__version__", "unknown")),
-            preprocessing_spec=f"uni2_tile_v1:{model_name}:resize224:imagenet_norm",
+            preprocessing_spec=f"uni2_tile_v2:{model_name}:resize224_bicubic_antialias:imagenet_norm",
             output_dim=self.output_dim,
         )
 
@@ -142,6 +142,28 @@ class FrozenUNI2TileEncoder(nn.Module):
         super().train(False)
         self.model.eval()
         return self
+
+    def _pil_bicubic_resize(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Resize a `[N, 3, H, W]` float tensor (values in `[0, 1]`) to
+        `(_INPUT_SIZE, _INPUT_SIZE)` via Pillow's own BICUBIC resampler --
+        implicitly antialiased on downsampling (Pillow applies a proper
+        anti-aliasing prefilter when reducing image size for BICUBIC/
+        LANCZOS, unlike a naive tensor interpolation), matching the
+        official loading recipe's own PIL-based transform pipeline
+        directly (`torchvision` is not installed in this sandbox -- see
+        `encode_available_patches`'s own docstring)."""
+        from PIL import Image
+
+        resample = getattr(Image, "Resampling", Image).BICUBIC
+        array = (tensor.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
+        resized = np.empty((array.shape[0], self._INPUT_SIZE, self._INPUT_SIZE, 3), dtype=np.uint8)
+        for i in range(array.shape[0]):
+            resized[i] = np.asarray(
+                Image.fromarray(np.ascontiguousarray(array[i])).resize(
+                    (self._INPUT_SIZE, self._INPUT_SIZE), resample=resample,
+                )
+            )
+        return torch.from_numpy(resized).permute(0, 3, 1, 2).float().div(255.0).to(tensor.device)
 
     @torch.inference_mode()
     def encode_available_patches(self, patches: np.ndarray) -> np.ndarray:
@@ -155,19 +177,44 @@ class FrozenUNI2TileEncoder(nn.Module):
         =True` (self._TIMM_KWARGS) let timm silently accept the wrong
         input size without erroring -- a different effective patch grid
         than UNI2-h was actually trained/documented for, not a crash a
-        caller would notice. Patches are now resized to exactly
-        `_INPUT_SIZE` (224) via bilinear interpolation before
-        normalization, on whichever spatial size they arrive at, so the
-        code matches what `preprocessing_spec` already claimed."""
+        caller would notice.
+
+        User audit follow-up (CONFIRMED real gap, fixed): the FIRST fix
+        used raw `torch.nn.functional.interpolate(..., mode="bilinear")`
+        with NO antialiasing at all -- the official loading recipe
+        (`mahmoodlab/UNI` README: `transform = create_transform(
+        **resolve_data_config(model.pretrained_cfg, model=model))`) goes
+        through `timm`'s standard eval-time image transform on a PIL
+        image (`Image.open(...)` then `transform(image)`), which
+        antialiases by construction whenever it downsamples. Downsampling
+        256x256 -> 224x224 without antialiasing aliases high-frequency
+        tissue/nuclear texture in a way a real UNI2-h checkpoint was
+        never trained to see. Resizing is now done via `_pil_bicubic_
+        resize` -- Pillow's own BICUBIC resampler (implicitly
+        antialiased on downsampling, exactly like the official PIL-based
+        transform) -- rather than a raw tensor interpolation.
+        `torchvision` (what a literal `torchvision.transforms.functional.
+        resize(..., antialias=True)` call would need) is not installed
+        in this sandbox; going through PIL directly is not a fallback
+        approximation of the official recipe, it is the SAME library the
+        official recipe itself resizes through.
+
+        HONEST LIMIT: `model.pretrained_cfg`'s own exact `interpolation`/
+        `crop_pct` values could not be independently confirmed here --
+        `huggingface.co/MahmoodLab/UNI2-h` is a gated model card and
+        returned 403 to this sandbox's WebFetch (no HF auth available,
+        no real checkpoint to test against either). Bicubic is the
+        common timm ViT eval-transform default and the best available
+        inference, not a byte-verified match -- must be checked against
+        the real model.pretrained_cfg (or a real-weight output
+        comparison) before trusting this as bit-exact."""
         if patches.ndim != 4 or patches.shape[-1] != 3:
             raise ValueError(f"patches must be [N, H, W, 3], got shape {patches.shape}")
         tensor = torch.from_numpy(np.ascontiguousarray(patches)).permute(0, 3, 1, 2).float().to(self.device)
         if tensor.max() > 1.5:  # heuristically 0-255 range, matches spot_feature_cache's own convention
             tensor = tensor.div(255.0)
         if tensor.shape[-2:] != (self._INPUT_SIZE, self._INPUT_SIZE):
-            tensor = torch.nn.functional.interpolate(
-                tensor, size=(self._INPUT_SIZE, self._INPUT_SIZE), mode="bilinear", align_corners=False,
-            )
+            tensor = self._pil_bicubic_resize(tensor)
         mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
         tensor = (tensor - mean) / std

@@ -73,6 +73,38 @@ def test_encode_available_patches_moves_model_and_inputs_to_the_configured_devic
     assert encoder.model.last_input_device == torch.device("cpu")
 
 
+def test_encode_available_patches_resize_uses_antialiasing():
+    """CONFIRMED real gap (user audit follow-up): the first device/resize
+    fix used raw F.interpolate(mode="bilinear") with NO antialiasing at
+    all -- downsampling a high-frequency pattern without antialiasing
+    aliases it rather than smoothing it. The real preprocessing path
+    (`_pil_bicubic_resize`, Pillow's own BICUBIC resampler -- implicitly
+    antialiased on downsampling) must differ substantially from a
+    non-antialiased resize on a checkerboard pattern, and must smooth it
+    (lower pixel-value spread) rather than alias it. torchvision is not
+    installed in this sandbox, so the comparison baseline is Pillow's own
+    NEAREST resampler (no antialiasing prefilter), not torchvision."""
+    from PIL import Image
+
+    encoder = _bare_encoder()
+    checker = (np.indices((256, 256)).sum(axis=0) % 2).astype(np.uint8) * 255
+    patches = np.stack([np.stack([checker, checker, checker], axis=-1)], axis=0)
+
+    encoder.encode_available_patches(patches)  # exercises the real code path (must not raise)
+
+    tensor = torch.from_numpy(patches).permute(0, 3, 1, 2).float() / 255.0
+    antialiased = encoder._pil_bicubic_resize(tensor)
+
+    nearest_resample = getattr(Image, "Resampling", Image).NEAREST
+    non_antialiased_np = np.asarray(
+        Image.fromarray(patches[0]).resize((224, 224), resample=nearest_resample)
+    )
+    non_antialiased = torch.from_numpy(non_antialiased_np.copy()).permute(2, 0, 1).float().div(255.0).unsqueeze(0)
+
+    assert not torch.allclose(antialiased, non_antialiased)
+    assert antialiased.std() < non_antialiased.std()  # antialiasing smooths the checkerboard toward gray
+
+
 def test_encode_available_patches_returns_finite_cpu_numpy_output():
     encoder = _bare_encoder(output_dim=8)
     patches = np.random.default_rng(0).integers(0, 255, size=(4, 256, 256, 3)).astype(np.uint8)

@@ -53,9 +53,13 @@ _ARM_REQUIRED_FINGERPRINTS = {
 # `audit_gen4_manifest_cache_coverage` requires to exist for EVERY
 # manifest sample the resolved experiment will actually use).
 _ARM_CACHE_MODALITIES = {
-    "gen4a": {"uni2"},
+    # Integration audit item 7: "uni2_dense" added for arm A/C -- ARM_TABLE's
+    # own global_context_source="uni2_pool" (gen4/dataset_adapter.py's
+    # `uses_uni2_primary` gate) means these two arms genuinely consume a
+    # real UNI2 dense-WSI cache now, not just the per-spot one.
+    "gen4a": {"uni2", "uni2_dense"},
     "gen4b": {"scfoundation"},
-    "gen4c": {"uni2", "scfoundation"},
+    "gen4c": {"uni2", "uni2_dense", "scfoundation"},
     "gen4d": set(),  # STPath/GigaPath consumed live inside the conditioner -- no per-sample spot cache to audit here
     "gen4e": {"uni2", "scfoundation"},
 }
@@ -249,10 +253,71 @@ def audit_scfoundation_cache_matches_config(cache_root: str | Path, sample_id: s
     }
 
 
+def audit_uni2_dense_cache_matches_config(cache_root: str | Path, sample_id: str, config: dict, *, require_exists: bool = False) -> dict:
+    """Same discipline as `audit_uni2_cache_matches_config`, applied to
+    the UNI2 dense-WSI cache arm A/C's `global_context_source=
+    "uni2_pool"` consumes (`gen4.uni2_dense_wsi_cache`). Resolves the
+    cache path the same way that module's own default (no
+    `data.uni2_slide_context_cache_dir` override) does, directly from
+    `cache_root` -- this function intentionally takes a plain `cache_root`
+    string (matching `audit_uni2_cache_matches_config`/
+    `audit_scfoundation_cache_matches_config`'s own signature) rather than
+    a full OmegaConf config, so a deployment using the override field
+    needs its own path resolved separately; the override is a rare case,
+    not the mandatory-gate default."""
+    from gen3_multiscale.gen4.uni2_dense_wsi_cache import _REQUIRED_FIELDS
+
+    path = Path(cache_root) / "uni2_dense_wsi_cache" / f"{sample_id}.npz"
+    if not path.is_file():
+        if require_exists:
+            raise FileNotFoundError(
+                f"UNI2 dense-WSI cache required for {sample_id!r} (arm needs global_context_source="
+                f"'uni2_pool') but missing: {path}. Build it with "
+                "gen4.uni2_dense_wsi_cache.build_uni2_dense_wsi_cache before training."
+            )
+        return {"cache_exists": False, "path": str(path)}
+    cached = np.load(path, allow_pickle=False)
+    missing_fields = sorted(_REQUIRED_FIELDS.difference(cached.files))
+    if missing_fields:
+        raise ValueError(f"UNI2 dense-WSI cache {path} is missing fields {missing_fields} -- rebuild it")
+    fingerprints = config.get("required_fingerprints") or {}
+    declared_revision = fingerprints.get("uni2_revision")
+    declared_checkpoint_path = fingerprints.get("uni2_checkpoint")
+    declared_package_version = fingerprints.get("uni2_package_version")
+    declared_preprocessing_spec = fingerprints.get("uni2_preprocessing_spec")
+    actual_revision = str(cached["uni2_pinned_revision"])
+    actual_checkpoint_sha256 = str(cached["uni2_checkpoint_sha256"])
+    actual_package_version = str(cached["uni2_package_version"])
+    actual_preprocessing_spec = str(cached["uni2_preprocessing_spec"])
+    mismatches = []
+    if declared_revision and actual_revision != declared_revision:
+        mismatches.append(f"uni2_revision: config={declared_revision} cache={actual_revision}")
+    if declared_package_version and actual_package_version != declared_package_version:
+        mismatches.append(f"uni2_package_version: config={declared_package_version} cache={actual_package_version}")
+    if declared_preprocessing_spec and actual_preprocessing_spec != declared_preprocessing_spec:
+        mismatches.append(f"uni2_preprocessing_spec: config={declared_preprocessing_spec} cache={actual_preprocessing_spec}")
+    if declared_checkpoint_path:
+        checkpoint_path = Path(str(declared_checkpoint_path))
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"required_fingerprints.uni2_checkpoint={checkpoint_path} does not exist")
+        expected_checkpoint_sha256 = _sha256_file(checkpoint_path)
+        if expected_checkpoint_sha256 != actual_checkpoint_sha256:
+            mismatches.append(
+                f"uni2_checkpoint content sha256: config file={expected_checkpoint_sha256} cache={actual_checkpoint_sha256}"
+            )
+    if mismatches:
+        raise ValueError(f"UNI2 dense-WSI cache {path} does not match config: {'; '.join(mismatches)}")
+    return {
+        "cache_exists": True, "path": str(path), "revision": actual_revision,
+        "checkpoint_sha256": actual_checkpoint_sha256, "package_version": actual_package_version,
+        "preprocessing_spec": actual_preprocessing_spec,
+    }
+
+
 def audit_gen4_manifest_cache_coverage(cache_root: str | Path, sample_ids: list[str], config: dict) -> dict:
     """Item 2 (six-launch-blocker audit): "Make preflight require exact
     manifest-derived cache coverage ... Missing or wrong-modality caches
-    must fail before model construction." Unlike the two per-sample audit
+    must fail before model construction." Unlike the per-sample audit
     functions above (soft-by-default, for ad hoc/manual checks), THIS is
     the mandatory pre-training gate: for the resolved experiment's arm
     and its REAL, resolved manifest sample_ids (never a hardcoded/partial
@@ -260,10 +325,24 @@ def audit_gen4_manifest_cache_coverage(cache_root: str | Path, sample_ids: list[
     (`_ARM_CACHE_MODALITIES`) must have a real, identity-matching cache
     for EVERY sample -- a single missing or mismatched cache raises
     before this function returns, and therefore before the caller may
-    proceed to model construction."""
+    proceed to model construction.
+
+    Integration audit item 7 ("generalize cache preflight by arm"):
+    `model.arm` is resolved through `gen4.trainer_adapter._resolve_gen4_arm`
+    first -- a Gen5 config's `model.arm` is a Gen5-style key
+    (`gen5.model_factory.GEN5_TO_GEN4_ARM`), which `_ARM_CACHE_MODALITIES`
+    (keyed by Gen4 arm names) would otherwise never recognize, silently
+    raising "unknown model.arm" for every real Gen5 experiment. This
+    function is additive to, never a replacement for, Gen3's own
+    tile-encoder-provenance preflight (`training.train.
+    expected_tile_encoder_provenance`/`load_and_preflight_samples`) --
+    a caller must run BOTH; this one only ever adds Gen4/5-specific
+    per-modality checks on top."""
     if not sample_ids:
         raise ValueError("audit_gen4_manifest_cache_coverage requires at least one resolved manifest sample_id")
-    arm = str((config.get("model") or {}).get("arm", ""))
+    from gen3_multiscale.gen4.trainer_adapter import _resolve_gen4_arm
+
+    arm = _resolve_gen4_arm(config)
     modalities = _ARM_CACHE_MODALITIES.get(arm)
     if modalities is None:
         raise ValueError(f"unknown model.arm {arm!r} -- expected one of {sorted(_ARM_CACHE_MODALITIES)}")
@@ -272,6 +351,8 @@ def audit_gen4_manifest_cache_coverage(cache_root: str | Path, sample_ids: list[
         sample_report = {}
         if "uni2" in modalities:
             sample_report["uni2"] = audit_uni2_cache_matches_config(cache_root, sample_id, config, require_exists=True)
+        if "uni2_dense" in modalities:
+            sample_report["uni2_dense"] = audit_uni2_dense_cache_matches_config(cache_root, sample_id, config, require_exists=True)
         if "scfoundation" in modalities:
             sample_report["scfoundation"] = audit_scfoundation_cache_matches_config(cache_root, sample_id, config, require_exists=True)
         checked["samples"][sample_id] = sample_report

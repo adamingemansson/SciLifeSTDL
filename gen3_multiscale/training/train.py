@@ -1753,7 +1753,13 @@ def run_training(
     config = resolved_config(config_path)
     data_cfg = config["data"]
     training_cfg = config["training"]
-    architecture_id = str(config["model"]["architecture"])
+    # Integration audit item 1: a Gen4/Gen5 config never sets
+    # model.architecture (its own generic model.kind covers the same
+    # role) -- `.get(..., "")` avoids a KeyError; `architecture_id` stays
+    # "" for those configs, matching `verify_resume_consistency`'s own
+    # already-`.get`-based read of the identical field (both sides must
+    # compute the same value for resume verification to be meaningful).
+    architecture_id = str((config.get("model") or {}).get("architecture", ""))
 
     manifest_path = data_cfg.get("gen3_manifest_path")
     if not manifest_path:
@@ -1829,6 +1835,25 @@ def run_training(
         )
 
     novae_enabled = bool((data_cfg.get("novae") or {}).get("enabled", False))
+    gene_names = list(dataset_manifest["gene_panel"])
+
+    # Integration audit item 2/1: a Gen4/Gen5 config (`model.arm` present,
+    # never set by a Gen3 config) builds its real (context, query)
+    # examples through `gen4.dataset_adapter.Gen4SpatialFieldDataset`
+    # instead -- the SAME real sample loading/mask schedule above
+    # (`load_and_preflight_samples`/`build_gen3_mask_schedule`), only the
+    # per-arm cache wiring (`__getitem__`) differs. See that class's own
+    # docstring for exactly which caches each arm consumes.
+    is_gen4_or_gen5 = (config.get("model") or {}).get("arm") is not None
+    if is_gen4_or_gen5:
+        from gen3_multiscale.gen4.dataset_adapter import Gen4SpatialFieldDataset
+
+        dataset_cls = Gen4SpatialFieldDataset
+        dataset_extra_args = (cfg_om, gene_names)
+    else:
+        dataset_cls = Gen3SpatialFieldDataset
+        dataset_extra_args = ()
+
     # Requirement #5: `train_dataset` is indexed DIRECTLY by a
     # deterministic per-step index (deterministic_train_index_for_step,
     # below) rather than iterated through a shuffled DataLoader --  a
@@ -1836,12 +1861,12 @@ def run_training(
     # permutation every epoch, so a resumed run previously continued from
     # a different point in a different random ordering than the original
     # run would have reached by the same step.
-    train_dataset = Gen3SpatialFieldDataset(
-        dataset_manifest, train_samples, train_schedule, strata, novae_enabled=novae_enabled,
+    train_dataset = dataset_cls(
+        dataset_manifest, train_samples, train_schedule, strata, *dataset_extra_args, novae_enabled=novae_enabled,
     )
     if val_schedule is not None:
-        val_dataset = Gen3SpatialFieldDataset(
-            dataset_manifest, val_samples, val_schedule, strata, novae_enabled=novae_enabled,
+        val_dataset = dataset_cls(
+            dataset_manifest, val_samples, val_schedule, strata, *dataset_extra_args, novae_enabled=novae_enabled,
         )
         boundary_preflight = val_dataset.validate_boundary_schedule()
         print(
@@ -1859,7 +1884,6 @@ def run_training(
     np.random.seed(seed)
     sample_rng = random.Random(seed)
 
-    gene_names = list(dataset_manifest["gene_panel"])
     device = torch.device(training_cfg.get("device", "cpu") if torch.cuda.is_available() else "cpu")
 
     # Audit #2: the ONE shared model-reconstruction pipeline -- builds the
@@ -1874,10 +1898,19 @@ def run_training(
         cache_content_by_sample=preflight_report.get("cache_content_by_sample"),
     )
     kind = model_info["kind"]
-    gene_basis = model_info["gene_basis"]
-    gigapath_checkpoint_sha256 = model_info["gigapath_checkpoint_sha256"]
-    synchronized_init_manifest_path = model_info["synchronized_init_manifest_path"]
-    architecture3_conditioner_info = model_info["architecture3_conditioner"]
+    # Integration audit item 1: Gen4/Gen5's own normalized model_info
+    # schema (gen4.trainer_adapter.build_gen4_or_gen5_model_for_inference)
+    # has no gene_basis/gigapath_checkpoint_sha256/
+    # synchronized_init_manifest_path/architecture3_conditioner keys at
+    # all -- those are Gen3-Architecture-4-specific concepts with no
+    # Gen4/5 equivalent. `.get(..., None)` makes every downstream use of
+    # these (already None-safe -- e.g. "gene_basis.gene_names_hash if
+    # gene_basis is not None else None") correctly produce an honestly
+    # empty run-manifest field for a Gen4/5 run instead of a KeyError.
+    gene_basis = model_info.get("gene_basis")
+    gigapath_checkpoint_sha256 = model_info.get("gigapath_checkpoint_sha256")
+    synchronized_init_manifest_path = model_info.get("synchronized_init_manifest_path")
+    architecture3_conditioner_info = model_info.get("architecture3_conditioner")
 
     # Requirement #9: real, TRAINING-ONLY per-gene standardization scale
     # for the spatial-gradient loss -- computed here (train_samples are

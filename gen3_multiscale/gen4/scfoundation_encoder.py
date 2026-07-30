@@ -54,6 +54,22 @@ reference pipeline this class now reproduces:
    post-encoder representations) concatenated with a max-pool and a
    mean-pool over every other (real gene) position.
 
+User audit follow-up (CONFIRMED real, fixed): the batched vendored
+`gatherData` call above (point 4) computed `max_num` as the LARGEST
+labeled-position count across the whole batch, so any row with fewer
+expressed genes than another row sharing its `encode_rows` call got
+right-padded -- and both the fixed-index resolution-token read
+(`geneemb[:, -1, :]`/`geneemb[:, -2, :]`) and the max/mean gene pooling
+silently included those padding positions, making one row's embedding
+depend on which OTHER rows happened to share its batch. The official
+script only ever processes one cell/spot at a time, so this can never
+happen there. `encode_rows` now encodes ONE row at a time internally
+(`_encode_one_row`, batch dimension of size 1) -- this is not an
+approximation of the official per-row behavior, it reduces to it
+exactly, since a batch of 1 has zero padding by construction. See
+`tests/test_scfoundation_encoder.py::test_encode_rows_is_row_independent_
+across_batch_composition_and_size` for the adversarial proof.
+
 HONEST LIMIT (GEN4_CONTRACT.md section 13 / RUNBOOK.md section 4): no
 real `scfoundation` package is installed in this environment, so this
 has never been run against the real package/checkpoint and MUST be
@@ -256,6 +272,77 @@ class FrozenSCFoundationEncoder(nn.Module):
         total_count_token = np.log10(raw_library_size).astype(np.float32).reshape(n_rows, 1)
         return np.concatenate([vocab_input, resolution_token, total_count_token], axis=1)
 
+    def _encode_one_row(self, row: np.ndarray) -> np.ndarray:
+        """Runs the gather -> token_emb -> pos_emb -> encoder -> pool
+        pipeline for exactly ONE row (batch dimension of size 1).
+
+        Batch-independence fix (CONFIRMED real bug, user-reported): the
+        prior version called `gather_scfoundation_data` on the whole
+        batch at once. That function's own `max_num` is `labels.sum(1).
+        max()` -- the LARGEST labeled-position count across every row in
+        the call, not each row's own count -- so any row with fewer
+        expressed genes than the batch's max got right-padded, and the
+        encoder still produces a real (non-zero, non-excluded) output
+        vector at those padded positions despite the padding mask
+        (padding masks attention INTO a position, it does not blank that
+        position's own output). Two consequences, both batch-composition
+        dependent for any row that is not the batch's own max: (1)
+        `geneemb[:, -1, :]`/`geneemb[:, -2, :]` -- assumed to always be
+        the two resolution tokens' own representations -- were actually
+        reading PADDING positions instead, since gatherData appends
+        padding strictly AFTER every row's real (labeled) positions, so
+        the true resolution-token positions sit at that row's own
+        `k-1`/`k-2`, not at the batch-wide `max_num-1`/`max_num-2`; (2)
+        the max/mean pool over `geneemb[:, :-2, :]` included those same
+        padding positions. Both effects meant one row's embedding could
+        change depending on which OTHER rows shared its batch -- a
+        structural violation of `encode_rows`'s own row-independence
+        contract (this module's docstring) and of the official script's
+        actual behavior (it only ever processes one row/cell at a time,
+        so `max_num` there always equals that single row's own count,
+        with zero padding, by construction).
+
+        Calling `gather_scfoundation_data` on a single row makes
+        `max_num` trivially equal to that row's own labeled-position
+        count, so there is never any padding to mis-pool or mis-index --
+        this reduces EXACTLY to the official per-row semantics, not an
+        approximation of them. `encode_rows` below loops this over every
+        row rather than vectorizing across rows; this encoder is a
+        frozen, precompute-once-per-sample cache builder
+        (`gen4.scfoundation_cache.build_scfoundation_spot_feature_cache`),
+        never called per training step, so correctness is strictly
+        preferred over batched throughput here."""
+        pretrain_gene_x = torch.as_tensor(row, dtype=torch.float32, device=self.device).unsqueeze(0)
+        data_gene_ids = torch.arange(pretrain_gene_x.shape[1], device=self.device).unsqueeze(0)
+
+        # Official model/get_embedding.py, output_type="cell": only
+        # strictly-positive positions (real expression + both resolution
+        # tokens) are kept; gathered/compacted, embedded, encoded, pooled.
+        value_labels = pretrain_gene_x > 0
+        x, x_padding = gather_scfoundation_data(pretrain_gene_x, value_labels, self.pad_token_id)
+        position_gene_ids, _ = gather_scfoundation_data(data_gene_ids.float(), value_labels, self.pad_token_id)
+        assert not bool(x_padding.any())  # batch of 1: max_num == this row's own count, by construction
+
+        x = self.model.token_emb(torch.unsqueeze(x, 2).float(), output_weight=0)
+        position_emb = self.model.pos_emb(position_gene_ids.long())
+        x = x + position_emb
+        geneemb = self.model.encoder(x, x_padding)
+
+        # Official four-way "all" pooling: the two resolution tokens'
+        # own post-encoder representations (the LAST two gathered
+        # positions -- guaranteed true here, since this row alone has no
+        # padding at all) concatenated with a max-pool and a mean-pool
+        # over every other (real gene) position.
+        geneemb1 = geneemb[:, -1, :]
+        geneemb2 = geneemb[:, -2, :]
+        geneemb3, _ = torch.max(geneemb[:, :-2, :], dim=1)
+        geneemb4 = torch.mean(geneemb[:, :-2, :], dim=1)
+        if self.pool_type == "all":
+            pooled = torch.cat([geneemb1, geneemb2, geneemb3, geneemb4], dim=1)
+        else:
+            pooled, _ = torch.max(geneemb, dim=1)
+        return pooled.detach().to("cpu").numpy().astype(np.float32)[0]
+
     @torch.inference_mode()
     def encode_rows(self, expression: np.ndarray, raw_library_size: np.ndarray | None = None) -> np.ndarray:
         if expression.ndim != 2 or expression.shape[1] != len(self.gene_names):
@@ -278,37 +365,11 @@ class FrozenSCFoundationEncoder(nn.Module):
             raise ValueError("raw_library_size must be strictly positive (log10 of a real total count)")
 
         model_input = self._to_scfoundation_input(np.asarray(expression, dtype=np.float32), raw_library_size)
-        pretrain_gene_x = torch.as_tensor(model_input, dtype=torch.float32, device=self.device)
-        data_gene_ids = torch.arange(pretrain_gene_x.shape[1], device=self.device).repeat(pretrain_gene_x.shape[0], 1)
-
-        # Official model/get_embedding.py, output_type="cell": only
-        # strictly-positive positions (real expression + both resolution
-        # tokens) are kept; gathered/compacted, embedded, encoded, pooled.
-        value_labels = pretrain_gene_x > 0
-        x, x_padding = gather_scfoundation_data(pretrain_gene_x, value_labels, self.pad_token_id)
-        position_gene_ids, _ = gather_scfoundation_data(data_gene_ids.float(), value_labels, self.pad_token_id)
-
-        x = self.model.token_emb(torch.unsqueeze(x, 2).float(), output_weight=0)
-        position_emb = self.model.pos_emb(position_gene_ids.long())
-        x = x + position_emb
-        geneemb = self.model.encoder(x, x_padding)
-
-        # Official four-way "all" pooling: the two resolution tokens'
-        # own post-encoder representations (always the LAST two gathered
-        # positions -- gatherData preserves original left-to-right order
-        # and both tokens were appended last, so they sort last among
-        # every row's real, positive-valued positions) concatenated with
-        # a max-pool and a mean-pool over every other (gene) position.
-        geneemb1 = geneemb[:, -1, :]
-        geneemb2 = geneemb[:, -2, :]
-        geneemb3, _ = torch.max(geneemb[:, :-2, :], dim=1)
-        geneemb4 = torch.mean(geneemb[:, :-2, :], dim=1)
-        if self.pool_type == "all":
-            pooled = torch.cat([geneemb1, geneemb2, geneemb3, geneemb4], dim=1)
-        else:
-            pooled, _ = torch.max(geneemb, dim=1)
-
-        out = pooled.detach().to("cpu").numpy().astype(np.float32)
+        # Row-independence fix: encode ONE row at a time -- see
+        # `_encode_one_row`'s own docstring for why this is not merely a
+        # style choice but the actual correctness fix for a real,
+        # user-reported batch-composition-dependence bug.
+        out = np.stack([self._encode_one_row(row) for row in model_input], axis=0)
         if out.shape != (expression.shape[0], self.output_dim):
             raise RuntimeError(f"scFoundation encoder returned shape {out.shape}, expected ({expression.shape[0]}, {self.output_dim})")
         if not np.isfinite(out).all():
