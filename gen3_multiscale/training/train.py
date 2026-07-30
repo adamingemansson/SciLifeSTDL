@@ -1721,8 +1721,16 @@ def run_training(
     train_samples = {sid: s for sid, s in samples.items() if sid in train_ids}
     val_samples = {sid: s for sid, s in samples.items() if sid in validation_ids}
 
-    n_training_masks = 2 if smoke else int(data_cfg.get("n_training_masks_per_sample", 500))
-    n_validation_masks = 1 if smoke else int(data_cfg.get("n_validation_masks", 4))
+    # A smoke run still has to construct a structurally valid stratified
+    # schedule.  Using two training masks and one validation mask was only
+    # valid for the small two-stratum test fixture; the real configs have
+    # four strata, and the fail-closed scheduler correctly rejects fewer
+    # items than strata.  Keep the smoke pool minimal while covering every
+    # declared stratum once.  The loop below still executes exactly one
+    # optimizer step and one validation step.
+    n_smoke_masks = max(1, len(strata))
+    n_training_masks = n_smoke_masks if smoke else int(data_cfg.get("n_training_masks_per_sample", 500))
+    n_validation_masks = n_smoke_masks if smoke else int(data_cfg.get("n_validation_masks", 4))
 
     train_schedule = build_gen3_mask_schedule(
         dataset_manifest, train_samples, strata, role="train", n_training_masks_per_sample=n_training_masks,

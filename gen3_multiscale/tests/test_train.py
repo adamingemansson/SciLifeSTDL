@@ -131,6 +131,31 @@ def test_run_training_smoke_runs_one_step_for_architecture1_and_2(tmp_path, monk
     assert "code_commit_hash" in run_manifest
 
 
+def test_run_training_smoke_covers_every_real_config_stratum(tmp_path, monkeypatch):
+    """Regression: production has four strata, while smoke formerly
+    hard-coded only two training masks and one validation mask.  The
+    fail-closed scheduler then rejected the smoke before model construction.
+    A one-step smoke may be small, but its schedule must remain valid."""
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    config_path = tmp_path / "config_four_strata.yaml"
+    checkpoint_dir = tmp_path / "ckpt_four_strata"
+    _write_config(
+        cfg, manifest_path, config_path, architecture="1", checkpoint_dir=checkpoint_dir,
+    )
+    config = yaml.safe_load(config_path.read_text())
+    template = dict(config["masking"]["strata"][0])
+    config["masking"]["strata"] = [
+        {**template, "name": f"smoke_stratum_{index}"}
+        for index in range(4)
+    ]
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+
+    summary = train_module.run_training(str(config_path), smoke=True)
+    assert summary["ok"] is True
+    assert summary["smoke"] is True
+    assert summary["final_step"] == 1
+
+
 def test_run_training_smoke_runs_architecture3_with_regional_he(tmp_path, monkeypatch):
     """use_regional_he=True, use_global_gex=True, use_global_slide=False --
     the real, sandbox-testable subset of Architecture 3 (see module
