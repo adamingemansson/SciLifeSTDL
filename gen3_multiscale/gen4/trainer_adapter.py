@@ -1,6 +1,6 @@
-"""Item 5 (six-launch-blocker audit): "Add minimal adapters to the
-existing Gen3 trainer/evaluator. Reuse them; do not create another
-trainer/evaluator."
+"""Item 5 (six-launch-blocker audit) + Integration audit follow-up:
+"Add minimal adapters to the existing Gen3 trainer/evaluator. Reuse
+them; do not create another trainer/evaluator."
 
 `training/train.py::build_model_for_inference` is already the ONE real
 model-reconstruction pipeline every Gen3 caller (the trainer loop, the
@@ -11,25 +11,23 @@ aggregation, baselines, split lock, query fingerprints, and generative
 uncertainty (see CONTRACT.md's audit-response history) against whatever
 model that ONE function hands it. This module therefore does not touch
 either of those -- it is the missing piece `build_model_for_inference`
-needs to also recognize a Gen4 config (`model.arm` present) and dispatch
-to `gen4.model_factory`'s real builders + `gen4.staged_loader`'s real
-staged-conditioner discipline instead of Gen3's own
-`model_factory.build_architecture`/`maybe_load_pretrained_conditioner_
-for_architecture4`. Once wired (see `training/train.py`'s own dispatch
-at the top of `build_model_for_inference`), every existing caller gets a
-real Gen4 model for free, with zero changes to their own code.
+needs to also recognize a Gen4/Gen5 config (`model.arm` present) and
+dispatch to `gen4.model_factory`/`gen5.model_factory`'s real builders +
+`gen4.staged_loader`'s real staged-conditioner discipline instead of
+Gen3's own `model_factory.build_architecture`/`maybe_load_pretrained_
+conditioner_for_architecture4`. Once wired (see `training/train.py`'s
+own dispatch at the top of `build_model_for_inference`), every existing
+caller gets a real Gen4/Gen5 model for free, with zero changes of their
+own.
 
-Scope of this pass (documented, not silently omitted): `model.kind ==
-"conditioner"` and `"flow"` (Gen4) are wired here. `"latent_flow"`
-(Gen5) is NOT -- Gen5's own `ExpressionAutoencoder` needs its exact
-training-time `hidden_dim` to reconstruct an architecturally-identical
-module before `gen4.staged_loader.load_shared_autoencoder` can load real
-weights onto it, and no Gen5 flow config currently records that
-dimension (`model.params.hidden_dim` in configs/gen5/*.yaml is the FLOW
-model's own hidden_dim, a different, independently-configured value).
-Wiring Gen5 requires that config-schema addition first; deferred rather
-than guessing a dimension that could silently produce a wrong-shape (or
-worse, coincidentally-same-shape-but-wrong-semantics) load.
+`model.kind == "conditioner"`/`"flow"` (Gen4) and `"latent_flow"` (Gen5)
+are all wired here. Gen5's shared `ExpressionAutoencoder` is loaded via
+`gen5.autoencoder.load_expression_autoencoder_checkpoint` -- that
+function ALREADY reconstructs the exact architecture from the
+checkpoint's own saved n_genes/latent_dim/hidden_dim (see
+`gen4/staged_loader.py`'s own docstring for why this module no longer
+defines a second, incompatible autoencoder loader of its own), so no
+extra config field is needed to know its dimensions ahead of time.
 """
 from __future__ import annotations
 
@@ -59,20 +57,54 @@ def is_gen4_config(config: dict) -> bool:
     return "arm" in (config.get("model") or {})
 
 
-def _maybe_build_stpath_encoder(config: dict, gene_names: list[str], image_feature_dim: int):
+def _resolve_gen4_arm(config: dict) -> str:
+    """A Gen4 config's `model.arm` already IS a gen4-style key (gen4a-e).
+    A Gen5 config's `model.arm` is a gen5-style key (gen5a-e) -- translate
+    it through `GEN5_TO_GEN4_ARM` so the encoder-construction helpers
+    below (both keyed by `gen4.model_factory.ARM_TABLE`) work identically
+    for either caller without needing two copies of the same logic."""
+    model_cfg = config.get("model") or {}
+    arm = str(model_cfg.get("arm", ""))
+    if arm in ARM_TABLE:
+        return arm
+    from gen3_multiscale.gen5.model_factory import GEN5_TO_GEN4_ARM
+
+    return GEN5_TO_GEN4_ARM.get(arm, arm)
+
+
+def _maybe_build_gigapath_slide_encoder(config: dict, gen4_arm: str):
+    """Gen4-arm-table equivalent of `train.py::maybe_build_slide_encoder`
+    -- that function gates on Gen3's own `model.params.use_global_slide`
+    flag, which no Gen4/Gen5 config ever sets (arm needs are derived from
+    `ARM_TABLE[arm]["global_context_source"]` instead), so it can't be
+    called as-is; this reuses the SAME `FrozenGigaPathSlideEncoder`
+    construction + `required_fingerprints.gigapath_checkpoint` sourcing,
+    just gated on the real Gen4/Gen5 condition. Returns `(None, None)`
+    when the arm doesn't need one."""
+    if gen4_arm not in ARM_TABLE or ARM_TABLE[gen4_arm]["global_context_source"] != "gigapath":
+        return None, None
+    checkpoint_path = (config.get("required_fingerprints") or {}).get("gigapath_checkpoint")
+    if not checkpoint_path:
+        return None, None
+    from gen3_multiscale.models.slide_encoder import FrozenGigaPathSlideEncoder
+
+    encoder = FrozenGigaPathSlideEncoder(str(checkpoint_path))
+    return encoder, encoder.checkpoint_sha256
+
+
+def _maybe_build_stpath_encoder(config: dict, gen4_arm: str, gene_names: list[str], image_feature_dim: int):
     """Mirrors `training/train.py::maybe_build_slide_encoder`'s own
     "only construct when the arm actually needs it, and only when a real
     checkpoint is configured" discipline, applied to
     `gen4.stpath_context.Gen4STPathContextEncoder` (arm D/3, arm 4's
-    STPath-consuming path). No real STPath package/weights are available
-    in this environment (GEN4_CONTRACT.md section 13's documented gap) --
-    this function is structurally complete and exercised in tests only
-    via a stub `stpath_encoder=` passed directly to `build_gen4_
-    conditioner`/`build_gen4_flow`; real-weight construction is listed as
-    an explicit gap in the runbook (Item 6)."""
-    model_cfg = config.get("model") or {}
-    arm = str(model_cfg.get("arm", ""))
-    if arm not in ARM_TABLE or ARM_TABLE[arm]["image_feature_source"] not in ("stpath_context", "hybrid_context"):
+    STPath-consuming path -- for BOTH Gen4 and Gen5, via `gen4_arm`).
+    No real STPath package/weights are available in this environment
+    (GEN4_CONTRACT.md section 13's documented gap) -- this function is
+    structurally complete and exercised in tests only via a stub
+    `stpath_encoder=` passed directly to `build_gen4_conditioner`/
+    `build_gen4_flow`/`build_gen5_model`; real-weight construction is
+    listed as an explicit gap in the runbook (Item 6)."""
+    if gen4_arm not in ARM_TABLE or ARM_TABLE[gen4_arm]["image_feature_source"] not in ("stpath_context", "hybrid_context"):
         return None
     fingerprints = config.get("required_fingerprints") or {}
     checkpoint_path = fingerprints.get("stpath_checkpoint")
@@ -110,14 +142,27 @@ def build_gen4_model_for_inference(
     gex_feature_dim = int(data_cfg.get("gex_feature_dim", 128))
     image_feature_dim = int(params.get("image_feature_dim", 1536))
     seed = int(training_cfg.get("seed", 0))
+    # Integration audit finding #3 (CONFIRMED real): this was never read
+    # from config at all, so every scFoundation-consuming arm (frozen_context/
+    # hybrid_context -- gen4b/c/e) unconditionally hit
+    # gen4_model_factory's own "requires gex_context_embedding_dim" guard.
+    gex_context_embedding_dim = params.get("gex_context_embedding_dim")
+    gex_context_embedding_dim = int(gex_context_embedding_dim) if gex_context_embedding_dim else None
 
-    stpath_encoder = _maybe_build_stpath_encoder(config, gene_names, image_feature_dim)
+    gen4_arm = _resolve_gen4_arm(config)
+    stpath_encoder = _maybe_build_stpath_encoder(config, gen4_arm, gene_names, image_feature_dim)
+    # Integration audit finding #3 (CONFIRMED real): no GigaPath slide
+    # encoder was ever constructed here, so gen4b (global_context_source
+    # == "gigapath") would fail on that guard right after the
+    # gex_context_embedding_dim one above was fixed.
+    slide_encoder, gigapath_checkpoint_sha256 = _maybe_build_gigapath_slide_encoder(config, gen4_arm)
 
     torch.manual_seed(seed)
     if kind == "conditioner":
         model = gen4_model_factory.build_gen4_conditioner(
             config, n_genes=n_genes, gex_feature_dim=gex_feature_dim, image_feature_dim=image_feature_dim,
-            stpath_encoder=stpath_encoder, seed=seed,
+            gex_context_embedding_dim=gex_context_embedding_dim, slide_encoder=slide_encoder,
+            gigapath_checkpoint_sha256=gigapath_checkpoint_sha256, stpath_encoder=stpath_encoder, seed=seed,
         ).to(device)
         conditioner_info = dict(_UNLOADED_CONDITIONER_INFO)
     else:
@@ -144,6 +189,8 @@ def build_gen4_model_for_inference(
             )
         model = gen4_model_factory.build_gen4_flow(
             config, n_genes=n_genes, gex_feature_dim=gex_feature_dim, image_feature_dim=image_feature_dim,
+            gex_context_embedding_dim=gex_context_embedding_dim, slide_encoder=slide_encoder,
+            gigapath_checkpoint_sha256=gigapath_checkpoint_sha256,
             gene_basis=gene_basis, gene_names=gene_names, stpath_encoder=stpath_encoder, seed=seed,
         ).to(device)
 
@@ -170,8 +217,142 @@ def build_gen4_model_for_inference(
         checkpoint_module.load_trainable_state(model, resolved_checkpoint_identity.resolved_dir)
 
     return model, {
+        "kind": kind,
         "conditioner_info": conditioner_info,
+        "autoencoder_info": None,
         "checkpoint_bundle_id": resolved_checkpoint_identity.bundle_dir if resolved_checkpoint_identity else None,
         "checkpoint_manifest_sha256": resolved_checkpoint_identity.manifest_sha256 if resolved_checkpoint_identity else None,
         "trainable_weights_sha256": resolved_checkpoint_identity.weights_sha256 if resolved_checkpoint_identity else None,
     }
+
+
+def build_gen5_model_for_inference(
+    config: dict, *, gene_names: list[str], device: torch.device,
+    checkpoint_dir: str | Path | None = None, smoke: bool = False, staged_smoke: bool = False,
+    dataset_manifest: dict | None = None,
+) -> tuple[nn.Module, dict]:
+    """Gen5 equivalent of `build_gen4_model_for_inference` -- construct a
+    `Gen5LatentFlowModel` (kind == "latent_flow"): load the exact shared
+    `ExpressionAutoencoder` (Integration audit finding #8: via
+    `gen5.autoencoder.load_expression_autoencoder_checkpoint`, the real,
+    already-complete standalone-checkpoint loader -- see
+    `gen4/staged_loader.py`'s own docstring for why this module does not
+    define a second, transactional-bundle-shaped loader of its own),
+    stage-load+freeze the flow's conditioner from `required_fingerprints.
+    gen4_conditioner_checkpoint`, then optionally load `checkpoint_dir`'s
+    trainable weights on top -- the same checkpoint_dir=None/real-path
+    contract every other `build_*_model_for_inference` function uses."""
+    from gen3_multiscale.gen5 import model_factory as gen5_model_factory
+    from gen3_multiscale.gen5.autoencoder import (
+        ExpressionAutoencoder, load_expression_autoencoder_checkpoint, verify_expression_autoencoder_gene_names,
+    )
+
+    model_cfg = config.get("model") or {}
+    kind = str(model_cfg.get("kind", ""))
+    if kind != "latent_flow":
+        raise ValueError(f"build_gen5_model_for_inference: unsupported model.kind {kind!r} (expected 'latent_flow')")
+    data_cfg = config.get("data") or {}
+    training_cfg = config.get("training") or {}
+    params = model_cfg.get("params") or {}
+    n_genes = len(gene_names)
+    gex_feature_dim = int(data_cfg.get("gex_feature_dim", 128))
+    image_feature_dim = int(params.get("image_feature_dim", 1536))
+    seed = int(training_cfg.get("seed", 0))
+    gex_context_embedding_dim = params.get("gex_context_embedding_dim")
+    gex_context_embedding_dim = int(gex_context_embedding_dim) if gex_context_embedding_dim else None
+
+    fingerprints = config.get("required_fingerprints") or {}
+    needs_staged = not (smoke and not staged_smoke)
+    autoencoder_checkpoint_path = fingerprints.get("expression_autoencoder_checkpoint")
+    if autoencoder_checkpoint_path and needs_staged:
+        from gen3_multiscale.training.train import dataset_manifest_fingerprint
+
+        manifest_fp = dataset_manifest_fingerprint(dataset_manifest) if dataset_manifest is not None else None
+        autoencoder, ae_payload = load_expression_autoencoder_checkpoint(
+            str(autoencoder_checkpoint_path), dataset_manifest_fingerprint=manifest_fp,
+        )
+        verify_expression_autoencoder_gene_names(autoencoder, gene_names)
+        autoencoder_info = {
+            "loaded": True, "checkpoint_path": str(autoencoder_checkpoint_path),
+            "latent_dim": ae_payload["latent_dim"], "hidden_dim": ae_payload["hidden_dim"],
+            "code_identity": ae_payload.get("code_identity"),
+        }
+    elif needs_staged:
+        raise ValueError(
+            "a Gen5 latent_flow config requires required_fingerprints.expression_autoencoder_checkpoint -- "
+            "a real, already-fit shared ExpressionAutoencoder checkpoint (gen5.autoencoder."
+            "save_expression_autoencoder_checkpoint). Gen5 must never train from a random or unstaged "
+            "autoencoder"
+        )
+    else:
+        # Construction-only smoke with no real autoencoder configured yet.
+        latent_dim = int(params.get("latent_dim") or 0)
+        if not latent_dim:
+            raise ValueError("model.params.latent_dim must be set (even for a construction-only smoke)")
+        autoencoder = ExpressionAutoencoder(n_genes, gene_names, latent_dim, hidden_dim=params.get("autoencoder_hidden_dim", 1024))
+        autoencoder_info = {"loaded": False, "checkpoint_path": None, "latent_dim": latent_dim, "hidden_dim": None, "code_identity": None}
+
+    gen4_arm = _resolve_gen4_arm(config)
+    stpath_encoder = _maybe_build_stpath_encoder(config, gen4_arm, gene_names, image_feature_dim)
+    slide_encoder, gigapath_checkpoint_sha256 = _maybe_build_gigapath_slide_encoder(config, gen4_arm)
+
+    torch.manual_seed(seed)
+    model = gen5_model_factory.build_gen5_model(
+        config, n_genes=n_genes, gene_names=gene_names, gex_feature_dim=gex_feature_dim,
+        image_feature_dim=image_feature_dim, autoencoder=autoencoder,
+        gex_context_embedding_dim=gex_context_embedding_dim, slide_encoder=slide_encoder,
+        gigapath_checkpoint_sha256=gigapath_checkpoint_sha256, stpath_encoder=stpath_encoder, seed=seed,
+    ).to(device)
+
+    conditioner_checkpoint_dir = fingerprints.get("gen4_conditioner_checkpoint")
+    if conditioner_checkpoint_dir and needs_staged:
+        conditioner_info = gen4_staged_loader.load_and_freeze_deterministic_conditioner(
+            model, str(conditioner_checkpoint_dir), gene_names,
+        )
+    elif needs_staged:
+        raise ValueError(
+            "a Gen5 latent_flow config requires required_fingerprints.gen4_conditioner_checkpoint -- a "
+            "real, already-trained, validation-selected matching gen4 conditioner checkpoint_dir. A Gen5 "
+            "flow model must never start training from a random or unstaged conditioner"
+        )
+    else:
+        conditioner_info = dict(_UNLOADED_CONDITIONER_INFO)
+
+    resolved_checkpoint_identity = None
+    if checkpoint_dir is not None:
+        resolved_checkpoint_identity = checkpoint_module.resolve_checkpoint_identity(checkpoint_dir)
+        checkpoint_module.verify_gene_names(resolved_checkpoint_identity.resolved_dir, gene_names)
+        checkpoint_module.load_trainable_state(model, resolved_checkpoint_identity.resolved_dir)
+
+    return model, {
+        "kind": kind,
+        "conditioner_info": conditioner_info,
+        "autoencoder_info": autoencoder_info,
+        "checkpoint_bundle_id": resolved_checkpoint_identity.bundle_dir if resolved_checkpoint_identity else None,
+        "checkpoint_manifest_sha256": resolved_checkpoint_identity.manifest_sha256 if resolved_checkpoint_identity else None,
+        "trainable_weights_sha256": resolved_checkpoint_identity.weights_sha256 if resolved_checkpoint_identity else None,
+    }
+
+
+def build_gen4_or_gen5_model_for_inference(
+    config: dict, *, gene_names: list[str], device: torch.device,
+    checkpoint_dir: str | Path | None = None, smoke: bool = False, staged_smoke: bool = False,
+    dataset_manifest: dict | None = None,
+) -> tuple[nn.Module, dict]:
+    """The single dispatch point `training/train.py::build_model_for_
+    inference` calls whenever `is_gen4_config(config)` is true --
+    Integration-1's "normalized model_info schema" requirement: every
+    branch below returns the SAME dict shape (kind/conditioner_info/
+    autoencoder_info/checkpoint_*), so a caller never needs to know
+    whether it got a Gen4 or Gen5 model back to read identity-binding
+    fields for a run manifest."""
+    kind = str((config.get("model") or {}).get("kind", ""))
+    if kind == "latent_flow":
+        return build_gen5_model_for_inference(
+            config, gene_names=gene_names, device=device, checkpoint_dir=checkpoint_dir,
+            smoke=smoke, staged_smoke=staged_smoke, dataset_manifest=dataset_manifest,
+        )
+    return build_gen4_model_for_inference(
+        config, gene_names=gene_names, device=device, checkpoint_dir=checkpoint_dir,
+        smoke=smoke, staged_smoke=staged_smoke,
+    )

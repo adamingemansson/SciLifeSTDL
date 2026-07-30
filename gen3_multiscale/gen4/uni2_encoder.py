@@ -68,6 +68,11 @@ class FrozenUNI2TileEncoder(nn.Module):
         embed_dim=1536, mlp_ratio=2.66667 * 2, num_classes=0, no_embed_class=True,
         reg_tokens=8, dynamic_img_size=True,
     )
+    # Official MahmoodLab/UNI2-h model card: 224x224 input, ImageNet
+    # normalization -- see encode_available_patches's own docstring
+    # (Integration audit finding #6) for why this must be enforced
+    # explicitly rather than trusted to dynamic_img_size.
+    _INPUT_SIZE = 224
 
     def __init__(
         self,
@@ -117,6 +122,12 @@ class FrozenUNI2TileEncoder(nn.Module):
         for parameter in self.model.parameters():
             parameter.requires_grad_(False)
         self.model.eval()
+        # Integration audit finding #6 (CONFIRMED real): `device` was
+        # accepted but never used -- the model (and every input tensor
+        # below) always stayed on whatever device timm.create_model
+        # defaulted to (CPU), silently ignoring device="cuda".
+        self.device = torch.device(device)
+        self.model = self.model.to(self.device)
         self.output_dim = int(output_dim)
         self.identity = EncoderIdentity(
             encoder_name="uni2",
@@ -134,15 +145,33 @@ class FrozenUNI2TileEncoder(nn.Module):
 
     @torch.inference_mode()
     def encode_available_patches(self, patches: np.ndarray) -> np.ndarray:
+        """Integration audit finding #6 (CONFIRMED real): the official
+        MahmoodLab/UNI2-h model card specifies 224x224 input with
+        ImageNet normalization -- this class's own `preprocessing_spec`
+        already CLAIMED "resize224", but the prior version never actually
+        resized: HEST's dense-WSI tiles are produced at 256x256 (see
+        `scripts/precompute_gigapath_wsi_tiles.py`'s own `_tile_grid`,
+        `output_size=256`) and were fed straight through. `dynamic_img_size
+        =True` (self._TIMM_KWARGS) let timm silently accept the wrong
+        input size without erroring -- a different effective patch grid
+        than UNI2-h was actually trained/documented for, not a crash a
+        caller would notice. Patches are now resized to exactly
+        `_INPUT_SIZE` (224) via bilinear interpolation before
+        normalization, on whichever spatial size they arrive at, so the
+        code matches what `preprocessing_spec` already claimed."""
         if patches.ndim != 4 or patches.shape[-1] != 3:
             raise ValueError(f"patches must be [N, H, W, 3], got shape {patches.shape}")
-        tensor = torch.from_numpy(np.ascontiguousarray(patches)).permute(0, 3, 1, 2).float()
+        tensor = torch.from_numpy(np.ascontiguousarray(patches)).permute(0, 3, 1, 2).float().to(self.device)
         if tensor.max() > 1.5:  # heuristically 0-255 range, matches spot_feature_cache's own convention
             tensor = tensor.div(255.0)
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        if tensor.shape[-2:] != (self._INPUT_SIZE, self._INPUT_SIZE):
+            tensor = torch.nn.functional.interpolate(
+                tensor, size=(self._INPUT_SIZE, self._INPUT_SIZE), mode="bilinear", align_corners=False,
+            )
+        mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
         tensor = (tensor - mean) / std
-        out = self.model(tensor).cpu().numpy().astype(np.float32)
+        out = self.model(tensor).detach().to("cpu").numpy().astype(np.float32)
         if out.shape != (patches.shape[0], self.output_dim):
             raise RuntimeError(
                 f"UNI2 encoder returned features with shape {out.shape}, expected "

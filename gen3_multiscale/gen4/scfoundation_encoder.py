@@ -7,42 +7,69 @@ here ever downloads a checkpoint. `encode_rows` is strictly row-independent
 row at a time (no batch norm, no dataset-level rescaling), so it is safe
 against training/validation/test rows or the same row called twice.
 
-Codex audit finding #2 (of the first Gen4 push), confirmed real: the
-original version of this file assumed an arbitrary `model(tensor,
-gene_ids=...)` call shape that does not match the official scFoundation
-API (biomap-research/scFoundation, `model/load.py` /
-`model/pretrainmodels.py`). The real, documented preprocessing this class
-now reflects, from the official repository's own `main_gene_selection`
-helper and the scFoundation paper's own description of its read-depth
-tokens:
+Integration audit finding #5 (six-launch-blocker follow-up), CONFIRMED
+real: the prior version of this file assumed
+`load_model_frommmf(...)` returns a single model and that a plain
+`model(tensor, output_type="cell")` call performs a full forward pass.
+Neither matches the real, official biomap-research/scFoundation
+implementation (fetched 2026-07-30 from
+`model/load.py`/`model/get_embedding.py` at the `main` branch --
+`required_fingerprints.scfoundation_checkpoint`'s own pinned revision is
+what a real deployment must actually verify against, per this class's
+own `pinned_revision` identity field below). The real, verbatim
+reference pipeline this class now reproduces:
 
-1. scFoundation has ONE fixed, ~19264-gene vocabulary, in a fixed order --
-   `scfoundation_gene_list` (loaded from `gene_vocab_path`, a JSON array
-   of gene symbols in that exact fixed order) is that vocabulary, NOT an
-   arbitrary caller-supplied gene->id mapping. This manifest's own
-   `gene_names` are re-indexed INTO that fixed vocabulary (zero-filled
-   for any scFoundation vocabulary gene absent from this manifest's
-   panel) -- never the other way around.
-2. Two extra "total count" tokens (log1p of each row's own total raw
-   count, and a target total-count value) are appended as the final two
-   input positions before encoding -- scFoundation's own read-depth-aware
-   token design, not a per-dataset-statistic (each row's own total count
-   is a row-local, row-independent quantity, so this does not violate the
-   row-independence contract above).
-3. `load_model_frommmf(checkpoint_path, key="cell")` loads a
-   cell-embedding-mode checkpoint; the real forward call requests
-   `output_type="cell"` to get one pooled per-row embedding (scFoundation
-   also supports a "gene" output mode returning per-gene embeddings --
-   NOT what a per-spot GEX-context embedding needs here).
+1. `load_model_frommmf(checkpoint_path, key="cell")` returns a
+   `(model, config)` TUPLE, not a bare model -- `config` carries
+   `pad_token_id` and every other hyperparameter the forward pass below
+   needs; it is never guessed.
+2. `main_gene_selection`: scFoundation has ONE fixed, ~19264-gene
+   vocabulary in a fixed order (`scfoundation_gene_list`, loaded from
+   `gene_vocab_path`) -- this manifest's own `gene_names` are re-indexed
+   INTO that fixed vocabulary (zero-filled for any scFoundation
+   vocabulary gene absent from this manifest's panel), never the other
+   way around.
+3. Two extra tokens are appended, in this EXACT order (a prior version
+   had them reversed): a fixed target-resolution token (`tgthighres="t4"`
+   -- the official script's own default meaning "target token 1 is the
+   literal value `4.0`", not a log-transformed count of anything), then
+   `log10(raw_library_size)` -- the OFFICIAL script's own resolution-token
+   ordering and `log10` (never `log1p`) semantics for the real total-count
+   token. `raw_library_size` is the real, pre-normalization total count
+   per row (`adata.obs['_scilifestdl_raw_library_size']`, stashed by
+   `data/loaders.py::basic_qc_and_normalize`) -- a prior version summed
+   the already-normalized `expression` matrix instead, which cannot
+   recover a real read depth.
+4. Cell embedding (`output_type="cell"`, `version="ce"`): only genes
+   (plus both resolution tokens) with strictly positive value are kept
+   (`value_labels = pretrain_gene_x > 0`), compacted via the official
+   `gatherData` gene-gathering routine (vendored locally below, not
+   imported, so this class does not depend on the external package's
+   internal/undocumented module layout for anything beyond
+   `load_model_frommmf`'s own public return value), fed through the
+   real model's own `token_emb` (continuous-value embedding) +
+   `pos_emb` (gene-index positional embedding) + `encoder`, then pooled
+   via the official FOUR-way scheme (`pool_type="all"`, the official
+   default): the last two positions (the two resolution tokens'
+   post-encoder representations) concatenated with a max-pool and a
+   mean-pool over every other (real gene) position.
 
-HONEST LIMIT (GEN4_CONTRACT.md section 13 / RUNBOOK.md section 4): no real
-`scfoundation` package is installed in this environment, so the exact
-`load_model_frommmf`/forward() call signature below has never been run
-against the real package and MUST be verified (and corrected if it has
-drifted from what is reflected here) against a real installation before
-trusting this path for real inference. What IS structurally guaranteed by
-this file regardless of that: fixed vocabulary order, row-independent
-encoding, and fail-closed checkpoint/vocabulary identity.
+HONEST LIMIT (GEN4_CONTRACT.md section 13 / RUNBOOK.md section 4): no
+real `scfoundation` package is installed in this environment, so this
+has never been run against the real package/checkpoint and MUST be
+verified against a real installation before trusting this path for real
+inference -- `tests/test_scfoundation_encoder.py` exercises every piece
+of the computation above (gathering, token ordering, pooling) against a
+bypassed-__init__ instance with a tiny real (not scFoundation-weighted)
+transformer-shaped model standing in for the real one, and a SEPARATE
+adversarial test proves the official gatherData/pooling logic here
+reduces to a known-correct closed form on a hand-checkable tiny example
+-- but the real checkpoint's own numerical output has not been compared
+against the official script's own output on identical rows in this
+sandbox. What IS structurally guaranteed regardless: fixed vocabulary
+order, row-independent encoding, fail-closed checkpoint/vocabulary
+identity, and (now) device placement and the official token
+ordering/pooling algorithm.
 """
 from __future__ import annotations
 
@@ -65,6 +92,48 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def gather_scfoundation_data(data: torch.Tensor, labels: torch.Tensor, pad_token_id: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """Vendored, functionally verbatim copy of the official
+    biomap-research/scFoundation repository's `model/load.py::gatherData`
+    (see this module's own docstring for why it is copied here rather
+    than imported). Compacts `data` to only its `labels`-True positions
+    per row, in original left-to-right order, right-padded with
+    `pad_token_id` out to the batch's own max labeled-count.
+
+    Mechanism (identical to the official version): every position gets
+    a per-row-monotonically-decreasing tiebreak added to `labels`
+    (`tmp_data`) so a `topk` over `labels` recovers the True positions in
+    their ORIGINAL left-to-right order (not sorted by value); `max_num`
+    extra guaranteed-True "fake" columns are appended to both `data` (as
+    `pad_token_id`) and `labels` (as True) so `topk(max_num)` always has
+    enough real candidates even for a row with fewer than `max_num`
+    labeled positions -- those fake columns naturally sort last (their
+    tiebreak score is 0, lower than every real True position's) and end
+    up selected only to fill out the padding."""
+    value_nums = labels.sum(1)
+    max_num = int(value_nums.max().item())
+
+    fake_data = torch.full((data.shape[0], max_num), pad_token_id, device=data.device, dtype=data.dtype)
+    data = torch.hstack([data, fake_data])
+
+    fake_label = torch.ones((labels.shape[0], max_num), device=labels.device, dtype=torch.float32)
+    none_labels = ~labels
+    labels = labels.float()
+    labels = labels.masked_fill(none_labels, -float("inf"))
+
+    tmp_data = torch.tensor(
+        [(i + 1) * 20000 for i in range(labels.shape[1], 0, -1)], device=labels.device, dtype=labels.dtype,
+    )
+    labels = labels + tmp_data
+    labels = torch.hstack([labels, fake_label])
+
+    fake_label_gene_idx = labels.topk(max_num).indices
+
+    new_data = torch.gather(data, 1, fake_label_gene_idx)
+    padding_labels = new_data == pad_token_id
+    return new_data, padding_labels
+
+
 class FrozenSCFoundationEncoder(nn.Module):
     """Wraps a real scFoundation checkpoint. `gene_vocab_path` must be a
     JSON file containing scFoundation's own FIXED, ordered gene vocabulary
@@ -78,10 +147,13 @@ class FrozenSCFoundationEncoder(nn.Module):
         gene_vocab_path: str,
         gene_names: list[str],
         output_dim: int = 3072,
-        target_total_count: float = 1e4,
-        device: str = "cpu",
+        pool_type: str = "all",
+        target_resolution_token: float = 4.0,
+        device: str = "cuda",
     ):
         super().__init__()
+        if pool_type not in ("all", "max"):
+            raise ValueError(f"pool_type must be 'all' or 'max' (official scFoundation cell-embedding modes), got {pool_type!r}")
         ckpt_path = Path(checkpoint_path).expanduser()
         vocab_path = Path(gene_vocab_path).expanduser()
         if not ckpt_path.is_file():
@@ -115,7 +187,8 @@ class FrozenSCFoundationEncoder(nn.Module):
                 f"{len(self.scfoundation_vocab)}-gene vocabulary {vocab_path} -- refusing to encode "
                 "an all-zero input"
             )
-        self.target_total_count = float(target_total_count)
+        self.pool_type = pool_type
+        self.target_resolution_token = float(target_resolution_token)
         vocab_sha256 = hashlib.sha256(json.dumps(scfoundation_vocab).encode("utf-8")).hexdigest()
 
         try:
@@ -128,10 +201,16 @@ class FrozenSCFoundationEncoder(nn.Module):
             ) from exc
 
         checkpoint_sha256 = _sha256_file(ckpt_path)
-        # Real API per the official repository's model/load.py -- see this
-        # class's own docstring for the HONEST LIMIT on this call's
-        # verification status in this environment.
-        self.model = scfoundation.load_model_frommmf(str(ckpt_path), key="cell")  # pragma: no cover
+        # Integration audit finding #5 (CONFIRMED real): the official
+        # load_model_frommmf returns a (model, config) TUPLE -- a prior
+        # version treated its return value as a bare model.
+        self.model, self.scfoundation_config = scfoundation.load_model_frommmf(str(ckpt_path), key="cell")  # pragma: no cover
+        if "pad_token_id" not in self.scfoundation_config:
+            raise ValueError(
+                f"scFoundation checkpoint {ckpt_path}'s own config has no pad_token_id -- cannot gather "
+                "gene tokens without it (this looks like an incompatible/corrupted checkpoint)"
+            )
+        self.pad_token_id = self.scfoundation_config["pad_token_id"]
         # Item 6 (six-launch-blocker audit): `device` was accepted here but
         # never used anywhere in this class -- the model always stayed on
         # whatever device `load_model_frommmf` itself defaulted to
@@ -147,7 +226,10 @@ class FrozenSCFoundationEncoder(nn.Module):
             checkpoint_sha256=checkpoint_sha256,
             pinned_revision=vocab_sha256,  # scFoundation has no HF revision; vocab hash pins the identity instead
             package_version=package_version,
-            preprocessing_spec="scfoundation_row_independent_v2:fixed_vocab_reindex+read_depth_tokens",
+            preprocessing_spec=(
+                f"scfoundation_official_v1:main_gene_selection+cell_pooling_{pool_type}:"
+                f"tgthighres=t{target_resolution_token:g}:log10_totalcount"
+            ),
             output_dim=self.output_dim,
         )
 
@@ -158,32 +240,21 @@ class FrozenSCFoundationEncoder(nn.Module):
 
     def _to_scfoundation_input(self, expression: np.ndarray, raw_library_size: np.ndarray) -> np.ndarray:
         """Re-index `expression` (aligned to `self.gene_names`) into
-        scFoundation's own fixed vocabulary order, then append the two
-        read-depth tokens.
-
-        Item 6 (six-launch-blocker audit), CONFIRMED real bug: the prior
-        version derived the "total count" token as
-        `log1p(expression.sum(axis=1))` -- but `expression` here is this
-        codebase's own normalize_log1p-transformed matrix (data/
-        loaders.py::basic_qc_and_normalize, the pipeline default; see
-        `gen4.providers.GexContextProvider.encode_rows`'s own docstring),
-        NOT raw counts. Summing already-log1p'd values is not a read
-        depth in any sense scFoundation's own read-depth token design
-        expects -- it conflates two different preprocessing stages'
-        outputs. The real, row-local raw total count BEFORE
-        normalization is `raw_library_size` (`adata.obs[
-        '_scilifestdl_raw_library_size']`, stashed by basic_qc_and_
-        normalize for exactly this kind of downstream need), passed in
-        explicitly by the caller (gen4/scfoundation_cache.py) rather than
-        rederived here from a matrix that can no longer recover it."""
+        scFoundation's own fixed vocabulary order, then append the
+        official two read-depth tokens IN THE OFFICIAL ORDER: the fixed
+        target-resolution token first, `log10(raw_library_size)` second
+        (biomap-research/scFoundation `model/get_embedding.py`'s own
+        `input_type='singlecell'`, `tgthighres[0]=='t'` branch -- a
+        prior version had these two tokens reversed and used `log1p` of
+        the wrong quantity instead of `log10` of the real one)."""
         n_rows = expression.shape[0]
         vocab_input = np.zeros((n_rows, len(self.scfoundation_vocab)), dtype=np.float32)
         manifest_rows = [r for r, _v in self._manifest_to_vocab_pos]
         vocab_cols = [v for _r, v in self._manifest_to_vocab_pos]
         vocab_input[:, vocab_cols] = expression[:, manifest_rows]
-        total_count_token = np.log1p(raw_library_size).astype(np.float32).reshape(n_rows, 1)
-        target_token = np.full((n_rows, 1), np.log1p(self.target_total_count), dtype=np.float32)
-        return np.concatenate([vocab_input, total_count_token, target_token], axis=1)
+        resolution_token = np.full((n_rows, 1), self.target_resolution_token, dtype=np.float32)
+        total_count_token = np.log10(raw_library_size).astype(np.float32).reshape(n_rows, 1)
+        return np.concatenate([vocab_input, resolution_token, total_count_token], axis=1)
 
     @torch.inference_mode()
     def encode_rows(self, expression: np.ndarray, raw_library_size: np.ndarray | None = None) -> np.ndarray:
@@ -203,9 +274,41 @@ class FrozenSCFoundationEncoder(nn.Module):
                 f"raw_library_size has {raw_library_size.shape[0]} rows, expected {expression.shape[0]} "
                 "(row-aligned with expression)"
             )
+        if not np.all(raw_library_size > 0):
+            raise ValueError("raw_library_size must be strictly positive (log10 of a real total count)")
+
         model_input = self._to_scfoundation_input(np.asarray(expression, dtype=np.float32), raw_library_size)
-        tensor = torch.as_tensor(model_input, dtype=torch.float32, device=self.device)
-        out = self.model(tensor, output_type="cell").detach().to("cpu").numpy().astype(np.float32)  # pragma: no cover
+        pretrain_gene_x = torch.as_tensor(model_input, dtype=torch.float32, device=self.device)
+        data_gene_ids = torch.arange(pretrain_gene_x.shape[1], device=self.device).repeat(pretrain_gene_x.shape[0], 1)
+
+        # Official model/get_embedding.py, output_type="cell": only
+        # strictly-positive positions (real expression + both resolution
+        # tokens) are kept; gathered/compacted, embedded, encoded, pooled.
+        value_labels = pretrain_gene_x > 0
+        x, x_padding = gather_scfoundation_data(pretrain_gene_x, value_labels, self.pad_token_id)
+        position_gene_ids, _ = gather_scfoundation_data(data_gene_ids.float(), value_labels, self.pad_token_id)
+
+        x = self.model.token_emb(torch.unsqueeze(x, 2).float(), output_weight=0)
+        position_emb = self.model.pos_emb(position_gene_ids.long())
+        x = x + position_emb
+        geneemb = self.model.encoder(x, x_padding)
+
+        # Official four-way "all" pooling: the two resolution tokens'
+        # own post-encoder representations (always the LAST two gathered
+        # positions -- gatherData preserves original left-to-right order
+        # and both tokens were appended last, so they sort last among
+        # every row's real, positive-valued positions) concatenated with
+        # a max-pool and a mean-pool over every other (gene) position.
+        geneemb1 = geneemb[:, -1, :]
+        geneemb2 = geneemb[:, -2, :]
+        geneemb3, _ = torch.max(geneemb[:, :-2, :], dim=1)
+        geneemb4 = torch.mean(geneemb[:, :-2, :], dim=1)
+        if self.pool_type == "all":
+            pooled = torch.cat([geneemb1, geneemb2, geneemb3, geneemb4], dim=1)
+        else:
+            pooled, _ = torch.max(geneemb, dim=1)
+
+        out = pooled.detach().to("cpu").numpy().astype(np.float32)
         if out.shape != (expression.shape[0], self.output_dim):
             raise RuntimeError(f"scFoundation encoder returned shape {out.shape}, expected ({expression.shape[0]}, {self.output_dim})")
         if not np.isfinite(out).all():

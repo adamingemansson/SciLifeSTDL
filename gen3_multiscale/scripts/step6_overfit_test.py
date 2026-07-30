@@ -50,7 +50,8 @@ from gen3_multiscale.evaluation.gen3_evaluator import per_item_reconstruction_me
 from gen3_multiscale.training.gen3_dataset import Gen3SpatialFieldDataset, build_gen3_mask_schedule
 from gen3_multiscale.training.gen3_preflight import load_and_preflight_samples
 from gen3_multiscale.training.train import (
-    build_model_for_inference, expected_tile_encoder_provenance, predict_for_metrics, run_training,
+    build_model_for_inference, expected_tile_encoder_provenance, model_kind_for_architecture_id,
+    predict_for_metrics, run_training,
 )
 
 
@@ -105,7 +106,7 @@ def _build_fixed_eval_item(config: dict, manifest: dict, sample_id: str):
     return dataset[0]
 
 
-def _evaluate_fixed_item(architecture_id: str, model: torch.nn.Module, item, *, generator=None) -> dict:
+def _evaluate_fixed_item(kind: str, model: torch.nn.Module, item, *, generator=None) -> dict:
     """Adam's Step 6 audit #1 of commit a32051b: Architecture 4's
     capacity-gate metric must come from `sample_predictive_distribution`'s
     predictive mean, not `forward()`'s frozen conditioner -- the prior
@@ -114,11 +115,14 @@ def _evaluate_fixed_item(architecture_id: str, model: torch.nn.Module, item, *, 
     conditioner reconstructs its one memorized sample well, without the
     flow apparatus this test is meant to be exercising ever being
     evaluated at all. `generator`, when given, makes repeated calls
-    (before/after training) reproducible."""
+    (before/after training) reproducible. `kind` (Integration audit
+    finding #1) is `model_kind_for_architecture_id(architecture_id)` --
+    this script is Gen3-only (builds items via `Gen3SpatialFieldDataset`
+    directly), so `kind` is always `"conditioner"` or `"flow"` here."""
     inputs, targets = item
     model.eval()
     with torch.no_grad():
-        prediction = predict_for_metrics(architecture_id, model, inputs, generator=generator)
+        prediction = predict_for_metrics(kind, model, inputs, generator=generator)
     model.train()
     pred = np.asarray(prediction["expression"].detach().cpu().numpy(), dtype=np.float32)
     true = np.asarray(targets.query_expression, dtype=np.float32)
@@ -157,6 +161,7 @@ def run_overfit_gate(
     fixed_item = _build_fixed_eval_item(config, overfit_manifest, sample_id)
 
     architecture_id = str(config["model"]["architecture"])
+    kind = model_kind_for_architecture_id(architecture_id)
     gene_names = list(overfit_manifest["gene_panel"])
     seed = int(config["training"].get("seed", 0))
     device = torch.device(config["training"].get("device", "cpu") if torch.cuda.is_available() else "cpu")
@@ -166,7 +171,7 @@ def run_overfit_gate(
         dataset_manifest=overfit_manifest,
     )
     before_generator = torch.Generator(device=device).manual_seed(seed)
-    before_metrics = _evaluate_fixed_item(architecture_id, before_model, fixed_item, generator=before_generator)
+    before_metrics = _evaluate_fixed_item(kind, before_model, fixed_item, generator=before_generator)
 
     training_summary = run_training(str(overfit_config_path), smoke=False)
 
@@ -175,7 +180,7 @@ def run_overfit_gate(
         dataset_manifest=overfit_manifest,
     )
     after_generator = torch.Generator(device=device).manual_seed(seed)
-    after_metrics = _evaluate_fixed_item(architecture_id, after_model, fixed_item, generator=after_generator)
+    after_metrics = _evaluate_fixed_item(kind, after_model, fixed_item, generator=after_generator)
 
     rmse_before, rmse_after = before_metrics["rmse"], after_metrics["rmse"]
     relative_improvement = (rmse_before - rmse_after) / rmse_before if rmse_before > 0 else float("nan")

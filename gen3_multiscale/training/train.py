@@ -630,20 +630,19 @@ def build_model_for_inference(
     failing closed on a mismatched gene panel or incomplete checkpoint,
     exactly as every other checkpoint load in this package.
 
-    Item 5 (six-launch-blocker audit): a Gen4 config (`model.arm`
-    present, never set by a Gen3 config) dispatches to
-    `gen4.trainer_adapter.build_gen4_model_for_inference` instead of
-    everything below -- the ONE minimal adapter point that lets every
-    existing caller of THIS function (the trainer loop, the evaluator,
-    the overfit gate) construct a real Gen4 model with zero changes of
-    their own. See that module's docstring for exactly what is (Gen4
-    conditioner/flow) and is not yet (Gen5 latent_flow) wired here."""
+    Item 5 (six-launch-blocker audit) + Integration audit follow-up: a
+    Gen4/Gen5 config (`model.arm` present, never set by a Gen3 config)
+    dispatches to `gen4.trainer_adapter.build_gen4_or_gen5_model_for_
+    inference` instead of everything below -- the ONE minimal adapter
+    point that lets every existing caller of THIS function (the trainer
+    loop, the evaluator, the overfit gate) construct a real Gen4/Gen5
+    model with zero changes of their own."""
     if (config.get("model") or {}).get("arm") is not None:
-        from gen3_multiscale.gen4.trainer_adapter import build_gen4_model_for_inference
+        from gen3_multiscale.gen4.trainer_adapter import build_gen4_or_gen5_model_for_inference
 
-        return build_gen4_model_for_inference(
+        return build_gen4_or_gen5_model_for_inference(
             config, gene_names=gene_names, device=device, checkpoint_dir=checkpoint_dir,
-            smoke=smoke, staged_smoke=staged_smoke,
+            smoke=smoke, staged_smoke=staged_smoke, dataset_manifest=dataset_manifest,
         )
     architecture_id = str((config.get("model") or {}).get("architecture", ""))
     training_cfg = config.get("training") or {}
@@ -737,6 +736,7 @@ def build_model_for_inference(
 
     info = {
         "architecture_id": architecture_id,
+        "kind": model_kind_for_architecture_id(architecture_id),
         "gene_basis": gene_basis,
         "gigapath_checkpoint_sha256": gigapath_checkpoint_sha256,
         "synchronized_init_manifest_path": synchronized_init_manifest_path,
@@ -746,35 +746,69 @@ def build_model_for_inference(
     return model, info
 
 
-def predict_for_metrics(
-    architecture_id: str, model, inputs, *, generator: torch.Generator | None = None, n_samples: int | None = None,
-) -> dict:
-    """The metric-basis prediction for `inputs` -- Adam's Step 6 audit #1
-    of commit a32051b: "Architecture 4 validation/evaluation/overfit must
-    evaluate a deterministic fixed-seed predictive mean from
-    `sample_predictive_distribution`, not `forward()`'s frozen
-    conditioner. Log conditioner-only metrics separately." Architectures
-    1-3's `forward()` already IS the real model, so their `expression`
-    output is used directly and there is no separate "conditioner-only"
-    number to report.
+def model_kind_for_architecture_id(architecture_id: str) -> str:
+    """Gen3's own numeric `model.architecture` mapped onto the generic
+    `model.kind` vocabulary (`"conditioner"` / `"flow"`) that Gen4/Gen5
+    configs already carry directly via their own `model.kind` field.
+    Architecture 4 IS Gen3's residual-flow architecture -- deterministic
+    reconstruction training/`forward()` prediction for architectures 1-3
+    was always exactly what `"conditioner"` means below; Architecture 4's
+    `compute_losses()["flow_loss"]` training and
+    `sample_predictive_distribution()` evaluation was always exactly what
+    `"flow"` means. Integration audit finding #1: this lets
+    `predict_for_metrics`/`compute_step_losses`/
+    `compute_deterministic_reconstruction_losses` dispatch on ONE shared
+    `kind` vocabulary for both Gen3 and Gen4/Gen5, instead of Gen3's
+    numeric `architecture_id` -- a Gen4 flow config has no
+    `model.architecture` at all, so the prior `architecture_id == "4"`
+    check silently fell through to the `forward()` branch for it, which
+    for `Gen4ResidualFlowModel` returns the FROZEN CONDITIONER's own
+    output (by design, for the single-conditioner-pass loss discipline),
+    not the flow model's real prediction -- and `Gen5LatentFlowModel` has
+    no `forward()` at all, so it would have raised `NotImplementedError`
+    outright."""
+    return "flow" if str(architecture_id) == "4" else "conditioner"
 
-    Returns `{"expression": <the metric-basis prediction>}` for every
-    architecture, plus (Architecture 4 only) `"conditioner_only_expression"`
-    (the frozen conditioner's own, secondary, mean -- never the reported
-    headline metric), `"predictive_std"` (per-query sampled-residual
-    uncertainty) and `"predictive_samples"` (the raw per-draw field,
-    `[n_samples, n_query, n_genes]`, for empirical-quantile calibration).
-    `generator`, when given, makes Architecture 4's stochastic sampling
-    reproducible -- required for exact resume/evaluation consistency
-    (same audit item). `n_samples`, when given, overrides the model's own
-    configured `n_flow_samples` -- Codex re-audit of commit f7bb8a1,
-    secondary fix #4: "Treat Gaussian coverage from 8 flow samples as
-    approximate; preferably use empirical quantiles with a larger
-    configurable sample count." A caller that wants a more reliable
-    calibration estimate than the training-time default can ask for more
-    draws here without changing `n_flow_samples` itself."""
-    if architecture_id == "4":
-        conditioner_out = model(inputs)
+
+def predict_for_metrics(
+    kind: str, model, inputs, *, generator: torch.Generator | None = None, n_samples: int | None = None,
+) -> dict:
+    """The metric-basis prediction for `inputs`, dispatched by `kind`
+    (`"conditioner"`, `"flow"`, or `"latent_flow"` -- see
+    `model_kind_for_architecture_id`'s docstring and Integration audit
+    finding #1). Adam's Step 6 audit #1 of commit a32051b: "Architecture
+    4 validation/evaluation/overfit must evaluate a deterministic
+    fixed-seed predictive mean from `sample_predictive_distribution`, not
+    `forward()`'s frozen conditioner. Log conditioner-only metrics
+    separately." A `"conditioner"` model's `forward()` already IS the
+    real model, so its `expression` output is used directly and there is
+    no separate "conditioner-only" number to report.
+
+    Returns `{"expression": <the metric-basis prediction>}` for
+    `"conditioner"`, plus (`"flow"`/`"latent_flow"` only)
+    `"conditioner_only_expression"` (the frozen conditioner's own,
+    secondary, mean -- never the reported headline metric),
+    `"predictive_std"` (per-query sampled-residual uncertainty) and
+    `"predictive_samples"` (the raw per-draw field, `[n_samples,
+    n_query, n_genes]`, for empirical-quantile calibration). `generator`,
+    when given, makes the flow's stochastic sampling reproducible --
+    required for exact resume/evaluation consistency (same audit item).
+    `n_samples`, when given, overrides the model's own configured
+    `n_flow_samples` -- Codex re-audit of commit f7bb8a1, secondary fix
+    #4: "Treat Gaussian coverage from 8 flow samples as approximate;
+    preferably use empirical quantiles with a larger configurable sample
+    count." A caller that wants a more reliable calibration estimate than
+    the training-time default can ask for more draws here without
+    changing `n_flow_samples` itself.
+
+    A `"flow"`/`"latent_flow"` model's frozen conditioner is read via
+    `model.conditioner(inputs)` directly, never `model(inputs)` -- Gen5's
+    `Gen5LatentFlowModel` has no ordinary `forward()` at all (only Gen3's
+    `Architecture4`/Gen4's `Gen4ResidualFlowModel` happen to alias their
+    own `forward()` to the conditioner pass; relying on that alias is
+    exactly the bug this function's genericization fixes)."""
+    if kind in ("flow", "latent_flow"):
+        conditioner_out = model.conditioner(inputs)
         predictive = model.sample_predictive_distribution(inputs, n_samples=n_samples, generator=generator)
         return {
             "expression": predictive["predictive_mean"],
@@ -944,23 +978,44 @@ def _validate_numeric_config(training_cfg: dict, loss_cfg: dict) -> None:
         raise ValueError(f"config field training.optimizer.betas={betas!r} must be exactly two values in [0, 1)")
 
 
-def compute_step_losses(architecture_id: str, model, inputs, target_expression: torch.Tensor,
+def compute_step_losses(kind: str, model, inputs, target_expression: torch.Tensor,
                          query_coords: torch.Tensor, gradient_weight: float, k_neighbors: int,
                          flow_weight: float = 1.0, per_gene_scale: torch.Tensor | None = None,
                          flow_generator: torch.Generator | None = None) -> dict:
-    """Architecture-generic where possible: Architectures 1/2/3 share one
-    deterministic reconstruction objective (models/losses.py); Architecture
-    4 additionally adds its stopped-gradient flow-matching loss, computed
-    from a SINGLE conditioner pass (model.compute_losses) so the
-    reconstruction and flow losses agree on the same dropout mask (3rd
-    Codex re-audit finding, CONTRACT.md). `flow_weight` was previously
-    hardcoded at every call site (Adam's Step 6 audit #9, confirmed) --
-    now always threaded through from `loss.flow_weight` in the resolved
-    config. `flow_generator`, when given, makes the flow loss's own
-    random t/x0 draw reproducible (used for validation logging only --
-    see `compute_deterministic_reconstruction_losses` for the metric
-    actually used for model selection, audit #8)."""
-    if architecture_id == "4":
+    """Dispatched by `kind` (see `model_kind_for_architecture_id`'s
+    docstring, Integration audit finding #1): `"conditioner"` models
+    (Gen3 Architectures 1/2/3, Gen4 conditioner arms) share one
+    deterministic reconstruction objective (models/losses.py).
+
+    `"flow"` models (Gen3 Architecture 4, Gen4 flow arms) additionally
+    add their stopped-gradient flow-matching loss to a reconstruction
+    loss computed from the SAME single conditioner pass
+    (model.compute_losses) so the reconstruction and flow losses agree on
+    the same dropout mask (3rd Codex re-audit finding, CONTRACT.md) --
+    `model.compute_losses`'s own `out["expression"]` is the conditioner's
+    deterministic mean, real and safe to combine with the flow loss for
+    these models.
+
+    `"latent_flow"` models (Gen5) train ONLY `flow_weight *
+    out["flow_loss"]` -- GEN5_CONTRACT.md section 5 is explicit that
+    Gen5's conditioner is already a frozen, separately-pretrained
+    artifact (loaded from a real Gen4 conditioner checkpoint, never
+    trained here) and that its own expression output must NEVER be
+    combined with the flow loss; `Gen5LatentFlowModel.compute_losses`
+    reflects this directly -- it returns
+    `"conditioner_expression_diagnostic_only"`, not `"expression"`, and
+    that key is intentionally never read here. There is no separate
+    reconstruction term to add: the flow loss IS the entire training
+    objective for a latent_flow model.
+
+    `flow_weight` was previously hardcoded at every call site (Adam's
+    Step 6 audit #9, confirmed) -- now always threaded through from
+    `loss.flow_weight` in the resolved config. `flow_generator`, when
+    given, makes the flow loss's own random t/x0 draw reproducible (used
+    for validation logging only -- see
+    `compute_deterministic_reconstruction_losses` for the metric actually
+    used for model selection, audit #8)."""
+    if kind == "flow":
         out = model.compute_losses(inputs, target_expression, generator=flow_generator)
         recon = combined_reconstruction_loss(
             out["expression"], target_expression, query_coords,
@@ -968,6 +1023,10 @@ def compute_step_losses(architecture_id: str, model, inputs, target_expression: 
         )
         total = recon["total"] + flow_weight * out["flow_loss"]
         return {"total": total, "primary": recon["primary"], "gradient": recon["gradient"], "flow_loss": out["flow_loss"]}
+    if kind == "latent_flow":
+        out = model.compute_losses(inputs, target_expression, generator=flow_generator)
+        total = flow_weight * out["flow_loss"]
+        return {"total": total, "flow_loss": out["flow_loss"]}
     out = model(inputs)
     return combined_reconstruction_loss(
         out["expression"], target_expression, query_coords,
@@ -976,26 +1035,27 @@ def compute_step_losses(architecture_id: str, model, inputs, target_expression: 
 
 
 def compute_deterministic_reconstruction_losses(
-    architecture_id: str, model, inputs, target_expression: torch.Tensor, query_coords: torch.Tensor,
+    kind: str, model, inputs, target_expression: torch.Tensor, query_coords: torch.Tensor,
     gradient_weight: float, k_neighbors: int, per_gene_scale: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> dict:
     """The reconstruction objective used for VALIDATION/model-selection
     (Adam's Step 6 audit #8, then corrected by audit #1 of commit
-    a32051b). For Architectures 1-3, `model(inputs)` (their real forward
-    pass) is used directly. For Architecture 4, audit #1 is explicit:
-    "Architecture 4 validation/evaluation/overfit must evaluate a
-    deterministic fixed-seed predictive mean from
+    a32051b). For `"conditioner"` models, `model(inputs)` (their real
+    forward pass) is used directly. For `"flow"`/`"latent_flow"` models,
+    audit #1 is explicit: "Architecture 4 validation/evaluation/overfit
+    must evaluate a deterministic fixed-seed predictive mean from
     `sample_predictive_distribution`, not `forward()`'s frozen
-    conditioner." `forward()` never touches the trained flow apparatus at
-    all -- selecting on it would let Architecture 4's flow weights train
-    for hours while the ONLY metric ever checked is blind to whether they
-    learned anything. `predict_for_metrics` (with a caller-supplied,
-    fixed-per-step `generator` for resume-exact reproducibility) is now
-    used for every architecture; the result additionally carries
-    `conditioner_only_total` for Architecture 4 -- a SECONDARY diagnostic
-    logged alongside the real metric, never used for selection."""
-    prediction = predict_for_metrics(architecture_id, model, inputs, generator=generator)
+    conditioner." `forward()`/the conditioner pass never touches the
+    trained flow apparatus at all -- selecting on it would let the flow
+    weights train for hours while the ONLY metric ever checked is blind
+    to whether they learned anything. `predict_for_metrics` (with a
+    caller-supplied, fixed-per-step `generator` for resume-exact
+    reproducibility) is now used for every `kind`; the result
+    additionally carries `conditioner_only_total` for `"flow"`/
+    `"latent_flow"` -- a SECONDARY diagnostic logged alongside the real
+    metric, never used for selection."""
+    prediction = predict_for_metrics(kind, model, inputs, generator=generator)
     result = combined_reconstruction_loss(
         prediction["expression"], target_expression, query_coords,
         gradient_weight=gradient_weight, k_neighbors=k_neighbors, per_gene_scale=per_gene_scale,
@@ -1813,6 +1873,7 @@ def run_training(
         smoke=smoke, staged_smoke=staged_smoke, dataset_manifest=dataset_manifest,
         cache_content_by_sample=preflight_report.get("cache_content_by_sample"),
     )
+    kind = model_info["kind"]
     gene_basis = model_info["gene_basis"]
     gigapath_checkpoint_sha256 = model_info["gigapath_checkpoint_sha256"]
     synchronized_init_manifest_path = model_info["synchronized_init_manifest_path"]
@@ -2077,17 +2138,26 @@ def run_training(
                 # frozen-conditioner-only forward(), which used to be
                 # silently used for its selection metric.
                 det_losses = compute_deterministic_reconstruction_losses(
-                    architecture_id, model, val_inputs, val_target_expression, val_query_coords,
+                    kind, model, val_inputs, val_target_expression, val_query_coords,
                     gradient_weight=gradient_weight, k_neighbors=k_neighbors, per_gene_scale=gene_scale_tensor,
                     generator=predictive_val_generator,
                 )
                 val_totals.append(float(det_losses["total"]))
                 if "conditioner_only_total" in det_losses:
                     val_conditioner_only_totals.append(float(det_losses["conditioner_only_total"]))
-                if architecture_id == "4":
+                if kind == "flow":
+                    # Gen3 Architecture 4 / Gen4 flow arms expose a
+                    # dedicated compute_flow_matching_loss -- Gen5's
+                    # latent_flow does not (see the `latent_flow` branch
+                    # below), only the combined compute_losses() contract.
                     flow_loss = model.compute_flow_matching_loss(
                         val_inputs, val_target_expression, generator=flow_val_generator,
                     )
+                    val_flow_losses.append(float(flow_loss))
+                elif kind == "latent_flow":
+                    flow_loss = model.compute_losses(
+                        val_inputs, val_target_expression, generator=flow_val_generator,
+                    )["flow_loss"]
                     val_flow_losses.append(float(flow_loss))
                 if smoke:
                     break
@@ -2147,7 +2217,7 @@ def run_training(
 
         optimizer.zero_grad(set_to_none=True)
         losses = compute_step_losses(
-            architecture_id, model, inputs, target_expression, query_coords,
+            kind, model, inputs, target_expression, query_coords,
             gradient_weight=gradient_weight, k_neighbors=k_neighbors, flow_weight=flow_weight,
             per_gene_scale=gene_scale_tensor,
         )

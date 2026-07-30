@@ -152,18 +152,32 @@ def build_gen4_spatial_field_example(
     mapping (same shape/contract as `gex_context_embedding`, e.g. a real
     `gen4.uni2_spot_cache.load_uni2_spot_features` record turned into a
     dict) covering every realized context barcode -- used ONLY by arm 4
-    (`image_feature_source="hybrid_context"`). Selected via the SAME
-    `_select_by_barcode` helper against this call's OWN realized
-    `observed_barcodes`, so it inherits the identical query/hole
-    exclusion `precomputed_spot_features`/`context_gex_embedding` already
-    get here: query rows are structurally absent from
-    `inputs.observed_barcodes` (this function delegates realization
-    entirely to `build_spatial_field_example`), and any context row whose
-    H&E physically overlaps the hole was already excluded from
-    `precomputed_spot_features`/`context_image_available` upstream -- no
-    exclusion logic is reimplemented for this field, it is inherited by
-    construction. `None` for every other arm, leaving
-    `observed_uni2_features` `None` on the returned object.
+    (`image_feature_source="hybrid_context"`). Query rows are
+    structurally absent from `inputs.observed_barcodes` (this function
+    delegates realization entirely to `build_spatial_field_example`), so
+    those are excluded the same way every other observed_* field is.
+
+    Integration-audit finding #4 (CONFIRMED real bug, fixed): a context
+    row's H&E can PHYSICALLY overlap the query hole even though its own
+    barcode is disjoint from every query barcode (the patch footprint is
+    a real square of pixels, not a point -- see example_builder.py's own
+    docstring). `build_spatial_field_example` already computes exactly
+    this per-row exclusion as `inputs.observed_image_available` and
+    applies it when building `precomputed_spot_features` (a spot whose
+    patch overlaps the hole gets an explicit zero row there, never its
+    real cached feature). The FIRST version of this function selected
+    `observed_uni2_features` directly from `uni2_spot_embedding` with NO
+    reference to `observed_image_available` at all -- a context spot
+    physically inside the hole's footprint would leak its real, cached
+    UNI2 morphology feature into the hybrid arm's input even though the
+    SAME spot's `precomputed_spot_features`/STPath-tokenizer row was
+    correctly zeroed. `observed_uni2_features` is now explicitly zeroed
+    at every row where `observed_image_available` is False, exactly
+    mirroring `precomputed_spot_features`'s own contract -- see
+    `test_build_gen4_spatial_field_example_zeroes_uni2_features_for_
+    physically_overlapping_context_rows` for the adversarial proof.
+    `None` for every other arm, leaving `observed_uni2_features` `None`
+    on the returned object.
 
     `wsi_tile_feature_provenance` (audit finding #1) tags which encoder
     produced `slide_context`'s tiles -- pass `"uni2"` when `slide_context`
@@ -204,6 +218,15 @@ def build_gen4_spatial_field_example(
         uni2_features = _select_by_barcode(
             uni2_spot_embedding, inputs.observed_barcodes, field_name="observed_uni2_features",
         )
+        # Integration-audit finding #4: zero every row whose H&E is not
+        # actually available (physically overlaps the query hole, or was
+        # never available in the first place) -- the same exclusion
+        # precomputed_spot_features already gets, applied here too since
+        # this field is selected from a separate, unmasked source.
+        unavailable = ~np.asarray(inputs.observed_image_available, dtype=bool)
+        if unavailable.any():
+            uni2_features = uni2_features.copy()
+            uni2_features[unavailable] = 0.0
 
     base_fields = {field: getattr(inputs, field) for field in inputs.__dataclass_fields__}
     gen4_inputs = Gen4SpatialFieldInputs(

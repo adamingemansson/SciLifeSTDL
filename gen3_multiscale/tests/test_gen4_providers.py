@@ -3,7 +3,9 @@ build_gen4_spatial_field_example integration test on synthetic HEST-shaped
 data (reusing _step6_fixtures.py's real dataset-manifest/patch machinery)."""
 from __future__ import annotations
 
+import anndata as ad
 import numpy as np
+import pandas as pd
 import pytest
 
 from gen3_multiscale.data import loaders
@@ -16,6 +18,21 @@ from gen3_multiscale.gen4.scfoundation_cache import (
 from gen3_multiscale.gen4.uni2_spot_cache import build_uni2_spot_feature_cache, load_uni2_spot_features
 from gen3_multiscale.tests._gen4_fixtures import StubSCFoundationEncoder, StubUNI2Encoder
 from gen3_multiscale.tests._step6_fixtures import prepare_step6_experiment
+
+
+def _square_grid_adata(n_side: int = 6, spacing: float = 10.0, n_genes: int = 5, seed: int = 0) -> "ad.AnnData":
+    """Mirrors tests/test_example_builder.py's own helper -- kept local
+    rather than cross-imported so this file's geometry tests don't
+    depend on that module's internals."""
+    rng = np.random.default_rng(seed)
+    coords = np.array([[x * spacing, y * spacing] for x in range(n_side) for y in range(n_side)], dtype=np.float64)
+    n = coords.shape[0]
+    barcodes = [f"SPOT{i}-1" for i in range(n)]
+    gene_names = [f"GENE{i}" for i in range(n_genes)]
+    counts = rng.poisson(5, size=(n, n_genes)).astype(np.float32)
+    adata = ad.AnnData(X=counts, obs=pd.DataFrame(index=pd.Index(barcodes)), var=pd.DataFrame(index=pd.Index(gene_names)))
+    adata.obsm["spatial"] = coords
+    return adata
 
 
 def test_encoder_identity_rejects_blank_fields():
@@ -126,6 +143,53 @@ def test_build_gen4_spatial_field_example_populates_uni2_features_provenance_and
     assert np.array_equal(inputs.observed_uni2_features, expected)
     assert inputs.wsi_tile_feature_provenance == "uni2"
     assert inputs.sample_organ == "Lung"
+
+
+def test_build_gen4_spatial_field_example_zeroes_uni2_features_for_physically_overlapping_context_rows():
+    """Integration-audit finding #4 (CONFIRMED real bug, fixed): a
+    context spot's H&E can physically overlap the query hole (patch
+    footprint, not barcode identity) even though its own barcode is
+    disjoint from every query barcode -- example_builder.py already
+    computes this as observed_image_available=False and zeroes
+    precomputed_spot_features there. The first version of
+    observed_uni2_features selected directly from uni2_spot_embedding
+    with no reference to that flag at all, leaking the real cached UNI2
+    feature for a physically-hidden row. Proves the fix: mutating that
+    exact row's cached UNI2 feature to a distinctive value must NOT
+    change the constructed model input."""
+    adata = _square_grid_adata(n_side=6, spacing=10.0)
+    patches = np.zeros((adata.n_obs, 4, 4, 3), dtype=np.uint8)
+    barcodes = list(adata.obs_names)
+    coords = adata.obsm["spatial"]
+
+    query_idx = 14
+    query_barcode = barcodes[query_idx]
+    query_xy = coords[query_idx]
+    distances = np.linalg.norm(coords - query_xy, axis=1)
+    distances[query_idx] = np.inf
+    neighbor_idx = int(np.argmin(distances))  # close enough to physically overlap -> unavailable
+    neighbor_barcode = barcodes[neighbor_idx]
+
+    context_barcodes = [b for b in barcodes if b != query_barcode]
+    image_features = np.zeros((adata.n_obs, 6), dtype=np.float32)
+    uni2_lookup_a = {b: np.zeros(6, dtype=np.float32) for b in barcodes}
+    uni2_lookup_b = dict(uni2_lookup_a)
+    uni2_lookup_b[neighbor_barcode] = np.full(6, 12345.0, dtype=np.float32)  # distinctive, real-looking value
+
+    kwargs = dict(
+        sample_id="S0", patient_id="P0", patch_size_fullres=30.0, require_full_sample_coords=False,
+        precomputed_spot_features=image_features, full_sample_coords=coords,
+    )
+    inputs_a, _ = build_gen4_spatial_field_example(
+        adata, patches, context_barcodes, [query_barcode], uni2_spot_embedding=uni2_lookup_a, **kwargs,
+    )
+    inputs_b, _ = build_gen4_spatial_field_example(
+        adata, patches, context_barcodes, [query_barcode], uni2_spot_embedding=uni2_lookup_b, **kwargs,
+    )
+    neighbor_pos = inputs_b.observed_barcodes.tolist().index(neighbor_barcode)
+    assert inputs_b.observed_image_available[neighbor_pos] == False  # noqa: E712 -- real numpy bool, physical overlap confirmed
+    assert np.all(inputs_b.observed_uni2_features[neighbor_pos] == 0.0)  # zeroed, not leaked
+    np.testing.assert_array_equal(inputs_a.observed_uni2_features, inputs_b.observed_uni2_features)
 
 
 def test_build_gen4_spatial_field_example_rejects_bad_wsi_tile_feature_provenance(tmp_path, monkeypatch):

@@ -54,7 +54,7 @@ from gen3_multiscale.training.gen3_preflight import load_and_preflight_samples
 from gen3_multiscale.training.train import (
     _code_commit_hash, _worktree_diff_hash, build_model_for_inference, common_random_validation_seed,
     config_identity_fingerprint, dataset_manifest_fingerprint, expected_tile_encoder_provenance,
-    predict_for_metrics, resolved_config, verify_full_checkpoint_identity,
+    model_kind_for_architecture_id, predict_for_metrics, resolved_config, verify_full_checkpoint_identity,
 )
 
 
@@ -322,6 +322,7 @@ def evaluate_gen3_checkpoint(
 
     config = resolved_config(config_path)
     architecture_id = str(config["model"]["architecture"])
+    kind = model_kind_for_architecture_id(architecture_id)
     data_cfg = config["data"]
     dataset_manifest = load_dataset_manifest(data_cfg["gen3_manifest_path"])
     split_ids = list(dataset_manifest[f"{split}_sample_ids"])
@@ -498,7 +499,7 @@ def evaluate_gen3_checkpoint(
                 common_random_validation_seed(evaluation_seed, stable_key)
             )
             prediction = predict_for_metrics(
-                architecture_id, model, inputs, generator=item_generator, n_samples=calibration_n_samples,
+                kind, model, inputs, generator=item_generator, n_samples=calibration_n_samples,
             )
             model_pred = np.asarray(prediction["expression"].detach().cpu().numpy(), dtype=np.float32)
             model_item_metrics = per_item_reconstruction_metrics(model_pred, true_expression)
