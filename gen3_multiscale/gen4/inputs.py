@@ -61,6 +61,13 @@ class Gen4SpatialFieldInputs(SpatialFieldInputs):
     # source, used ONLY by `image_feature_source="hybrid_context"`;
     # `None` for every other arm.
     observed_uni2_features: np.ndarray | None = None
+    # Audit finding: STPath's organ token was fixed at construction time
+    # ("Kidney" default), silently wrong for every non-Kidney sample in a
+    # multi-organ QC2 dataset (Lung/Liver/Bowel). This is the real,
+    # per-sample manifest organ -- one example is always exactly one
+    # sample, so one organ. Required (fails closed) whenever arm D/3 or
+    # arm 4's STPath-consuming path is used; `None` for every other arm.
+    sample_organ: str | None = None
 
 
 def validate_gen4_spatial_field_example(inputs: Gen4SpatialFieldInputs, targets: SpatialFieldTargets) -> None:
