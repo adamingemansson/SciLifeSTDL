@@ -30,9 +30,19 @@ CPU data with deterministic stub encoders
    - Arms A-C: gen4/inputs.py::build_gen4_spatial_field_example
      (precomputed_spot_features from step 1's image cache;
       gex_context_embedding from step 1's scFoundation cache, arms B/C only)
-   - Arm D: gen4/stpath_example.py::build_gen4_stpath_example
-     (runs Gen4STPathContextEncoder.encode_context_only PER MASK -- see
-      GEN4_CONTRACT.md section 8 for why this cannot be precomputed once)
+   - Arm D: gen4/inputs.py::build_gen4_spatial_field_example (same builder
+     as arm B -- raw observed coords/expression/GigaPath-tokenizer-input
+     features pass through unchanged). STPath's own trainable
+     `encode_context_only` call happens LIVE inside
+     `Gen4Conditioner._observed_tokens` on every forward pass, not at data-
+     build time -- construct the arm with
+     `image_feature_source="stpath_context"`,
+     `gex_feature_source="stpath_joint"`, `stpath_encoder=<real Gen4STPathContextEncoder>`
+     so gradients reach STPath's trainable projection (Codex audit finding
+     #3: a prior version ran this encoding under `torch.no_grad()` at data-
+     build time, which permanently froze that projection at its random
+     init). See GEN4_CONTRACT.md section 8 for why the encoding cannot be
+     precomputed once independent of the mask.
 
 4. Train the deterministic conditioner:
    gen4/model_factory.py::build_gen4_conditioner(config, ...) + an ordinary

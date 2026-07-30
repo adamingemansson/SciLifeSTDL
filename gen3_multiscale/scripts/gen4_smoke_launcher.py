@@ -70,7 +70,25 @@ class _StubSlideEncoder(nn.Module):
         return self.proj(tile_features.mean(dim=0, keepdim=True)).squeeze(0)
 
 
-def _with_wsi_context(inputs):
+class _StubSTPathEncoder(nn.Module):
+    """Deterministic stand-in for Gen4STPathContextEncoder -- same
+    `encode_context_only` signature (no query parameter at all), a real
+    trainable linear layer over concatenated coordinate/expression/image
+    features, no real `stpath` package or weights. Mirrors
+    `tests/_gen4_fixtures.py::Gen4STPathStub`."""
+
+    def __init__(self, n_genes: int, hidden_dim: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.proj = nn.Linear(2 + n_genes + 1, hidden_dim)
+
+    def encode_context_only(self, context_coords, context_expression, context_image_features, context_image_available=None):
+        image_summary = context_image_features.mean(dim=-1, keepdim=True)
+        combined = torch.cat([context_coords, context_expression, image_summary], dim=-1)
+        return self.proj(combined)
+
+
+def _with_wsi_context(inputs, wsi_tile_feature_provenance=None):
     rng = np.random.default_rng(2)
     n_tiles, bound = 12, 10.0
     return dataclasses.replace(
@@ -79,14 +97,15 @@ def _with_wsi_context(inputs):
         wsi_tile_regional_coords=rng.uniform(-bound + 0.5, bound - 0.5, size=(n_tiles, 2)).astype(np.float32),
         wsi_tile_features=rng.normal(size=(n_tiles, IMAGE_DIM)).astype(np.float32),
         full_slide_coord_bounds=(-bound, bound, -bound, bound), slide_cache_namespace="smoke-slide",
+        wsi_tile_feature_provenance=wsi_tile_feature_provenance,
     )
 
 
 _ARM_SETUP = {
-    "gen4a": dict(gex_feature_source="weighted_linear", global_context_source="uni2_pool", gex_context_dim=None),
-    "gen4b": dict(gex_feature_source="frozen_context", global_context_source="gigapath", gex_context_dim=CONTEXT_DIM),
-    "gen4c": dict(gex_feature_source="frozen_context", global_context_source="uni2_pool", gex_context_dim=CONTEXT_DIM),
-    "gen4d": dict(gex_feature_source="weighted_linear", global_context_source="none", gex_context_dim=None),
+    "gen4a": dict(gex_feature_source="weighted_linear", image_feature_source="precomputed", global_context_source="uni2_pool", gex_context_dim=None),
+    "gen4b": dict(gex_feature_source="frozen_context", image_feature_source="precomputed", global_context_source="gigapath", gex_context_dim=CONTEXT_DIM),
+    "gen4c": dict(gex_feature_source="frozen_context", image_feature_source="precomputed", global_context_source="uni2_pool", gex_context_dim=CONTEXT_DIM),
+    "gen4d": dict(gex_feature_source="stpath_joint", image_feature_source="stpath_context", global_context_source="none", gex_context_dim=None),
 }
 
 
@@ -94,7 +113,8 @@ def _build_conditioner(arm: str) -> Gen4Conditioner:
     setup = _ARM_SETUP[arm]
     kwargs = dict(
         n_genes=N_GENES, gex_feature_dim=GEX_DIM, image_feature_dim=IMAGE_DIM,
-        gex_feature_source=setup["gex_feature_source"], global_context_source=setup["global_context_source"],
+        gex_feature_source=setup["gex_feature_source"], image_feature_source=setup["image_feature_source"],
+        global_context_source=setup["global_context_source"],
         use_regional_he=setup["global_context_source"] != "none", **MODEL_KWARGS,
     )
     if setup["gex_context_dim"]:
@@ -106,6 +126,8 @@ def _build_conditioner(arm: str) -> Gen4Conditioner:
     elif setup["global_context_source"] == "uni2_pool":
         kwargs["uni2_global_pool"] = MaskAwareCoordinateAttentionPool(tile_feature_dim=IMAGE_DIM, output_dim=16, hidden_dim=16, n_heads=2)
         kwargs["global_slide_dim"] = 16
+    if setup["image_feature_source"] == "stpath_context":
+        kwargs["stpath_encoder"] = _StubSTPathEncoder(n_genes=N_GENES, hidden_dim=IMAGE_DIM)
     return Gen4Conditioner(**kwargs)
 
 
@@ -113,7 +135,8 @@ def _build_flow(arm: str, gene_basis, gene_names: list[str]) -> Gen4ResidualFlow
     setup = _ARM_SETUP[arm]
     kwargs = dict(
         n_genes=N_GENES, gex_feature_dim=GEX_DIM, image_feature_dim=IMAGE_DIM, gene_basis=gene_basis, gene_names=gene_names,
-        gex_feature_source=setup["gex_feature_source"], global_context_source=setup["global_context_source"],
+        gex_feature_source=setup["gex_feature_source"], image_feature_source=setup["image_feature_source"],
+        global_context_source=setup["global_context_source"],
         use_regional_he=setup["global_context_source"] != "none", n_flow_blocks=1, n_flow_samples=2, n_ode_steps=2, **MODEL_KWARGS,
     )
     if setup["gex_context_dim"]:
@@ -125,6 +148,8 @@ def _build_flow(arm: str, gene_basis, gene_names: list[str]) -> Gen4ResidualFlow
     elif setup["global_context_source"] == "uni2_pool":
         kwargs["uni2_global_pool"] = MaskAwareCoordinateAttentionPool(tile_feature_dim=IMAGE_DIM, output_dim=16, hidden_dim=16, n_heads=2)
         kwargs["global_slide_dim"] = 16
+    if setup["image_feature_source"] == "stpath_context":
+        kwargs["stpath_encoder"] = _StubSTPathEncoder(n_genes=N_GENES, hidden_dim=IMAGE_DIM)
     return Gen4ResidualFlowModel(**kwargs)
 
 
@@ -132,7 +157,8 @@ def smoke_one_arm(arm: str) -> dict:
     setup = _ARM_SETUP[arm]
     inputs, targets = _synthetic_example(gex_context_dim=setup["gex_context_dim"])
     if setup["global_context_source"] != "none":
-        inputs = _with_wsi_context(inputs)
+        provenance = "uni2" if setup["global_context_source"] == "uni2_pool" else None
+        inputs = _with_wsi_context(inputs, wsi_tile_feature_provenance=provenance)
     target = torch.as_tensor(targets.query_expression, dtype=torch.float32)
 
     torch.manual_seed(0)

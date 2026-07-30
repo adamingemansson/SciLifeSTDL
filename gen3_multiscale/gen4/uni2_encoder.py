@@ -54,11 +54,26 @@ class FrozenUNI2TileEncoder(nn.Module):
     class (that is `uni2_global_pool.py`'s job, run separately on this
     encoder's already-produced per-tile features)."""
 
+    # "uni2-h" is not a registered timm architecture -- Codex audit finding #2
+    # (of the first Gen4 push), confirmed real: `timm.create_model("uni2-h")`
+    # raises immediately, since UNI2-h is not a named timm model but a
+    # specific parameterization of `vit_giant_patch14_224`. This is the
+    # real, official construction (MahmoodLab/UNI2-h model card / the
+    # mahmoodlab/UNI GitHub repository's own loading example) -- a plain
+    # ViT-Giant/14 with UNI2-h's documented non-default arguments
+    # (register tokens, SwiGLU MLP, no class-token positional embedding).
+    _TIMM_BASE_MODEL = "vit_giant_patch14_224"
+    _TIMM_KWARGS = dict(
+        img_size=224, patch_size=14, depth=24, num_heads=24, init_values=1e-5,
+        embed_dim=1536, mlp_ratio=2.66667 * 2, num_classes=0, no_embed_class=True,
+        reg_tokens=8, dynamic_img_size=True,
+    )
+
     def __init__(
         self,
         checkpoint_path: str,
         revision: str,
-        model_name: str = "uni2-h",
+        model_name: str = _TIMM_BASE_MODEL,
         output_dim: int = 1536,
         device: str = "cpu",
     ):
@@ -70,17 +85,27 @@ class FrozenUNI2TileEncoder(nn.Module):
                 "MahmoodLab/UNI2-h checkpoint to this exact path -- a randomly "
                 "initialized model is never permitted."
             )
+        if model_name != self._TIMM_BASE_MODEL:
+            raise ValueError(
+                f"FrozenUNI2TileEncoder only ever constructs {self._TIMM_BASE_MODEL!r} with UNI2-h's "
+                f"documented non-default arguments -- never fall back to a different UNI model or a "
+                f"caller-supplied architecture name (got {model_name!r})"
+            )
         revision = _validate_immutable_revision(revision)
         try:
             import timm
+            from timm.layers import SwiGLUPacked
         except Exception as exc:  # pragma: no cover - optional external dependency
             raise ImportError(
-                "The `timm` package is required to construct FrozenUNI2TileEncoder. "
-                "Install it in the training environment."
+                "The `timm` package (with timm.layers.SwiGLUPacked) is required to construct "
+                "FrozenUNI2TileEncoder. Install it in the training environment."
             ) from exc
 
         self.checkpoint_sha256 = _sha256_file(path)
-        self.model = timm.create_model(model_name, pretrained=False, num_classes=0)
+        self.model = timm.create_model(
+            self._TIMM_BASE_MODEL, pretrained=False, mlp_layer=SwiGLUPacked, act_layer=torch.nn.SiLU,
+            **self._TIMM_KWARGS,
+        )
         state_dict = torch.load(path, map_location="cpu")
         missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
         if missing or unexpected:

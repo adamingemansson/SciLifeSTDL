@@ -1,7 +1,8 @@
 """Gen4ResidualFlowModel tests -- mirrors test_architectures.py's own
-Architecture4 test shape, one representative arm (D, the simplest -- no
-global/regional branch) plus one frozen_context arm (B) for the
-gex_context_proj path."""
+Architecture4 test shape. Most tests below use a minimal
+(weighted_linear GEX, no global/regional branch) configuration for
+CPU-fast coverage of the shared flow apparatus; `test_arm_d_flow_*` below
+covers the REAL arm D (STPath live context-only encoder)."""
 from __future__ import annotations
 
 import numpy as np
@@ -9,7 +10,7 @@ import torch
 
 from gen3_multiscale.gen4.flow import Gen4ResidualFlowModel
 from gen3_multiscale.models.gene_basis import fit_gene_residual_basis
-from gen3_multiscale.tests._gen4_fixtures import GEN4_MODEL_KWARGS, synthetic_gen4_inputs
+from gen3_multiscale.tests._gen4_fixtures import GEN4_MODEL_KWARGS, Gen4STPathStub, synthetic_gen4_inputs
 
 
 def _gene_basis_for(n_genes, rank=4, seed=99):
@@ -19,7 +20,7 @@ def _gene_basis_for(n_genes, rank=4, seed=99):
     return fit_gene_residual_basis(residuals, gene_names, rank=rank), gene_names
 
 
-def test_arm_d_flow_forward_matches_conditioner_contract():
+def test_minimal_config_flow_forward_matches_conditioner_contract():
     inputs, targets = synthetic_gen4_inputs()
     n_genes, gex_dim, image_dim = 6, 4, 8
     gene_basis, gene_names = _gene_basis_for(n_genes)
@@ -34,7 +35,7 @@ def test_arm_d_flow_forward_matches_conditioner_contract():
     assert out["expression"].shape == targets.query_expression.shape
 
 
-def test_arm_d_compute_losses_single_conditioner_pass():
+def test_minimal_config_compute_losses_single_conditioner_pass():
     inputs, targets = synthetic_gen4_inputs()
     n_genes, gex_dim, image_dim = 6, 4, 8
     gene_basis, gene_names = _gene_basis_for(n_genes)
@@ -50,7 +51,7 @@ def test_arm_d_compute_losses_single_conditioner_pass():
     assert out["expression"].shape == target.shape
 
 
-def test_arm_d_sample_predictive_distribution_deterministic_with_generator():
+def test_minimal_config_sample_predictive_distribution_deterministic_with_generator():
     inputs, targets = synthetic_gen4_inputs()
     n_genes, gex_dim, image_dim = 6, 4, 8
     gene_basis, gene_names = _gene_basis_for(n_genes)
@@ -126,3 +127,37 @@ def test_basis_fitting_uses_only_supplied_training_residuals():
         _unused_validation_example = synthetic_gen4_inputs(n_genes=n_genes, gex_dim=gex_dim, image_dim=image_dim, seed=999)
         basis2 = fit_gen4_residual_basis(conditioner, train_examples, gene_names, rank=2, output_basis_path=os.path.join(tmp, "basis2.pt"))
         assert torch.allclose(basis1.basis, basis2.basis)
+
+
+def test_arm_d_flow_forward_and_stpath_wiring():
+    """The REAL arm D: image_feature_source='stpath_context' +
+    gex_feature_source='stpath_joint', end to end through
+    Gen4ResidualFlowModel. Unlike the conditioner-level regression test
+    (test_gen4_conditioner.py::test_arm_d_stpath_context_conditioner_forward_and_gradients,
+    which proves the fix for Codex audit finding #3 directly), flow_loss
+    here is computed from a DETACHED query_hidden/conditioner_out
+    (gen4/flow.py's compute_losses -- the same "single conditioner pass,
+    detached query_hidden" discipline Architecture4 uses so the flow model
+    can be trained against a FROZEN conditioner). So flow_loss.backward()
+    correctly produces NO gradient on STPath's projection here -- this
+    test checks the flow model still constructs/forwards correctly with
+    arm D's wiring and that stpath_encoder is a real registered submodule
+    (so its trained weights persist through checkpoint save/load)."""
+    n_genes, gex_dim, image_dim = 6, 4, 8
+    inputs, targets = synthetic_gen4_inputs(n_genes=n_genes, gex_dim=gex_dim, image_dim=image_dim)
+    gene_basis, gene_names = _gene_basis_for(n_genes)
+    stpath_stub = Gen4STPathStub(n_genes=n_genes, hidden_dim=image_dim)
+    model = Gen4ResidualFlowModel(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        gene_basis=gene_basis, gene_names=gene_names,
+        gex_feature_source="stpath_joint", image_feature_source="stpath_context", stpath_encoder=stpath_stub,
+        use_regional_he=False, global_context_source="none",
+        n_flow_blocks=1, n_flow_samples=2, n_ode_steps=2, **GEN4_MODEL_KWARGS,
+    )
+    assert model.conditioner.stpath_encoder is stpath_stub
+    assert any(p is stpath_stub.proj.weight for p in model.parameters())
+    target = torch.as_tensor(targets.query_expression, dtype=torch.float32)
+    out = model.compute_losses(inputs, target, generator=torch.Generator().manual_seed(0))
+    assert torch.isfinite(out["flow_loss"])
+    out["flow_loss"].backward()
+    assert stpath_stub.proj.weight.grad is None  # detached-conditioner discipline: no flow-stage gradient reaches it

@@ -63,7 +63,15 @@ def synthetic_gen4_inputs(
     return inputs, targets
 
 
-def with_synthetic_wsi_context(inputs: Gen4SpatialFieldInputs, image_dim: int, n_tiles: int = 12, grid_bound: float = 10.0, seed: int = 1):
+def with_synthetic_wsi_context(
+    inputs: Gen4SpatialFieldInputs, image_dim: int, n_tiles: int = 12, grid_bound: float = 10.0, seed: int = 1,
+    wsi_tile_feature_provenance: str | None = None,
+):
+    """`wsi_tile_feature_provenance` must be explicitly passed as "uni2" by
+    callers exercising `global_context_source="uni2_pool"` -- real
+    (non-test) data never has this set, since no real UNI2 dense-WSI cache
+    builder exists yet (Codex audit finding #4; see
+    Gen4SpatialFieldInputs.wsi_tile_feature_provenance's docstring)."""
     rng = np.random.default_rng(seed)
     longnet_coords = rng.uniform(10_000.0, 20_000.0, size=(n_tiles, 2)).astype(np.float32)
     regional_coords = rng.uniform(-grid_bound + 0.5, grid_bound - 0.5, size=(n_tiles, 2)).astype(np.float32)
@@ -72,7 +80,7 @@ def with_synthetic_wsi_context(inputs: Gen4SpatialFieldInputs, image_dim: int, n
         inputs,
         wsi_tile_longnet_coords=longnet_coords, wsi_tile_regional_coords=regional_coords,
         wsi_tile_features=features, full_slide_coord_bounds=(-grid_bound, grid_bound, -grid_bound, grid_bound),
-        slide_cache_namespace="gen4-unit-test-slide-abc123",
+        slide_cache_namespace="gen4-unit-test-slide-abc123", wsi_tile_feature_provenance=wsi_tile_feature_provenance,
     )
 
 

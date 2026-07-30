@@ -38,6 +38,18 @@ class Gen4SpatialFieldInputs(SpatialFieldInputs):
     A and D -- see GEN4_CONTRACT.md section 4)."""
     context_gex_embedding: np.ndarray | None = None
     context_gex_embedding_provenance: dict | None = None
+    # Codex audit finding #4: `wsi_tile_features` (inherited from the base
+    # class) is populated by Gen3's existing dense-WSI tile cache, which is
+    # GigaPath-encoded, not UNI2-encoded -- no real UNI2 dense-WSI cache
+    # builder exists yet. Arm A/C's `global_context_source="uni2_pool"`
+    # branch would otherwise silently consume those GigaPath-shaped
+    # features as if they were UNI2 features. `Gen4Conditioner` requires
+    # this field to equal exactly "uni2" before it will read
+    # `wsi_tile_features` for that branch (gen4/conditioner.py's
+    # `_global_slide_vector`) -- Gen3's builder never sets it, so the
+    # pathway fails closed until a real, provenance-tagged UNI2 dense-WSI
+    # cache exists.
+    wsi_tile_feature_provenance: str | None = None
 
 
 def validate_gen4_spatial_field_example(inputs: Gen4SpatialFieldInputs, targets: SpatialFieldTargets) -> None:

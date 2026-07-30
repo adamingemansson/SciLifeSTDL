@@ -1,9 +1,13 @@
 # Gen4 arm D conditioner: context-only STPath representation stands in for
-# the whole image branch (image_feature_dim = STPath's own trainable
-# projection width); GEX conditioning stays the ordinary trainable
-# WeightedGeneExpressionEncoder (unchanged -- GEN4_CONTRACT.md section 4
-# divergence 4). No regional/global slide branch (section 4 divergence 3).
-# See GEN4_CONTRACT.md sections 2, 4, 8.
+# BOTH per-spot encoders -- image_feature_source="stpath_context" and
+# gex_feature_source="stpath_joint" together (Codex audit finding #3: a
+# prior version kept a redundant separate weighted-linear GEX encoder and
+# ran STPath's encoding under torch.no_grad() at data-build time, which
+# permanently froze its trainable projection). STPath's
+# `encode_context_only` runs LIVE inside the conditioner's forward pass, so
+# its projection is a real registered, trainable submodule
+# (`Gen4Conditioner.stpath_encoder`). No regional/global slide branch
+# (section 4 divergence 3). See GEN4_CONTRACT.md sections 2, 4, 8.
 
 experiment_name: gen4_arm_d_stpath_context_only_v1
 
@@ -61,7 +65,7 @@ masking:
 data:
   hest_data_dir: data/raw/hest1k
   hest_cache_dir: data/cache/hest1k
-  slide_context_source: dense_wsi_cache   # only used for STPath's own image-token GigaPath cache -- see gen4/stpath_example.py
+  slide_context_source: dense_wsi_cache   # only used for STPath's own image-token GigaPath cache (STPath encoding itself runs live inside Gen4Conditioner, not precomputed)
   gen3_manifest_path: null
   tile_encoder_revision: null   # GigaPath revision pinning STPath's own image tokenizer's input features
   gex_feature_dim: 256

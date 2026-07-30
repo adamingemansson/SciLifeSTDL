@@ -15,12 +15,13 @@ from gen3_multiscale.gen4.flow import Gen4ResidualFlowModel
 from gen3_multiscale.gen4.uni2_global_pool import MaskAwareCoordinateAttentionPool
 from gen3_multiscale.models.gene_basis import GeneResidualBasis
 
-# arm -> (gex_feature_source, global_context_source) -- GEN4_CONTRACT.md section 2.
+# arm -> (gex_feature_source, global_context_source, image_feature_source) --
+# GEN4_CONTRACT.md section 2.
 ARM_TABLE = {
-    "gen4a": {"gex_feature_source": "weighted_linear", "global_context_source": "uni2_pool"},
-    "gen4b": {"gex_feature_source": "frozen_context", "global_context_source": "gigapath"},
-    "gen4c": {"gex_feature_source": "frozen_context", "global_context_source": "uni2_pool"},
-    "gen4d": {"gex_feature_source": "weighted_linear", "global_context_source": "none"},
+    "gen4a": {"gex_feature_source": "weighted_linear", "global_context_source": "uni2_pool", "image_feature_source": "precomputed"},
+    "gen4b": {"gex_feature_source": "frozen_context", "global_context_source": "gigapath", "image_feature_source": "precomputed"},
+    "gen4c": {"gex_feature_source": "frozen_context", "global_context_source": "uni2_pool", "image_feature_source": "precomputed"},
+    "gen4d": {"gex_feature_source": "stpath_joint", "global_context_source": "none", "image_feature_source": "stpath_context"},
 }
 
 _KNOWN_NON_CONSTRUCTOR_FIELDS = frozenset({"init_seed"})
@@ -29,6 +30,10 @@ _FLOW_EXTRA_NON_CONSTRUCTOR_FIELDS = frozenset({"gene_basis_rank"})
 
 def _constructor_param_names(cls: type) -> frozenset[str]:
     return frozenset(inspect.signature(cls.__init__).parameters) - {"self"}
+
+
+def _resolve_seed(model_cfg: dict, seed: int | None) -> int | None:
+    return seed if seed is not None else (model_cfg.get("params") or {}).get("init_seed")
 
 
 def _build_uni2_pool_if_needed(arm: str, model_cfg: dict, image_feature_dim: int, global_slide_dim: int):
@@ -45,7 +50,7 @@ def _build_uni2_pool_if_needed(arm: str, model_cfg: dict, image_feature_dim: int
 def _resolve_kwargs(
     config: dict, cls: type, *, extra_metadata: frozenset[str], n_genes: int, gex_feature_dim: int,
     image_feature_dim: int, gex_context_embedding_dim: int | None, slide_encoder, gigapath_checkpoint_sha256,
-    uni2_global_pool, gene_basis: GeneResidualBasis | None, gene_names: list[str] | None,
+    uni2_global_pool, stpath_encoder, gene_basis: GeneResidualBasis | None, gene_names: list[str] | None,
 ) -> dict:
     model_cfg = config.get("model") or {}
     arm = str(model_cfg.get("arm", ""))
@@ -86,6 +91,10 @@ def _resolve_kwargs(
         if uni2_global_pool is None:
             raise ValueError(f"arm {arm!r} requires a real uni2_global_pool module")
         kwargs["uni2_global_pool"] = uni2_global_pool
+    if kwargs["image_feature_source"] == "stpath_context":
+        if stpath_encoder is None:
+            raise ValueError(f"arm {arm!r} requires a real stpath_encoder module")
+        kwargs["stpath_encoder"] = stpath_encoder
 
     if cls is Gen4ResidualFlowModel:
         if gene_basis is None or gene_names is None:
@@ -106,10 +115,20 @@ def _resolve_kwargs(
 def build_gen4_conditioner(
     config: dict, *, n_genes: int, gex_feature_dim: int, image_feature_dim: int,
     gex_context_embedding_dim: int | None = None, slide_encoder=None, gigapath_checkpoint_sha256: str | None = None,
-    uni2_global_pool=None, seed: int | None = None,
+    uni2_global_pool=None, stpath_encoder=None, seed: int | None = None,
 ) -> Gen4Conditioner:
     model_cfg = config.get("model") or {}
     arm = str(model_cfg.get("arm", ""))
+    # Codex audit (first Gen4 push), confirmed real: seeding MUST happen
+    # before any trainable submodule is constructed, including the
+    # uni2_global_pool this function builds on the caller's behalf below --
+    # a prior version seeded only right before the top-level model's own
+    # construction, after MaskAwareCoordinateAttentionPool's own random
+    # init had already consumed RNG state from an UNSEEDED stream, so two
+    # "same seed" calls produced different pool weights.
+    effective_seed = _resolve_seed(model_cfg, seed)
+    if effective_seed is not None:
+        torch.manual_seed(int(effective_seed))
     if uni2_global_pool is None and arm in ARM_TABLE and ARM_TABLE[arm]["global_context_source"] == "uni2_pool":
         global_slide_dim = int((model_cfg.get("params") or {}).get("global_slide_dim", 768))
         uni2_global_pool = _build_uni2_pool_if_needed(arm, model_cfg, image_feature_dim, global_slide_dim)
@@ -117,21 +136,24 @@ def build_gen4_conditioner(
         config, Gen4Conditioner, extra_metadata=frozenset(), n_genes=n_genes, gex_feature_dim=gex_feature_dim,
         image_feature_dim=image_feature_dim, gex_context_embedding_dim=gex_context_embedding_dim,
         slide_encoder=slide_encoder, gigapath_checkpoint_sha256=gigapath_checkpoint_sha256,
-        uni2_global_pool=uni2_global_pool, gene_basis=None, gene_names=None,
+        uni2_global_pool=uni2_global_pool, stpath_encoder=stpath_encoder, gene_basis=None, gene_names=None,
     )
-    effective_seed = seed if seed is not None else (model_cfg.get("params") or {}).get("init_seed")
-    if effective_seed is not None:
-        torch.manual_seed(int(effective_seed))
     return Gen4Conditioner(**kwargs)
 
 
 def build_gen4_flow(
     config: dict, *, n_genes: int, gex_feature_dim: int, image_feature_dim: int, gene_basis: GeneResidualBasis,
     gene_names: list[str], gex_context_embedding_dim: int | None = None, slide_encoder=None,
-    gigapath_checkpoint_sha256: str | None = None, uni2_global_pool=None, seed: int | None = None,
+    gigapath_checkpoint_sha256: str | None = None, uni2_global_pool=None, stpath_encoder=None,
+    seed: int | None = None,
 ) -> Gen4ResidualFlowModel:
     model_cfg = config.get("model") or {}
     arm = str(model_cfg.get("arm", ""))
+    # See build_gen4_conditioner's identical comment: seed BEFORE
+    # constructing any trainable submodule, including uni2_global_pool.
+    effective_seed = _resolve_seed(model_cfg, seed)
+    if effective_seed is not None:
+        torch.manual_seed(int(effective_seed))
     if uni2_global_pool is None and arm in ARM_TABLE and ARM_TABLE[arm]["global_context_source"] == "uni2_pool":
         global_slide_dim = int((model_cfg.get("params") or {}).get("global_slide_dim", 768))
         uni2_global_pool = _build_uni2_pool_if_needed(arm, model_cfg, image_feature_dim, global_slide_dim)
@@ -140,9 +162,6 @@ def build_gen4_flow(
         n_genes=n_genes, gex_feature_dim=gex_feature_dim, image_feature_dim=image_feature_dim,
         gex_context_embedding_dim=gex_context_embedding_dim, slide_encoder=slide_encoder,
         gigapath_checkpoint_sha256=gigapath_checkpoint_sha256, uni2_global_pool=uni2_global_pool,
-        gene_basis=gene_basis, gene_names=gene_names,
+        stpath_encoder=stpath_encoder, gene_basis=gene_basis, gene_names=gene_names,
     )
-    effective_seed = seed if seed is not None else (model_cfg.get("params") or {}).get("init_seed")
-    if effective_seed is not None:
-        torch.manual_seed(int(effective_seed))
     return Gen4ResidualFlowModel(**kwargs)
