@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from gen3_multiscale.models.harmonic import harmonic_interpolation
+from gen3_multiscale.data.boundary_graph import build_knn_adjacency
 
 
 def _square_grid(n=15, spacing=1.0):
@@ -71,6 +72,25 @@ def test_is_deterministic():
     a = harmonic_interpolation(observed, observed_expr, query)
     b = harmonic_interpolation(observed, observed_expr, query)
     assert np.array_equal(a, b)
+
+
+def test_exact_solution_satisfies_every_query_mean_equation():
+    """The returned field is the actual graph-harmonic fixed point, not
+    merely an early-stopped approximation."""
+    rng = np.random.default_rng(7)
+    grid = _square_grid(n=17)
+    observed, query = _split_by_circular_hole(grid, radius=3.0)
+    observed_expr = rng.normal(size=(observed.shape[0], 5))
+
+    result = harmonic_interpolation(observed, observed_expr, query, k_neighbors=8)
+    values = np.concatenate([observed_expr, result], axis=0)
+    adjacency = build_knn_adjacency(
+        np.concatenate([observed, query], axis=0), k_neighbors=8,
+    )
+
+    for full_pos in range(observed.shape[0], values.shape[0]):
+        expected = values[adjacency[full_pos]].mean(axis=0)
+        assert np.allclose(values[full_pos], expected, atol=1e-6)
 
 
 def test_output_shape():

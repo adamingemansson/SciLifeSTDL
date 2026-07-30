@@ -27,14 +27,16 @@ def harmonic_interpolation(
 ) -> np.ndarray:
     """Solve the discrete Laplace/harmonic equation on the geometry-only
     k-NN graph (the same graph construction boundary_graph.py's Phase 2
-    boundary-ring extraction uses): every query node's value converges to
-    the mean of its current neighbors' values, with observed nodes fixed
-    at their real measured expression throughout. Solved by vectorized
-    Jacobi relaxation (no sparse-linear-solver dependency) -- correct
-    regardless of iteration count, since it's a genuine iterative fixed-
-    point solver, not a fixed-depth approximation; n_iterations/tol only
-    trade off runtime against how close to the true fixed point the
-    result gets.
+    boundary-ring extraction uses): every query node equals the mean of
+    its current neighbors, with observed nodes fixed at their real
+    measured expression throughout.
+
+    The solve is reduced to the query nodes and performed exactly, one
+    connected query component at a time.  This is mathematically the
+    fixed point that the former Jacobi implementation approximated, but
+    avoids repeating a full [n_query, n_genes] update hundreds of times.
+    ``n_iterations`` and ``tol`` remain accepted for API/checkpoint
+    compatibility; an exact linear solve has no iteration budget.
 
     A query node with zero graph neighbors (isolated, only possible for a
     pathological/disconnected mask) keeps its initial value (the mean of
@@ -56,36 +58,71 @@ def harmonic_interpolation(
     all_coords = np.concatenate([observed_coords, query_coords], axis=0)
     adjacency = build_knn_adjacency(all_coords, k_neighbors=k_neighbors)
 
-    n_genes = observed_expression.shape[1]
-    n_total = n_observed + n_query
-    max_degree = max((len(a) for a in adjacency), default=0)
-    neighbor_idx = np.zeros((n_total, max(max_degree, 1)), dtype=np.int64)
-    neighbor_mask = np.zeros((n_total, max(max_degree, 1)), dtype=bool)
-    for i, neighbors in enumerate(adjacency):
-        n = len(neighbors)
-        if n:
-            neighbor_idx[i, :n] = neighbors
-            neighbor_mask[i, :n] = True
-    degree = neighbor_mask.sum(axis=1, keepdims=True).astype(np.float64)
+    observed_values = np.asarray(observed_expression, dtype=np.float64)
+    n_genes = observed_values.shape[1]
+    observed_mean = observed_values.mean(axis=0)
+    result = np.empty((n_query, n_genes), dtype=np.float64)
 
-    values = np.zeros((n_total, n_genes), dtype=np.float64)
-    values[:n_observed] = observed_expression
-    values[n_observed:] = np.asarray(observed_expression, dtype=np.float64).mean(axis=0, keepdims=True)
+    # Components are found only over query-query edges.  Solving them
+    # separately keeps the dense system small and lets us preserve the
+    # former, explicit behavior for a pathological query component that
+    # has no observed boundary: it receives the global observed mean.
+    query_adjacency: list[list[int]] = [[] for _ in range(n_query)]
+    for query_pos in range(n_query):
+        full_pos = n_observed + query_pos
+        query_adjacency[query_pos] = [
+            int(neighbor - n_observed)
+            for neighbor in adjacency[full_pos]
+            if neighbor >= n_observed
+        ]
 
-    query_neighbor_idx = neighbor_idx[n_observed:]
-    query_neighbor_mask = neighbor_mask[n_observed:]
-    query_degree = degree[n_observed:]
-    isolated = query_degree[:, 0] == 0
-    safe_degree = np.clip(query_degree, 1.0, None)
+    unseen = set(range(n_query))
+    while unseen:
+        root = min(unseen)
+        stack = [root]
+        unseen.remove(root)
+        component: list[int] = []
+        while stack:
+            query_pos = stack.pop()
+            component.append(query_pos)
+            for neighbor in query_adjacency[query_pos]:
+                if neighbor in unseen:
+                    unseen.remove(neighbor)
+                    stack.append(neighbor)
+        component.sort()
 
-    for _ in range(n_iterations):
-        gathered = values[query_neighbor_idx] * query_neighbor_mask[..., None]
-        new_query_values = gathered.sum(axis=1) / safe_degree
-        if isolated.any():
-            new_query_values[isolated] = values[n_observed:][isolated]
-        delta = float(np.abs(new_query_values - values[n_observed:]).max())
-        values[n_observed:] = new_query_values
-        if delta < tol:
-            break
+        local_by_query = {query_pos: local for local, query_pos in enumerate(component)}
+        system = np.eye(len(component), dtype=np.float64)
+        rhs = np.zeros((len(component), n_genes), dtype=np.float64)
+        has_observed_boundary = False
 
-    return values[n_observed:].astype(np.float32)
+        for local, query_pos in enumerate(component):
+            neighbors = adjacency[n_observed + query_pos]
+            degree = len(neighbors)
+            if degree == 0:
+                rhs[local] = observed_mean
+                continue
+            inv_degree = 1.0 / float(degree)
+            for neighbor in neighbors:
+                neighbor = int(neighbor)
+                if neighbor < n_observed:
+                    rhs[local] += observed_values[neighbor] * inv_degree
+                    has_observed_boundary = True
+                else:
+                    system[local, local_by_query[neighbor - n_observed]] -= inv_degree
+
+        component_idx = np.asarray(component, dtype=int)
+        if not has_observed_boundary:
+            result[component_idx] = observed_mean
+            continue
+        try:
+            result[component_idx] = np.linalg.solve(system, rhs)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError(
+                "harmonic query system is singular despite having an observed boundary; "
+                "the geometry graph is not a valid missing-tissue interpolation domain"
+            ) from exc
+
+    if not np.isfinite(result).all():
+        raise ValueError("harmonic interpolation produced non-finite values")
+    return result.astype(np.float32)
