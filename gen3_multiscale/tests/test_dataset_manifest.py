@@ -116,6 +116,36 @@ def test_build_dataset_manifest_basic_fields(tmp_path):
         assert record["wsi_cache"] is None  # no cache file exists in this fixture
 
 
+def test_manifest_exclusions_apply_before_gene_panel_and_sample_records(tmp_path):
+    hest_dir, meta_path, _ = _make_synthetic_hest1k(
+        tmp_path, {"Lung": ["L0", "L1", "L2", "L3"]},
+    )
+    manifest = build_dataset_manifest(
+        hest_dir, str(meta_path), organs="all", min_samples_per_organ=4,
+        n_validation_per_organ=0, n_test_per_organ=0, split_seed=0,
+        excluded_sample_ids=["L1"], **_SMALL_BUILD_KWARGS,
+    )
+    assert manifest["build_args"]["excluded_sample_ids"] == ["L1"]
+    assert "L1" not in manifest["train_sample_ids"]
+    assert "L1" not in manifest["samples"]
+    assert manifest["gene_panel"]
+
+
+def test_manifest_exclusions_reject_unknown_or_duplicate_ids(tmp_path):
+    hest_dir, meta_path, _ = _make_synthetic_hest1k(
+        tmp_path, {"Lung": ["L0", "L1", "L2"]},
+    )
+    kwargs = dict(
+        hest_data_dir=hest_dir, metadata_csv=str(meta_path), organs="all",
+        min_samples_per_organ=3, n_validation_per_organ=0,
+        n_test_per_organ=0, split_seed=0, **_SMALL_BUILD_KWARGS,
+    )
+    with pytest.raises(ValueError, match="absent from the resolved selection"):
+        build_dataset_manifest(**kwargs, excluded_sample_ids=["NOT_SELECTED"])
+    with pytest.raises(ValueError, match="duplicate"):
+        build_dataset_manifest(**kwargs, excluded_sample_ids=["L0", "L0"])
+
+
 def test_composite_spot_ids_are_unique_even_when_raw_barcodes_collide_across_samples(tmp_path):
     """The exact real-world scenario this whole module exists to guard
     against: two DIFFERENT samples reusing the identical literal Visium

@@ -182,6 +182,47 @@ def _write_dense_wsi_cache(path, features, coords, tile_size=256.0, **extra_prov
     )
 
 
+def _load_edge_alignment_fixture(tmp_path, spot_coords):
+    cache_dir = tmp_path / "hest1k" / "gigapath_slide_cache"
+    cache_dir.mkdir(parents=True)
+    features = np.ones((1, 1536), dtype=np.float32)
+    tile_coords = np.asarray([[0.0, 0.0]], dtype=np.float32)
+    _write_dense_wsi_cache(
+        cache_dir / "S0.npz", features, tile_coords,
+        level0_coords=tile_coords,
+        level0_tile_size=np.asarray(256.0),
+        wsi_dimensions=np.asarray([1024.0, 1024.0]),
+    )
+    cfg = OmegaConf.create({
+        "data": {
+            "slide_context_source": "dense_wsi_cache",
+            "hest_data_dir": str(tmp_path / "hest1k"),
+        }
+    })
+    return load_slide_context(cfg, "S0", None, spot_coords)
+
+
+def test_load_slide_context_allows_a_rare_subtile_crop_edge_offset(tmp_path):
+    spots = np.repeat(np.asarray([[10.0, 10.0]], dtype=np.float32), 1000, axis=0)
+    spots[-1] = [-139.0, 10.0]  # 0.1% outside, less than one 256px tile
+    context = _load_edge_alignment_fixture(tmp_path, spots)
+    assert context["source"] == "dense_wsi_cache"
+
+
+def test_load_slide_context_rejects_a_far_crop_edge_offset(tmp_path):
+    spots = np.repeat(np.asarray([[10.0, 10.0]], dtype=np.float32), 1000, axis=0)
+    spots[-1] = [-300.0, 10.0]  # beyond one 256px tile
+    with pytest.raises(ValueError, match="maximum edge offset"):
+        _load_edge_alignment_fixture(tmp_path, spots)
+
+
+def test_load_slide_context_rejects_systematic_crop_edge_offsets(tmp_path):
+    spots = np.repeat(np.asarray([[10.0, 10.0]], dtype=np.float32), 1000, axis=0)
+    spots[-10:, 0] = -20.0  # 1% outside, despite each offset being small
+    with pytest.raises(ValueError, match="allowed: <=0.5%"):
+        _load_edge_alignment_fixture(tmp_path, spots)
+
+
 def test_load_slide_context_id_is_bound_to_real_content_not_just_file_stat(tmp_path):
     """15th Codex re-audit (Step 5 acceptance criteria), CONFIRMED: a
     prior version identified the cache by file path+size+mtime -- a

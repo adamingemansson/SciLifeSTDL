@@ -345,6 +345,7 @@ def build_dataset_manifest(
     expression_target_sum: float = 1e4,
     hest_cache_dir: str | Path | None = None,
     digest_cache_path: str | Path | None = None,
+    excluded_sample_ids: Iterable[str] | None = None,
 ) -> dict:
     """Build the complete, in-memory dataset manifest. A pure function of
     its inputs and the real files on disk EXCEPT for one deliberate side
@@ -367,9 +368,32 @@ def build_dataset_manifest(
         min_gene_coverage=min_gene_coverage, min_sample_coverage=min_sample_coverage,
         min_panel_size=min_panel_size, split_by_patient=split_by_patient,
     )
-    train_ids = split["train_sample_ids"]
-    validation_ids = split["validation_sample_ids"]
-    test_ids = split["test_sample_ids"]
+    train_ids = list(split["train_sample_ids"])
+    validation_ids = list(split["validation_sample_ids"])
+    test_ids = list(split["test_sample_ids"])
+
+    # Dataset-level QC exclusions must happen BEFORE the training-derived
+    # gene panel is frozen.  Silently deleting a bad WSI only from a later
+    # model arm would make the arms incomparable; deriving the panel first
+    # would also let an excluded training slide influence the vocabulary.
+    excluded_ids = [str(sample_id).strip() for sample_id in (excluded_sample_ids or [])]
+    if any(not sample_id for sample_id in excluded_ids):
+        raise ValueError("excluded_sample_ids must contain only non-empty sample IDs")
+    if len(set(excluded_ids)) != len(excluded_ids):
+        raise ValueError("excluded_sample_ids contains duplicate sample IDs")
+    selected_ids = set(train_ids) | set(validation_ids) | set(test_ids)
+    unknown_exclusions = sorted(set(excluded_ids) - selected_ids)
+    if unknown_exclusions:
+        raise ValueError(
+            "excluded_sample_ids contains samples absent from the resolved selection: "
+            f"{unknown_exclusions}"
+        )
+    excluded_set = set(excluded_ids)
+    train_ids = [sample_id for sample_id in train_ids if sample_id not in excluded_set]
+    validation_ids = [sample_id for sample_id in validation_ids if sample_id not in excluded_set]
+    test_ids = [sample_id for sample_id in test_ids if sample_id not in excluded_set]
+    if not train_ids:
+        raise ValueError("excluded_sample_ids removed every training sample")
 
     # The gene panel is derived from TRAINING samples ONLY, via the real
     # QC/normalization pipeline every sample actually goes through
@@ -505,6 +529,7 @@ def build_dataset_manifest(
             "min_panel_size": min_panel_size, "split_by_patient": split_by_patient,
             "gene_min_genes_per_spot": gene_min_genes_per_spot, "gene_min_cells": gene_min_cells,
             "expression_transform": expression_transform, "expression_target_sum": expression_target_sum,
+            "excluded_sample_ids": sorted(excluded_set),
         },
         "train_sample_ids": train_ids,
         "validation_sample_ids": validation_ids,

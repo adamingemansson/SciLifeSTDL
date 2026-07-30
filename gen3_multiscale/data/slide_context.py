@@ -304,10 +304,29 @@ def load_slide_context(
                 (spot_xy[:, 0] >= 0) & (spot_xy[:, 0] < wsi_dimensions[0])
                 & (spot_xy[:, 1] >= 0) & (spot_xy[:, 1] < wsi_dimensions[1])
             )
-            if not bool(inside.all()):
+            # A few HEST spot centres can sit just outside a cropped WSI by
+            # tens of level-0 pixels (for example, a Visium spot centred on
+            # the crop boundary).  That is not a coordinate-frame mismatch.
+            # Permit only a very small fraction of such points, and only when
+            # every one is within one cached level-0 tile of the slide.  The
+            # independent >=90% retained-tissue-tile check below remains
+            # unchanged and catches systematic crop/origin mismatches.
+            outside_fraction = float(np.mean(~inside))
+            x_edge_distance = np.maximum(
+                np.maximum(-spot_xy[:, 0], spot_xy[:, 0] - wsi_dimensions[0]),
+                0.0,
+            )
+            y_edge_distance = np.maximum(
+                np.maximum(-spot_xy[:, 1], spot_xy[:, 1] - wsi_dimensions[1]),
+                0.0,
+            )
+            max_outside_distance = float(np.max(np.maximum(x_edge_distance, y_edge_distance)))
+            if outside_fraction > 0.005 or max_outside_distance > mask_tile_size:
                 raise ValueError(
                     f"{(~inside).sum()}/{len(inside)} ST spots fall outside the cached WSI; "
-                    "the H5AD and WSI coordinate frames do not match"
+                    f"maximum edge offset is {max_outside_distance:.1f} level-0 pixels "
+                    f"(allowed: <=0.5% of spots and <=one {mask_tile_size:.1f}px tile); "
+                    "the H5AD and WSI coordinate frames likely do not match"
                 )
         # Most measured spots must fall in, or immediately beside, a retained
         # tissue tile.  This catches the far more dangerous case where both
