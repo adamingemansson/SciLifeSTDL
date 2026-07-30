@@ -82,6 +82,10 @@ def extract_boundary_and_local_context(
     local_k: int = 32,
     max_rings: int = 3,
     max_boundary_size: int | None = None,
+    *,
+    full_adjacency: list[np.ndarray] | tuple[np.ndarray, ...] | None = None,
+    observed_full_idx: np.ndarray | None = None,
+    query_full_idx: np.ndarray | None = None,
 ) -> BoundaryExtractionResult:
     """Build the geometry-only slide spot graph over observed_coords UNION
     query_coords, then derive:
@@ -117,13 +121,50 @@ def extract_boundary_and_local_context(
     if n_query == 0:
         raise ValueError("query_coords is empty -- nothing to predict")
 
-    all_coords = np.concatenate([observed_coords, query_coords], axis=0)
-    # In this concatenated array, positions [0, n_observed) are observed
-    # spots (same order as observed_coords) and [n_observed, n_observed+n_query)
-    # are query spots (same order as query_coords) -- purely a local
-    # convenience for building one adjacency graph; never exposed outside
-    # this function.
-    adjacency = build_knn_adjacency(all_coords, k_neighbors=k_neighbors)
+    uses_cached_adjacency = full_adjacency is not None
+    if uses_cached_adjacency:
+        if observed_full_idx is None or query_full_idx is None:
+            raise ValueError(
+                "observed_full_idx and query_full_idx are required with full_adjacency"
+            )
+        observed_full_idx = np.asarray(observed_full_idx, dtype=int)
+        query_full_idx = np.asarray(query_full_idx, dtype=int)
+        if observed_full_idx.shape != (n_observed,) or query_full_idx.shape != (n_query,):
+            raise ValueError(
+                "observed_full_idx/query_full_idx must align with observed_coords/query_coords"
+            )
+        active_full_idx = np.concatenate([observed_full_idx, query_full_idx])
+        n_full = len(full_adjacency)
+        if (
+            np.any(active_full_idx < 0)
+            or np.any(active_full_idx >= n_full)
+            or np.unique(active_full_idx).size != active_full_idx.size
+        ):
+            raise ValueError(
+                "observed_full_idx/query_full_idx must be unique, disjoint indices into full_adjacency"
+            )
+        # Convert the one canonical, sample-level adjacency to this mask's
+        # local observed-then-query indexing.  This is an induced subgraph
+        # operation over O(N*k) integer edges; it never rebuilds a KD-tree.
+        local_by_full = np.full(n_full, -1, dtype=int)
+        local_by_full[active_full_idx] = np.arange(active_full_idx.size, dtype=int)
+        adjacency = []
+        for full_position in active_full_idx:
+            full_neighbors = np.asarray(full_adjacency[int(full_position)], dtype=int)
+            local_neighbors = local_by_full[full_neighbors]
+            adjacency.append(local_neighbors[local_neighbors >= 0])
+    else:
+        if observed_full_idx is not None or query_full_idx is not None:
+            raise ValueError(
+                "observed_full_idx/query_full_idx are only valid together with full_adjacency"
+            )
+        all_coords = np.concatenate([observed_coords, query_coords], axis=0)
+        # In this concatenated array, positions [0, n_observed) are observed
+        # spots (same order as observed_coords) and [n_observed, n_observed+n_query)
+        # are query spots (same order as query_coords) -- purely a local
+        # convenience for building one adjacency graph; never exposed outside
+        # this function.
+        adjacency = build_knn_adjacency(all_coords, k_neighbors=k_neighbors)
 
     def is_observed(pos: int) -> bool:
         return pos < n_observed
@@ -225,6 +266,7 @@ def extract_boundary_and_local_context(
         "n_query_touching_boundary_directly": len(boundary_touching_queries),
         "n_query_unreachable_from_boundary": n_unreachable,
         "max_query_depth_to_boundary": int(query_depth_to_boundary.max()) if n_query else 0,
+        "used_cached_sample_adjacency": bool(uses_cached_adjacency),
     }
 
     return BoundaryExtractionResult(

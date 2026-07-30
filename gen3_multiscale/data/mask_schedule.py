@@ -53,8 +53,46 @@ _STRATUM_SEED_STRIDE = 1_000_000
 # have left any already-persisted (buggy) schedule looking identical by
 # every OTHER fingerprint field, since none of dataset/spatial/strata
 # content actually changed -- only the algorithm did.
-_MASK_GENERATION_VERSION = "3"
+_MASK_GENERATION_VERSION = "4"
 _MAX_MASK_ATTEMPTS = 1000
+
+
+def prepare_masking_cfg_for_sample(
+    masking_cfg: dict, coords3d: np.ndarray, slice_ids: np.ndarray,
+) -> dict:
+    """Attach immutable per-slice spacing computed once for this sample.
+
+    ``random_dropout_patches`` historically rebuilt the same cKDTree for
+    every seed whenever ``radius_unit='spot_spacing'``.  A production
+    schedule has 500 seeds per sample and is re-verified twice, turning a
+    constant sample property into tens of thousands of redundant trees.
+    The prepared config preserves the exact radius calculation and random
+    stream; it only supplies the already-computed spacing lookup.
+    """
+    prepared = {
+        "strategy": masking_cfg.get("strategy"),
+        "params": dict(masking_cfg.get("params", {})),
+    }
+    params = prepared["params"]
+    if prepared["strategy"] != "random_dropout_patches" or params.get("radius_unit") != "spot_spacing":
+        return prepared
+
+    from scipy.spatial import cKDTree
+
+    coords2d = np.asarray(coords3d, dtype=np.float64)[:, :2]
+    slices = np.asarray(slice_ids)
+    spacing_by_slice = {}
+    for slice_id in np.unique(slices):
+        slice_coords = coords2d[slices == slice_id]
+        if len(slice_coords) < 2:
+            raise ValueError(f"cannot determine spot spacing for slice {slice_id!r} with fewer than 2 spots")
+        distances, _ = cKDTree(slice_coords).query(slice_coords, k=2)
+        spacing = float(np.median(distances[:, 1]))
+        if not np.isfinite(spacing) or spacing <= 0:
+            raise ValueError(f"could not determine positive spot spacing for slice {slice_id!r}")
+        spacing_by_slice[slice_id] = spacing
+    params["precomputed_spot_spacing_by_slice"] = spacing_by_slice
+    return prepared
 
 
 def validate_mask_has_observed_boundary(
@@ -64,6 +102,7 @@ def validate_mask_has_observed_boundary(
     query_obs_names: Iterable[str],
     *,
     k_neighbors: int = 6,
+    spatial_adjacency: list[np.ndarray] | tuple[np.ndarray, ...] | None = None,
 ) -> dict:
     """Require a realized mask to represent a hole with observed tissue around it.
 
@@ -79,6 +118,28 @@ def validate_mask_has_observed_boundary(
         query_pos = np.asarray([position_by_name[str(x)] for x in query_obs_names], dtype=int)
     except KeyError as exc:
         raise ValueError(f"mask references unknown observation {exc.args[0]!r}") from exc
+    if spatial_adjacency is not None:
+        if len(spatial_adjacency) != len(names):
+            raise ValueError(
+                f"spatial_adjacency has {len(spatial_adjacency)} nodes, expected {len(names)}"
+            )
+        context_mask = np.zeros(len(names), dtype=bool)
+        context_mask[context_pos] = True
+        for query_position in query_pos:
+            neighbors = np.asarray(spatial_adjacency[int(query_position)], dtype=int)
+            if neighbors.size and context_mask[neighbors].any():
+                return {
+                    "n_observed": int(context_pos.size),
+                    "n_query": int(query_pos.size),
+                    "boundary_validated_from_cached_spatial_graph": True,
+                }
+        raise EmptyBoundaryError(
+            "realized query mask has no observed boundary in the cached symmetric geometry graph "
+            f"(n_observed={context_pos.size}, n_query={query_pos.size}, "
+            f"k_neighbors={k_neighbors}); the mask likely covers an entire disconnected tissue "
+            "fragment and is not a valid missing-tissue hole"
+        )
+
     result = extract_boundary_and_local_context(
         np.asarray(coords3d)[context_pos, :2], np.asarray(coords3d)[query_pos, :2],
         k_neighbors=k_neighbors, local_k=1, max_rings=1,
@@ -164,7 +225,8 @@ def build_stratified_mask_bank(
     }
     for i, stratum in enumerate(strata):
         stratum_name = stratum["name"]
-        masking_cfg = stratum_to_masking_cfg(stratum)
+        masking_cfg_raw = stratum_to_masking_cfg(stratum)
+        masking_cfg = prepare_masking_cfg_for_sample(masking_cfg_raw, coords3d, slice_ids)
         stratum_seeds = {split: int(seed) + i * _STRATUM_SEED_STRIDE for split, seed in split_seeds.items()}
         max_context = mask_bank._cfg_get(masking_cfg, "max_context_points", None)
         context_selection = str(mask_bank._cfg_get(masking_cfg, "context_selection", "random"))
@@ -216,7 +278,7 @@ def build_stratified_mask_bank(
                     )
                 all_records.append(accepted)
         per_stratum_fingerprints[stratum_name] = mask_bank.masking_fingerprint(
-            masking_cfg, split_counts, stratum_seeds,
+            masking_cfg_raw, split_counts, stratum_seeds,
         )
 
     return {

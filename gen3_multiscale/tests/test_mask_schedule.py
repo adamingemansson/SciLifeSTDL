@@ -19,7 +19,7 @@ from gen3_multiscale.data import mask_bank
 from gen3_multiscale.data.mask_schedule import (
     build_stratified_mask_bank, build_stratified_training_seed_bank, ensure_stratified_mask_bank,
     ensure_stratified_training_seed_bank, load_stratified_mask_bank, save_stratified_mask_bank,
-    strata_fingerprint, stratum_records, stratum_to_masking_cfg,
+    prepare_masking_cfg_for_sample, strata_fingerprint, stratum_records, stratum_to_masking_cfg,
 )
 
 _CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
@@ -62,6 +62,22 @@ def test_stratum_to_masking_cfg_is_directly_usable_by_the_real_reused_make_split
         context, query = mask_bank.make_split(coords3d, slice_ids, masking_cfg, seed=0)
         assert context.any() and query.any()
         assert not np.any(context & query)
+
+
+def test_precomputed_spot_spacing_preserves_exact_realized_masks():
+    coords3d, slice_ids, _obs_names = _synthetic_slide()
+    raw = stratum_to_masking_cfg({
+        "name": "spacing", "radius_range": [2.0, 4.0],
+        "radius_unit": "spot_spacing", "shape": "mixed",
+    })
+    prepared = prepare_masking_cfg_for_sample(raw, coords3d, slice_ids)
+    assert "precomputed_spot_spacing_by_slice" not in raw["params"]
+    assert prepared["params"]["precomputed_spot_spacing_by_slice"]["slide_a"] == pytest.approx(1.0)
+    for seed in range(20):
+        raw_context, raw_query = mask_bank.make_split(coords3d, slice_ids, raw, seed)
+        cached_context, cached_query = mask_bank.make_split(coords3d, slice_ids, prepared, seed)
+        np.testing.assert_array_equal(cached_context, raw_context)
+        np.testing.assert_array_equal(cached_query, raw_query)
 
 
 def test_build_stratified_mask_bank_tags_every_record_with_its_stratum():

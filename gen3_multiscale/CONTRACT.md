@@ -6095,6 +6095,32 @@ gen2_architectures + gen3_multiscale: 847 passed, 1 skipped
   anything in this round)
 ```
 
+## Post-launch boundary-geometry performance correction
+
+The first real 56-sample launch exposed a contained performance bug in
+the boundary-safety correction: every one of 500 training masks per
+sample rebuilt both the sample's spot-spacing KD-tree and its symmetric
+kNN graph, and the schedule report re-realized the same pool twice more.
+This was scientifically fail-closed but made startup CPU-bound for tens
+of minutes and repeated one redundant graph validation in every training
+item.
+
+The production path now builds one canonical symmetric geometry graph
+and one per-slice spot-spacing lookup per loaded sample. Schedule
+generation, both verification passes, validation preflight, and example
+construction reuse those immutable geometry artifacts. Random mask
+realization and spot-spacing arithmetic are unchanged; boundary rings,
+depth, and mask-validity checks now consistently use the same canonical
+sample graph rather than rebuilding an order-dependent equivalent for
+each mask. Mask-generation version 4 forces any older persisted bank to
+be regenerated under that canonical-graph contract.
+Regression tests compare cached and legacy extraction arrays exactly on
+continuous coordinates, compare raw and precomputed-spacing masks over
+20 seeds, and forbid the cached schedule path from entering the legacy
+per-mask graph constructor. A synthetic 1,600-spot, four-stratum,
+500-mask build plus both verification passes completes in about 1.5
+seconds in the local CPU test environment.
+
 The block immediately below (pre-f7bb8a1-audit-response test counts) is
 kept for historical continuity rather than deleted, per this document's
 append-only discipline:

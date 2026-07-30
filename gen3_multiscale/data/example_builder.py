@@ -203,6 +203,7 @@ def build_spatial_field_example(
     image_mode: str = "target_zero",
     image_source_available: np.ndarray | None = None,
     precomputed_spot_features: np.ndarray | None = None,
+    full_sample_adjacency: list[np.ndarray] | tuple[np.ndarray, ...] | None = None,
 ) -> tuple[SpatialFieldInputs, SpatialFieldTargets]:
     """Build one real SpatialFieldInputs/SpatialFieldTargets pair from
     one realized (context, query) barcode split.
@@ -607,6 +608,9 @@ def build_spatial_field_example(
     boundary = extract_boundary_and_local_context(
         observed_coords, query_coords, k_neighbors=k_neighbors, local_k=local_k,
         max_rings=max_rings, max_boundary_size=max_boundary_size,
+        full_adjacency=full_sample_adjacency,
+        observed_full_idx=context_pos if full_sample_adjacency is not None else None,
+        query_full_idx=query_pos if full_sample_adjacency is not None else None,
     )
 
     inputs = SpatialFieldInputs(

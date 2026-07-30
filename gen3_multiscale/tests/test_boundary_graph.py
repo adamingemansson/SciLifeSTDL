@@ -35,6 +35,35 @@ def test_build_knn_adjacency_is_symmetric_and_has_no_self_loops():
             assert i in adjacency[int(neighbor)]
 
 
+def test_cached_full_adjacency_matches_legacy_per_mask_extraction():
+    """The production fast path must preserve the old extraction result;
+    it changes graph construction frequency, not boundary semantics."""
+    rng = np.random.default_rng(42)
+    full_coords = rng.normal(size=(120, 2))  # continuous coordinates avoid distance-tie ambiguity
+    query_full_idx = np.sort(rng.choice(120, size=24, replace=False))
+    query_mask = np.zeros(120, dtype=bool)
+    query_mask[query_full_idx] = True
+    observed_full_idx = np.flatnonzero(~query_mask)
+    observed = full_coords[observed_full_idx]
+    query = full_coords[query_full_idx]
+
+    legacy = extract_boundary_and_local_context(
+        observed, query, k_neighbors=6, local_k=8, max_rings=3,
+    )
+    cached = extract_boundary_and_local_context(
+        observed, query, k_neighbors=6, local_k=8, max_rings=3,
+        full_adjacency=tuple(build_knn_adjacency(full_coords, k_neighbors=6)),
+        observed_full_idx=observed_full_idx, query_full_idx=query_full_idx,
+    )
+
+    np.testing.assert_array_equal(cached.query_local_neighbor_idx, legacy.query_local_neighbor_idx)
+    np.testing.assert_array_equal(cached.boundary_idx, legacy.boundary_idx)
+    np.testing.assert_array_equal(cached.boundary_ring, legacy.boundary_ring)
+    np.testing.assert_array_equal(cached.query_depth_to_boundary, legacy.query_depth_to_boundary)
+    assert cached.diagnostic["used_cached_sample_adjacency"] is True
+    assert legacy.diagnostic["used_cached_sample_adjacency"] is False
+
+
 def test_symmetric_knn_recovers_boundary_hidden_by_directed_query_edges():
     """Regression for the real validation crash: every query's outgoing
     nearest-neighbour edge stays inside the dense query cluster, while the

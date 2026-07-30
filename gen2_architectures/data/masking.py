@@ -163,6 +163,7 @@ def random_dropout_patches(coords_xy: np.ndarray, slice_ids: np.ndarray,
                             blob_strength_range=(0.2, 0.45),
                             blob_harmonics: int = 4,
                             center_mode: str = "random",
+                            precomputed_spot_spacing_by_slice: dict | None = None,
                             ) -> tuple[np.ndarray, np.ndarray]:
     """Multiple random holes per call — for stress-testing / making a held-
     out evaluation set with varied difficulty.
@@ -219,13 +220,18 @@ def random_dropout_patches(coords_xy: np.ndarray, slice_ids: np.ndarray,
         center = coords_xy[center_idx]
         radius = rng.uniform(*radius_range)
         if radius_unit == "spot_spacing":
-            from scipy.spatial import cKDTree
+            if precomputed_spot_spacing_by_slice is not None:
+                if s not in precomputed_spot_spacing_by_slice:
+                    raise ValueError(f"no precomputed spot spacing for slice {s!r}")
+                spacing = float(precomputed_spot_spacing_by_slice[s])
+            else:
+                from scipy.spatial import cKDTree
 
-            slice_coords = np.asarray(coords_xy[in_slice_idx], dtype=np.float64)
-            if len(slice_coords) < 2:
-                continue
-            neighbour_distances, _ = cKDTree(slice_coords).query(slice_coords, k=2)
-            spacing = float(np.median(neighbour_distances[:, 1]))
+                slice_coords = np.asarray(coords_xy[in_slice_idx], dtype=np.float64)
+                if len(slice_coords) < 2:
+                    continue
+                neighbour_distances, _ = cKDTree(slice_coords).query(slice_coords, k=2)
+                spacing = float(np.median(neighbour_distances[:, 1]))
             if not np.isfinite(spacing) or spacing <= 0:
                 raise ValueError(f"could not determine positive spot spacing for slice {s!r}")
             radius *= spacing

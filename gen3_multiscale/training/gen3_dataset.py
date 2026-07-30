@@ -66,9 +66,17 @@ import torch
 
 from gen3_multiscale.data import example_builder, novae_graph, slide_context, spot_feature_cache
 from gen3_multiscale.data import mask_fingerprint
-from gen3_multiscale.data.boundary_graph import EmptyBoundaryError, extract_boundary_and_local_context
+from gen3_multiscale.data.boundary_graph import (
+    EmptyBoundaryError,
+    build_knn_adjacency,
+    extract_boundary_and_local_context,
+)
 from gen3_multiscale.data.dataset_manifest import verify_content_provenance
-from gen3_multiscale.data.mask_schedule import ensure_stratified_mask_bank, stratum_to_masking_cfg
+from gen3_multiscale.data.mask_schedule import (
+    ensure_stratified_mask_bank,
+    prepare_masking_cfg_for_sample,
+    stratum_to_masking_cfg,
+)
 
 
 @dataclass(frozen=True)
@@ -89,8 +97,21 @@ class Gen3SampleData:
     slice_ids: np.ndarray  # [n] str, every entry == sample_id (mask_bank's single-slice convention)
     slide_context_record: dict | None
     tile_encoder_provenance: dict  # {"dense_wsi": {...} | None, "spot_features": {...}}
+    spatial_adjacency: tuple[np.ndarray, ...] | None = None  # canonical graph, built once per sample
 
     def __post_init__(self):
+        if self.spatial_adjacency is None:
+            object.__setattr__(
+                self,
+                "spatial_adjacency",
+                tuple(build_knn_adjacency(self.full_sample_coords, k_neighbors=6)),
+            )
+        elif len(self.spatial_adjacency) != self.full_sample_coords.shape[0]:
+            raise ValueError(
+                f"{self.sample_id}: spatial_adjacency has {len(self.spatial_adjacency)} nodes, "
+                f"expected {self.full_sample_coords.shape[0]}"
+            )
+
         # Mandatory requirement #2's "verify at the trainer call site"
         # half -- see module docstring. Real, confirmed gap (Codex audit
         # of commit 27e1232): a row-COUNT check alone cannot catch a
@@ -142,6 +163,7 @@ def load_gen3_sample_data(cfg, manifest: dict, sample_id: str) -> Gen3SampleData
     full_sample_coords = np.asarray(adata.obsm["spatial"], dtype=np.float64)
     coords3d = np.concatenate([full_sample_coords, np.zeros((full_sample_coords.shape[0], 1))], axis=1)
     slice_ids = np.full(obs_names.shape[0], sample_id, dtype=object)
+    spatial_adjacency = tuple(build_knn_adjacency(full_sample_coords, k_neighbors=6))
 
     # Mandatory requirement #2: the COMPLETE verified spot-feature cache
     # record -- barcodes, availability, AND features loaded and checked
@@ -193,6 +215,7 @@ def load_gen3_sample_data(cfg, manifest: dict, sample_id: str) -> Gen3SampleData
         full_sample_coords=full_sample_coords,
         coords3d=coords3d,
         slice_ids=slice_ids,
+        spatial_adjacency=spatial_adjacency,
         slide_context_record=slide_context_record,
         tile_encoder_provenance={
             "dense_wsi": dense_wsi_provenance,
@@ -278,10 +301,12 @@ def build_gen3_mask_schedule(
                 n_items=n_training_masks_per_sample, base_seed=sample_base_seed,
                 reserved_query_composite_ids=set(),  # nothing reserved: no same-sample val/test masks are drawn -- see module docstring
                 manifest=manifest,
+                spatial_adjacency=sample.spatial_adjacency,
             )
             report = mask_fingerprint.build_training_sample_mask_report(
                 manifest, sample_id, sample.coords3d, sample.slice_ids, obs_names, strata,
                 training_schedule, reserved_query_composite_ids=set(),
+                spatial_adjacency=sample.spatial_adjacency,
             )
             if not report.get("passed"):
                 raise ValueError(f"{sample_id}: training mask report did not pass: {report}")
@@ -354,6 +379,13 @@ class Gen3SpatialFieldDataset(torch.utils.data.Dataset):
         self.max_boundary_size = max_boundary_size
         self.patch_size_fullres = patch_size_fullres
         self._masking_cfg_by_stratum = _masking_cfg_by_stratum(strata)
+        self._masking_cfg_by_sample_stratum = {
+            sample_id: {
+                name: prepare_masking_cfg_for_sample(cfg, sample.coords3d, sample.slice_ids)
+                for name, cfg in self._masking_cfg_by_stratum.items()
+            }
+            for sample_id, sample in samples.items()
+        }
         self._items = schedule.train_items if schedule.role == "train" else schedule.held_out_items
         if not self._items:
             raise ValueError(f"Gen3SpatialFieldDataset: role {schedule.role!r} has zero mask items")
@@ -395,10 +427,10 @@ class Gen3SpatialFieldDataset(torch.utils.data.Dataset):
         if isinstance(item, _TrainMaskItem):
             sample = self.samples[item.sample_id]
             obs_names = np.asarray(sample.adata.obs_names, dtype=str)
-            masking_cfg = self._masking_cfg_by_stratum[item.stratum]
+            masking_cfg = self._masking_cfg_by_sample_stratum[item.sample_id][item.stratum]
             record = mask_fingerprint.realize_seed_and_fingerprint(
                 sample.coords3d, sample.slice_ids, obs_names, item.sample_id, masking_cfg, item.seed,
-                manifest=self.manifest,
+                manifest=self.manifest, spatial_adjacency=sample.spatial_adjacency,
             )
             return record["context_obs_names"], record["query_obs_names"]
         return list(item.context_obs_names), list(item.query_obs_names)
@@ -430,6 +462,9 @@ class Gen3SpatialFieldDataset(torch.utils.data.Dataset):
                     sample.full_sample_coords[context_pos], sample.full_sample_coords[query_pos],
                     k_neighbors=self.k_neighbors, local_k=self.local_k,
                     max_rings=self.max_rings, max_boundary_size=self.max_boundary_size,
+                    full_adjacency=sample.spatial_adjacency,
+                    observed_full_idx=context_pos,
+                    query_full_idx=query_pos,
                 )
             except EmptyBoundaryError as exc:
                 identity = self.item_identity(idx)
@@ -460,6 +495,7 @@ class Gen3SpatialFieldDataset(torch.utils.data.Dataset):
                 slide_context=sample.slide_context_record, image_mode="target_zero",
                 image_source_available=sample.image_source_available,
                 precomputed_spot_features=sample.precomputed_spot_features,
+                full_sample_adjacency=sample.spatial_adjacency,
             )
         except EmptyBoundaryError as exc:
             identity = self.item_identity(idx)

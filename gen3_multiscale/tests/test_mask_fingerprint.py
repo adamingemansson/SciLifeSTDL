@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from gen3_multiscale.data import mask_bank
+from gen3_multiscale.data.boundary_graph import build_knn_adjacency
 from gen3_multiscale.data.dataset_manifest import composite_spot_id
 from gen3_multiscale.data.mask_fingerprint import (
     EmptyMaskRealizationError, build_collision_free_training_schedule, build_held_out_sample_mask_report,
@@ -264,6 +265,37 @@ def test_build_collision_free_training_schedule_avoids_reserved_and_duplicate_ma
         record = realize_seed_and_fingerprint(coords3d, slice_ids, obs_names, "S0", cfg, item["seed"])
         query_ids = {composite_spot_id("S0", b) for b in record["query_obs_names"]}
         assert query_ids.isdisjoint(reserved_ids)
+
+
+def test_cached_spatial_graph_preserves_schedule_and_avoids_rebuilding_knn(monkeypatch):
+    """Production builds one canonical graph per sample and reuses it for
+    all schedule generation/report passes.  The cached path must produce
+    the same deterministic schedule while never entering the legacy
+    per-mask graph constructor."""
+    import gen3_multiscale.data.mask_schedule as mask_schedule_module
+
+    coords3d, slice_ids, obs_names = _synthetic_slide()
+    manifest = {"samples": {"S0": {"barcodes": list(obs_names), "split": "train"}}}
+    adjacency = tuple(build_knn_adjacency(coords3d[:, :2], k_neighbors=6))
+    kwargs = dict(
+        coords3d=coords3d, slice_ids=slice_ids, obs_names=obs_names,
+        sample_id="S0", strata=[_STRATUM], n_items=12, base_seed=123,
+        reserved_query_composite_ids=set(), manifest=manifest,
+    )
+    legacy = build_collision_free_training_schedule(**kwargs)
+
+    def forbidden_per_mask_graph(*_args, **_kwargs):
+        raise AssertionError("per-mask kNN graph was rebuilt despite cached spatial_adjacency")
+
+    monkeypatch.setattr(mask_schedule_module, "extract_boundary_and_local_context", forbidden_per_mask_graph)
+    cached = build_collision_free_training_schedule(**kwargs, spatial_adjacency=adjacency)
+    assert cached == legacy
+
+    report = build_training_sample_mask_report(
+        manifest, "S0", coords3d, slice_ids, obs_names, [_STRATUM], cached, set(),
+        spatial_adjacency=adjacency,
+    )
+    assert report["passed"] is True
 
 
 def test_build_collision_free_training_schedule_raises_when_impossible_within_budget():

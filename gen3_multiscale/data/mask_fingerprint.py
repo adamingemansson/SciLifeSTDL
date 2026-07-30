@@ -85,6 +85,7 @@ from gen3_multiscale.data import mask_bank
 from gen3_multiscale.data.boundary_graph import EmptyBoundaryError
 from gen3_multiscale.data.dataset_manifest import composite_spot_id
 from gen3_multiscale.data.mask_schedule import (
+    prepare_masking_cfg_for_sample,
     _MASK_GENERATION_VERSION, _STRATUM_SEED_STRIDE, strata_fingerprint,
     stratum_to_masking_cfg, validate_mask_has_observed_boundary,
 )
@@ -158,6 +159,7 @@ def validate_realized_barcodes_against_manifest(manifest: dict, sample_id: str, 
 def realize_seed_and_fingerprint(
     coords3d: np.ndarray, slice_ids: np.ndarray, obs_names: Iterable[str],
     sample_id: str, masking_cfg: dict, seed: int, *, manifest: dict | None = None,
+    spatial_adjacency: list[np.ndarray] | tuple[np.ndarray, ...] | None = None,
 ) -> dict:
     """Realize ONE (masking_cfg, seed) draw exactly as
     `mask_bank.build_mask_bank` does internally (same `make_split` call,
@@ -182,6 +184,7 @@ def realize_seed_and_fingerprint(
     query_obs_names = names[query].tolist()
     validate_mask_has_observed_boundary(
         coords3d, names, context_obs_names, query_obs_names,
+        spatial_adjacency=spatial_adjacency,
     )
     if manifest is not None:
         validate_realized_barcodes_against_manifest(manifest, sample_id, context_obs_names)
@@ -328,6 +331,7 @@ def build_collision_free_training_schedule(
     coords3d: np.ndarray, slice_ids: np.ndarray, obs_names: Iterable[str], sample_id: str,
     strata: list[dict], n_items: int, base_seed: int, reserved_query_composite_ids: set[str],
     *, manifest: dict | None = None, max_attempts_per_item: int = 1000,
+    spatial_adjacency: list[np.ndarray] | tuple[np.ndarray, ...] | None = None,
 ) -> dict:
     """Deterministically build a training schedule whose realized masks
     are GUARANTEED, by construction, to (a) never query a RESERVED
@@ -382,7 +386,10 @@ def build_collision_free_training_schedule(
             f"n_items ({n_items}) must be >= the number of strata ({n_strata}) to guarantee every "
             "stratum is covered at least once"
         )
-    masking_cfg_by_stratum = {s["name"]: stratum_to_masking_cfg(s) for s in strata}
+    masking_cfg_by_stratum = {
+        s["name"]: prepare_masking_cfg_for_sample(stratum_to_masking_cfg(s), coords3d, slice_ids)
+        for s in strata
+    }
 
     accepted_items: list[dict] = []
     accepted_fingerprints: set[str] = set()
@@ -401,6 +408,7 @@ def build_collision_free_training_schedule(
             try:
                 record = realize_seed_and_fingerprint(
                     coords3d, slice_ids, obs_names, sample_id, masking_cfg, seed, manifest=manifest,
+                    spatial_adjacency=spatial_adjacency,
                 )
             except (EmptyMaskRealizationError, EmptyBoundaryError):
                 # Empty context/query, or a mask that removes an entire
@@ -496,6 +504,7 @@ def _input_fingerprints(
 def validate_collision_free_training_schedule(
     schedule: dict, coords3d: np.ndarray, slice_ids: np.ndarray, obs_names: Iterable[str], sample_id: str,
     strata: list[dict], reserved_query_composite_ids: set[str], *, manifest: dict | None = None,
+    spatial_adjacency: list[np.ndarray] | tuple[np.ndarray, ...] | None = None,
 ) -> dict:
     """Fail-closed re-verification of a (typically LOADED-from-disk)
     `build_collision_free_training_schedule` output against LIVE data
@@ -544,12 +553,16 @@ def validate_collision_free_training_schedule(
     if len(items) != schedule.get("n_items"):
         raise ValueError("schedule items length does not match its own recorded n_items")
 
-    masking_cfg_by_stratum = {s["name"]: stratum_to_masking_cfg(s) for s in strata}
+    masking_cfg_by_stratum = {
+        s["name"]: prepare_masking_cfg_for_sample(stratum_to_masking_cfg(s), coords3d, slice_ids)
+        for s in strata
+    }
     seen_fingerprints: set[str] = set()
     for i, (item, recorded_fp) in enumerate(zip(items, fingerprints)):
         masking_cfg = masking_cfg_by_stratum[item["stratum"]]
         record = realize_seed_and_fingerprint(
             coords3d, slice_ids, obs_names, sample_id, masking_cfg, item["seed"], manifest=manifest,
+            spatial_adjacency=spatial_adjacency,
         )
         fresh_fp = record["query_composite_fingerprint"]
         if fresh_fp != recorded_fp:
@@ -571,6 +584,7 @@ def build_training_sample_mask_report(
     manifest: dict, sample_id: str, coords3d: np.ndarray, slice_ids: np.ndarray, obs_names: Iterable[str],
     strata: list[dict], training_schedule: dict, reserved_query_composite_ids: set[str], *,
     same_sample_diagnostic_mask_bank: dict | None = None,
+    spatial_adjacency: list[np.ndarray] | tuple[np.ndarray, ...] | None = None,
 ) -> dict:
     """The primary mask-fingerprint report for a TRAINING sample
     (`dataset_manifest.py`'s `train_sample_ids`). 12th Codex re-audit of
@@ -634,15 +648,18 @@ def build_training_sample_mask_report(
     # confirms no duplicates -- raises (fail-closed) on any mismatch.
     validate_collision_free_training_schedule(
         training_schedule, coords3d, slice_ids, obs_names, sample_id, strata, reserved_query_composite_ids,
-        manifest=manifest,
+        manifest=manifest, spatial_adjacency=spatial_adjacency,
     )
 
-    masking_cfg_by_stratum = {s["name"]: stratum_to_masking_cfg(s) for s in strata}
+    masking_cfg_by_stratum = {
+        s["name"]: prepare_masking_cfg_for_sample(stratum_to_masking_cfg(s), coords3d, slice_ids)
+        for s in strata
+    }
     train_query_ids: set[str] = set()
     for it in training_schedule["items"]:
         record = realize_seed_and_fingerprint(
             coords3d, slice_ids, obs_names, sample_id, masking_cfg_by_stratum[it["stratum"]], it["seed"],
-            manifest=manifest,
+            manifest=manifest, spatial_adjacency=spatial_adjacency,
         )
         train_query_ids.update(composite_spot_id(sample_id, b) for b in record["query_obs_names"])
 
