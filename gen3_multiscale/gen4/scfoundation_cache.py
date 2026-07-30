@@ -31,17 +31,26 @@ def _cache_path(cache_root: str | Path, sample_id: str) -> Path:
     return Path(cache_root) / "scfoundation_gen3_spot_cache" / f"{sample_id}.npz"
 
 
-def _expression_content_hash(expression: np.ndarray) -> str:
+def _expression_content_hash(expression: np.ndarray, raw_library_size: np.ndarray | None = None) -> str:
     """Codex audit finding: cache identity previously hashed neither the
     expression VALUES nor the preprocessing that produced them, so a
     stale/changed input could silently reuse an old cached embedding. This
     hashes the exact float32 bytes of the row-aligned expression matrix
     fed into the encoder -- any change to a single value (a re-run QC
     fix, a different normalization, a corrected count) changes the hash
-    and forces a rebuild rather than silently reusing a stale cache."""
+    and forces a rebuild rather than silently reusing a stale cache.
+
+    Item 6 (six-launch-blocker audit): `raw_library_size`, when given, is
+    folded in too -- it is now a REAL second input the encoder's output
+    depends on (the read-depth token), so a cache built from one
+    raw_library_size must not be silently reused after that changes
+    (e.g. a re-run QC fix that changes per-spot raw counts) even if
+    `expression` itself happens to stay byte-identical."""
     expression = np.ascontiguousarray(expression, dtype=np.float32)
     digest = hashlib.sha256()
     digest.update(expression.tobytes())
+    if raw_library_size is not None:
+        digest.update(np.ascontiguousarray(raw_library_size, dtype=np.float32).tobytes())
     return digest.hexdigest()
 
 
@@ -53,6 +62,7 @@ def build_scfoundation_spot_feature_cache(
     gene_panel_hash: str,
     encoder,
     batch_size: int = 256,
+    raw_library_size: np.ndarray | None = None,
 ) -> Path:
     """`encoder` must satisfy `gen4.providers.GexContextProvider`. Every
     row of `expression` is treated as available (scFoundation's own
@@ -60,7 +70,16 @@ def build_scfoundation_spot_feature_cache(
     can be physically missing) -- `feature_available` is still recorded,
     all-True, so the on-disk schema stays uniform with uni2_spot_cache.py's
     availability convention and any future encoder that DOES have partial
-    per-row failures can reuse the identical loader contract."""
+    per-row failures can reuse the identical loader contract.
+
+    `raw_library_size` (Item 6, six-launch-blocker audit): [N] real,
+    pre-normalization total count per row (e.g. `adata.obs[
+    '_scilifestdl_raw_library_size']`, data/loaders.py's own stash),
+    row-aligned with `barcodes`/`expression` -- forwarded to
+    `encoder.encode_rows` unchanged. Required for `FrozenSCFoundationEncoder`
+    (it cannot derive a real read-depth token from the already-
+    normalized `expression` matrix alone); `None` only for encoders
+    (e.g. `StubSCFoundationEncoder`) that don't need it."""
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
     barcodes = np.asarray([str(b) for b in barcodes])
@@ -68,6 +87,10 @@ def build_scfoundation_spot_feature_cache(
     n = barcodes.shape[0]
     if expression.shape[0] != n:
         raise ValueError(f"{sample_id}: barcodes and expression must be row-aligned")
+    if raw_library_size is not None:
+        raw_library_size = np.asarray(raw_library_size, dtype=np.float32).reshape(-1)
+        if raw_library_size.shape[0] != n:
+            raise ValueError(f"{sample_id}: raw_library_size has {raw_library_size.shape[0]} rows, expected {n}")
     unique_barcodes, counts = np.unique(barcodes, return_counts=True)
     duplicated = unique_barcodes[counts > 1]
     if duplicated.size:
@@ -77,7 +100,8 @@ def build_scfoundation_spot_feature_cache(
     features = np.zeros((n, output_dim), dtype=np.float32)
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
-        out = encoder.encode_rows(expression[start:end])
+        batch_library_size = raw_library_size[start:end] if raw_library_size is not None else None
+        out = encoder.encode_rows(expression[start:end], batch_library_size)
         if out.shape != (end - start, output_dim):
             raise ValueError(f"{sample_id}: encoder returned shape {out.shape}, expected ({end - start}, {output_dim})")
         features[start:end] = out.astype(np.float32)
@@ -104,7 +128,7 @@ def build_scfoundation_spot_feature_cache(
             # any pre-existing cache missing this field fails closed via
             # _REQUIRED_FIELDS below, rather than silently loading.
             scfoundation_schema_version=np.asarray(2),
-            expression_content_hash=np.asarray(_expression_content_hash(expression)),
+            expression_content_hash=np.asarray(_expression_content_hash(expression, raw_library_size)),
         )
     os.replace(tmp, path)
     return path
@@ -116,6 +140,7 @@ def load_scfoundation_spot_features(
     barcodes: np.ndarray,
     gene_panel_hash: str,
     expression: np.ndarray,
+    raw_library_size: np.ndarray | None = None,
 ) -> dict:
     """`expression` must be the SAME live `n_spots x n_genes` matrix (row-
     aligned with `barcodes`) that would be fed into the encoder right now.
@@ -123,7 +148,10 @@ def load_scfoundation_spot_features(
     (sample_id, barcodes, gene_panel_hash) -- none of which change when
     the underlying expression VALUES change (a re-run QC fix, a corrected
     count, a different normalization), so a stale cache could be reused
-    silently. Now fails closed on any content mismatch instead."""
+    silently. Now fails closed on any content mismatch instead.
+    `raw_library_size`, when the cache was built with one, must be passed
+    here too (same row-aligned array) -- see `_expression_content_hash`'s
+    own docstring (Item 6)."""
     path = _cache_path(cache_root, sample_id)
     if not path.is_file():
         raise FileNotFoundError(
@@ -149,7 +177,7 @@ def load_scfoundation_spot_features(
             f"scFoundation spot-feature cache {path}: live expression has {expression.shape[0]} rows, "
             f"but {real_barcodes.shape[0]} barcodes were supplied -- must be row-aligned"
         )
-    live_hash = _expression_content_hash(expression)
+    live_hash = _expression_content_hash(expression, raw_library_size)
     if str(cached["expression_content_hash"]) != live_hash:
         raise ValueError(
             f"scFoundation spot-feature cache {path} was built from different expression values than "

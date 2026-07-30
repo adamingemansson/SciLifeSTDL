@@ -130,7 +130,7 @@ class StubSCFoundationEncoder:
             package_version="stub-0.0.0", preprocessing_spec="stub_scfoundation_v1", output_dim=output_dim,
         )
 
-    def encode_rows(self, expression: np.ndarray) -> np.ndarray:
+    def encode_rows(self, expression: np.ndarray, raw_library_size: np.ndarray | None = None) -> np.ndarray:
         return (np.asarray(expression, dtype=np.float32) @ self._weight).astype(np.float32)
 
 

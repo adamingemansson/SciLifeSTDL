@@ -9,6 +9,8 @@ documented_divergences:
   - model.params.image_feature_dim
   - required_fingerprints.uni2_checkpoint
   - required_fingerprints.uni2_revision
+  - required_fingerprints.uni2_package_version
+  - required_fingerprints.uni2_preprocessing_spec
 
 model:
   arm: gen5a
@@ -89,6 +91,8 @@ evaluation:
 required_fingerprints:
   uni2_checkpoint: null
   uni2_revision: null
+  uni2_package_version: null      # e.g. timm's __version__ at cache-build time
+  uni2_preprocessing_spec: null    # gen4/uni2_encoder.py::FrozenUNI2TileEncoder's exact preprocessing_spec string
   gene_vocabulary: null
   expression_autoencoder_checkpoint: null   # gen5/autoencoder.py checkpoint, shared by all four arms
   gen4_conditioner_checkpoint: null         # the matching, already-trained, validation-selected gen4a conditioner checkpoint
