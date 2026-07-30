@@ -899,10 +899,27 @@ def load_trainable_state(model: nn.Module, checkpoint_dir: str | Path) -> None:
             )
         model.load_state_dict(state, strict=False)
     else:
-        if trainable_names:
+        # Codex re-audit of commit 7a2d819, finding #1: "if
+        # trainable_weights.pt is absent, load_trainable_state() only
+        # checks whether trainable parameters exist -- not expected
+        # buffers." Confirmed real: this branch (the ENTIRE weights file
+        # missing, not merely a key inside it) checked `trainable_names`
+        # only -- a fully-frozen model (`trainable_names` empty) that
+        # still has real non-frozen registered buffers (`expected_names`
+        # non-empty, e.g. `target_gene_scale`) passed silently here even
+        # though the checkpoint has NO saved buffer values at all,
+        # continuing with whatever the freshly-constructed model
+        # happened to initialize those buffers to. `expected_names` is
+        # the same complete set (trainable parameters + non-frozen
+        # buffers) the `weights_path.is_file()` branch above already
+        # requires exact equality against -- checking it here instead of
+        # `trainable_names` makes "the whole file is missing" fail
+        # exactly whenever "the file exists but is missing some expected
+        # keys" would have failed too.
+        if expected_names:
             raise RuntimeError(
-                f"{weights_path} is missing but this model architecture has trainable "
-                f"parameters {trainable_names}; the checkpoint at {in_dir} looks incomplete"
+                f"{weights_path} is missing but this model architecture has expected trainable "
+                f"parameter(s)/buffer(s) {sorted(expected_names)}; the checkpoint at {in_dir} looks incomplete"
             )
 
 

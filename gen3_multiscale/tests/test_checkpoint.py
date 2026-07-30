@@ -33,6 +33,20 @@ class _AllFrozen(nn.Module):
             p.requires_grad_(False)
 
 
+class _FrozenWithBuffer(nn.Module):
+    """Zero trainable parameters (like `_AllFrozen`), but a real
+    non-frozen buffer registered directly on the top-level module (never
+    under `self.frozen`, so `_is_frozen_backbone_module` never excludes
+    it) -- `_expected_trainable_state_names` is therefore non-empty
+    (`{"some_buffer"}`) even though `trainable_names` is empty."""
+    def __init__(self):
+        super().__init__()
+        self.frozen = nn.Linear(4, 4)
+        for p in self.frozen.parameters():
+            p.requires_grad_(False)
+        self.register_buffer("some_buffer", torch.zeros(3))
+
+
 def test_checkpoint_round_trip_preserves_trainable_weights_only():
     m = _Tiny()
     with torch.no_grad():
@@ -769,3 +783,43 @@ def test_save_checkpoint_rejects_a_negative_step_explicitly():
             save_checkpoint(m, {"name": "tiny"}, ["g1"], tmp, step=-1)
         # Nothing was written -- a failed save must leave no partial state.
         assert list_checkpoint_history(tmp) == []
+
+
+def test_load_trainable_state_rejects_a_fully_frozen_model_missing_its_entire_weights_file():
+    """Codex re-audit of commit 7a2d819, finding #1: 'if trainable_
+    weights.pt is absent, load_trainable_state() only checks whether
+    trainable parameters exist -- not expected buffers. A fully frozen
+    model with saved buffers can still silently continue with freshly
+    initialized buffers.' `_FrozenWithBuffer` has zero trainable
+    parameters (so the OLD `trainable_names`-only check would have
+    treated a missing weights file as a legitimate no-op) but a real
+    non-frozen buffer -- `save_checkpoint` DOES write trainable_weights.pt
+    for it (since `expected_names` is non-empty); this test then deletes
+    that ENTIRE file plus its manifest entry (not merely a key inside
+    it), simulating a damaged/incomplete checkpoint, and proves loading
+    now fails instead of silently keeping the fresh buffer value."""
+    import hashlib
+
+    m = _FrozenWithBuffer()
+    with torch.no_grad():
+        m.some_buffer.fill_(9.0)
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(m, {"name": "frozen_with_buffer"}, ["g1"], tmp, step=1)
+        identity = resolve_checkpoint_identity(tmp)
+        weights_path = identity.resolved_dir / "trainable_weights.pt"
+        assert weights_path.is_file()  # a real buffer means a real weights file is written
+
+        manifest_path = identity.resolved_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        assert "trainable_weights.pt" in manifest["files"]
+        del manifest["files"]["trainable_weights.pt"]
+        weights_path.unlink()
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        pointer_path = Path(tmp) / "latest_bundle.json"
+        pointer = json.loads(pointer_path.read_text())
+        pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        pointer_path.write_text(json.dumps(pointer, indent=2))
+
+        reloaded = _FrozenWithBuffer()
+        with pytest.raises(RuntimeError, match="missing but this model architecture has expected"):
+            load_trainable_state(reloaded, tmp)

@@ -172,6 +172,84 @@ def test_evaluate_gen3_checkpoint_supports_different_mask_counts_without_stale_b
     assert not (checkpoint_dir / "evaluation_masks").exists()
 
 
+def test_evaluate_gen3_checkpoint_never_mixes_identities_if_best_is_replaced_mid_evaluation(tmp_path, monkeypatch):
+    """Codex re-audit of commit 7a2d819, finding #2: 'The evaluator
+    verifies best/, resolves its identity, then later loads from the
+    mutable best/ pointer again. If training replaces best/ between
+    those operations, the report can identify bundle A while predictions
+    came from bundle B. The new test only replaces best/ after
+    evaluation, so it misses this.' This test replaces `best/` with a
+    genuinely different bundle (different weights, different bundle_id)
+    IMMEDIATELY AFTER the evaluator's own identity-pinning call resolves
+    it -- i.e. inside the evaluation itself, before verification/loading
+    run -- by monkeypatching `checkpoint_module.resolve_checkpoint_identity`
+    to perform the replacement as a side effect the first time it is
+    called with the mutable `best/` path (the ONE call the fix makes
+    against that mutable path; every subsequent internal resolution
+    operates on the already-pinned, immutable bundle directory, whose
+    name is never "best"). Proves both the report's recorded identity
+    AND the actual argument passed to model-loading are bound to the
+    ORIGINAL (pre-replacement) bundle throughout, never mixing in the
+    replacement bundle that appeared mid-evaluation."""
+    from gen3_multiscale.training import checkpoint as checkpoint_module
+    from gen3_multiscale.training.train import build_model_for_inference, resolved_config
+    import gen3_multiscale.evaluation.gen3_evaluator as evaluator_module
+
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    config_path, checkpoint_dir = _train_a_real_checkpoint(tmp_path, cfg, manifest, manifest_path)
+    original_identity = checkpoint_module.resolve_checkpoint_identity(checkpoint_dir / "best")
+
+    real_resolve = checkpoint_module.resolve_checkpoint_identity
+    replaced = {"done": False}
+
+    def _resolve_and_then_replace_best(path):
+        result = real_resolve(path)
+        if not replaced["done"] and Path(path).name == "best":
+            replaced["done"] = True
+            # Simulate a concurrent training job replacing best/ with a
+            # genuinely different bundle (freshly re-initialized, never-
+            # trained weights -- definitely different content, and a
+            # definitely different bundle_id) right after this call.
+            config = resolved_config(str(config_path))
+            gene_names = list(manifest["gene_panel"])
+            fresh_model, _info = build_model_for_inference(
+                config, gene_names=gene_names, device=torch.device("cpu"), checkpoint_dir=None,
+                smoke=False, dataset_manifest=manifest,
+            )
+            model_config_path = original_identity.resolved_dir / "model_config.json"
+            model_config = json.loads(model_config_path.read_text())
+            checkpoint_module.save_checkpoint(
+                fresh_model, model_config, gene_names, checkpoint_dir / "best", step=original_identity.step,
+            )
+        return result
+
+    monkeypatch.setattr(
+        evaluator_module.checkpoint_module, "resolve_checkpoint_identity", _resolve_and_then_replace_best,
+    )
+
+    captured = {}
+    real_load_model = evaluator_module._load_model_for_evaluation
+
+    def _capture_load(config, checkpoint_dir_arg, *args, **kwargs):
+        captured["checkpoint_dir_arg"] = Path(checkpoint_dir_arg)
+        return real_load_model(config, checkpoint_dir_arg, *args, **kwargs)
+
+    monkeypatch.setattr(evaluator_module, "_load_model_for_evaluation", _capture_load)
+
+    report = evaluator_module.evaluate_gen3_checkpoint(
+        str(config_path), checkpoint_dir, split="validation", n_masks_per_sample=2,
+    )
+
+    assert replaced["done"] is True  # confirm the mid-evaluation replacement actually ran
+    new_identity = checkpoint_module.resolve_checkpoint_identity(checkpoint_dir / "best")
+    assert new_identity.bundle_dir != original_identity.bundle_dir
+    assert new_identity.weights_sha256 != original_identity.weights_sha256
+
+    assert report["checkpoint_identity"]["resolved_bundle_dir"] == original_identity.bundle_dir
+    assert report["checkpoint_identity"]["weights_sha256"] == original_identity.weights_sha256
+    assert captured["checkpoint_dir_arg"] == original_identity.resolved_dir
+
+
 def test_evaluate_gen3_checkpoint_refuses_test_split_by_default(tmp_path, monkeypatch):
     cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
     config_path, checkpoint_dir = _train_a_real_checkpoint(tmp_path, cfg, manifest, manifest_path)

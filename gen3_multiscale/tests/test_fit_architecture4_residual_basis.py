@@ -343,6 +343,68 @@ def test_maybe_load_gene_basis_rejects_a_conditioner_rolled_to_a_different_bundl
         train_module.run_training(str(arch4_config_path), smoke=False)
 
 
+def test_build_model_for_inference_pins_the_conditioner_identity_once_across_basis_validation_and_loading(tmp_path, monkeypatch):
+    """Codex re-audit of commit 7a2d819, finding #3: 'Apply the same
+    resolve-once principle to Architecture 4's conditioner/basis
+    orchestration.' Replaces the Architecture 3 conditioner checkpoint
+    with a genuinely DIFFERENT bundle (freshly re-initialized weights,
+    different bundle_id) IMMEDIATELY AFTER `build_model_for_inference`'s
+    own identity-pinning call resolves it -- i.e. inside construction
+    itself, before `maybe_load_gene_basis`'s validation and
+    `maybe_load_pretrained_conditioner_for_architecture4`'s weight-load
+    run -- by monkeypatching `checkpoint_module.resolve_checkpoint_identity`
+    to perform the replacement as a side effect the first (and, since the
+    fix resolves exactly once, ONLY) time it is called with the
+    conditioner's mutable path. Proves the info dict returned describes
+    the ORIGINAL (pre-replacement) bundle throughout -- never mixing in
+    the bundle that appeared mid-construction -- and that basis
+    validation (which would fail closed on any mismatch) still passed."""
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    arch3_config_path, arch3_checkpoint_dir, basis_path, arch4_config_path, arch4_checkpoint_dir = (
+        _train_a_real_architecture4_checkpoint_with_basis(tmp_path, cfg, manifest, manifest_path)
+    )
+    from gen3_multiscale.training import checkpoint as checkpoint_module
+    from gen3_multiscale.training.train import build_model_for_inference, resolved_config
+
+    original_identity = checkpoint_module.resolve_checkpoint_identity(arch3_checkpoint_dir)
+    gene_names = list(manifest["gene_panel"])
+
+    real_resolve = checkpoint_module.resolve_checkpoint_identity
+    replaced = {"done": False}
+
+    def _resolve_and_then_replace(path):
+        result = real_resolve(path)
+        if not replaced["done"] and Path(path) == Path(arch3_checkpoint_dir):
+            replaced["done"] = True
+            arch3_config = resolved_config(str(arch3_config_path))
+            fresh_model, _info = build_model_for_inference(
+                arch3_config, gene_names=gene_names, device=torch.device("cpu"), checkpoint_dir=None,
+                smoke=False, dataset_manifest=manifest,
+            )
+            model_config_path = original_identity.resolved_dir / "model_config.json"
+            model_config = json.loads(model_config_path.read_text())
+            checkpoint_module.save_checkpoint(
+                fresh_model, model_config, gene_names, arch3_checkpoint_dir, step=original_identity.step,
+            )
+        return result
+
+    monkeypatch.setattr(train_module.checkpoint_module, "resolve_checkpoint_identity", _resolve_and_then_replace)
+
+    arch4_config = resolved_config(str(arch4_config_path))
+    model, info = build_model_for_inference(
+        arch4_config, gene_names=gene_names, device=torch.device("cpu"), checkpoint_dir=None, smoke=False,
+        dataset_manifest=manifest,
+    )
+
+    assert replaced["done"] is True  # confirm the mid-construction replacement actually ran
+    new_identity = checkpoint_module.resolve_checkpoint_identity(arch3_checkpoint_dir)
+    assert new_identity.bundle_dir != original_identity.bundle_dir
+    assert new_identity.weights_sha256 != original_identity.weights_sha256
+
+    assert info["architecture3_conditioner"]["checkpoint_bundle_id"] == original_identity.bundle_dir
+    assert info["architecture3_conditioner"]["checkpoint_sha256"] == original_identity.weights_sha256
+
+
 def test_maybe_load_gene_basis_rejects_a_basis_sidecar_whose_cache_content_disagrees_with_the_conditioners_own_canonical_run_manifest(tmp_path, monkeypatch):
     """Codex re-audit of commit 66d65f2, finding #4: 'the basis sidecar's
     training-sample cache identities are required, but they are not

@@ -369,8 +369,35 @@ def evaluate_gen3_checkpoint(
     # in-memory evaluation mask banks") -- so it never needs the on-disk
     # cache at all, closing both the ordering gap and the stale-filename
     # collision at once.
+    #
+    # Codex re-audit of commit 7a2d819, finding #2: "The evaluator
+    # verifies best/, resolves its identity, then later loads from the
+    # mutable best/ pointer again. If training replaces best/ between
+    # those operations, the report can identify bundle A while
+    # predictions came from bundle B." Confirmed real: `weights_dir`
+    # (`checkpoint_dir / "best"`, a MUTABLE path whose `latest_bundle.json`
+    # pointer a concurrent training job can rewrite at any time) was
+    # independently re-resolved by THREE separate calls below --
+    # `verify_full_checkpoint_identity`, `resolve_checkpoint_identity`
+    # (for the report), and `_load_model_for_evaluation` -- each of which
+    # could in principle resolve to a DIFFERENT bundle if `best/` was
+    # replaced in between. Fixed: `resolve_checkpoint_identity(weights_dir)`
+    # is now called EXACTLY ONCE, up front, pinning an immutable
+    # `pinned_identity.resolved_dir` (a real bundle directory with its own
+    # `manifest.json` and no pointer of its own -- `checkpoint.py::
+    # _resolve_checkpoint_source`'s own documented "caller directly
+    # resolves a HISTORY BUNDLE'S OWN path" exception, the same pattern
+    # `checkpoint.py`'s own tests already use to load a specific past
+    # snapshot). Every subsequent operation -- verification, model
+    # loading, and the report's own recorded identity -- now passes THAT
+    # exact resolved directory, never the mutable `weights_dir`, so all
+    # three are structurally guaranteed to describe the same bundle: if
+    # `best/` is replaced after this point, this evaluation either keeps
+    # using the ORIGINAL pinned bundle (verified content, immutable once
+    # written) or fails outright -- it can never silently mix identities.
+    pinned_identity = checkpoint_module.resolve_checkpoint_identity(weights_dir)
     checkpoint_run_manifest = verify_full_checkpoint_identity(
-        weights_dir, config=config, dataset_manifest=dataset_manifest, gene_names=gene_names,
+        pinned_identity.resolved_dir, config=config, dataset_manifest=dataset_manifest, gene_names=gene_names,
         cache_content_by_sample=preflight_report.get("cache_content_by_sample"), allow_code_drift=allow_code_drift,
     )
     strata = config["masking"]["strata"]
@@ -383,17 +410,10 @@ def evaluate_gen3_checkpoint(
     # are not bound to the exact checkpoint... records paths, not the
     # bundle ID, step, manifest SHA, or weights SHA. If best/ later
     # changes, the report no longer proves which weights produced it."
-    # Confirmed real: `verify_full_checkpoint_identity`'s return value
-    # (the checkpoint's own recorded run_manifest.json) was discarded
-    # here, and the report only ever recorded `checkpoint_dir`/
-    # `weights_dir` as PATHS -- a real, mutable location, not a durable
-    # binding to the exact weights that produced this report's numbers.
-    # `resolve_checkpoint_identity` is called AFTER `verify_full_checkpoint_
-    # identity` already passed (weights are now known-verified), so this
-    # is the exact resolved bundle the loaded weights came from -- the
-    # SAME identity `checkpoint_module.resolve_checkpoint_identity` computes
-    # everywhere else in this codebase, never independently re-derived.
-    checkpoint_identity = checkpoint_module.resolve_checkpoint_identity(weights_dir)
+    # `checkpoint_identity` below IS `pinned_identity` -- the SAME
+    # resolved identity used for verification and loading, never a fresh,
+    # independently re-resolved one (finding #2, above).
+    checkpoint_identity = pinned_identity
     recorded_commit = checkpoint_run_manifest.get("code_commit_hash")
     current_commit = _code_commit_hash()
     recorded_diff_hash = checkpoint_run_manifest.get("code_worktree_diff_hash")
@@ -403,7 +423,7 @@ def evaluate_gen3_checkpoint(
         or recorded_commit != current_commit or recorded_diff_hash != current_diff_hash
     )
     model = _load_model_for_evaluation(
-        config, weights_dir, gene_names, device, dataset_manifest=dataset_manifest,
+        config, pinned_identity.resolved_dir, gene_names, device, dataset_manifest=dataset_manifest,
         cache_content_by_sample=preflight_report.get("cache_content_by_sample"),
     )
 

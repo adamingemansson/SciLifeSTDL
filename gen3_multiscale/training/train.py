@@ -99,6 +99,7 @@ def maybe_build_slide_encoder(config: dict):
 def maybe_load_gene_basis(
     config: dict, gene_names: list[str], dataset_manifest: dict | None = None, *, smoke: bool = False,
     cache_content_by_sample: dict[str, dict] | None = None,
+    conditioner_identity: "checkpoint_module.CheckpointIdentity | None" = None,
 ):
     """Architecture 4 only: `required_fingerprints.gene_basis` must point
     at an already-fit, saved `GeneResidualBasis`
@@ -283,7 +284,27 @@ def maybe_load_gene_basis(
         )
     recorded_checkpoint_sha256 = _require_field("architecture3_checkpoint_trainable_weights_sha256")
     recorded_checkpoint_step = _require_field("architecture3_checkpoint_step")
-    actual_identity = checkpoint_module.resolve_checkpoint_identity(conditioner_checkpoint_dir)
+    # Codex re-audit of commit 7a2d819, finding #3: "Apply the same
+    # resolve-once principle to Architecture 4's conditioner/basis
+    # orchestration." Confirmed real: `conditioner_checkpoint_dir` (a
+    # MUTABLE path -- Architecture 3 may still be training/checkpointing
+    # concurrently) was independently resolved TWICE within this
+    # function alone (`resolve_checkpoint_identity` here, then
+    # `load_checkpoint_run_manifest` further below), and a THIRD time by
+    # `maybe_load_pretrained_conditioner_for_architecture4` when it
+    # actually loads weights onto the model -- three separate
+    # resolutions of the same mutable path, any of which could observe a
+    # DIFFERENT bundle if Architecture 3 saved a new checkpoint in
+    # between. `build_model_for_inference` now resolves this path
+    # EXACTLY ONCE and passes the result down as `conditioner_identity`
+    # to both this function and `maybe_load_pretrained_conditioner_for_
+    # architecture4` -- when given, it is used here INSTEAD of
+    # re-resolving, so basis validation and the eventual weight load are
+    # structurally guaranteed to describe the same immutable bundle.
+    # `conditioner_identity` stays optional (falls back to resolving here
+    # directly) so this function remains independently callable/testable
+    # without requiring a caller to pin one first.
+    actual_identity = conditioner_identity or checkpoint_module.resolve_checkpoint_identity(conditioner_checkpoint_dir)
     if actual_identity.weights_sha256 != recorded_checkpoint_sha256:
         raise ValueError(
             f"gene residual basis at {path} was fit against a different Architecture 3 checkpoint "
@@ -330,8 +351,13 @@ def maybe_load_gene_basis(
     # real, valid value to compare the sidecar's recorded fingerprint
     # against -- closing the gap where the recorded fingerprint could be
     # wrong (or from a stale/different Architecture 3 run) even while
-    # every other conditioner-identity field matches.
-    conditioner_run_manifest = checkpoint_module.load_checkpoint_run_manifest(conditioner_checkpoint_dir)
+    # every other conditioner-identity field matches. Reads from
+    # `actual_identity.resolved_dir` (the SAME already-pinned, immutable
+    # bundle directory used above), never `conditioner_checkpoint_dir`
+    # directly -- a second raw resolution of the mutable path here is
+    # exactly the TOCTOU finding #3 (Codex re-audit of commit 7a2d819)
+    # closes.
+    conditioner_run_manifest = checkpoint_module.load_checkpoint_run_manifest(actual_identity.resolved_dir)
     if conditioner_run_manifest is None:
         raise ValueError(
             f"gene residual basis at {path}: the configured Architecture 3 conditioner checkpoint at "
@@ -463,6 +489,7 @@ def maybe_load_gene_basis(
 def maybe_load_pretrained_conditioner_for_architecture4(
     model, config: dict, architecture_id: str, gene_names: list[str], smoke: bool,
     *, require_for_smoke: bool = False,
+    conditioner_identity: "checkpoint_module.CheckpointIdentity | None" = None,
 ) -> dict:
     """Adam's Step 6 audit #11 (confirmed real gap): "There is no real
     pipeline for fitting [Architecture 4's] residual basis... initialize
@@ -523,23 +550,35 @@ def maybe_load_pretrained_conditioner_for_architecture4(
             "checkpoint to fit a real gene-residual basis); Architecture 4 must never start "
             "training from a random or merely synchronized-init conditioner"
         )
-    checkpoint_module.verify_gene_names(checkpoint_dir, gene_names)
-    checkpoint_module.load_trainable_state(model.conditioner, checkpoint_dir)
+    # Codex re-audit of commit 7a2d819, finding #3: "Apply the same
+    # resolve-once principle to Architecture 4's conditioner/basis
+    # orchestration." Confirmed real: `checkpoint_dir` here (the SAME
+    # mutable `required_fingerprints.architecture3_conditioner_checkpoint`
+    # path `maybe_load_gene_basis` also resolves, to validate the basis
+    # against) was independently resolved a THIRD time by this function's
+    # OWN `resolve_checkpoint_identity` call below, on top of whatever
+    # `verify_gene_names`/`load_trainable_state` each resolve internally
+    # -- across the two functions together, up to five separate
+    # resolutions of one mutable path. `build_model_for_inference` now
+    # resolves this path EXACTLY ONCE and passes the result down as
+    # `conditioner_identity`; when given, `identity.resolved_dir` (an
+    # immutable, already-verified bundle directory) is used for
+    # `verify_gene_names`/`load_trainable_state` INSTEAD of the mutable
+    # `checkpoint_dir`, and the identity itself is reused directly rather
+    # than re-resolved a final time for the returned info dict --
+    # structurally guaranteeing the SAME bundle is what gets gene-name-
+    # checked, loaded onto the model, AND recorded, never three
+    # potentially-different ones. Stays optional (falls back to resolving
+    # `checkpoint_dir` directly) so this function remains independently
+    # callable/testable without a caller pinning one first.
+    identity = conditioner_identity or checkpoint_module.resolve_checkpoint_identity(checkpoint_dir)
+    load_source = identity.resolved_dir if conditioner_identity is not None else checkpoint_dir
+    checkpoint_module.verify_gene_names(load_source, gene_names)
+    checkpoint_module.load_trainable_state(model.conditioner, load_source)
     freeze = bool(((config.get("model") or {}).get("params") or {}).get("freeze_conditioner_initially", True))
     if freeze:
         for p in model.conditioner.parameters():
             p.requires_grad = False
-    # Codex re-audit of commit 90f853e, launch blocker #2: weights are
-    # loaded from the VERIFIED, resolved bundle (via load_trainable_state
-    # above, which itself resolves through checkpoint.py's transactional
-    # pointer) but the identity previously recorded here was hashed from
-    # `checkpoint_dir`'s ROOT convenience mirror directly -- a crash
-    # between the mirror refresh and the real bundle write could make
-    # those represent DIFFERENT model states, so the recorded identity
-    # would not actually describe what was just loaded onto the model.
-    # `resolve_checkpoint_identity` computes `weights_sha256` from the
-    # SAME resolved/verified path `load_trainable_state` just read from.
-    identity = checkpoint_module.resolve_checkpoint_identity(checkpoint_dir)
     return {
         "loaded": True, "checkpoint_dir": str(checkpoint_dir),
         "checkpoint_sha256": identity.weights_sha256, "checkpoint_step": identity.step,
@@ -593,12 +632,32 @@ def build_model_for_inference(
     seed = int(training_cfg.get("seed", 0))
 
     slide_encoder, gigapath_checkpoint_sha256 = maybe_build_slide_encoder(config)
+    # Codex re-audit of commit 7a2d819, finding #3: "Apply the same
+    # resolve-once principle to Architecture 4's conditioner/basis
+    # orchestration." The mutable `required_fingerprints.architecture3_
+    # conditioner_checkpoint` path is resolved to an immutable bundle
+    # identity EXACTLY ONCE here -- before `maybe_load_gene_basis`
+    # validates the basis's provenance against it, and before
+    # `maybe_load_pretrained_conditioner_for_architecture4` loads weights
+    # from it -- and the SAME `pinned_conditioner_identity` is threaded
+    # through both calls below, so a concurrent Architecture 3 checkpoint
+    # save between them can never make basis validation describe a
+    # DIFFERENT bundle than what actually gets loaded onto the model.
+    # `needs_conditioner` mirrors exactly the condition under which BOTH
+    # downstream functions actually consult the conditioner checkpoint
+    # (skipped for a plain, construction-only `--smoke` run, required
+    # otherwise -- including the real staged smoke).
+    conditioner_checkpoint_dir = (config.get("required_fingerprints") or {}).get("architecture3_conditioner_checkpoint")
+    needs_conditioner = architecture_id == "4" and not (smoke and not staged_smoke)
+    pinned_conditioner_identity = None
+    if needs_conditioner and conditioner_checkpoint_dir:
+        pinned_conditioner_identity = checkpoint_module.resolve_checkpoint_identity(conditioner_checkpoint_dir)
     # staged_smoke behaves like a non-smoke run for provenance purposes --
     # its whole point is to validate the real, provenanced artifacts, not
     # bypass that validation the way a construction-only smoke may.
     gene_basis, resolved_gene_names = maybe_load_gene_basis(
         config, gene_names, dataset_manifest=dataset_manifest, smoke=smoke and not staged_smoke,
-        cache_content_by_sample=cache_content_by_sample,
+        cache_content_by_sample=cache_content_by_sample, conditioner_identity=pinned_conditioner_identity,
     )
 
     torch.manual_seed(seed)  # re-seed immediately before construction -- shared init discipline
@@ -628,6 +687,7 @@ def build_model_for_inference(
 
     conditioner_info = maybe_load_pretrained_conditioner_for_architecture4(
         model, config, architecture_id, gene_names, smoke, require_for_smoke=staged_smoke,
+        conditioner_identity=pinned_conditioner_identity,
     )
 
     if checkpoint_dir is not None:

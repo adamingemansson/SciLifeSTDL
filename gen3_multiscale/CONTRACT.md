@@ -7217,3 +7217,238 @@ gen2_architectures + gen3_multiscale: 869 passed, 1 skipped
   failing identically before this round's changes; not touched by
   anything in this round)
 ```
+
+## 56. Response to the Codex re-audit of commit 7a2d819 -- 5 further contained artifact-identity fixes (a missing-buffer hole when the weights file is fully absent, evaluator/orchestration TOCTOU closed by resolve-once-and-pin, resolved configs made real transactional bundles with a verified loader, and the resolver's remaining validation gaps closed)
+
+Adam forwarded a re-audit of commit `7a2d819` (the previous round's own
+response to the `66d65f2` re-audit). Verdict: "This round does not
+reveal a new biological leakage or coordinate-learning problem; the
+remaining issues concern artifact identity and reliable orchestration."
+Four findings, all independently verified against real code before any
+fix was written and confirmed real. Per Adam's explicit instructions
+("close these contained artifact-identity issues" before continuing
+orchestration), all four are fixed this round; the staged deployment
+orchestrator itself remains **unbuilt**, reported honestly as such
+below. **No 24-hour run, and no GPU training of any kind, has been
+started.** Only unit/CPU tests were run.
+
+**Finding #1 -- the missing-buffer fix (prior round) still had one
+hole.** Confirmed real: the exact-key-set-equality check the prior round
+added only runs inside the `weights_path.is_file()` branch of
+`load_trainable_state`; the `else` branch (the ENTIRE `trainable_
+weights.pt` file absent, not merely a key missing inside it) still
+checked `trainable_names` only -- a fully-frozen model (zero trainable
+PARAMETERS) with a real non-frozen registered BUFFER passed silently
+here even with no saved buffer values at all, continuing with whatever
+the freshly-constructed model happened to initialize that buffer to.
+Fixed: the `else` branch now checks `expected_names` (trainable
+parameters + non-frozen buffers -- the same complete set the other
+branch already requires) instead of `trainable_names`, so "the whole
+file is missing" now fails exactly whenever "the file exists but is
+missing some expected keys" would have. A new adversarial test
+(`_FrozenWithBuffer`, zero trainable parameters but one real buffer
+registered directly on the top-level module, never under a frozen
+submodule) saves a real checkpoint, deletes the ENTIRE `trainable_
+weights.pt` file plus its manifest entry, and confirms loading now
+fails instead of silently keeping the fresh buffer value.
+
+**Finding #2 -- a checkpoint TOCTOU race in the evaluator.** Confirmed
+real: `evaluate_gen3_checkpoint` resolved `weights_dir` (`checkpoint_dir
+/ "best"`, a MUTABLE path -- a concurrent training job can rewrite its
+`latest_bundle.json` pointer at any time) independently THREE times --
+once inside `verify_full_checkpoint_identity`, once via `resolve_
+checkpoint_identity` for the report, and once more inside `_load_model_
+for_evaluation` -- any two of which could resolve to a DIFFERENT bundle
+if `best/` was replaced in between, letting the report identify bundle A
+while the actual predictions came from bundle B. Fixed:
+`resolve_checkpoint_identity(weights_dir)` is now called EXACTLY ONCE,
+pinning an immutable `pinned_identity.resolved_dir` -- a real bundle
+directory with its own `manifest.json` and no pointer of its own,
+`checkpoint.py::_resolve_checkpoint_source`'s own documented "caller
+directly resolves a HISTORY BUNDLE'S OWN path" exception (the same
+pattern `checkpoint.py`'s own tests already use). Every subsequent
+operation (verification, model loading, and the report's own recorded
+identity) now uses THAT exact resolved directory, never the mutable
+`weights_dir` again, so all three are structurally guaranteed to
+describe the same bundle. A new adversarial test replaces `best/` with a
+genuinely different bundle (different weights, different bundle_id)
+IMMEDIATELY AFTER the pinning call resolves it -- via a monkeypatched
+`resolve_checkpoint_identity` that performs the replacement as a side
+effect the one time it's called against the mutable path -- and proves
+both the report's recorded identity and the actual argument passed to
+model-loading stay bound to the ORIGINAL bundle throughout, confirming
+the prior round's own new test ("only replaces best/ AFTER evaluation")
+would have missed exactly this.
+
+**Finding #3 -- the same resolve-once principle needed to reach
+Architecture 4's conditioner/basis orchestration.** Confirmed real:
+`required_fingerprints.architecture3_conditioner_checkpoint` (also a
+MUTABLE path -- Architecture 3 may still be checkpointing concurrently)
+was independently resolved up to FIVE separate times across `maybe_load_
+gene_basis` (basis-provenance validation) and `maybe_load_pretrained_
+conditioner_for_architecture4` (actually loading weights onto the
+model), called back to back from `build_model_for_inference` -- the
+basis could be validated against whatever bundle happened to resolve
+FIRST while the model's conditioner ends up loaded from whatever
+resolves LATER, a real, silent mismatch between "the basis this run
+claims to be validated against" and "the conditioner actually inside the
+model." Fixed with the identical resolve-once-and-pin pattern: both
+functions gained an optional `conditioner_identity` parameter (falls
+back to resolving internally when not given, so each stays independently
+callable/testable); `build_model_for_inference` now resolves the
+conditioner path EXACTLY ONCE, before either function touches it, and
+threads that SAME identity through both -- basis validation, gene-name
+verification, and weight loading are now structurally guaranteed to
+describe one bundle. A new adversarial test replaces the conditioner
+checkpoint with a genuinely different bundle immediately after `build_
+model_for_inference`'s pinning call resolves it (same monkeypatch
+technique as finding #2) and confirms the returned conditioner info
+still describes the ORIGINAL bundle throughout, with basis validation
+(which would fail closed on any real mismatch) still passing.
+
+**Finding #4 -- the resolver's "immutable pair" was not transactional or
+verified.** Confirmed real: `resolve_and_save_experiment_config` wrote
+the resolved YAML first and the identity sidecar second as two
+INDEPENDENT file writes -- a crash between them left exactly one
+artifact on disk; `force=True` could overwrite the pair inconsistently
+(e.g. crash mid-overwrite, leaving a NEW config beside an OLD identity
+sidecar or vice versa); the sidecar never recorded the exact
+`config.yaml` file's own SHA256 or the base template's SHA256; and
+nothing existed to verify a bundle's own files still agreed with its
+recorded identity before consuming it. Fixed by making a resolved config
+a real TRANSACTIONAL BUNDLE DIRECTORY, mirroring `training/checkpoint.py`'s
+own already-established staging-then-atomic-rename discipline: `resolve_
+and_save_experiment_config` now takes an `output_dir`, writes `config
+.yaml` and `identity.json` (last, so its presence is itself the
+"complete" signal) into a staging directory, then performs ONE atomic
+`os.rename` of the whole directory into place -- a crash at any point
+before that rename leaves the final `output_dir` completely untouched,
+and the final bundle can never contain one file without the other.
+`identity.json` now additionally records `config_yaml_sha256` (the exact
+bundled `config.yaml` bytes) and `base_template_sha256` (the exact base
+template file resolution started from). A new `load_verified_resolved_
+config` is the loader anything in the future orchestrator must use to
+CONSUME a bundle: it recomputes `config_yaml_sha256` from the bundle's
+own file bytes and recomputes both `config_fingerprint`/`config_identity
+_fingerprint` from the loaded config, refusing a bundle whose files
+disagree with its own recorded identity (corruption, a hand-edit, a
+partially-applied patch) rather than silently trusting it. Eight new
+tests cover the bundle write, the atomic-rename discipline (no staging
+directory left behind, either on success or on a resolution failure), and
+`load_verified_resolved_config` correctly accepting an untampered bundle
+and rejecting a tampered `config.yaml`, a tampered `identity.json`, and
+an incomplete bundle missing one of its two files.
+
+**Finding #5 -- the resolver's remaining validation gaps.** Two real,
+confirmed sub-gaps, both closed: (a) `data.gen3_manifest_path`/`tile_
+encoder_revision`/`training.synchronized_init_dir` were stringified
+UNCONDITIONALLY (`str(gen3_manifest_path)`, etc.) before the "is this
+still missing" check ran -- a direct Python caller passing `None`
+(bypassing argparse's own `required=True`, which only guards the CLI,
+not a library call) produced the literal, TRUTHY string `"None"`, which
+silently passed the old `if not value:` check. Fixed: every deployment
+field is now validated as a non-`None`, non-blank string BEFORE being
+used anywhere, via a shared `_require_non_blank_string` helper, never
+stringified first and validated after. (b) `tile_encoder_revision` was
+accepted as any non-empty string; it is now required to match
+`^[0-9a-f]{40}$` (a pinned, lowercase, exactly-40-hex Hugging Face commit
+SHA -- the same format `train.py`'s own `expected_tile_encoder_
+provenance` already assumes). Also added, matching the audit's explicit
+ask: `model.architecture` (read from the loaded base template) must be
+one of `"1"`/`"2"`/`"3"`/`"4"`, a defensive check against a malformed or
+tampered template. `force`/`--force` is REMOVED entirely from both the
+Python API and the CLI (finding #4's fix already makes "overwrite in
+place" structurally impossible -- `resolve_and_save_experiment_config`
+always refuses an already-existing `output_dir` unconditionally; the
+correct way to "replace" a resolved config is a genuinely new,
+distinctly-named bundle). Six new tests cover: `None` rejected for each
+of the three required fields (proving it never reaches `str()`), blank/
+whitespace-only strings rejected, a non-hex and a wrong-length and an
+uppercase tile revision all rejected, an unknown `model.architecture`
+rejected, `force` confirmed absent from the Python function's signature,
+and the CLI's `--force` confirmed to fail argument parsing.
+
+**What remains honestly undone.** Unchanged from the prior three
+rounds' own lists: a standalone synchronized-init verification/
+preparation command; one consolidated experiment-preflight command; the
+real staged orchestrator itself (Stages A-D, with the "never let
+Architecture 4 use an older/pre-existing Architecture 3 path merely
+because it exists" requirement, and now additionally: "must pin
+immutable bundle identities between stages, especially the selected
+Architecture 3 bundle consumed by basis fitting and Architecture 4" --
+this round's resolve-once-and-pin fixes (findings #2/#3) and the
+transactional resolved-config bundle (finding #4) are real, tested
+building blocks toward that requirement, but the orchestrator's own
+stage-sequencing/state-machine/resume logic that would actually USE them
+across Stages A-D does not exist yet); dedicated failure/recovery tests
+for interruption during each stage; subprocess-based orchestration tests
+proving Architecture 4 cannot start before Architecture 3 selection and
+basis fitting; a generated run-plan JSON; progress/summary/resume/
+evaluation convenience commands; disk/RAM/GPU estimates. This remains a
+genuinely large, multi-day engineering effort in its own right.
+
+**Adversarial tests added this round:** 14 new tests -- `test_checkpoint
+.py` (+1: fully-frozen-model-missing-entire-weights-file refusal, with a
+new `_FrozenWithBuffer` fixture), `test_gen3_evaluator.py` (+1: never-
+mixes-identities-if-best-is-replaced-mid-evaluation, the exact scenario
+the prior round's own new test explicitly missed), `test_fit_
+architecture4_residual_basis.py` (+1: build_model_for_inference-pins-
+the-conditioner-identity-once-across-basis-validation-and-loading), and
+`test_resolve_experiment_config.py` (+11, largely rewritten for the new
+bundle API: none/blank-string rejection for each required field,
+non-40-hex/wrong-length/uppercase tile-revision rejection, unknown-
+architecture-id rejection, transactional-bundle-write verification, no-
+staging-directory-left-behind on both success and failure,
+`load_verified_resolved_config` accepting an untampered bundle and
+rejecting 3 distinct tampering/incompleteness scenarios, `force`
+confirmed absent from both the Python signature and the CLI). All
+exercise the real production code path against real, trained checkpoints
+-- no mocking of the identity-verification machinery itself.
+
+## Test status as of this document
+
+```
+gen3_multiscale/tests/: 727 passed (23 hest1k-catalog + 5 gene-panel-compat
+  + 4 query-overlap-report + 27 example-schema + 11 boundary-graph +
+  36 slide-context + 9 slide-encoder + 2 debug-plot + 18 transport-head +
+  10 tokens + 16 attention + 10 global-context + 7 harmonic +
+  7 geometry-utils + 9 backbone + 31 architectures + 9 gene-basis +
+  11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  36 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 21 dataset-manifest + 31 example-builder +
+  46 mask-fingerprint + 22 novae-graph + 4 loaders + 17 spot-feature-cache
+  + 12 tile-encoder-preflight + 15 gen3-dataset + 10 gen3-preflight +
+  33 train + 8 step6-scripts + 26 gen3-evaluator +
+  15 fit-architecture4-residual-basis + 16 a32051b-adversarial +
+  33 checkpoint + 20 resolve-experiment-config)
+gen2_architectures + gen3_multiscale: 900 passed, 1 skipped
+(repo-root tests/: 322 passed, 1 pre-existing unrelated failure --
+  tests/test_multi_sample.py::test_inject_multi_sample_n_genes, confirmed
+  failing identically before this round's changes; not touched by
+  anything in this round)
+```
+
+The block immediately below (pre-7a2d819-re-audit-response test counts)
+is kept for historical continuity rather than deleted, per this
+document's append-only discipline:
+
+```
+gen3_multiscale/tests/: 713 passed (23 hest1k-catalog + 5 gene-panel-compat
+  + 4 query-overlap-report + 27 example-schema + 11 boundary-graph +
+  36 slide-context + 9 slide-encoder + 2 debug-plot + 18 transport-head +
+  10 tokens + 16 attention + 10 global-context + 7 harmonic +
+  7 geometry-utils + 9 backbone + 31 architectures + 9 gene-basis +
+  11 flow + 11 losses + 21 metrics + 8 diagnostics +
+  36 launch-four-gpu-suite + 36 model-factory + 4 gene-encoder +
+  37 mask-schedule + 21 dataset-manifest + 31 example-builder +
+  46 mask-fingerprint + 22 novae-graph + 4 loaders + 17 spot-feature-cache
+  + 12 tile-encoder-preflight + 15 gen3-dataset + 10 gen3-preflight +
+  33 train + 8 step6-scripts + 25 gen3-evaluator +
+  14 fit-architecture4-residual-basis + 16 a32051b-adversarial +
+  32 checkpoint + 9 resolve-experiment-config)
+gen2_architectures + gen3_multiscale: 886 passed, 1 skipped
+(repo-root tests/: 322 passed, 1 pre-existing unrelated failure --
+  tests/test_multi_sample.py::test_inject_multi_sample_n_genes, confirmed
+  failing identically before this round's changes; not touched by
+  anything in this round)
+```
