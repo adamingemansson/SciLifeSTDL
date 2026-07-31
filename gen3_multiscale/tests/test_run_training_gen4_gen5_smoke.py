@@ -13,8 +13,11 @@ it) a real scFoundation cache -- exactly `tests/test_gen4_dataset_adapter.
 py`'s own fixture discipline, reused directly rather than duplicated."""
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
+import numpy as np
+import pytest
 import yaml
 
 from gen3_multiscale.data.dataset_manifest import save_dataset_manifest
@@ -65,6 +68,40 @@ def _prepare_experiment(tmp_path, monkeypatch):
     return cfg, manifest, manifest_path, samples
 
 
+def _pin_uni2_test_artifacts_for_real_run(config: dict, cfg, samples, tmp_path) -> None:
+    """Make the synthetic UNI2 caches satisfy the real-run provenance gate.
+
+    The shared lightweight encoder fixture records a deliberately fake
+    checkpoint hash because construction-only smoke tests do not load a
+    real checkpoint.  A non-smoke integration test must instead bind the
+    caches to an actual file whose content hash the production preflight
+    can recompute.
+    """
+    checkpoint_path = tmp_path / "uni2_test_checkpoint.bin"
+    checkpoint_path.write_bytes(b"deterministic UNI2 integration-test checkpoint")
+    checkpoint_sha256 = hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
+
+    for sample_id in samples:
+        for cache_path in (
+            Path(str(cfg.data.hest_cache_dir)) / "uni2_gen3_spot_cache" / f"{sample_id}.npz",
+            Path(str(cfg.data.hest_cache_dir)) / "uni2_dense_wsi_cache" / f"{sample_id}.npz",
+        ):
+            with np.load(cache_path, allow_pickle=False) as cached:
+                payload = {key: cached[key] for key in cached.files}
+            payload["uni2_checkpoint_sha256"] = np.asarray(checkpoint_sha256)
+            with cache_path.open("wb") as handle:
+                np.savez(handle, **payload)
+
+    config["required_fingerprints"].update(
+        {
+            "uni2_checkpoint": str(checkpoint_path),
+            "uni2_revision": "0" * 40,
+            "uni2_package_version": "stub-0.0.0",
+            "uni2_preprocessing_spec": "stub_uni2_v1",
+        }
+    )
+
+
 def test_run_training_smoke_gen4a_conditioner_kind(tmp_path, monkeypatch):
     cfg, manifest, manifest_path, samples = _prepare_experiment(tmp_path, monkeypatch)
     _write_uni2_caches(cfg, samples, output_dim=_TINY_PARAMS["image_feature_dim"])
@@ -112,3 +149,57 @@ def test_run_training_smoke_gen5a_latent_flow_kind(tmp_path, monkeypatch):
 
     result = run_training(str(config_path), smoke=True)
     assert result["ok"] is True
+
+
+def test_run_training_fails_closed_when_gen4_cache_missing(tmp_path, monkeypatch):
+    """The arm-specific cache gate runs before model/dataset construction."""
+    cfg, manifest, manifest_path, _samples = _prepare_experiment(tmp_path, monkeypatch)
+
+    config = yaml.safe_load((_CONFIG_DIR / "gen4" / "gen4a_conditioner.yaml").read_text())
+    config["model"]["params"].update(_TINY_PARAMS)
+    config_path = tmp_path / "gen4a_config_missing_cache.yaml"
+    _write_config(
+        config,
+        config_path,
+        cfg=cfg,
+        manifest_path=manifest_path,
+        checkpoint_dir=tmp_path / "ckpt_gen4a_missing",
+    )
+
+    with pytest.raises(FileNotFoundError, match="UNI2"):
+        run_training(str(config_path), smoke=True)
+
+
+def test_run_training_non_smoke_gen4a_then_evaluate(tmp_path, monkeypatch):
+    """Exercise the real train -> checkpoint -> evaluator Gen4 path."""
+    cfg, manifest, manifest_path, samples = _prepare_experiment(tmp_path, monkeypatch)
+    _write_uni2_caches(cfg, samples, output_dim=_TINY_PARAMS["image_feature_dim"])
+
+    config = yaml.safe_load((_CONFIG_DIR / "gen4" / "gen4a_conditioner.yaml").read_text())
+    config["model"]["params"].update(_TINY_PARAMS)
+    config["training"]["total_steps"] = 1
+    config["evaluation"]["gene_panels"] = {}
+    _pin_uni2_test_artifacts_for_real_run(config, cfg, samples, tmp_path)
+    config_path = tmp_path / "gen4a_nonsmoke_config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_gen4a_nonsmoke"
+    _write_config(
+        config,
+        config_path,
+        cfg=cfg,
+        manifest_path=manifest_path,
+        checkpoint_dir=checkpoint_dir,
+    )
+
+    result = run_training(str(config_path), smoke=False)
+    assert result["ok"] is True
+    assert result["final_step"] == 1
+
+    from gen3_multiscale.evaluation.gen3_evaluator import evaluate_gen3_checkpoint
+
+    report = evaluate_gen3_checkpoint(
+        str(config_path),
+        checkpoint_dir,
+        split="validation",
+        use_best=False,
+    )
+    assert report["kind"] == "gen3_step7_evaluation_report"

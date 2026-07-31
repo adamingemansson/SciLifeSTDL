@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sys
 import types
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 
 import anndata as ad
@@ -54,6 +55,10 @@ def stub_gigapath(monkeypatch, feat_dim: int = GIGAPATH_FEAT_DIM) -> None:
         return means.expand(tensor.shape[0], feat_dim).clone()
 
     fake_timm = types.ModuleType("timm")
+    # Some Torch versions ask importlib for timm's spec while AdamW
+    # initializes torch._dynamo. A module stub without a spec makes that
+    # standard package-presence check raise instead of returning True.
+    fake_timm.__spec__ = ModuleSpec("timm", loader=None)
     fake_timm.__version__ = "0.0.0-test-stub"
     monkeypatch.setitem(sys.modules, "timm", fake_timm)
     monkeypatch.setattr("src.models.conditioning._load_gigapath_tile_encoder", _fake_load)
