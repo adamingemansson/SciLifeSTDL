@@ -4,6 +4,7 @@ test battery) plus the new patient-aggregation, gene-panel, binning,
 edge-gradient, and spatial-agreement functions this project needed built
 from scratch (confirmed absent anywhere else in the repo)."""
 import numpy as np
+from scipy.stats import pearsonr
 
 from gen3_multiscale.evaluation.metrics import (
     aggregate_patient_metrics, boundary_interior_bins, edge_gradient_agreement, gene_panel_metrics,
@@ -26,6 +27,23 @@ def test_pearson_per_gene_perfect_and_constant_cases():
     true_with_constant[:, 0] = 5.0  # truth-constant gene -> NaN
     out2 = pearson_per_gene(pred_perfect, true_with_constant)
     assert np.isnan(out2[0])
+
+
+def test_pearson_per_gene_vectorized_matches_scalar_reference_and_preserves_failure_semantics():
+    rng = np.random.default_rng(17)
+    true = rng.normal(size=(257, 31)).astype(np.float32)
+    pred = (0.4 * true + rng.normal(size=true.shape)).astype(np.float32)
+    true[:, 3] = 7.0       # truth-constant: ineligible -> NaN
+    pred[:, 8] = -2.0      # prediction-constant with variable truth -> 0
+
+    actual = pearson_per_gene(pred, true)
+    expected = np.array([
+        np.nan if np.std(true[:, gene]) < 1e-8
+        else 0.0 if np.std(pred[:, gene]) < 1e-8
+        else pearsonr(pred[:, gene], true[:, gene])[0]
+        for gene in range(true.shape[1])
+    ])
+    assert np.allclose(actual, expected, atol=1e-7, equal_nan=True)
 
 
 def test_rmse_zero_for_identical_arrays():

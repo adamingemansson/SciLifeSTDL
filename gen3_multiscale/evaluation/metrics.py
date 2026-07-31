@@ -3,13 +3,11 @@ Phase 7 of the handoff ("Add losses, metrics, and diagnostic
 interventions").
 
 The eight pointwise/distributional functions below (through
-pool_knn_neighborhood) are copied VERBATIM from
-gen2_architectures/evaluation/metrics.py (itself identical to
-src/evaluation/metrics.py) -- same provenance discipline as every other
-reused module in this package (CONTRACT.md section 2): "do not let this
-drift without a deliberate reason." They are pure functions with no
-gen2-specific dependencies (only numpy/scipy/sklearn), so nothing about
-the copy needed adaptation.
+pool_knn_neighborhood) originate from gen2_architectures/evaluation/
+metrics.py.  `pearson_per_gene` deliberately uses an equivalent
+vectorized implementation here: full-panel Gen3 evaluation otherwise
+made millions of scalar scipy calls and emitted one warning per constant
+gene.  The eligibility/failure semantics remain unchanged.
 
 Everything from resolve_gene_panels onward is NEW for gen3_multiscale,
 built to satisfy the handoff's Phase 7 requirements that have no existing
@@ -36,8 +34,8 @@ from scipy.stats import pearsonr, t as _student_t
 
 
 # ---------------------------------------------------------------------------
-# Verbatim copy from gen2_architectures/evaluation/metrics.py -- do not let
-# this drift from that file without a deliberate, documented reason.
+# Adapted from gen2_architectures/evaluation/metrics.py.  Pearson is
+# deliberately vectorized; the remaining functions retain the reused logic.
 # ---------------------------------------------------------------------------
 def pearson_per_gene(pred: np.ndarray, true: np.ndarray) -> np.ndarray:
     """Per-gene PCC with eligibility defined from ground truth only.
@@ -46,16 +44,40 @@ def pearson_per_gene(pred: np.ndarray, true: np.ndarray) -> np.ndarray:
     is returned as NaN. A constant prediction for a truth-variable gene is a
     model failure and receives 0 instead of disappearing from the mean.
     """
-    G = pred.shape[1]
-    out = np.zeros(G)
-    for g in range(G):
-        if np.std(true[:, g]) < 1e-8:
-            out[g] = np.nan
-            continue
-        if np.std(pred[:, g]) < 1e-8:
-            out[g] = 0.0
-            continue
-        out[g] = pearsonr(pred[:, g], true[:, g])[0]
+    pred = np.asarray(pred, dtype=np.float64)
+    true = np.asarray(true, dtype=np.float64)
+    if pred.ndim != 2 or true.ndim != 2 or pred.shape != true.shape:
+        raise ValueError(
+            f"pred and true must be matching 2-D [n_items, n_genes] arrays; "
+            f"got {pred.shape} and {true.shape}"
+        )
+    if pred.shape[0] == 0:
+        raise ValueError("cannot compute per-gene PCC over zero items")
+
+    # Computing one scipy.stats.pearsonr call per gene made full-panel
+    # evaluation perform millions of Python/scipy calls.  The centered-dot
+    # formula is the same Pearson correlation, evaluated for every gene in
+    # two vectorized passes.  Float64 accumulation prevents large-offset
+    # float32 values from being misclassified as constant through rounding.
+    pred_centered = pred - pred.mean(axis=0, keepdims=True)
+    true_centered = true - true.mean(axis=0, keepdims=True)
+    pred_ss = np.einsum("ng,ng->g", pred_centered, pred_centered)
+    true_ss = np.einsum("ng,ng->g", true_centered, true_centered)
+    pred_std = np.sqrt(pred_ss / pred.shape[0])
+    true_std = np.sqrt(true_ss / true.shape[0])
+
+    out = np.full(pred.shape[1], np.nan, dtype=np.float64)
+    truth_variable = true_std >= 1e-8
+    prediction_constant = truth_variable & (pred_std < 1e-8)
+    out[prediction_constant] = 0.0
+
+    eligible = truth_variable & ~prediction_constant
+    if np.any(eligible):
+        covariance = np.einsum(
+            "ng,ng->g", pred_centered[:, eligible], true_centered[:, eligible]
+        )
+        denominator = np.sqrt(pred_ss[eligible] * true_ss[eligible])
+        out[eligible] = np.clip(covariance / denominator, -1.0, 1.0)
     return out
 
 

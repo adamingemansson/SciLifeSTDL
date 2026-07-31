@@ -99,7 +99,18 @@ def fit_gene_residual_basis(
 
     from sklearn.utils.extmath import randomized_svd
 
-    _u, _s, vt = randomized_svd(residuals, n_components=effective_rank, random_state=random_state)
+    # Explicit QR normalization avoids sklearn's AUTO -> LU path and its
+    # LAPACK SLASWP calls, which have failed on the real 90k x 17k memmap.
+    # Four power iterations are a bounded, deterministic accuracy/runtime
+    # compromise for the fixed rank-64 residual basis; leaving n_iter=AUTO
+    # selected seven expensive full-matrix passes for this shape.
+    _u, _s, vt = randomized_svd(
+        residuals,
+        n_components=effective_rank,
+        n_iter=4,
+        power_iteration_normalizer="QR",
+        random_state=random_state,
+    )
     basis = vt[:effective_rank]  # [effective_rank, n_genes], orthonormal rows by construction
 
     gene_names_hash = hashlib.sha256("\0".join(gene_names).encode()).hexdigest()
