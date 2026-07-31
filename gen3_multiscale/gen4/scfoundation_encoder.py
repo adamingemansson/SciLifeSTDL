@@ -305,6 +305,7 @@ class FrozenSCFoundationEncoder(nn.Module):
         pool_type: str = "all",
         target_resolution_token: float = 4.0,
         device: str = "cuda",
+        release_cuda_cache_between_rows: bool = True,
     ):
         super().__init__()
         if pool_type not in ("all", "max"):
@@ -374,6 +375,15 @@ class FrozenSCFoundationEncoder(nn.Module):
         # (typically CPU), silently ignoring a caller's `device="cuda"`.
         self.device = torch.device(device)
         self.model = self.model.to(self.device)
+        # scFoundation's official cell-embedding path is row-by-row and
+        # produces variable sequence lengths (one token per positive gene).
+        # PyTorch's CUDA caching allocator otherwise retains differently
+        # sized inactive workspaces as spots are processed, so nvidia-smi can
+        # climb toward the full device capacity even though no tensor is
+        # intentionally retained.  Releasing inactive cached blocks after
+        # each independent row bounds that accumulation without changing the
+        # model, inputs, operations, or returned embedding values.
+        self.release_cuda_cache_between_rows = bool(release_cuda_cache_between_rows)
         for parameter in self.model.parameters():
             parameter.requires_grad_(False)
         self.model.eval()
@@ -514,7 +524,18 @@ class FrozenSCFoundationEncoder(nn.Module):
         # `_encode_one_row`'s own docstring for why this is not merely a
         # style choice but the actual correctness fix for a real,
         # user-reported batch-composition-dependence bug.
-        out = np.stack([self._encode_one_row(row) for row in model_input], axis=0)
+        out = np.empty((expression.shape[0], self.output_dim), dtype=np.float32)
+        for row_index, row in enumerate(model_input):
+            out[row_index] = self._encode_one_row(row)
+            if (
+                self.device.type == "cuda"
+                and getattr(self, "release_cuda_cache_between_rows", True)
+            ):
+                # `_encode_one_row` has returned and its CPU copy completed,
+                # so all row-local CUDA tensors are out of scope here.
+                # `empty_cache` releases only *unoccupied* allocator blocks;
+                # live model parameters remain resident and untouched.
+                torch.cuda.empty_cache()
         if out.shape != (expression.shape[0], self.output_dim):
             raise RuntimeError(f"scFoundation encoder returned shape {out.shape}, expected ({expression.shape[0]}, {self.output_dim})")
         if not np.isfinite(out).all():

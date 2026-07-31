@@ -321,6 +321,33 @@ def test_encode_rows_is_row_independent_across_batch_composition_and_size():
     np.testing.assert_array_equal(alone[0], batch_of_three[1])
 
 
+def test_encode_rows_releases_inactive_cuda_cache_after_each_independent_row(monkeypatch):
+    """Variable-length rows must not accumulate inactive CUDA workspaces.
+
+    The actual row encoder is replaced so this contract can be tested on a
+    CPU-only CI host; only the cache-release control flow is under test.
+    """
+    encoder = _bare_encoder(["g0"], ["g0"])
+    encoder.device = torch.device("cuda")
+    encoder.output_dim = 4
+    encoder.release_cuda_cache_between_rows = True
+    monkeypatch.setattr(
+        encoder,
+        "_encode_one_row",
+        lambda _row: np.arange(4, dtype=np.float32),
+    )
+    empty_cache_calls = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: empty_cache_calls.append(True))
+
+    output = encoder.encode_rows(
+        np.ones((3, 1), dtype=np.float32),
+        raw_library_size=np.asarray([10.0, 20.0, 30.0], dtype=np.float32),
+    )
+
+    assert output.shape == (3, 4)
+    assert len(empty_cache_calls) == 3
+
+
 def test_encode_rows_zero_expression_genes_excluded_from_gathered_input():
     """A gene with zero expression must not appear in the compacted,
     strictly-positive-only sequence the official gatherData routine
