@@ -113,9 +113,84 @@ def compute_training_residuals(
     return residuals
 
 
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _residual_sidecar_path(residual_path: str | Path) -> Path:
+    return Path(f"{residual_path}.provenance.json")
+
+
+def _json_normalized(value):
+    """Return the exact JSON representation persisted in sidecars."""
+    return json.loads(json.dumps(value, sort_keys=True, default=str))
+
+
+def _write_verified_residual_cache(
+    residuals: np.memmap, residual_path: str | Path, expected_identity: dict,
+) -> Path:
+    """Write the identity sidecar last, after a complete residual matrix.
+
+    A residual file without this sidecar is deliberately not reusable: it
+    may be a partial file left by an interrupted inference pass.  Binding
+    the file hash and all scientific inputs lets a later SVD retry skip
+    Architecture 3 inference without silently accepting stale residuals.
+    """
+    residuals.flush()
+    residual_path = Path(residual_path)
+    sidecar_path = _residual_sidecar_path(residual_path)
+    payload = {
+        "version": 1,
+        "kind": "gen3_architecture4_training_residual_cache",
+        "identity": expected_identity,
+        "shape": [int(value) for value in residuals.shape],
+        "dtype": residuals.dtype.str,
+        "residual_file_sha256": _file_sha256(residual_path),
+    }
+    tmp = sidecar_path.with_name(f"{sidecar_path.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str))
+    os.replace(tmp, sidecar_path)
+    return sidecar_path
+
+
+def _load_verified_residual_cache(
+    residual_path: str | Path, expected_identity: dict,
+) -> np.memmap:
+    residual_path = Path(residual_path)
+    sidecar_path = _residual_sidecar_path(residual_path)
+    if not residual_path.is_file() or not sidecar_path.is_file():
+        raise FileNotFoundError(
+            f"reusable residuals require both {residual_path} and {sidecar_path}; "
+            "a residual file without its completed provenance sidecar may be partial and is refused"
+        )
+    payload = json.loads(sidecar_path.read_text())
+    if payload.get("version") != 1 or payload.get("kind") != "gen3_architecture4_training_residual_cache":
+        raise ValueError(f"{sidecar_path}: unsupported residual-cache schema")
+    if payload.get("identity") != expected_identity:
+        raise ValueError(
+            f"{sidecar_path}: residual-cache scientific identity does not match this basis-fitting run"
+        )
+    actual_sha256 = _file_sha256(residual_path)
+    if actual_sha256 != payload.get("residual_file_sha256"):
+        raise ValueError(f"{residual_path}: residual-cache content SHA256 does not match its sidecar")
+    residuals = np.load(residual_path, mmap_mode="r")
+    if list(residuals.shape) != payload.get("shape") or residuals.dtype.str != payload.get("dtype"):
+        raise ValueError(f"{residual_path}: residual-cache shape/dtype does not match its sidecar")
+    if residuals.ndim != 2 or residuals.shape[0] == 0 or residuals.shape[1] != expected_identity["n_genes"]:
+        raise ValueError(f"{residual_path}: residual-cache matrix has invalid shape {residuals.shape}")
+    if not np.all(np.isfinite(residuals)):
+        raise ValueError(f"{residual_path}: residual-cache matrix contains non-finite values")
+    return residuals
+
+
 def fit_and_save_architecture4_basis(
     architecture3_config_path: str, architecture3_checkpoint_dir: str, output_basis_path: str,
     *, n_masks_per_sample: int = 20, rank: int = 64, device_str: str = "cpu", allow_code_drift: bool = False,
+    reuse_residuals_path: str | None = None,
 ) -> dict:
     """The full pipeline. Returns (and persists alongside the basis file,
     as `<output_basis_path>.provenance.json`) a provenance record binding
@@ -189,34 +264,71 @@ def fit_and_save_architecture4_basis(
 
     device = torch.device(device_str)
 
-    # Audit #2 of commit a32051b: the ONE shared model-reconstruction
-    # pipeline (`train.py::build_model_for_inference`) -- this is
-    # Architecture 3, so the Architecture-4-conditioner step is a
-    # structural no-op here, but this call site now shares the exact
-    # same construction + synchronized-init + checkpoint-loading logic
-    # every other caller uses, rather than its own fourth independent
-    # inline duplicate. `checkpoint_dir=pinned_arch3_identity.resolved_dir`
-    # -- the SAME immutable bundle already verified above, never the raw
-    # mutable `architecture3_checkpoint_dir` again (Codex re-audit of
-    # commit 57f0e3c).
-    architecture3_model, _info = build_model_for_inference(
-        config, gene_names=gene_names, device=device, checkpoint_dir=pinned_arch3_identity.resolved_dir, smoke=False,
-        dataset_manifest=dataset_manifest, cache_content_by_sample=preflight_report.get("cache_content_by_sample"),
-    )
+    training_mask_schedule_fingerprint = hashlib.sha256(
+        json.dumps(train_schedule.reports, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    residual_identity = _json_normalized({
+        "architecture3_config_fingerprint": config_fingerprint(config),
+        "architecture3_config_identity_fingerprint": config_identity_fingerprint(config),
+        "architecture3_checkpoint_trainable_weights_sha256": pinned_arch3_identity.weights_sha256,
+        "architecture3_checkpoint_step": pinned_arch3_identity.step,
+        "architecture3_checkpoint_bundle_id": pinned_arch3_identity.bundle_dir,
+        "architecture3_checkpoint_manifest_sha256": pinned_arch3_identity.manifest_sha256,
+        "dataset_manifest_fingerprint": dataset_manifest_fingerprint(dataset_manifest),
+        "gene_panel_hash": gene_panel_hash(gene_names),
+        "n_genes": len(gene_names),
+        "train_sample_ids": sorted(train_ids),
+        "n_masks_per_sample": int(n_masks_per_sample),
+        "training_mask_schedule_fingerprint": training_mask_schedule_fingerprint,
+        "cache_content_by_sample": preflight_report.get("cache_content_by_sample"),
+    })
 
-    # Launch blocker #11: a real, disk-backed memmap file, not a Python
-    # list of chunks -- see compute_training_residuals's own docstring.
-    # Placed next to the output basis (same filesystem, so no surprise
-    # cross-device temp-dir space usage), and always removed afterward
-    # regardless of whether fitting succeeds.
-    memmap_path = Path(f"{output_basis_path}.residuals.tmp.{os.getpid()}.npy")
+    residual_path = (
+        Path(reuse_residuals_path)
+        if reuse_residuals_path is not None
+        else Path(f"{output_basis_path}.residuals.tmp.{os.getpid()}.npy")
+    )
+    residual_sidecar_path = _residual_sidecar_path(residual_path)
     try:
-        residuals = compute_training_residuals(architecture3_model, train_dataset, device, memmap_path=memmap_path)
+        if reuse_residuals_path is not None:
+            residuals = _load_verified_residual_cache(residual_path, residual_identity)
+            print(f"reusing verified Architecture 4 residual matrix: {residual_path}")
+        else:
+            # Audit #2 of commit a32051b: the ONE shared model-
+            # reconstruction pipeline, pinned to the exact bundle already
+            # verified above.  Model construction is skipped entirely when
+            # retrying SVD from a verified residual cache.
+            architecture3_model, _info = build_model_for_inference(
+                config, gene_names=gene_names, device=device,
+                checkpoint_dir=pinned_arch3_identity.resolved_dir, smoke=False,
+                dataset_manifest=dataset_manifest,
+                cache_content_by_sample=preflight_report.get("cache_content_by_sample"),
+            )
+            try:
+                residuals = compute_training_residuals(
+                    architecture3_model, train_dataset, device, memmap_path=residual_path,
+                )
+            except BaseException:
+                # No sidecar was committed, so this can only be incomplete.
+                residual_path.unlink(missing_ok=True)
+                residual_sidecar_path.unlink(missing_ok=True)
+                raise
+            _write_verified_residual_cache(residuals, residual_path, residual_identity)
+
         n_residual_rows = int(residuals.shape[0])
         basis = fit_gene_residual_basis(residuals, gene_names, rank=rank)
-        del residuals  # drop the memmap reference before unlinking its backing file
-    finally:
-        memmap_path.unlink(missing_ok=True)
+    except BaseException:
+        if residual_path.is_file() and residual_sidecar_path.is_file():
+            print(
+                f"basis fitting failed; verified residual matrix retained at {residual_path}. "
+                f"Retry with --reuse-residuals {residual_path}"
+            )
+        elif reuse_residuals_path is None:
+            # A locally-created file without a committed sidecar is not a
+            # valid retry artifact (for example, interruption while hashing).
+            residual_path.unlink(missing_ok=True)
+            residual_sidecar_path.unlink(missing_ok=True)
+        raise
     # Launch blocker #5 / Codex re-audit of commit 2162ff4, finding #5:
     # "write basis + provenance transactionally." `save_gene_residual_
     # basis` is already an atomic tmp-then-`os.replace` write; the
@@ -243,9 +355,6 @@ def fit_and_save_architecture4_basis(
     # own docstring) deliberately not equality-checked at load time,
     # since a legitimately re-diversified training schedule must not
     # invalidate an otherwise-valid basis.
-    training_mask_schedule_fingerprint = hashlib.sha256(
-        json.dumps(train_schedule.reports, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()
     # Codex re-audit of commit 2162ff4, finding #5: "record the numerical
     # basis SHA256 and verify it when loading" -- the sidecar previously
     # recorded shape (`n_genes`/`rank`) but nothing binding it to the
@@ -287,6 +396,13 @@ def fit_and_save_architecture4_basis(
     provenance_tmp = provenance_path.with_name(f"{provenance_path.name}.tmp.{os.getpid()}")
     provenance_tmp.write_text(json.dumps(provenance, indent=2, sort_keys=True, default=str))
     os.replace(provenance_tmp, provenance_path)
+
+    # Only discard the expensive residual matrix after BOTH basis and
+    # provenance have been committed.  Any SVD/save interruption leaves a
+    # hash-verified retry artifact rather than forcing inference again.
+    del residuals
+    residual_path.unlink(missing_ok=True)
+    residual_sidecar_path.unlink(missing_ok=True)
     return provenance
 
 
@@ -299,6 +415,10 @@ def main() -> None:
     parser.add_argument("--rank", type=int, default=64)
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
+        "--reuse-residuals",
+        help="Retry basis fitting from a retained, hash-verified residual .npy file produced by a failed prior run",
+    )
+    parser.add_argument(
         "--allow-code-drift", action="store_true",
         help="Explicit override to fit a basis from an Architecture 3 checkpoint trained under a "
              "different git commit or dirty worktree than the current one. Codex re-audit of commit "
@@ -308,7 +428,7 @@ def main() -> None:
     provenance = fit_and_save_architecture4_basis(
         args.config, args.architecture3_checkpoint_dir, args.output_basis_path,
         n_masks_per_sample=args.n_masks_per_sample, rank=args.rank, device_str=args.device,
-        allow_code_drift=args.allow_code_drift,
+        allow_code_drift=args.allow_code_drift, reuse_residuals_path=args.reuse_residuals,
     )
     print(f"gene residual basis fit and saved: {json.dumps(provenance, indent=2, default=str)}")
 
