@@ -71,10 +71,13 @@ exactly, since a batch of 1 has zero padding by construction. See
 across_batch_composition_and_size` for the adversarial proof.
 
 HONEST LIMIT (GEN4_CONTRACT.md section 13 / RUNBOOK.md section 4): no
-real `scfoundation` package is installed in this environment, so this
-has never been run against the real package/checkpoint and MUST be
-verified against a real installation before trusting this path for real
-inference -- `tests/test_scfoundation_encoder.py` exercises every piece
+real scFoundation checkpoint is available in this development
+environment, so this must still pass the real-weight cache smoke on the
+target A100 before a long run. The official project is a repository, not
+an installable `scfoundation` package; construction therefore requires
+the official repository path and exact checked-out 40-hex commit, and
+loads its real `model/load.py`. `tests/test_scfoundation_encoder.py`
+exercises that repository-loading contract and every piece
 of the computation above (gathering, token ordering, pooling) against a
 bypassed-__init__ instance with a tiny real (not scFoundation-weighted)
 transformer-shaped model standing in for the real one, and a SEPARATE
@@ -90,7 +93,11 @@ ordering/pooling algorithm.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
+import re
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -106,6 +113,137 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _load_scfoundation_vocabulary(path: Path) -> list[str]:
+    """Load either the repository's official TSV or a legacy JSON list.
+
+    The official scFoundation artifact is
+    ``OS_scRNA_gene_index.19264.tsv`` and exposes a ``gene_name`` column.
+    JSON remains accepted for existing, already-provenanced caches, but
+    mappings and duplicate/blank names are refused.
+    """
+    if path.suffix.lower() == ".json":
+        vocab = json.loads(path.read_text())
+        if not isinstance(vocab, list):
+            raise ValueError(
+                f"scFoundation gene vocabulary {path} must be a JSON array, not a mapping"
+            )
+        genes = [str(value).strip() for value in vocab]
+    else:
+        lines = path.read_text().splitlines()
+        if not lines:
+            raise ValueError(f"scFoundation gene vocabulary {path} is empty")
+        header = lines[0].split("\t")
+        if "gene_name" in header:
+            gene_col = header.index("gene_name")
+            rows = lines[1:]
+        elif len(header) == 1:
+            gene_col = 0
+            rows = lines
+        else:
+            raise ValueError(
+                f"scFoundation vocabulary {path} must contain a 'gene_name' TSV column"
+            )
+        genes = []
+        for line_number, line in enumerate(rows, start=2):
+            fields = line.split("\t")
+            if gene_col >= len(fields):
+                raise ValueError(
+                    f"scFoundation vocabulary {path}:{line_number} has no gene_name value"
+                )
+            genes.append(fields[gene_col].strip())
+    if not genes or any(not gene for gene in genes):
+        raise ValueError(
+            f"scFoundation gene vocabulary {path} must contain non-empty gene symbols"
+        )
+    if len(set(genes)) != len(genes):
+        raise ValueError(f"scFoundation gene vocabulary {path} contains duplicate gene symbols")
+    return genes
+
+
+def _verified_repo_revision(repo_path: Path, declared_revision: str) -> str:
+    revision = str(declared_revision).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError(
+            "scFoundation repository revision must be an immutable 40-character "
+            f"lowercase Git commit SHA, got {declared_revision!r}"
+        )
+    try:
+        actual = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip().lower()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError(
+            f"cannot verify scFoundation repository revision at {repo_path}"
+        ) from exc
+    if actual != revision:
+        raise ValueError(
+            f"scFoundation repository revision mismatch: declared {revision}, "
+            f"but {repo_path} is checked out at {actual}"
+        )
+    tracked_diff = subprocess.run(
+        ["git", "-C", str(repo_path), "diff", "--quiet", "HEAD", "--", "model"],
+        check=False,
+    )
+    if tracked_diff.returncode != 0:
+        raise ValueError(
+            f"scFoundation repository {repo_path} has modified tracked code under model/; "
+            "use a clean checkout so the declared revision identifies the code that runs"
+        )
+    untracked = subprocess.run(
+        [
+            "git", "-C", str(repo_path), "ls-files", "--others",
+            "--exclude-standard", "--", "model",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    untracked_python = sorted(path for path in untracked if path.endswith(".py"))
+    if untracked_python:
+        raise ValueError(
+            f"scFoundation repository {repo_path} has untracked Python code under model/: "
+            f"{untracked_python}; refusing an execution path not identified by {revision}"
+        )
+    return revision
+
+
+def _load_official_scfoundation_api(repo_path: Path, revision: str):
+    """Load the official repository's ``model/load.py`` at a verified SHA."""
+    verified_revision = _verified_repo_revision(repo_path, revision)
+    model_dir = repo_path / "model"
+    load_path = model_dir / "load.py"
+    if not load_path.is_file():
+        raise FileNotFoundError(
+            f"official scFoundation loader missing: {load_path}; clone "
+            "biomap-research/scFoundation at the declared revision"
+        )
+    module_name = f"_scilifestdl_scfoundation_load_{verified_revision}"
+    spec = importlib.util.spec_from_file_location(module_name, load_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot import official scFoundation loader {load_path}")
+    module = importlib.util.module_from_spec(spec)
+    prior_path = list(sys.path)
+    try:
+        # Official load.py imports sibling modules (for example
+        # pretrainmodels) as top-level names, so its own model directory
+        # must be first while the module is executed.
+        sys.path.insert(0, str(model_dir))
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise ImportError(
+            f"failed to import official scFoundation loader {load_path}"
+        ) from exc
+    finally:
+        sys.path[:] = prior_path
+    loader = getattr(module, "load_model_frommmf", None)
+    if not callable(loader):
+        raise ImportError(f"{load_path} has no callable load_model_frommmf")
+    return loader, verified_revision
 
 
 def gather_scfoundation_data(data: torch.Tensor, labels: torch.Tensor, pad_token_id: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -152,16 +290,17 @@ def gather_scfoundation_data(data: torch.Tensor, labels: torch.Tensor, pad_token
 
 class FrozenSCFoundationEncoder(nn.Module):
     """Wraps a real scFoundation checkpoint. `gene_vocab_path` must be a
-    JSON file containing scFoundation's own FIXED, ordered gene vocabulary
-    (a list of gene symbols, in the exact order the real checkpoint was
-    trained with) -- this class re-indexes the manifest's `gene_names`
-    into that fixed vocabulary, not the reverse."""
+    scFoundation's own FIXED, ordered gene vocabulary (the official
+    ``OS_scRNA_gene_index.19264.tsv`` or a legacy JSON list). The official
+    repository path and exact checked-out commit are mandatory."""
 
     def __init__(
         self,
         checkpoint_path: str,
         gene_vocab_path: str,
         gene_names: list[str],
+        repo_path: str,
+        repo_revision: str,
         output_dim: int = 3072,
         pool_type: str = "all",
         target_resolution_token: float = 4.0,
@@ -180,12 +319,10 @@ class FrozenSCFoundationEncoder(nn.Module):
             )
         if not vocab_path.is_file():
             raise FileNotFoundError(f"scFoundation gene-vocabulary file not found: {vocab_path}")
-        scfoundation_vocab = json.loads(vocab_path.read_text())
-        if not isinstance(scfoundation_vocab, list) or not scfoundation_vocab:
-            raise ValueError(
-                f"scFoundation gene vocabulary {vocab_path} must be a non-empty JSON array of gene "
-                "symbols in scFoundation's own fixed vocabulary order, not a name->id mapping"
-            )
+        repository = Path(repo_path).expanduser().resolve()
+        if not repository.is_dir():
+            raise FileNotFoundError(f"scFoundation repository not found: {repository}")
+        scfoundation_vocab = _load_scfoundation_vocabulary(vocab_path)
         self.scfoundation_vocab = list(scfoundation_vocab)
         self.gene_names = tuple(gene_names)
         # Position in scfoundation_vocab for each manifest gene that scFoundation
@@ -205,22 +342,26 @@ class FrozenSCFoundationEncoder(nn.Module):
             )
         self.pool_type = pool_type
         self.target_resolution_token = float(target_resolution_token)
-        vocab_sha256 = hashlib.sha256(json.dumps(scfoundation_vocab).encode("utf-8")).hexdigest()
-
-        try:
-            import scfoundation  # noqa: F401 -- optional external dependency, real import deferred to real use
-            package_version = str(getattr(scfoundation, "__version__", "unknown"))
-        except Exception as exc:  # pragma: no cover - optional external dependency
-            raise ImportError(
-                "The `scfoundation` package is required to construct FrozenSCFoundationEncoder. "
-                "Install it in the training environment."
-            ) from exc
+        # Preflight verifies the exact configured vocabulary artifact.
+        # Record that file's byte-level SHA256 (not a separately
+        # serialized in-memory list, which can differ despite identical
+        # genes and made correctly-built caches fail provenance checks).
+        vocab_sha256 = _sha256_file(vocab_path)
 
         checkpoint_sha256 = _sha256_file(ckpt_path)
+        load_model_frommmf, verified_revision = _load_official_scfoundation_api(
+            repository, repo_revision,
+        )
+        package_version = f"git:{verified_revision}"
         # Integration audit finding #5 (CONFIRMED real): the official
         # load_model_frommmf returns a (model, config) TUPLE -- a prior
         # version treated its return value as a bare model.
-        self.model, self.scfoundation_config = scfoundation.load_model_frommmf(str(ckpt_path), key="cell")  # pragma: no cover
+        loaded = load_model_frommmf(str(ckpt_path), key="cell")  # pragma: no cover - real weights
+        if not isinstance(loaded, tuple) or len(loaded) != 2:
+            raise ValueError(
+                "official scFoundation load_model_frommmf must return (model, config)"
+            )
+        self.model, self.scfoundation_config = loaded
         if "pad_token_id" not in self.scfoundation_config:
             raise ValueError(
                 f"scFoundation checkpoint {ckpt_path}'s own config has no pad_token_id -- cannot gather "

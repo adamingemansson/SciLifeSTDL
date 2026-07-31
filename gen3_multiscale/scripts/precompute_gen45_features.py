@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+from pathlib import Path
 
 import numpy as np
 from omegaconf import OmegaConf
@@ -28,6 +30,12 @@ def main() -> None:
     parser.add_argument("--uni2-revision")
     parser.add_argument("--scfoundation-checkpoint")
     parser.add_argument("--scfoundation-vocab")
+    parser.add_argument("--scfoundation-repo")
+    parser.add_argument("--scfoundation-revision")
+    parser.add_argument(
+        "--report",
+        help="Optional JSON path for the completed shard and exact encoder identities.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--spot-batch-size", type=int, default=32)
     parser.add_argument("--wsi-batch-size", type=int, default=32)
@@ -56,9 +64,16 @@ def main() -> None:
     use_scf = args.modalities in {"scfoundation", "both"}
     if use_uni2 and (not args.uni2_checkpoint or not args.uni2_revision):
         raise ValueError("UNI2 caching requires --uni2-checkpoint and --uni2-revision")
-    if use_scf and (not args.scfoundation_checkpoint or not args.scfoundation_vocab):
+    if use_scf and (
+        not args.scfoundation_checkpoint
+        or not args.scfoundation_vocab
+        or not args.scfoundation_repo
+        or not args.scfoundation_revision
+    ):
         raise ValueError(
-            "scFoundation caching requires --scfoundation-checkpoint and --scfoundation-vocab"
+            "scFoundation caching requires --scfoundation-checkpoint, "
+            "--scfoundation-vocab, --scfoundation-repo, and "
+            "--scfoundation-revision"
         )
 
     uni2 = (
@@ -72,6 +87,8 @@ def main() -> None:
             args.scfoundation_checkpoint,
             args.scfoundation_vocab,
             list(manifest["gene_panel"]),
+            repo_path=args.scfoundation_repo,
+            repo_revision=args.scfoundation_revision,
             device=args.device,
         )
         if use_scf else None
@@ -128,6 +145,12 @@ def main() -> None:
             scfoundation.identity.as_dict() if scfoundation is not None else None
         ),
     }
+    if args.report:
+        report_path = Path(args.report).expanduser().resolve()
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = report_path.with_name(f".{report_path.name}.{os.getpid()}.tmp")
+        tmp_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp_path, report_path)
     print(json.dumps(report, indent=2))
 
 

@@ -27,14 +27,22 @@ split, optimizer settings, and evaluation protocol for all arms.
      --uni2-checkpoint <UNI2-h.bin> \
      --uni2-revision <40-hex-commit> \
      --scfoundation-checkpoint <scfoundation.ckpt> \
-     --scfoundation-vocab <vocab.json> \
-     --device cuda
+     --scfoundation-vocab <scFoundation/OS_scRNA_gene_index.19264.tsv> \
+     --scfoundation-repo <scFoundation-repository> \
+     --scfoundation-revision <40-hex-commit> \
+     --device cuda \
+     --report <cache-report.json>
    ```
 
    Use `--shard-index I --n-shards N` to split cache construction across
    GPUs. The command loads each encoder once and writes provenance-bound
-   caches. Arms using GigaPath/STPath additionally consume the existing
-   provenance-bound GigaPath spot caches.
+   caches. The scFoundation repository must be the official
+   `biomap-research/scFoundation` checkout at exactly the declared commit;
+   the loader uses its real `model/load.py` API rather than assuming an
+   installable package that the official release does not provide. The
+   report records the exact checkpoint/vocabulary/code/preprocessing
+   identities to use when resolving configs. Arms using GigaPath/STPath
+   additionally consume the existing provenance-bound GigaPath caches.
 
 2. Resolve each conditioner config. Supply only the artifacts required by
    that arm; resolution fails if required values remain unset:

@@ -132,9 +132,9 @@ def _evaluate_fixed_item(kind: str, model: torch.nn.Module, item, *, generator=N
     flow apparatus this test is meant to be exercising ever being
     evaluated at all. `generator`, when given, makes repeated calls
     (before/after training) reproducible. `kind` (Integration audit
-    finding #1) is `model_kind_for_architecture_id(architecture_id)` --
-    this script is Gen3-only (builds items via `Gen3SpatialFieldDataset`
-    directly), so `kind` is always `"conditioner"` or `"flow"` here."""
+    finding #1) is the resolved model kind. Gen4/Gen5 items are built
+    through their real cache-aware adapter, so `kind` may be
+    `"conditioner"`, `"flow"`, or `"latent_flow"` here."""
     inputs, targets = item
     model.eval()
     with torch.no_grad():

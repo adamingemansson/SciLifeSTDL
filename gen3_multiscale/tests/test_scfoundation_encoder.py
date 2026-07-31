@@ -13,12 +13,93 @@ standing in for the real one, so the gather/embed/pool SEQUENCE itself is
 proven correct."""
 from __future__ import annotations
 
+import hashlib
 import numpy as np
 import pytest
+import subprocess
 import torch
 import torch.nn as nn
 
-from gen3_multiscale.gen4.scfoundation_encoder import FrozenSCFoundationEncoder, gather_scfoundation_data
+from gen3_multiscale.gen4.scfoundation_encoder import (
+    FrozenSCFoundationEncoder,
+    _load_official_scfoundation_api,
+    _load_scfoundation_vocabulary,
+    gather_scfoundation_data,
+)
+
+
+def test_loads_official_scfoundation_tsv_vocabulary(tmp_path):
+    vocab = tmp_path / "OS_scRNA_gene_index.19264.tsv"
+    vocab.write_text("gene_name\tindex\nTP53\t0\nEGFR\t1\n")
+    assert _load_scfoundation_vocabulary(vocab) == ["TP53", "EGFR"]
+
+
+def test_scfoundation_vocabulary_rejects_duplicates(tmp_path):
+    vocab = tmp_path / "vocab.tsv"
+    vocab.write_text("gene_name\tindex\nTP53\t0\nTP53\t1\n")
+    with pytest.raises(ValueError, match="duplicate"):
+        _load_scfoundation_vocabulary(vocab)
+
+
+def test_loads_official_repository_api_only_at_declared_git_revision(tmp_path):
+    repo = tmp_path / "scFoundation"
+    model_dir = repo / "model"
+    model_dir.mkdir(parents=True)
+    (model_dir / "helper.py").write_text("MARKER = 17\n")
+    (model_dir / "load.py").write_text(
+        "import torch\n"
+        "from helper import MARKER\n"
+        "class TinyModel(torch.nn.Module):\n"
+        "    def __init__(self):\n"
+        "        super().__init__()\n"
+        "        self.weight = torch.nn.Parameter(torch.ones(1))\n"
+        "def load_model_frommmf(path, key='cell'):\n"
+        "    return TinyModel(), {'pad_token_id': 0, 'marker': MARKER}\n"
+    )
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=Test",
+            "-c", "user.email=test@example.invalid", "commit", "-m", "fixture",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    revision = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    loader, verified = _load_official_scfoundation_api(repo, revision)
+
+    assert verified == revision
+    model, config = loader("checkpoint", key="cell")
+    assert isinstance(model, nn.Module)
+    assert config == {"pad_token_id": 0, "marker": 17}
+    with pytest.raises(ValueError, match="revision mismatch"):
+        _load_official_scfoundation_api(repo, "0" * 40)
+
+    checkpoint = tmp_path / "models.ckpt"
+    checkpoint.write_bytes(b"checkpoint identity bytes")
+    vocab = repo / "OS_scRNA_gene_index.19264.tsv"
+    vocab.write_text("gene_name\tindex\nTP53\t0\nEGFR\t1\n")
+    encoder = FrozenSCFoundationEncoder(
+        str(checkpoint),
+        str(vocab),
+        ["EGFR", "TP53"],
+        repo_path=str(repo),
+        repo_revision=revision,
+        output_dim=4,
+        device="cpu",
+    )
+    assert encoder.identity.pinned_revision == hashlib.sha256(vocab.read_bytes()).hexdigest()
+    assert encoder.identity.package_version == f"git:{revision}"
+    (model_dir / "load.py").write_text((model_dir / "load.py").read_text() + "\n# local edit\n")
+    with pytest.raises(ValueError, match="modified tracked code"):
+        _load_official_scfoundation_api(repo, revision)
 
 
 def _bare_encoder(gene_names, vocab, target_resolution_token=4.0, pool_type="all"):
