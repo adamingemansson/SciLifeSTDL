@@ -11,7 +11,10 @@ import numpy as np
 from omegaconf import OmegaConf
 
 from gen3_multiscale.data.dataset_manifest import gene_panel_hash, load_dataset_manifest
-from gen3_multiscale.data.example_builder import load_sample_for_examples
+from gen3_multiscale.data.example_builder import (
+    load_expression_for_model_target_space,
+    load_sample_for_examples,
+)
 from gen3_multiscale.gen4.scfoundation_cache import build_scfoundation_spot_feature_cache
 from gen3_multiscale.gen4.scfoundation_encoder import FrozenSCFoundationEncoder
 from gen3_multiscale.gen4.uni2_dense_wsi_cache import build_uni2_dense_wsi_cache
@@ -95,9 +98,22 @@ def main() -> None:
     )
     completed = []
     for sample_id in sample_ids:
-        adata, patches, image_available = load_sample_for_examples(manifest, sample_id)
+        # scFoundation consumes expression only.  The old shared path loaded
+        # and aligned every sample's full H&E patch tensor even for
+        # ``--modalities scfoundation``; those multi-gigabyte allocations
+        # were scientifically irrelevant and could leave the process at a
+        # very high RSS watermark across a cohort.  Only UNI2 needs pixels.
+        if uni2 is not None:
+            adata, patches, image_available = load_sample_for_examples(
+                manifest, sample_id,
+            )
+        else:
+            adata = load_expression_for_model_target_space(manifest, sample_id)
+            patches = None
+            image_available = None
         barcodes = np.asarray(adata.obs_names, dtype=str)
         if uni2 is not None:
+            assert patches is not None and image_available is not None
             build_uni2_spot_feature_cache(
                 cache_root,
                 sample_id,
@@ -119,12 +135,11 @@ def main() -> None:
                 raise ValueError(
                     f"{sample_id}: raw library sizes are missing; cannot build scFoundation cache"
                 )
-            expression = adata.X.toarray() if hasattr(adata.X, "toarray") else np.asarray(adata.X)
             build_scfoundation_spot_feature_cache(
                 cache_root,
                 sample_id,
                 barcodes,
-                np.asarray(expression, dtype=np.float32),
+                adata.X,
                 gene_panel_hash(list(manifest["gene_panel"])),
                 scfoundation,
                 batch_size=args.scfoundation_batch_size,

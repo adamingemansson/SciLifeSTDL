@@ -31,7 +31,28 @@ def _cache_path(cache_root: str | Path, sample_id: str) -> Path:
     return Path(cache_root) / "scfoundation_gen3_spot_cache" / f"{sample_id}.npz"
 
 
-def _expression_content_hash(expression: np.ndarray, raw_library_size: np.ndarray | None = None) -> str:
+def _dense_expression_rows(expression, start: int, end: int) -> np.ndarray:
+    """Materialize only ``expression[start:end]`` as contiguous float32.
+
+    Real HEST expression is commonly scipy sparse.  Converting the complete
+    sample before batching defeats the cache builder's bounded-memory
+    contract, so every caller goes through this row-sliced helper instead.
+    """
+    rows = expression[start:end]
+    if hasattr(rows, "toarray"):
+        rows = rows.toarray()
+    rows = np.asarray(rows, dtype=np.float32)
+    if rows.ndim != 2:
+        raise ValueError(f"expression rows must be two-dimensional, got {rows.shape}")
+    return np.ascontiguousarray(rows)
+
+
+def _expression_content_hash(
+    expression,
+    raw_library_size: np.ndarray | None = None,
+    *,
+    row_batch_size: int = 256,
+) -> str:
     """Codex audit finding: cache identity previously hashed neither the
     expression VALUES nor the preprocessing that produced them, so a
     stale/changed input could silently reuse an old cached embedding. This
@@ -46,9 +67,17 @@ def _expression_content_hash(expression: np.ndarray, raw_library_size: np.ndarra
     raw_library_size must not be silently reused after that changes
     (e.g. a re-run QC fix that changes per-spot raw counts) even if
     `expression` itself happens to stay byte-identical."""
-    expression = np.ascontiguousarray(expression, dtype=np.float32)
+    if row_batch_size <= 0:
+        raise ValueError(f"row_batch_size must be positive, got {row_batch_size}")
+    if not hasattr(expression, "shape") or len(expression.shape) != 2:
+        raise ValueError(
+            f"expression must be a two-dimensional array or sparse matrix, got "
+            f"{getattr(expression, 'shape', None)}"
+        )
     digest = hashlib.sha256()
-    digest.update(expression.tobytes())
+    for start in range(0, int(expression.shape[0]), row_batch_size):
+        end = min(start + row_batch_size, int(expression.shape[0]))
+        digest.update(_dense_expression_rows(expression, start, end).tobytes())
     if raw_library_size is not None:
         digest.update(np.ascontiguousarray(raw_library_size, dtype=np.float32).tobytes())
     return digest.hexdigest()
@@ -58,7 +87,7 @@ def build_scfoundation_spot_feature_cache(
     cache_root: str | Path,
     sample_id: str,
     barcodes: np.ndarray,
-    expression: np.ndarray,
+    expression,
     gene_panel_hash: str,
     encoder,
     batch_size: int = 256,
@@ -83,8 +112,11 @@ def build_scfoundation_spot_feature_cache(
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
     barcodes = np.asarray([str(b) for b in barcodes])
-    expression = np.asarray(expression, dtype=np.float32)
     n = barcodes.shape[0]
+    if not hasattr(expression, "shape") or len(expression.shape) != 2:
+        raise ValueError(
+            f"{sample_id}: expression must be a two-dimensional array or sparse matrix"
+        )
     if expression.shape[0] != n:
         raise ValueError(f"{sample_id}: barcodes and expression must be row-aligned")
     if raw_library_size is not None:
@@ -101,7 +133,8 @@ def build_scfoundation_spot_feature_cache(
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
         batch_library_size = raw_library_size[start:end] if raw_library_size is not None else None
-        out = encoder.encode_rows(expression[start:end], batch_library_size)
+        expression_batch = _dense_expression_rows(expression, start, end)
+        out = encoder.encode_rows(expression_batch, batch_library_size)
         if out.shape != (end - start, output_dim):
             raise ValueError(f"{sample_id}: encoder returned shape {out.shape}, expected ({end - start}, {output_dim})")
         features[start:end] = out.astype(np.float32)
@@ -128,7 +161,11 @@ def build_scfoundation_spot_feature_cache(
             # any pre-existing cache missing this field fails closed via
             # _REQUIRED_FIELDS below, rather than silently loading.
             scfoundation_schema_version=np.asarray(2),
-            expression_content_hash=np.asarray(_expression_content_hash(expression, raw_library_size)),
+            expression_content_hash=np.asarray(
+                _expression_content_hash(
+                    expression, raw_library_size, row_batch_size=batch_size,
+                )
+            ),
         )
     os.replace(tmp, path)
     return path
@@ -139,7 +176,7 @@ def load_scfoundation_spot_features(
     sample_id: str,
     barcodes: np.ndarray,
     gene_panel_hash: str,
-    expression: np.ndarray,
+    expression,
     raw_library_size: np.ndarray | None = None,
 ) -> dict:
     """`expression` must be the SAME live `n_spots x n_genes` matrix (row-

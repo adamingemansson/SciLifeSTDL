@@ -7,14 +7,19 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 import pytest
+import scipy.sparse as sp
 
 from gen3_multiscale.data import loaders
 from gen3_multiscale.data.example_builder import load_sample_for_examples
 from gen3_multiscale.gen4.inputs import build_gen4_spatial_field_example
 from gen3_multiscale.gen4.providers import EncoderIdentity
 from gen3_multiscale.gen4.scfoundation_cache import (
-    barcode_embedding_lookup, build_scfoundation_spot_feature_cache, load_scfoundation_spot_features,
+    _expression_content_hash,
+    barcode_embedding_lookup,
+    build_scfoundation_spot_feature_cache,
+    load_scfoundation_spot_features,
 )
+from gen3_multiscale.scripts import precompute_gen45_features
 from gen3_multiscale.gen4.uni2_spot_cache import build_uni2_spot_feature_cache, load_uni2_spot_features
 from gen3_multiscale.tests._gen4_fixtures import StubSCFoundationEncoder, StubUNI2Encoder
 from gen3_multiscale.tests._step6_fixtures import prepare_step6_experiment
@@ -76,6 +81,104 @@ def test_scfoundation_cache_round_trip(tmp_path):
     assert np.allclose(loaded["features"], encoder.encode_rows(expression))
     lookup = barcode_embedding_lookup(loaded)
     assert set(lookup) == {"a", "b"}
+
+
+def test_scfoundation_sparse_cache_materializes_only_bounded_row_batches(tmp_path):
+    class TrackingSparseExpression:
+        def __init__(self, array):
+            self.matrix = sp.csr_matrix(array)
+            self.shape = self.matrix.shape
+            self.row_batch_sizes = []
+
+        def __getitem__(self, key):
+            row_key = key[0] if isinstance(key, tuple) else key
+            start, stop, step = row_key.indices(self.shape[0])
+            assert step == 1
+            self.row_batch_sizes.append(stop - start)
+            return self.matrix[key]
+
+        def __array__(self, *args, **kwargs):
+            raise AssertionError("the complete sparse expression matrix must never be densified")
+
+    gene_names = [f"g{i}" for i in range(4)]
+    dense = np.arange(28, dtype=np.float32).reshape(7, 4)
+    expression = TrackingSparseExpression(dense)
+    encoder = StubSCFoundationEncoder(gene_names, output_dim=7)
+    barcodes = np.asarray([f"b{i}" for i in range(7)])
+
+    build_scfoundation_spot_feature_cache(
+        tmp_path, "s1", barcodes, expression, "hash123", encoder, batch_size=2,
+    )
+
+    assert expression.row_batch_sizes
+    assert max(expression.row_batch_sizes) <= 2
+    assert _expression_content_hash(sp.csr_matrix(dense)) == _expression_content_hash(dense)
+
+
+def test_scfoundation_only_precompute_never_loads_hest_patches(tmp_path, monkeypatch):
+    gene_names = ["g0", "g1"]
+    encoder = StubSCFoundationEncoder(gene_names, output_dim=3)
+    adata = ad.AnnData(
+        X=sp.csr_matrix(np.ones((2, 2), dtype=np.float32)),
+        obs=pd.DataFrame(
+            {"_scilifestdl_raw_library_size": [10.0, 20.0]},
+            index=pd.Index(["a", "b"]),
+        ),
+        var=pd.DataFrame(index=pd.Index(gene_names)),
+    )
+    manifest = {
+        "samples": {"s1": {}},
+        "gene_panel": gene_names,
+        "hest_data_dir": str(tmp_path / "hest"),
+        "hest_cache_dir": str(tmp_path / "cache"),
+    }
+    captured = {}
+
+    monkeypatch.setattr(precompute_gen45_features, "load_dataset_manifest", lambda _path: manifest)
+    monkeypatch.setattr(
+        precompute_gen45_features,
+        "load_expression_for_model_target_space",
+        lambda _manifest, _sample_id: adata,
+    )
+    monkeypatch.setattr(
+        precompute_gen45_features,
+        "load_sample_for_examples",
+        lambda *_args, **_kwargs: pytest.fail(
+            "scFoundation-only precompute must not load H&E patches"
+        ),
+    )
+    monkeypatch.setattr(
+        precompute_gen45_features,
+        "FrozenSCFoundationEncoder",
+        lambda *_args, **_kwargs: encoder,
+    )
+
+    def capture_cache(_root, sample_id, _barcodes, expression, *_args, **_kwargs):
+        captured[sample_id] = expression
+
+    monkeypatch.setattr(
+        precompute_gen45_features,
+        "build_scfoundation_spot_feature_cache",
+        capture_cache,
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "precompute_gen45_features",
+            "--manifest", "manifest.json",
+            "--cache-root", str(tmp_path / "cache"),
+            "--modalities", "scfoundation",
+            "--scfoundation-checkpoint", "models.ckpt",
+            "--scfoundation-vocab", "vocab.tsv",
+            "--scfoundation-repo", "repo",
+            "--scfoundation-revision", "a" * 40,
+            "--device", "cpu",
+        ],
+    )
+
+    precompute_gen45_features.main()
+
+    assert captured == {"s1": adata.X}
 
 
 def test_build_gen4_spatial_field_example_real_pipeline(tmp_path, monkeypatch):
