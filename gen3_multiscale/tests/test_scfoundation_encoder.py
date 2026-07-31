@@ -321,8 +321,8 @@ def test_encode_rows_is_row_independent_across_batch_composition_and_size():
     np.testing.assert_array_equal(alone[0], batch_of_three[1])
 
 
-def test_encode_rows_releases_inactive_cuda_cache_after_each_independent_row(monkeypatch):
-    """Variable-length rows must not accumulate inactive CUDA workspaces.
+def test_encode_rows_releases_inactive_cuda_cache_only_at_bounded_ceiling(monkeypatch):
+    """Reuse CUDA workspaces below the ceiling and release above it.
 
     The actual row encoder is replaced so this contract can be tested on a
     CPU-only CI host; only the cache-release control flow is under test.
@@ -331,6 +331,7 @@ def test_encode_rows_releases_inactive_cuda_cache_after_each_independent_row(mon
     encoder.device = torch.device("cuda")
     encoder.output_dim = 4
     encoder.release_cuda_cache_between_rows = True
+    encoder.max_cuda_reserved_bytes = 60 * 1024 ** 3
     monkeypatch.setattr(
         encoder,
         "_encode_one_row",
@@ -338,6 +339,12 @@ def test_encode_rows_releases_inactive_cuda_cache_after_each_independent_row(mon
     )
     empty_cache_calls = []
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: empty_cache_calls.append(True))
+    reserved = iter([8, 62, 12])
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_reserved",
+        lambda _device: next(reserved) * 1024 ** 3,
+    )
 
     output = encoder.encode_rows(
         np.ones((3, 1), dtype=np.float32),
@@ -345,7 +352,7 @@ def test_encode_rows_releases_inactive_cuda_cache_after_each_independent_row(mon
     )
 
     assert output.shape == (3, 4)
-    assert len(empty_cache_calls) == 3
+    assert len(empty_cache_calls) == 1
 
 
 def test_encode_rows_zero_expression_genes_excluded_from_gathered_input():

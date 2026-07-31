@@ -306,6 +306,7 @@ class FrozenSCFoundationEncoder(nn.Module):
         target_resolution_token: float = 4.0,
         device: str = "cuda",
         release_cuda_cache_between_rows: bool = True,
+        max_cuda_reserved_gb: float = 60.0,
     ):
         super().__init__()
         if pool_type not in ("all", "max"):
@@ -378,12 +379,14 @@ class FrozenSCFoundationEncoder(nn.Module):
         # scFoundation's official cell-embedding path is row-by-row and
         # produces variable sequence lengths (one token per positive gene).
         # PyTorch's CUDA caching allocator otherwise retains differently
-        # sized inactive workspaces as spots are processed, so nvidia-smi can
-        # climb toward the full device capacity even though no tensor is
-        # intentionally retained.  Releasing inactive cached blocks after
-        # each independent row bounds that accumulation without changing the
-        # model, inputs, operations, or returned embedding values.
+        # sized inactive workspaces as spots are processed.  Retaining those
+        # workspaces is important for throughput, so release them only after
+        # reserved memory reaches a bounded ceiling instead of after every
+        # row.  This changes allocator reuse only, never model computation.
         self.release_cuda_cache_between_rows = bool(release_cuda_cache_between_rows)
+        if not np.isfinite(max_cuda_reserved_gb) or float(max_cuda_reserved_gb) <= 0:
+            raise ValueError("max_cuda_reserved_gb must be a finite positive number")
+        self.max_cuda_reserved_bytes = int(float(max_cuda_reserved_gb) * (1024 ** 3))
         for parameter in self.model.parameters():
             parameter.requires_grad_(False)
         self.model.eval()
@@ -527,15 +530,19 @@ class FrozenSCFoundationEncoder(nn.Module):
         out = np.empty((expression.shape[0], self.output_dim), dtype=np.float32)
         for row_index, row in enumerate(model_input):
             out[row_index] = self._encode_one_row(row)
-            if (
-                self.device.type == "cuda"
-                and getattr(self, "release_cuda_cache_between_rows", True)
+            if self.device.type == "cuda" and getattr(
+                self, "release_cuda_cache_between_rows", True
             ):
                 # `_encode_one_row` has returned and its CPU copy completed,
                 # so all row-local CUDA tensors are out of scope here.
                 # `empty_cache` releases only *unoccupied* allocator blocks;
-                # live model parameters remain resident and untouched.
-                torch.cuda.empty_cache()
+                # live model parameters remain resident and untouched.  An
+                # encoder built before the bounded policy existed has no
+                # ceiling attribute, so preserve its old release-every-row
+                # behavior rather than silently making it unbounded.
+                ceiling = getattr(self, "max_cuda_reserved_bytes", None)
+                if ceiling is None or torch.cuda.memory_reserved(self.device) >= ceiling:
+                    torch.cuda.empty_cache()
         if out.shape != (expression.shape[0], self.output_dim):
             raise RuntimeError(f"scFoundation encoder returned shape {out.shape}, expected ({expression.shape[0]}, {self.output_dim})")
         if not np.isfinite(out).all():
