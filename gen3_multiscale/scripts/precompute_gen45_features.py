@@ -43,12 +43,18 @@ def main() -> None:
     parser.add_argument("--spot-batch-size", type=int, default=32)
     parser.add_argument("--wsi-batch-size", type=int, default=32)
     parser.add_argument("--scfoundation-batch-size", type=int, default=256)
+    parser.add_argument("--scfoundation-inference-batch-size", type=int, default=4)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--n-shards", type=int, default=1)
     args = parser.parse_args()
     if args.n_shards <= 0 or not 0 <= args.shard_index < args.n_shards:
         raise ValueError("require n_shards > 0 and 0 <= shard_index < n_shards")
-    if min(args.spot_batch_size, args.wsi_batch_size, args.scfoundation_batch_size) <= 0:
+    if min(
+        args.spot_batch_size,
+        args.wsi_batch_size,
+        args.scfoundation_batch_size,
+        args.scfoundation_inference_batch_size,
+    ) <= 0:
         raise ValueError("all batch sizes must be positive")
 
     manifest = load_dataset_manifest(args.manifest)
@@ -93,6 +99,7 @@ def main() -> None:
             repo_path=args.scfoundation_repo,
             repo_revision=args.scfoundation_revision,
             device=args.device,
+            inference_microbatch_size=args.scfoundation_inference_batch_size,
         )
         if use_scf else None
     )

@@ -138,6 +138,10 @@ def build_scfoundation_spot_feature_cache(
         if out.shape != (end - start, output_dim):
             raise ValueError(f"{sample_id}: encoder returned shape {out.shape}, expected ({end - start}, {output_dim})")
         features[start:end] = out.astype(np.float32)
+        print(
+            f"scFoundation {sample_id}: encoded {end}/{n} spots",
+            flush=True,
+        )
     feature_available = np.ones(n, dtype=bool)
 
     path = _cache_path(cache_root, sample_id)

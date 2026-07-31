@@ -298,6 +298,8 @@ def test_encode_rows_is_row_independent_across_batch_composition_and_size():
     vocab = ["g0", "g1", "g2", "g3", "g4"]
     hidden_dim = 4
     encoder = _wired_bare_encoder(gene_names, vocab, output_dim=hidden_dim * 4, pool_type="all")
+    encoder.inference_microbatch_size = 3
+    encoder._microbatch_verified = False
 
     target_row = np.array([1.0, 0.0, 2.0, 0.0, 0.0], dtype=np.float32)  # 2 nonzero genes
     more_genes_row = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32)  # 5 nonzero genes
@@ -316,9 +318,9 @@ def test_encode_rows_is_row_independent_across_batch_composition_and_size():
         raw_library_size=np.array([lib, lib, lib], dtype=np.float32),
     )
 
-    np.testing.assert_array_equal(alone[0], beside_more[0])
-    np.testing.assert_array_equal(alone[0], beside_fewer[0])
-    np.testing.assert_array_equal(alone[0], batch_of_three[1])
+    np.testing.assert_allclose(alone[0], beside_more[0], rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(alone[0], beside_fewer[0], rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(alone[0], batch_of_three[1], rtol=1e-6, atol=1e-6)
 
 
 def test_encode_rows_releases_inactive_cuda_cache_only_at_bounded_ceiling(monkeypatch):
@@ -332,10 +334,12 @@ def test_encode_rows_releases_inactive_cuda_cache_only_at_bounded_ceiling(monkey
     encoder.output_dim = 4
     encoder.release_cuda_cache_between_rows = True
     encoder.max_cuda_reserved_bytes = 60 * 1024 ** 3
+    encoder.inference_microbatch_size = 1
+    encoder._microbatch_verified = True
     monkeypatch.setattr(
         encoder,
-        "_encode_one_row",
-        lambda _row: np.arange(4, dtype=np.float32),
+        "_encode_microbatch",
+        lambda rows: np.tile(np.arange(4, dtype=np.float32), (len(rows), 1)),
     )
     empty_cache_calls = []
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: empty_cache_calls.append(True))

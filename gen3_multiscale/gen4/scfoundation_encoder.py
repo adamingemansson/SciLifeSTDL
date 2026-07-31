@@ -3,8 +3,8 @@
 Same fail-closed discipline as `uni2_encoder.py`: a real, local checkpoint
 file and an exact gene-vocabulary mapping file are both mandatory; nothing
 here ever downloads a checkpoint. `encode_rows` is strictly row-independent
--- it must never compute or use any statistic derived from more than one
-row at a time (no batch norm, no dataset-level rescaling), so it is safe
+-- it must never compute or use any statistic derived from another row
+(no batch norm, no dataset-level rescaling), so it is safe
 against training/validation/test rows or the same row called twice.
 
 Integration audit finding #5 (six-launch-blocker follow-up), CONFIRMED
@@ -63,10 +63,11 @@ right-padded -- and both the fixed-index resolution-token read
 silently included those padding positions, making one row's embedding
 depend on which OTHER rows happened to share its batch. The official
 script only ever processes one cell/spot at a time, so this can never
-happen there. `encode_rows` now encodes ONE row at a time internally
-(`_encode_one_row`, batch dimension of size 1) -- this is not an
-approximation of the official per-row behavior, it reduces to it
-exactly, since a batch of 1 has zero padding by construction. See
+happen there. The corrected microbatch path tracks every row's own true
+length, reads its special tokens at that row's own last two positions,
+and excludes padding from max/mean pooling. On its first real call it
+also compares batched output against `_encode_one_row` and fails closed
+if the loaded checkpoint disagrees beyond floating-point tolerance. See
 `tests/test_scfoundation_encoder.py::test_encode_rows_is_row_independent_
 across_batch_composition_and_size` for the adversarial proof.
 
@@ -307,6 +308,7 @@ class FrozenSCFoundationEncoder(nn.Module):
         device: str = "cuda",
         release_cuda_cache_between_rows: bool = True,
         max_cuda_reserved_gb: float = 60.0,
+        inference_microbatch_size: int = 4,
     ):
         super().__init__()
         if pool_type not in ("all", "max"):
@@ -387,6 +389,10 @@ class FrozenSCFoundationEncoder(nn.Module):
         if not np.isfinite(max_cuda_reserved_gb) or float(max_cuda_reserved_gb) <= 0:
             raise ValueError("max_cuda_reserved_gb must be a finite positive number")
         self.max_cuda_reserved_bytes = int(float(max_cuda_reserved_gb) * (1024 ** 3))
+        if int(inference_microbatch_size) <= 0:
+            raise ValueError("inference_microbatch_size must be positive")
+        self.inference_microbatch_size = int(inference_microbatch_size)
+        self._microbatch_verified = False
         for parameter in self.model.parameters():
             parameter.requires_grad_(False)
         self.model.eval()
@@ -397,7 +403,7 @@ class FrozenSCFoundationEncoder(nn.Module):
             pinned_revision=vocab_sha256,  # scFoundation has no HF revision; vocab hash pins the identity instead
             package_version=package_version,
             preprocessing_spec=(
-                f"scfoundation_official_v1:main_gene_selection+cell_pooling_{pool_type}:"
+                f"scfoundation_official_v2:main_gene_selection+cell_pooling_{pool_type}:"
                 f"tgthighres=t{target_resolution_token:g}:log10_totalcount"
             ),
             output_dim=self.output_dim,
@@ -501,6 +507,72 @@ class FrozenSCFoundationEncoder(nn.Module):
             pooled, _ = torch.max(geneemb, dim=1)
         return pooled.detach().to("cpu").numpy().astype(np.float32)[0]
 
+    def _encode_microbatch(self, rows: np.ndarray) -> np.ndarray:
+        """Encode independent rows together without pooling padding.
+
+        The official gather operation right-pads each row to the largest
+        positive-token count in this microbatch.  Resolution tokens are
+        therefore selected at each row's own ``length-2``/``length-1``
+        positions, and gene max/mean pooling is restricted to positions
+        before them.  No statistic or attention connection crosses rows.
+        """
+        pretrain_gene_x = torch.as_tensor(
+            rows, dtype=torch.float32, device=self.device,
+        )
+        data_gene_ids = torch.arange(
+            pretrain_gene_x.shape[1], device=self.device,
+        ).unsqueeze(0).expand(pretrain_gene_x.shape[0], -1)
+        value_labels = pretrain_gene_x > 0
+        x, x_padding = gather_scfoundation_data(
+            pretrain_gene_x, value_labels, self.pad_token_id,
+        )
+        position_gene_ids, _ = gather_scfoundation_data(
+            data_gene_ids.float(), value_labels, self.pad_token_id,
+        )
+
+        x = self.model.token_emb(torch.unsqueeze(x, 2).float(), output_weight=0)
+        x = x + self.model.pos_emb(position_gene_ids.long())
+        geneemb = self.model.encoder(x, x_padding)
+
+        valid = ~x_padding.bool()
+        lengths = valid.sum(dim=1)
+        if bool((lengths <= 2).any()):
+            raise ValueError(
+                "scFoundation row has no positive expressed genes after vocabulary alignment"
+            )
+        batch_index = torch.arange(geneemb.shape[0], device=geneemb.device)
+        last = lengths - 1
+        second_last = lengths - 2
+
+        if self.pool_type == "all":
+            depth_token = geneemb[batch_index, last]
+            resolution_token = geneemb[batch_index, second_last]
+            positions = torch.arange(geneemb.shape[1], device=geneemb.device).unsqueeze(0)
+            gene_mask = positions < second_last.unsqueeze(1)
+            gene_count = gene_mask.sum(dim=1, keepdim=True)
+            gene_max = geneemb.masked_fill(~gene_mask.unsqueeze(-1), -torch.inf).amax(dim=1)
+            gene_mean = (
+                geneemb.masked_fill(~gene_mask.unsqueeze(-1), 0.0).sum(dim=1)
+                / gene_count.to(geneemb.dtype)
+            )
+            pooled = torch.cat(
+                [depth_token, resolution_token, gene_max, gene_mean], dim=1,
+            )
+        else:
+            pooled = geneemb.masked_fill(
+                ~valid.unsqueeze(-1), -torch.inf,
+            ).amax(dim=1)
+        return pooled.detach().to("cpu").numpy().astype(np.float32)
+
+    def _maybe_release_cuda_cache(self) -> None:
+        if self.device.type != "cuda" or not getattr(
+            self, "release_cuda_cache_between_rows", True,
+        ):
+            return
+        ceiling = getattr(self, "max_cuda_reserved_bytes", None)
+        if ceiling is None or torch.cuda.memory_reserved(self.device) >= ceiling:
+            torch.cuda.empty_cache()
+
     @torch.inference_mode()
     def encode_rows(self, expression: np.ndarray, raw_library_size: np.ndarray | None = None) -> np.ndarray:
         if expression.ndim != 2 or expression.shape[1] != len(self.gene_names):
@@ -523,26 +595,42 @@ class FrozenSCFoundationEncoder(nn.Module):
             raise ValueError("raw_library_size must be strictly positive (log10 of a real total count)")
 
         model_input = self._to_scfoundation_input(np.asarray(expression, dtype=np.float32), raw_library_size)
-        # Row-independence fix: encode ONE row at a time -- see
-        # `_encode_one_row`'s own docstring for why this is not merely a
-        # style choice but the actual correctness fix for a real,
-        # user-reported batch-composition-dependence bug.
         out = np.empty((expression.shape[0], self.output_dim), dtype=np.float32)
-        for row_index, row in enumerate(model_input):
-            out[row_index] = self._encode_one_row(row)
-            if self.device.type == "cuda" and getattr(
-                self, "release_cuda_cache_between_rows", True
-            ):
-                # `_encode_one_row` has returned and its CPU copy completed,
-                # so all row-local CUDA tensors are out of scope here.
-                # `empty_cache` releases only *unoccupied* allocator blocks;
-                # live model parameters remain resident and untouched.  An
-                # encoder built before the bounded policy existed has no
-                # ceiling attribute, so preserve its old release-every-row
-                # behavior rather than silently making it unbounded.
-                ceiling = getattr(self, "max_cuda_reserved_bytes", None)
-                if ceiling is None or torch.cuda.memory_reserved(self.device) >= ceiling:
-                    torch.cuda.empty_cache()
+        microbatch_size = int(getattr(self, "inference_microbatch_size", 1))
+
+        # The first real call proves on the loaded checkpoint that corrected
+        # padded microbatch pooling agrees with official single-row execution.
+        # This costs only two additional rows once per encoder process.
+        if microbatch_size > 1 and not getattr(self, "_microbatch_verified", False):
+            probe_n = min(2, model_input.shape[0])
+            if probe_n:
+                reference = np.stack(
+                    [self._encode_one_row(row) for row in model_input[:probe_n]], axis=0,
+                )
+                candidate = self._encode_microbatch(model_input[:probe_n])
+                if not np.allclose(reference, candidate, rtol=1e-4, atol=1e-5):
+                    max_error = float(np.max(np.abs(reference - candidate)))
+                    raise RuntimeError(
+                        "scFoundation microbatch output disagrees with official single-row "
+                        f"execution (maximum absolute error {max_error:.6g})"
+                    )
+            self._microbatch_verified = True
+            self._maybe_release_cuda_cache()
+
+        start = 0
+        active_batch_size = min(microbatch_size, max(1, model_input.shape[0]))
+        while start < model_input.shape[0]:
+            end = min(start + active_batch_size, model_input.shape[0])
+            try:
+                out[start:end] = self._encode_microbatch(model_input[start:end])
+            except torch.OutOfMemoryError:
+                if active_batch_size == 1:
+                    raise
+                torch.cuda.empty_cache()
+                active_batch_size = max(1, active_batch_size // 2)
+                continue
+            start = end
+            self._maybe_release_cuda_cache()
         if out.shape != (expression.shape[0], self.output_dim):
             raise RuntimeError(f"scFoundation encoder returned shape {out.shape}, expected ({expression.shape[0]}, {self.output_dim})")
         if not np.isfinite(out).all():
