@@ -112,3 +112,52 @@ def test_run_training_smoke_gen5a_latent_flow_kind(tmp_path, monkeypatch):
 
     result = run_training(str(config_path), smoke=True)
     assert result["ok"] is True
+
+
+def test_run_training_fails_closed_when_gen4_cache_missing(tmp_path, monkeypatch):
+    """Integration audit item 7: the mandatory Gen4 preflight gate runs
+    BEFORE any model/optimizer/DataLoader construction -- a resolved
+    manifest sample missing its real UNI2 cache must fail here, not
+    surface later as an opaque error deep inside the dataset's first
+    __getitem__ call."""
+    import pytest
+
+    cfg, manifest, manifest_path, samples = _prepare_experiment(tmp_path, monkeypatch)
+    # Deliberately never call _write_uni2_caches -- gen4a's required
+    # uni2/uni2_dense caches do not exist for any resolved sample.
+
+    config = yaml.safe_load((_CONFIG_DIR / "gen4" / "gen4a_conditioner.yaml").read_text())
+    config["model"]["params"].update(_TINY_PARAMS)
+    config_path = tmp_path / "gen4a_config_missing_cache.yaml"
+    _write_config(config, config_path, cfg=cfg, manifest_path=manifest_path, checkpoint_dir=tmp_path / "ckpt_gen4a_missing")
+
+    with pytest.raises(FileNotFoundError, match="UNI2"):
+        run_training(str(config_path), smoke=True)
+
+
+def test_run_training_non_smoke_gen4a_then_evaluate(tmp_path, monkeypatch):
+    """A real (non-smoke) one-step gen4a run writes a real checkpoint
+    (a plain --smoke run deliberately never does, matching every other
+    Gen3 architecture's own "construction-only" smoke contract) -- then
+    a real evaluate_gen3_checkpoint call over that checkpoint proves the
+    evaluator's own Gen4-aware dataset dispatch and kind-derived
+    prediction path (Integration audit item 9) actually execute."""
+    cfg, manifest, manifest_path, samples = _prepare_experiment(tmp_path, monkeypatch)
+    _write_uni2_caches(cfg, samples, output_dim=_TINY_PARAMS["image_feature_dim"])
+
+    config = yaml.safe_load((_CONFIG_DIR / "gen4" / "gen4a_conditioner.yaml").read_text())
+    config["model"]["params"].update(_TINY_PARAMS)
+    config["training"]["total_steps"] = 1
+    config["evaluation"]["gene_panels"] = {}  # the real named panel file isn't present in this sandbox
+    config_path = tmp_path / "gen4a_nonsmoke_config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_gen4a_nonsmoke"
+    _write_config(config, config_path, cfg=cfg, manifest_path=manifest_path, checkpoint_dir=checkpoint_dir)
+
+    result = run_training(str(config_path), smoke=False)
+    assert result["ok"] is True
+    assert result["final_step"] == 1
+
+    from gen3_multiscale.evaluation.gen3_evaluator import evaluate_gen3_checkpoint
+
+    report = evaluate_gen3_checkpoint(str(config_path), checkpoint_dir, split="validation", use_best=False)
+    assert report["kind"] == "gen3_step7_evaluation_report"

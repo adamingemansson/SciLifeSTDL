@@ -1760,6 +1760,7 @@ def run_training(
     # already-`.get`-based read of the identical field (both sides must
     # compute the same value for resume verification to be meaningful).
     architecture_id = str((config.get("model") or {}).get("architecture", ""))
+    is_gen4_or_gen5 = (config.get("model") or {}).get("arm") is not None
 
     manifest_path = data_cfg.get("gen3_manifest_path")
     if not manifest_path:
@@ -1787,6 +1788,19 @@ def run_training(
     samples, preflight_report = load_and_preflight_samples(
         cfg_om, dataset_manifest, train_ids + validation_ids, expected_provenance,
     )
+    # Integration audit item 7: mandatory Gen4/5 cache-coverage preflight,
+    # invoked here -- BEFORE any model/optimizer/DataLoader is
+    # constructed, in ADDITION to (never instead of) Gen3's own
+    # tile-encoder-provenance preflight immediately above. A missing or
+    # identity-mismatched UNI2/UNI2-dense/scFoundation cache for any
+    # resolved train+validation sample now fails closed here, rather
+    # than surfacing later as a FileNotFoundError from deep inside
+    # Gen4SpatialFieldDataset's first __getitem__ call.
+    if is_gen4_or_gen5:
+        from gen3_multiscale.gen4.preflight import audit_gen4_manifest_cache_coverage
+
+        gen4_cache_root = data_cfg.get("hest_cache_dir") or data_cfg.get("hest_data_dir")
+        audit_gen4_manifest_cache_coverage(gen4_cache_root, train_ids + validation_ids, config)
     # Codex re-audit of commit f7bb8a1, launch blocker #6: "Perform all
     # resume verification before writing preflight reports, mask banks,
     # gene scale, validation history or other checkpoint-directory
@@ -1844,7 +1858,6 @@ def run_training(
     # (`load_and_preflight_samples`/`build_gen3_mask_schedule`), only the
     # per-arm cache wiring (`__getitem__`) differs. See that class's own
     # docstring for exactly which caches each arm consumes.
-    is_gen4_or_gen5 = (config.get("model") or {}).get("arm") is not None
     if is_gen4_or_gen5:
         from gen3_multiscale.gen4.dataset_adapter import Gen4SpatialFieldDataset
 
