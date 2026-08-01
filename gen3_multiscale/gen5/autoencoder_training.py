@@ -48,7 +48,7 @@ def train_expression_autoencoder(
 
     autoencoder.train()
     loss_per_epoch = []
-    for _epoch in range(n_epochs):
+    for epoch in range(n_epochs):
         perm = torch.randperm(n_rows, generator=generator)
         epoch_loss, n_batches = 0.0, 0
         for start in range(0, n_rows, batch_size):
@@ -70,6 +70,11 @@ def train_expression_autoencoder(
             epoch_loss += float(loss.item())
             n_batches += 1
         loss_per_epoch.append(epoch_loss / max(n_batches, 1))
+        print(
+            f"[autoencoder epoch {epoch + 1}/{n_epochs}] "
+            f"train_mse={loss_per_epoch[-1]:.8f}",
+            flush=True,
+        )
 
     report = AutoencoderTrainingReport(
         n_epochs=n_epochs, n_rows=n_rows, final_train_loss=loss_per_epoch[-1] if loss_per_epoch else float("nan"),
