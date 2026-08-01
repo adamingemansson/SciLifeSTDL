@@ -852,11 +852,22 @@ def predict_for_metrics(
     own `forward()` to the conditioner pass; relying on that alias is
     exactly the bug this function's genericization fixes)."""
     if kind in ("flow", "latent_flow"):
-        conditioner_out = model.conditioner(inputs)
         predictive = model.sample_predictive_distribution(inputs, n_samples=n_samples, generator=generator)
+        conditioner_expression = predictive.get("deterministic_mean")
+        if conditioner_expression is None:
+            conditioner_expression = predictive.get(
+                "conditioner_expression_diagnostic_only"
+            )
+        if conditioner_expression is None:
+            # Backward-compatible guard for an external flow
+            # implementation that follows the sampling API but predates
+            # the deterministic_mean return field.  Every in-repository
+            # Gen3/Gen4/Gen5 flow supplies it, so production evaluation
+            # performs only one conditioner pass per prediction.
+            conditioner_expression = model.conditioner(inputs)["expression"]
         return {
             "expression": predictive["predictive_mean"],
-            "conditioner_only_expression": conditioner_out["expression"],
+            "conditioner_only_expression": conditioner_expression,
             "predictive_std": predictive["predictive_std"],
             "predictive_samples": predictive["predictive_samples"],
         }

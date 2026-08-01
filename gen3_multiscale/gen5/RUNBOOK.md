@@ -24,6 +24,7 @@ shared expression autoencoder:
    python -m gen3_multiscale.scripts.train_gen5_autoencoder \
      --manifest <manifest.json> \
      --output-checkpoint <run>/shared_autoencoder.pt \
+     --train-gene-panel-artifact <train_gene_panels.json> \
      --latent-dim 256 --hidden-dim 1024 \
      --epochs 50 --batch-size 64 --device cuda
    ```
@@ -37,19 +38,30 @@ shared expression autoencoder:
    for each arm. Gen5 must consume that exact verified immutable bundle,
    not a freshly initialized or differently selected conditioner.
 
-4. Resolve each Gen5 config with the manifest, frozen Gen4 conditioner,
-   shared encoder checkpoint, shared decoder checkpoint, and arm-specific
-   encoder/cache identities:
+4. Prepare all four primary configs together. This verifies the manifest,
+   train-derived panels, shared autoencoder, selected conditioners, frozen
+   model files, and every required per-sample cache before publishing one
+   immutable run root. Each mutable Gen4 `best/` input is resolved once;
+   the generated config records its exact immutable bundle.
 
    ```bash
-   python -m gen3_multiscale.scripts.resolve_gen45_config \
-     --base-config gen3_multiscale/configs/gen5/gen5c.yaml \
-     --output-config <run>/gen5c.yaml \
+   python -m gen3_multiscale.scripts.prepare_gen5_suite \
      --manifest <manifest.json> \
-     --checkpoint-dir <run>/gen5c_checkpoints \
-     --fingerprint gen4_conditioner_checkpoint=<selected-gen4-bundle> \
-     --fingerprint expression_autoencoder_checkpoint=<run>/shared_autoencoder.pt \
-     <arm-specific --fingerprint arguments>
+     --cache-root <hest-cache-root> \
+     --train-gene-panels <train_gene_panels.json> \
+     --autoencoder-checkpoint <autoencoder-run>/shared_autoencoder.pt \
+     --conditioner gen5c=<gen4c-checkpoints>/best \
+     --conditioner gen5b=<gen4b-checkpoints>/best \
+     --conditioner gen5d=<gen4d-checkpoints>/best \
+     --conditioner gen5e=<gen4e-checkpoints>/best \
+     --output-root <new-gen5-run-root> \
+     --uni2-checkpoint <UNI2-weights> \
+     --scfoundation-checkpoint <scFoundation-weights> \
+     --scfoundation-vocab <scFoundation-vocab> \
+     --stpath-checkpoint <STPath-weights> \
+     --stpath-gene-vocab <STPath-gene-vocab> \
+     --gigapath-checkpoint <GigaPath-LongNet-weights> \
+     --total-steps 100000000 --max-wall-clock-hours 24 --device cuda
    ```
 
 5. Run a real-artifact staged smoke and fixed-mask capacity gate, then the
@@ -57,16 +69,19 @@ shared expression autoencoder:
 
    ```bash
    python -m gen3_multiscale.training.train \
-     --config <resolved_gen5.yaml> --smoke --staged-smoke
+     --config <gen5-run-root>/configs/gen5c.yaml --smoke --staged-smoke
 
    python -m gen3_multiscale.scripts.step6_overfit_test \
-     --config <resolved_gen5.yaml> \
+     --config <gen5-run-root>/configs/gen5c.yaml \
      --sample-id <training-sample> \
      --checkpoint-dir <overfit-output>
 
    python -m gen3_multiscale.training.train \
-     --config <resolved_gen5.yaml>
+     --config <gen5-run-root>/configs/gen5c.yaml
    ```
+
+   Repeat the gate for `gen5b`, `gen5d`, and `gen5e`. Do not launch a
+   long run for an arm that fails either gate.
 
 6. Evaluate on validation using the common evaluator. Compare the Gen5
    latent flow with its matched Gen4 residual flow, its deterministic

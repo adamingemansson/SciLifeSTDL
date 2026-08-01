@@ -191,4 +191,10 @@ class Gen5LatentFlowModel(nn.Module):
             "predictive_std": predictive_std,
             "predictive_samples": decoded_samples,
             "latent_samples": z_samples,
+            # Explicitly diagnostic-only: this never enters expression,
+            # predictive_mean, or any sampled latent.  Returning the
+            # already-computed value avoids a second expensive conditioner
+            # pass in validation/evaluation without weakening Gen5's
+            # full-latent-generation contract.
+            "conditioner_expression_diagnostic_only": conditioner_out["expression"],
         }
