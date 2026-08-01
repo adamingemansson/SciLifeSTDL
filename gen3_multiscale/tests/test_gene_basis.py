@@ -92,6 +92,14 @@ def test_rejects_non_finite_residuals():
         fit_gene_residual_basis(residuals, [f"g{i}" for i in range(10)], rank=4)
 
 
+def test_rejects_unavailable_cuda_svd(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="CUDA is unavailable"):
+        fit_gene_residual_basis(
+            _residuals(), [f"g{i}" for i in range(10)], rank=4, svd_device="cuda"
+        )
+
+
 def test_randomized_svd_uses_explicit_qr_normalization_and_bounded_iterations(monkeypatch):
     import sklearn.utils.extmath
 
@@ -107,4 +115,5 @@ def test_randomized_svd_uses_explicit_qr_normalization_and_bounded_iterations(mo
 
     assert captured["power_iteration_normalizer"] == "QR"
     assert captured["n_iter"] == 4
+    assert captured["n_oversamples"] == 16
     assert captured["random_state"] == 0
