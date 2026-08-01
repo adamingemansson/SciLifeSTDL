@@ -190,7 +190,8 @@ def _load_verified_residual_cache(
 def fit_and_save_architecture4_basis(
     architecture3_config_path: str, architecture3_checkpoint_dir: str, output_basis_path: str,
     *, n_masks_per_sample: int = 20, rank: int = 64, device_str: str = "cpu", allow_code_drift: bool = False,
-    reuse_residuals_path: str | None = None,
+    reuse_residuals_path: str | None = None, svd_device: str = "cpu", svd_n_iter: int = 4,
+    svd_oversamples: int = 16,
 ) -> dict:
     """The full pipeline. Returns (and persists alongside the basis file,
     as `<output_basis_path>.provenance.json`) a provenance record binding
@@ -316,7 +317,18 @@ def fit_and_save_architecture4_basis(
             _write_verified_residual_cache(residuals, residual_path, residual_identity)
 
         n_residual_rows = int(residuals.shape[0])
-        basis = fit_gene_residual_basis(residuals, gene_names, rank=rank)
+        print(
+            f"fitting rank-{rank} residual basis on {svd_device} "
+            f"(n_iter={svd_n_iter}, n_oversamples={svd_oversamples}, shape={tuple(residuals.shape)})"
+        )
+        basis = fit_gene_residual_basis(
+            residuals,
+            gene_names,
+            rank=rank,
+            svd_device=svd_device,
+            n_iter=svd_n_iter,
+            n_oversamples=svd_oversamples,
+        )
     except BaseException:
         if residual_path.is_file() and residual_sidecar_path.is_file():
             print(
@@ -386,6 +398,9 @@ def fit_and_save_architecture4_basis(
         "n_masks_per_sample": int(n_masks_per_sample),
         "n_residual_rows": n_residual_rows,
         "rank": basis.rank,
+        "svd_device_type": torch.device(svd_device).type,
+        "svd_n_iter": int(svd_n_iter),
+        "svd_oversamples": int(svd_oversamples),
         "gene_residual_basis_sha256": gene_residual_basis_sha256,
         "mask_schedule_reports": train_schedule.reports,
         "training_mask_schedule_fingerprint": training_mask_schedule_fingerprint,
@@ -415,6 +430,12 @@ def main() -> None:
     parser.add_argument("--rank", type=int, default=64)
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
+        "--svd-device", default="cpu",
+        help="Device for the truncated SVD only. Use 'cuda' on an A100 to avoid the very slow CPU decomposition.",
+    )
+    parser.add_argument("--svd-n-iter", type=int, default=4)
+    parser.add_argument("--svd-oversamples", type=int, default=16)
+    parser.add_argument(
         "--reuse-residuals",
         help="Retry basis fitting from a retained, hash-verified residual .npy file produced by a failed prior run",
     )
@@ -429,6 +450,8 @@ def main() -> None:
         args.config, args.architecture3_checkpoint_dir, args.output_basis_path,
         n_masks_per_sample=args.n_masks_per_sample, rank=args.rank, device_str=args.device,
         allow_code_drift=args.allow_code_drift, reuse_residuals_path=args.reuse_residuals,
+        svd_device=args.svd_device, svd_n_iter=args.svd_n_iter,
+        svd_oversamples=args.svd_oversamples,
     )
     print(f"gene residual basis fit and saved: {json.dumps(provenance, indent=2, default=str)}")
 

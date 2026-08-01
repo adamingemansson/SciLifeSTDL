@@ -57,7 +57,14 @@ class GeneResidualBasis:
 
 
 def fit_gene_residual_basis(
-    residuals: np.ndarray, gene_names: list[str], rank: int = 64, *, random_state: int = 0,
+    residuals: np.ndarray,
+    gene_names: list[str],
+    rank: int = 64,
+    *,
+    random_state: int = 0,
+    svd_device: str = "cpu",
+    n_iter: int = 4,
+    n_oversamples: int = 16,
 ) -> GeneResidualBasis:
     """Fit a FIXED orthonormal low-rank basis via a DETERMINISTIC
     randomized truncated SVD on a TRAINING-only residuals matrix
@@ -96,22 +103,51 @@ def fit_gene_residual_basis(
     effective_rank = min(int(rank), max_rank)
     if effective_rank < 1:
         raise ValueError("rank must be positive")
+    if int(n_iter) < 0:
+        raise ValueError("n_iter must be non-negative")
+    if int(n_oversamples) < 0:
+        raise ValueError("n_oversamples must be non-negative")
 
-    from sklearn.utils.extmath import randomized_svd
+    device = torch.device(svd_device)
+    if device.type == "cpu":
+        from sklearn.utils.extmath import randomized_svd
 
-    # Explicit QR normalization avoids sklearn's AUTO -> LU path and its
-    # LAPACK SLASWP calls, which have failed on the real 90k x 17k memmap.
-    # Four power iterations are a bounded, deterministic accuracy/runtime
-    # compromise for the fixed rank-64 residual basis; leaving n_iter=AUTO
-    # selected seven expensive full-matrix passes for this shape.
-    _u, _s, vt = randomized_svd(
-        residuals,
-        n_components=effective_rank,
-        n_iter=4,
-        power_iteration_normalizer="QR",
-        random_state=random_state,
-    )
-    basis = vt[:effective_rank]  # [effective_rank, n_genes], orthonormal rows by construction
+        # Explicit QR normalization avoids sklearn's AUTO -> LU path and its
+        # LAPACK SLASWP calls, which have failed on the real 90k x 17k memmap.
+        _u, _s, vt = randomized_svd(
+            residuals,
+            n_components=effective_rank,
+            n_iter=int(n_iter),
+            n_oversamples=int(n_oversamples),
+            power_iteration_normalizer="QR",
+            random_state=random_state,
+        )
+        basis = vt[:effective_rank]
+    elif device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"svd_device={svd_device!r} requested but CUDA is unavailable")
+        # The real residual matrix is about 6.2 GB and fits comfortably on
+        # the project's 80-GB A100s. Keep the same randomized rank,
+        # oversampling, and iteration controls while moving the matrix
+        # multiplications off the prohibitively slow CPU path.
+        q = min(max_rank, effective_rank + int(n_oversamples))
+        torch.manual_seed(int(random_state))
+        torch.cuda.manual_seed_all(int(random_state))
+        matrix = torch.as_tensor(residuals, dtype=torch.float32, device=device)
+        try:
+            _u, _s, v = torch.svd_lowrank(matrix, q=q, niter=int(n_iter), M=None)
+            basis_tensor = v[:, :effective_rank].T.contiguous()
+            # SVD vector signs are arbitrary. Canonicalize them so a fixed
+            # numerical decomposition has a stable saved orientation.
+            pivot = basis_tensor.abs().argmax(dim=1)
+            row = torch.arange(effective_rank, device=device)
+            signs = torch.sign(basis_tensor[row, pivot])
+            signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+            basis = (basis_tensor * signs[:, None]).cpu().numpy()
+        finally:
+            del matrix
+    else:
+        raise ValueError(f"svd_device must be 'cpu' or a CUDA device, got {svd_device!r}")
 
     gene_names_hash = hashlib.sha256("\0".join(gene_names).encode()).hexdigest()
     return GeneResidualBasis(
