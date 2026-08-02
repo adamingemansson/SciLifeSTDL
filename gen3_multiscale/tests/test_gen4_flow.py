@@ -131,6 +131,52 @@ def test_basis_fitting_uses_only_supplied_training_residuals():
         assert torch.allclose(basis1.basis, basis2.basis)
 
 
+def test_basis_fitting_terminates_for_modulo_indexed_dataset():
+    """The real Gen4 dataset wraps indices and never raises IndexError."""
+    from gen3_multiscale.gen4.basis_fit import fit_gen4_residual_basis
+    from gen3_multiscale.gen4.conditioner import Gen4Conditioner
+
+    n_genes, gex_dim, image_dim = 6, 4, 8
+    examples = [
+        synthetic_gen4_inputs(
+            n_genes=n_genes, gex_dim=gex_dim, image_dim=image_dim, seed=seed,
+        )
+        for seed in range(3)
+    ]
+
+    class ModuloDataset:
+        def __init__(self, items):
+            self.items = items
+            self.n_getitem_calls = 0
+
+        def __len__(self):
+            return len(self.items)
+
+        def __getitem__(self, index):
+            self.n_getitem_calls += 1
+            return self.items[index % len(self.items)]
+
+    dataset = ModuloDataset(examples)
+    conditioner = Gen4Conditioner(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        use_regional_he=False, global_context_source="none", **GEN4_MODEL_KWARGS,
+    )
+
+    import os
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        fit_gen4_residual_basis(
+            conditioner,
+            dataset,
+            [f"g{i}" for i in range(n_genes)],
+            rank=2,
+            output_basis_path=os.path.join(tmp, "basis.pt"),
+        )
+
+    # One finite counting pass and one finite residual-inference pass.
+    assert dataset.n_getitem_calls == 2 * len(dataset)
+
+
 def test_arm_d_flow_forward_and_stpath_wiring():
     """The REAL arm D: image_feature_source='stpath_context' +
     gex_feature_source='stpath_joint', end to end through

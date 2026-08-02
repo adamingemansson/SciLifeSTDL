@@ -39,9 +39,17 @@ def compute_gen4_training_residuals(
     training-only data, matching the rest of this codebase's "fit offline,
     outside this class" discipline for anything that touches the
     train/validation/test boundary."""
-    if not train_examples:
+    n_examples = len(train_examples)
+    if n_examples == 0:
         raise ValueError("compute_gen4_training_residuals: train_examples is empty")
-    row_counts = [np.asarray(targets.query_expression).shape[0] for _inputs, targets in train_examples]
+    # Index explicitly over the declared finite Sequence length.  PyTorch
+    # Dataset implementations in this project intentionally wrap indices
+    # modulo their schedule length, so Python's legacy ``for x in dataset``
+    # protocol would never receive IndexError and would loop forever.
+    row_counts = [
+        np.asarray(train_examples[idx][1].query_expression).shape[0]
+        for idx in range(n_examples)
+    ]
     total_rows = int(sum(row_counts))
     if total_rows == 0:
         raise ValueError("compute_gen4_training_residuals: zero residual rows")
@@ -53,7 +61,8 @@ def compute_gen4_training_residuals(
     conditioner.eval()
     with torch.no_grad():
         offset = 0
-        for inputs, targets in train_examples:
+        for idx in range(n_examples):
+            inputs, targets = train_examples[idx]
             target_expression = torch.as_tensor(targets.query_expression, dtype=torch.float32, device=device)
             out = conditioner(inputs)
             residual = target_expression - torch.as_tensor(out["expression"], dtype=torch.float32, device=device)
