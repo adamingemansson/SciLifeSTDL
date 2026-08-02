@@ -69,12 +69,28 @@ def compute_gen4_training_residuals(
 def fit_gen4_residual_basis(
     conditioner, train_examples: Sequence, gene_names: list[str], *, rank: int = 64,
     device: torch.device | None = None, output_basis_path: str | Path,
+    svd_device: str = "cpu", svd_n_iter: int = 4, svd_oversamples: int = 16,
 ) -> GeneResidualBasis:
     device = device or torch.device("cpu")
     memmap_path = Path(f"{output_basis_path}.residuals.tmp.{os.getpid()}.npy")
     try:
         residuals = compute_gen4_training_residuals(conditioner, train_examples, device, memmap_path=memmap_path)
-        basis = fit_gene_residual_basis(residuals, gene_names, rank=rank)
+        # Residual inference is complete at this point. Move the large
+        # conditioner off CUDA before loading the 6-GB residual matrix for
+        # the truncated SVD; the conditioner is never used again in this
+        # fitting call.
+        if torch.device(svd_device).type == "cuda":
+            conditioner.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        basis = fit_gene_residual_basis(
+            residuals,
+            gene_names,
+            rank=rank,
+            svd_device=svd_device,
+            n_iter=svd_n_iter,
+            n_oversamples=svd_oversamples,
+        )
         del residuals
     finally:
         memmap_path.unlink(missing_ok=True)
