@@ -44,6 +44,9 @@ def fit_and_save_gen4_basis(
     rank: int = 64,
     device_str: str = "cpu",
     allow_code_drift: bool = False,
+    svd_device: str = "cpu",
+    svd_n_iter: int = 4,
+    svd_oversamples: int = 16,
 ) -> dict:
     config = resolved_config(conditioner_config_path)
     model_cfg = config.get("model") or {}
@@ -106,6 +109,9 @@ def fit_and_save_gen4_basis(
         rank=rank,
         device=device,
         output_basis_path=output_basis_path,
+        svd_device=svd_device,
+        svd_n_iter=svd_n_iter,
+        svd_oversamples=svd_oversamples,
     )
     basis_sha256 = hashlib.sha256(
         np.ascontiguousarray(basis.basis.detach().cpu().numpy()).tobytes()
@@ -126,6 +132,9 @@ def fit_and_save_gen4_basis(
         "gene_panel_hash": gene_panel_hash(gene_names),
         "gene_residual_basis_sha256": basis_sha256,
         "rank": int(basis.rank),
+        "svd_device_type": torch.device(svd_device).type,
+        "svd_n_iter": int(svd_n_iter),
+        "svd_oversamples": int(svd_oversamples),
         "n_masks_per_sample": int(n_masks_per_sample),
         "train_sample_ids": sorted(train_ids),
         "cache_content_by_sample": preflight["cache_content_by_sample"],
@@ -148,6 +157,9 @@ def main() -> None:
     parser.add_argument("--n-masks-per-sample", type=int, default=20)
     parser.add_argument("--rank", type=int, default=64)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--svd-device", default="cpu")
+    parser.add_argument("--svd-n-iter", type=int, default=4)
+    parser.add_argument("--svd-oversamples", type=int, default=16)
     parser.add_argument("--allow-code-drift", action="store_true")
     args = parser.parse_args()
     report = fit_and_save_gen4_basis(
@@ -158,6 +170,9 @@ def main() -> None:
         rank=args.rank,
         device_str=args.device,
         allow_code_drift=args.allow_code_drift,
+        svd_device=args.svd_device,
+        svd_n_iter=args.svd_n_iter,
+        svd_oversamples=args.svd_oversamples,
     )
     print(json.dumps(report, indent=2, default=str))
 
