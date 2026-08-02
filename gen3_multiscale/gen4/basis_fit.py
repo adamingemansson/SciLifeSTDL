@@ -46,14 +46,17 @@ def compute_gen4_training_residuals(
     # Dataset implementations in this project intentionally wrap indices
     # modulo their schedule length, so Python's legacy ``for x in dataset``
     # protocol would never receive IndexError and would loop forever.
-    row_counts = [
-        np.asarray(train_examples[idx][1].query_expression).shape[0]
-        for idx in range(n_examples)
-    ]
+    row_counts = []
+    n_genes = None
+    for idx in range(n_examples):
+        query_expression = np.asarray(train_examples[idx][1].query_expression)
+        row_counts.append(query_expression.shape[0])
+        if n_genes is None:
+            n_genes = query_expression.shape[1]
     total_rows = int(sum(row_counts))
     if total_rows == 0:
         raise ValueError("compute_gen4_training_residuals: zero residual rows")
-    n_genes = np.asarray(train_examples[0][1].query_expression).shape[1]
+    assert n_genes is not None
 
     memmap_path = Path(memmap_path)
     memmap_path.parent.mkdir(parents=True, exist_ok=True)
