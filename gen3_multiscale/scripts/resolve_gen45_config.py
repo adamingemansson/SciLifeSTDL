@@ -34,6 +34,7 @@ def resolve_gen45_config(
     checkpoint_dir: str,
     fingerprints: dict[str, str],
     data_overrides: dict[str, str],
+    evaluation_overrides: dict[str, str] | None = None,
     total_steps: int | None = None,
     max_wall_clock_hours: float | None = None,
     device: str = "cuda",
@@ -55,6 +56,7 @@ def resolve_gen45_config(
         config["training"]["max_wall_clock_hours"] = float(max_wall_clock_hours)
     config["required_fingerprints"].update(fingerprints)
     config["data"].update(data_overrides)
+    config["evaluation"].update(evaluation_overrides or {})
 
     kind = str((config.get("model") or {}).get("kind"))
     report = (
@@ -82,6 +84,13 @@ def main() -> None:
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--fingerprint", action="append", default=[], metavar="NAME=VALUE")
     parser.add_argument("--data", action="append", default=[], metavar="NAME=VALUE")
+    parser.add_argument(
+        "--evaluation",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="Set an evaluation field, e.g. train_gene_panel_artifact=/path/train_gene_panels.json",
+    )
     parser.add_argument("--total-steps", type=int)
     parser.add_argument("--max-wall-clock-hours", type=float)
     parser.add_argument("--device", default="cuda")
@@ -93,6 +102,7 @@ def main() -> None:
         checkpoint_dir=args.checkpoint_dir,
         fingerprints=_pairs(args.fingerprint),
         data_overrides=_pairs(args.data),
+        evaluation_overrides=_pairs(args.evaluation),
         total_steps=args.total_steps,
         max_wall_clock_hours=args.max_wall_clock_hours,
         device=args.device,
