@@ -382,6 +382,92 @@ def load_slide_context(
     }
 
 
+def load_slide_context_geometry_only(
+    cfg, sample_id: str, spot_coords: np.ndarray,
+) -> dict | None:
+    """Load WSI geometry for a no-image ablation without reading features.
+
+    Dense cache ``.npz`` members are decompressed lazily.  This function
+    accesses coordinates and scalar geometry only; it deliberately never
+    indexes the cache's ``features`` member or encoder-provenance members.
+    It supplies a correctly shaped zero feature matrix so architectures that
+    require regional/global WSI branches retain the identical visible-tile
+    geometry while receiving no image content.
+    """
+    source = str(cfg.data.get("slide_context_source", "disabled"))
+    if source == "disabled":
+        return None
+
+    if source == "spot_aligned":
+        tile_size = float(cfg.data.get("spot_patch_size_fullres", 224.0))
+        coords = np.asarray(spot_coords[:, :2], dtype=np.float32) - tile_size / 2.0
+        mask_coords = coords
+        mask_tile_size = tile_size
+        coords_are_centers = False
+    elif source == "dense_wsi_cache":
+        path = _cache_path(cfg, sample_id)
+        if not path.is_file():
+            raise FileNotFoundError(f"Dense WSI geometry cache missing for {sample_id}: {path}")
+        with np.load(path, allow_pickle=False) as cached:
+            required = {"coords", "tile_size", "coords_are_centers"}
+            missing = sorted(required.difference(cached.files))
+            if missing:
+                raise ValueError(f"slide cache {path} is missing geometry fields {missing}")
+            coords = np.asarray(cached["coords"], dtype=np.float32)
+            tile_size = float(np.asarray(cached["tile_size"]).item())
+            coords_are_centers = bool(np.asarray(cached["coords_are_centers"]).item())
+            mask_coords = np.asarray(
+                cached["level0_coords"] if "level0_coords" in cached.files else coords,
+                dtype=np.float32,
+            )
+            mask_tile_size = float(np.asarray(
+                cached["level0_tile_size"] if "level0_tile_size" in cached.files else tile_size,
+            ).item())
+            wsi_dimensions = (
+                np.asarray(cached["wsi_dimensions"], dtype=np.float64)
+                if "wsi_dimensions" in cached.files else None
+            )
+        if coords.ndim != 2 or coords.shape[1] != 2 or coords.shape[0] < 1:
+            raise ValueError(f"slide context coords must be non-empty [N,2], got {coords.shape}")
+        if mask_coords.shape != coords.shape:
+            raise ValueError(
+                f"slide context level0_coords must match coords shape {coords.shape}, got {mask_coords.shape}"
+            )
+        if not np.isfinite(coords).all() or not np.isfinite(mask_coords).all():
+            raise ValueError(f"slide context geometry for {sample_id} contains non-finite values")
+        if tile_size <= 0 or mask_tile_size <= 0:
+            raise ValueError(f"slide context geometry for {sample_id} has an invalid tile size")
+        validate_dense_wsi_tile_geometry(
+            sample_id, coords, mask_coords, mask_tile_size, spot_coords,
+            wsi_dimensions=wsi_dimensions, cache_label=f"dense WSI geometry cache {path}",
+        )
+    else:
+        raise ValueError(
+            "data.slide_context_source must be disabled, spot_aligned, or dense_wsi_cache"
+        )
+
+    geometry_digest = hashlib.sha256()
+    geometry_digest.update(np.ascontiguousarray(coords).tobytes())
+    geometry_digest.update(np.ascontiguousarray(mask_coords).tobytes())
+    geometry_digest.update(str(tile_size).encode())
+    geometry_digest.update(str(mask_tile_size).encode())
+    geometry_digest.update(str(coords_are_centers).encode())
+    return {
+        "features": np.zeros((coords.shape[0], 1536), dtype=np.float32),
+        "coords": coords,
+        "mask_coords": mask_coords,
+        "tile_size": tile_size,
+        "mask_tile_size": mask_tile_size,
+        "coords_are_centers": coords_are_centers,
+        "context_id": hashlib.sha256(
+            f"{sample_id}:zero-image-geometry:{geometry_digest.hexdigest()}".encode()
+        ).hexdigest()[:24],
+        "source": f"{source}_zero_image_geometry",
+        "tile_encoder_provenance": None,
+        "image_features_loaded": False,
+    }
+
+
 def _overlaps_query_hole(
     tile_centers: np.ndarray,
     tile_half_size: float,

@@ -9,7 +9,8 @@ import pytest
 from omegaconf import OmegaConf
 
 from gen3_multiscale.data.slide_context import (
-    load_slide_context, nonoverlapping_context_patch_mask, tile_centers, visible_slide_context,
+    load_slide_context, load_slide_context_geometry_only, nonoverlapping_context_patch_mask,
+    tile_centers, visible_slide_context,
 )
 
 
@@ -180,6 +181,34 @@ def _write_dense_wsi_cache(path, features, coords, tile_size=256.0, **extra_prov
         path, features=features, coords=coords, tile_size=np.asarray(tile_size),
         coords_are_centers=np.asarray(False), **kwargs,
     )
+
+
+def test_geometry_only_loader_does_not_consume_cached_image_features(tmp_path):
+    cache_dir = tmp_path / "hest1k" / "gigapath_slide_cache"
+    cache_dir.mkdir(parents=True)
+    coords = np.asarray([[0.0, 0.0], [256.0, 0.0], [512.0, 0.0]], dtype=np.float32)
+    # Deliberately unusable as a real image cache: wrong width and NaNs.
+    # A full loader would reject it. The no-image loader must never read
+    # or validate this member because its content cannot reach the model.
+    unusable_features = np.full((3, 7), np.nan, dtype=np.float32)
+    _write_dense_wsi_cache(
+        cache_dir / "S0.npz", unusable_features, coords,
+        level0_coords=coords, level0_tile_size=np.asarray(256.0),
+    )
+    cfg = OmegaConf.create({
+        "data": {
+            "slide_context_source": "dense_wsi_cache",
+            "hest_data_dir": str(tmp_path / "hest1k"),
+        }
+    })
+    spot_coords = np.asarray([[128.0, 128.0], [384.0, 128.0], [640.0, 128.0]], dtype=np.float32)
+
+    context = load_slide_context_geometry_only(cfg, "S0", spot_coords)
+
+    assert context["image_features_loaded"] is False
+    assert context["features"].shape == (3, 1536)
+    assert not np.any(context["features"])
+    np.testing.assert_array_equal(context["coords"], coords)
 
 
 def _load_edge_alignment_fixture(tmp_path, spot_coords):
