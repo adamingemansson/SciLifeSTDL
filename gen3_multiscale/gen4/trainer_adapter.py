@@ -65,6 +65,7 @@ def _pin_and_verify_conditioner(
     dataset_manifest: dict,
     gene_names: list[str],
     cache_content_by_sample: dict[str, dict] | None,
+    allow_code_drift: bool = False,
 ):
     """Resolve once and verify the staged conditioner in its own config.
 
@@ -95,6 +96,7 @@ def _pin_and_verify_conditioner(
         dataset_manifest=dataset_manifest,
         gene_names=gene_names,
         cache_content_by_sample=cache_content_by_sample,
+        allow_code_drift=allow_code_drift,
     )
     return identity
 
@@ -260,6 +262,7 @@ def build_gen4_model_for_inference(
     checkpoint_dir: str | Path | None = None, smoke: bool = False, staged_smoke: bool = False,
     dataset_manifest: dict | None = None,
     cache_content_by_sample: dict[str, dict] | None = None,
+    allow_code_drift: bool = False,
 ) -> tuple[nn.Module, dict]:
     """Gen4 equivalent of `train.py::build_model_for_inference` (called
     from that same function once it detects `is_gen4_config(config)`) --
@@ -333,6 +336,7 @@ def build_gen4_model_for_inference(
                     dataset_manifest=dataset_manifest,
                     gene_names=gene_names,
                     cache_content_by_sample=cache_content_by_sample,
+                    allow_code_drift=allow_code_drift,
                 )
             else:
                 # Backward-compatible low-level construction path used
@@ -400,6 +404,7 @@ def build_gen5_model_for_inference(
     checkpoint_dir: str | Path | None = None, smoke: bool = False, staged_smoke: bool = False,
     dataset_manifest: dict | None = None,
     cache_content_by_sample: dict[str, dict] | None = None,
+    allow_code_drift: bool = False,
 ) -> tuple[nn.Module, dict]:
     """Gen5 equivalent of `build_gen4_model_for_inference` -- construct a
     `Gen5LatentFlowModel` (kind == "latent_flow"): load the exact shared
@@ -482,6 +487,7 @@ def build_gen5_model_for_inference(
                 dataset_manifest=dataset_manifest,
                 gene_names=gene_names,
                 cache_content_by_sample=cache_content_by_sample,
+                allow_code_drift=allow_code_drift,
             )
         else:
             pinned_conditioner_identity = checkpoint_module.resolve_checkpoint_identity(
@@ -523,6 +529,7 @@ def build_gen4_or_gen5_model_for_inference(
     checkpoint_dir: str | Path | None = None, smoke: bool = False, staged_smoke: bool = False,
     dataset_manifest: dict | None = None,
     cache_content_by_sample: dict[str, dict] | None = None,
+    allow_code_drift: bool = False,
 ) -> tuple[nn.Module, dict]:
     """The single dispatch point `training/train.py::build_model_for_
     inference` calls whenever `is_gen4_config(config)` is true --
@@ -537,9 +544,11 @@ def build_gen4_or_gen5_model_for_inference(
             config, gene_names=gene_names, device=device, checkpoint_dir=checkpoint_dir,
             smoke=smoke, staged_smoke=staged_smoke, dataset_manifest=dataset_manifest,
             cache_content_by_sample=cache_content_by_sample,
+            allow_code_drift=allow_code_drift,
         )
     return build_gen4_model_for_inference(
         config, gene_names=gene_names, device=device, checkpoint_dir=checkpoint_dir,
         smoke=smoke, staged_smoke=staged_smoke, dataset_manifest=dataset_manifest,
         cache_content_by_sample=cache_content_by_sample,
+        allow_code_drift=allow_code_drift,
     )

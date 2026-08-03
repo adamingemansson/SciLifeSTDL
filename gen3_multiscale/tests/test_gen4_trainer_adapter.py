@@ -45,6 +45,57 @@ def test_is_gen4_config_distinguishes_gen3_and_gen4_schemas():
     assert is_gen4_config({"model": {"architecture": "3"}}) is False
 
 
+def test_shared_gen4_dispatch_propagates_allow_code_drift(monkeypatch):
+    from gen3_multiscale.gen4 import trainer_adapter
+
+    observed = {}
+
+    def fake_dispatch(*args, **kwargs):
+        observed["allow_code_drift"] = kwargs["allow_code_drift"]
+        return object(), {"kind": "conditioner"}
+
+    monkeypatch.setattr(
+        trainer_adapter, "build_gen4_or_gen5_model_for_inference", fake_dispatch,
+    )
+    build_model_for_inference(
+        {"model": {"arm": "gen4a"}},
+        gene_names=GENE_NAMES,
+        device=torch.device("cpu"),
+        allow_code_drift=True,
+    )
+    assert observed["allow_code_drift"] is True
+
+
+def test_conditioner_verifier_receives_allow_code_drift(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from gen3_multiscale.gen4 import trainer_adapter
+    from gen3_multiscale.training import train as train_module
+
+    (tmp_path / "model_config.json").write_text(json.dumps({
+        "model": {"arm": "gen4a", "kind": "conditioner"},
+    }))
+    identity = SimpleNamespace(resolved_dir=tmp_path)
+    monkeypatch.setattr(
+        checkpoint_module, "resolve_checkpoint_identity", lambda _path: identity,
+    )
+    observed = {}
+
+    def fake_verify(*args, **kwargs):
+        observed["allow_code_drift"] = kwargs["allow_code_drift"]
+
+    monkeypatch.setattr(train_module, "verify_full_checkpoint_identity", fake_verify)
+    trainer_adapter._pin_and_verify_conditioner(
+        tmp_path,
+        expected_arm="gen4a",
+        dataset_manifest={},
+        gene_names=GENE_NAMES,
+        cache_content_by_sample=None,
+        allow_code_drift=True,
+    )
+    assert observed["allow_code_drift"] is True
+
+
 def test_build_model_for_inference_dispatches_to_gen4_conditioner(tmp_path):
     config = _tiny_conditioner_config()
     model, info = build_model_for_inference(config, gene_names=GENE_NAMES, device=torch.device("cpu"), smoke=True)
