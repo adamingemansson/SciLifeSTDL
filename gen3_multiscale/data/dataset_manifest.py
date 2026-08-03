@@ -152,6 +152,34 @@ def _sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+def verify_expression_content_provenance(
+    hest_data_dir: str | Path, manifest: dict, sample_id: str,
+) -> None:
+    """Verify only the expression H5AD used by a no-image evaluation.
+
+    The no-image ablation deliberately never opens the patch H5 or image
+    feature caches.  Re-hashing the multi-gigabyte patch file would defeat
+    that contract even though none of its content can affect the prediction.
+    Expression remains a real model input/target, so its H5AD is still checked
+    against the immutable manifest exactly as in the full provenance gate.
+    """
+    record = manifest["samples"].get(sample_id)
+    if record is None:
+        raise ValueError(f"{sample_id!r} is not a sample the dataset manifest declares")
+    expected = record.get("content_provenance")
+    if not expected:
+        raise ValueError(f"{sample_id}: manifest has no content_provenance recorded -- rebuild the manifest")
+
+    h5ad_path = loaders._resolve_hest_sample_file(hest_data_dir, sample_id, ".h5ad")
+    actual_h5ad_sha256 = _sha256_file(h5ad_path)
+    if actual_h5ad_sha256 != expected["h5ad"]["sha256"]:
+        raise ValueError(
+            f"{sample_id}: h5ad file at {h5ad_path} has SHA256 {actual_h5ad_sha256}, but the "
+            f"dataset manifest declares {expected['h5ad']['sha256']} -- the file on disk has "
+            "changed since the manifest was built; rebuild the manifest or restore the original file"
+        )
+
+
 def verify_content_provenance(hest_data_dir: str | Path, manifest: dict, sample_id: str) -> None:
     """Recompute and compare this sample's real, ON-DISK h5ad/patch-h5
     content hashes against `manifest["samples"][sample_id]
@@ -176,17 +204,10 @@ def verify_content_provenance(hest_data_dir: str | Path, manifest: dict, sample_
     if not expected:
         raise ValueError(f"{sample_id}: manifest has no content_provenance recorded -- rebuild the manifest")
 
-    h5ad_path = loaders._resolve_hest_sample_file(hest_data_dir, sample_id, ".h5ad")
+    verify_expression_content_provenance(hest_data_dir, manifest, sample_id)
     patch_path = loaders._resolve_hest_sample_file(
         hest_data_dir, sample_id, ".h5", required_path_part="patches",
     )
-    actual_h5ad_sha256 = _sha256_file(h5ad_path)
-    if actual_h5ad_sha256 != expected["h5ad"]["sha256"]:
-        raise ValueError(
-            f"{sample_id}: h5ad file at {h5ad_path} has SHA256 {actual_h5ad_sha256}, but the "
-            f"dataset manifest declares {expected['h5ad']['sha256']} -- the file on disk has "
-            "changed since the manifest was built; rebuild the manifest or restore the original file"
-        )
     actual_patch_sha256 = _sha256_file(patch_path)
     if actual_patch_sha256 != expected["patch_h5"]["sha256"]:
         raise ValueError(

@@ -137,6 +137,7 @@ def cache_content_fingerprint(content_identity_by_sample: dict[str, dict]) -> st
 
 def load_and_preflight_samples(
     cfg, manifest: dict, sample_ids: list[str], expected_tile_encoder_provenance: dict,
+    *, zero_image_input: bool = False,
 ) -> tuple[dict[str, Gen3SampleData], dict]:
     """Load every sample in `sample_ids` EXACTLY once (real I/O -- the
     real, one-time preflight cost, not a per-epoch one), verify cache
@@ -168,12 +169,30 @@ def load_and_preflight_samples(
     provenance_by_source: dict[str, dict] = {}
     content_identity_by_sample: dict[str, dict] = {}
     for sample_id in sample_ids:
-        sample = load_gen3_sample_data(cfg, manifest, sample_id)
+        sample = load_gen3_sample_data(
+            cfg, manifest, sample_id, zero_image_input=zero_image_input,
+        )
         samples[sample_id] = sample
+        if zero_image_input:
+            continue
         provenance_by_source.update(collect_sample_cache_provenance(sample, require_dense_wsi=require_dense_wsi))
         content_identity_by_sample[sample_id] = collect_sample_cache_content_identity(
             sample, require_dense_wsi=require_dense_wsi,
         )
+
+    if zero_image_input:
+        return samples, {
+            "version": 3,
+            "kind": "gen3_no_image_evaluation_preflight",
+            "n_samples": len(sample_ids),
+            "sample_ids": sorted(sample_ids),
+            "image_patches_loaded": False,
+            "spot_image_features_loaded": False,
+            "dense_wsi_image_features_loaded": False,
+            "wsi_geometry_retained": bool(require_dense_wsi),
+            "cache_content_by_sample": {},
+            "passed": True,
+        }
 
     coverage = verify_cache_coverage(
         expected_cache_source_labels(sample_ids, require_dense_wsi=require_dense_wsi), provenance_by_source.keys(),

@@ -303,6 +303,7 @@ def test_evaluate_gen3_checkpoint_reports_model_and_baseline_metrics_on_validati
         "zero_image_input": False,
         "image_feature_content": "unmodified",
         "observed_image_available": "unmodified",
+        "source_image_data_loaded": True,
         "spatial_geometry": "retained",
     }
 
@@ -310,9 +311,18 @@ def test_evaluate_gen3_checkpoint_reports_model_and_baseline_metrics_on_validati
     assert saved_path.is_file()
 
 
-def test_evaluate_gen3_checkpoint_records_zero_image_ablation(tmp_path, monkeypatch):
+def test_evaluate_gen3_checkpoint_records_zero_image_ablation_without_loading_images(tmp_path, monkeypatch):
     cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
     config_path, checkpoint_dir = _train_a_real_checkpoint(tmp_path, cfg, manifest, manifest_path)
+
+    def _image_load_is_a_test_failure(*_args, **_kwargs):
+        raise AssertionError("no-image evaluation must not load raw patches or spot-image caches")
+
+    monkeypatch.setattr("gen3_multiscale.data.loaders.load_hest_patches", _image_load_is_a_test_failure)
+    monkeypatch.setattr(
+        "gen3_multiscale.data.spot_feature_cache.load_gen3_spot_features",
+        _image_load_is_a_test_failure,
+    )
 
     report = evaluate_gen3_checkpoint(
         str(config_path), checkpoint_dir, split="validation", n_masks_per_sample=2,
@@ -323,9 +333,13 @@ def test_evaluate_gen3_checkpoint_records_zero_image_ablation(tmp_path, monkeypa
         "zero_image_input": True,
         "image_feature_content": "all_zero",
         "observed_image_available": "all_false",
+        "source_image_data_loaded": False,
         "spatial_geometry": "retained",
     }
     assert report["n_items"] > 0
+    assert report["cache_preflight_report"]["image_patches_loaded"] is False
+    assert report["cache_preflight_report"]["spot_image_features_loaded"] is False
+    assert report["cache_preflight_report"]["dense_wsi_image_features_loaded"] is False
 
 
 def test_evaluate_gen3_checkpoint_report_is_bound_to_the_exact_checkpoint_identity(tmp_path, monkeypatch):

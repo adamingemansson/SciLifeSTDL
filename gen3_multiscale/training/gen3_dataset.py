@@ -71,7 +71,9 @@ from gen3_multiscale.data.boundary_graph import (
     build_knn_adjacency,
     extract_boundary_and_local_context,
 )
-from gen3_multiscale.data.dataset_manifest import verify_content_provenance
+from gen3_multiscale.data.dataset_manifest import (
+    verify_content_provenance, verify_expression_content_provenance,
+)
 from gen3_multiscale.data.mask_schedule import (
     ensure_stratified_mask_bank,
     prepare_masking_cfg_for_sample,
@@ -141,10 +143,16 @@ class Gen3SampleData:
             )
 
 
-def load_gen3_sample_data(cfg, manifest: dict, sample_id: str) -> Gen3SampleData:
-    """Load and fully verify one manifest sample's real data -- the ONLY
-    function in this module (and the real trainer) that reads
-    per-spot patches/features from disk, and it does so exactly once."""
+def load_gen3_sample_data(
+    cfg, manifest: dict, sample_id: str, *, zero_image_input: bool = False,
+) -> Gen3SampleData:
+    """Load and verify one manifest sample for training or evaluation.
+
+    Normal mode is the only path in this module that reads per-spot
+    patches/features from disk, exactly once. ``zero_image_input=True`` is
+    the evaluation-only fast path: it loads verified expression and spatial
+    geometry but never opens raw patches or cached image-feature matrices.
+    """
     record = manifest["samples"].get(sample_id)
     if record is None:
         raise ValueError(f"{sample_id!r} is not a sample the dataset manifest declares")
@@ -156,9 +164,17 @@ def load_gen3_sample_data(cfg, manifest: dict, sample_id: str) -> Gen3SampleData
     # changed h5ad with identical genes/barcodes could otherwise pass
     # every downstream check silently (see dataset_manifest.py's
     # verify_content_provenance docstring).
-    verify_content_provenance(cfg.data.hest_data_dir, manifest, sample_id)
-
-    adata, patches, image_source_available = example_builder.load_sample_for_examples(manifest, sample_id)
+    if zero_image_input:
+        verify_expression_content_provenance(cfg.data.hest_data_dir, manifest, sample_id)
+        adata = example_builder.load_expression_for_model_target_space(manifest, sample_id)
+        # Only the row count is consulted when precomputed features are
+        # supplied.  This tiny placeholder structurally satisfies the shared
+        # builder without opening or allocating the raw H&E patch tensor.
+        patches = np.empty((adata.n_obs, 0), dtype=np.uint8)
+        image_source_available = np.zeros(adata.n_obs, dtype=bool)
+    else:
+        verify_content_provenance(cfg.data.hest_data_dir, manifest, sample_id)
+        adata, patches, image_source_available = example_builder.load_sample_for_examples(manifest, sample_id)
     obs_names = np.asarray(adata.obs_names, dtype=str)
     full_sample_coords = np.asarray(adata.obsm["spatial"], dtype=np.float64)
     coords3d = np.concatenate([full_sample_coords, np.zeros((full_sample_coords.shape[0], 1))], axis=1)
@@ -168,9 +184,18 @@ def load_gen3_sample_data(cfg, manifest: dict, sample_id: str) -> Gen3SampleData
     # Mandatory requirement #2: the COMPLETE verified spot-feature cache
     # record -- barcodes, availability, AND features loaded and checked
     # together, never a bare features array obtained any other way.
-    spot_record = spot_feature_cache.load_gen3_spot_features(
-        cfg, sample_id, obs_names, patches, image_source_available,
-    )
+    if zero_image_input:
+        zero_features = np.zeros((obs_names.shape[0], 1536), dtype=np.float32)
+        spot_record = {
+            "features": zero_features,
+            "barcodes": obs_names,
+            "image_source_available": image_source_available,
+            "tile_encoder_provenance": None,
+        }
+    else:
+        spot_record = spot_feature_cache.load_gen3_spot_features(
+            cfg, sample_id, obs_names, patches, image_source_available,
+        )
 
     dense_wsi_provenance = None
     slide_context_record = None
@@ -192,7 +217,11 @@ def load_gen3_sample_data(cfg, manifest: dict, sample_id: str) -> Gen3SampleData
     architecture_needs_dense_wsi_cache = bool(model_params.get("use_regional_he", False)) or bool(
         model_params.get("use_global_slide", False)
     )
-    if source != "disabled" and architecture_needs_dense_wsi_cache:
+    if source != "disabled" and architecture_needs_dense_wsi_cache and zero_image_input:
+        slide_context_record = slide_context.load_slide_context_geometry_only(
+            cfg, sample_id, full_sample_coords.astype(np.float32),
+        )
+    elif source != "disabled" and architecture_needs_dense_wsi_cache:
         spot_features_for_slide = None  # dense_wsi_cache path never needs precomputed spot features
         slide_context_record = slide_context.load_slide_context(
             cfg, sample_id, spot_features_for_slide, full_sample_coords.astype(np.float32),
