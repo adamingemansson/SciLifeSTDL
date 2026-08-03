@@ -359,7 +359,7 @@ def evaluate_gen3_checkpoint(
 
     cfg_om = OmegaConf.create(config)
     expected_provenance = expected_tile_encoder_provenance(config)
-    samples, preflight_report = load_and_preflight_samples(cfg_om, dataset_manifest, split_ids, expected_provenance)
+    samples, preflight_report = load_and_preflight_samples(cfg_om, dataset_manifest, split_ids, expected_provenance, zero_image_input=zero_image_input)
 
     gene_names = list(dataset_manifest["gene_panel"])
     device = torch.device(device_str)
@@ -700,6 +700,7 @@ def evaluate_gen3_checkpoint(
             "zero_image_input": bool(zero_image_input),
             "image_feature_content": "all_zero" if zero_image_input else "unmodified",
             "observed_image_available": "all_false" if zero_image_input else "unmodified",
+            "source_image_data_loaded": not bool(zero_image_input),
             "spatial_geometry": "retained",
         },
         "cache_preflight_report": preflight_report,
