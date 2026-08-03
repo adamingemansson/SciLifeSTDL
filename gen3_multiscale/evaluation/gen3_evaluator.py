@@ -204,6 +204,54 @@ def architecture4_calibration_summary(standardized_residuals: list[float]) -> di
     }
 
 
+class _GaussianCalibrationAccumulator:
+    """Bounded-memory equivalent of ``architecture4_calibration_summary``.
+
+    Evaluation can cover hundreds of millions of spot/gene values.  Keeping
+    each standardized residual as a Python float costs tens of GiB per
+    evaluator, so retain only the sufficient statistics needed by the report.
+    """
+
+    def __init__(self) -> None:
+        self.n_values = 0
+        self.sum_z = 0.0
+        self.sum_z_squared = 0.0
+        self.in_interval = {
+            "coverage_68": 0,
+            "coverage_90": 0,
+            "coverage_95": 0,
+        }
+
+    def add_item(self, standardized_residuals: np.ndarray) -> None:
+        z = np.asarray(standardized_residuals, dtype=np.float64)
+        z = z[np.isfinite(z)]
+        if z.size == 0:
+            return
+        self.n_values += int(z.size)
+        self.sum_z += float(np.sum(z, dtype=np.float64))
+        self.sum_z_squared += float(np.sum(z * z, dtype=np.float64))
+        abs_z = np.abs(z)
+        self.in_interval["coverage_68"] += int(np.count_nonzero(abs_z <= 1.0))
+        self.in_interval["coverage_90"] += int(np.count_nonzero(abs_z <= 1.645))
+        self.in_interval["coverage_95"] += int(np.count_nonzero(abs_z <= 1.96))
+
+    def summary(self) -> dict:
+        if self.n_values == 0:
+            return {"n_values": 0}
+        mean = self.sum_z / self.n_values
+        variance = max(0.0, self.sum_z_squared / self.n_values - mean * mean)
+        return {
+            "method": "gaussian_std_approximation",
+            "n_values": int(self.n_values),
+            "z_mean": float(mean),
+            "z_std": float(np.sqrt(variance)),
+            **{
+                name: count / self.n_values
+                for name, count in self.in_interval.items()
+            },
+        }
+
+
 _EMPIRICAL_COVERAGE_LEVELS = {"coverage_68": 0.68, "coverage_90": 0.90, "coverage_95": 0.95}
 
 
@@ -496,7 +544,7 @@ def evaluate_gen3_checkpoint(
     patient_ids: list[str] = []
     per_item_records: list[dict] = []
     predictive_stds: list[float] = []
-    architecture4_standardized_residuals: list[float] = []
+    gaussian_calibration = _GaussianCalibrationAccumulator()
     empirical_coverage = _EmpiricalCoverageAccumulator()
     real_expression_for_embedding: list[np.ndarray] = []
     model_expression_for_embedding: list[np.ndarray] = []
@@ -537,7 +585,7 @@ def evaluate_gen3_checkpoint(
                 # query spot/gene in this item, never just the mean.
                 safe_std = np.where(predictive_std_arr > 1e-8, predictive_std_arr, np.nan)
                 z = (true_expression.astype(np.float64) - model_pred.astype(np.float64)) / safe_std
-                architecture4_standardized_residuals.extend(z.flatten().tolist())
+                gaussian_calibration.add_item(z)
                 # Secondary fix #4: empirical-quantile coverage computed
                 # directly from this item's raw flow draws, only when the
                 # caller actually asked for a (larger) calibration sample
@@ -590,6 +638,12 @@ def evaluate_gen3_checkpoint(
                 real_expression_for_embedding.append(true_expression)
                 model_expression_for_embedding.append(model_pred)
 
+            print(
+                f"evaluation progress: {idx + 1}/{len(dataset)} "
+                f"sample={item_identity['sample_id']} stratum={item_identity['stratum']}",
+                flush=True,
+            )
+
     aggregated = {
         arm: aggregate_patient_metrics(items, patient_ids) for arm, items in per_item_by_arm.items()
     }
@@ -620,7 +674,7 @@ def evaluate_gen3_checkpoint(
     # Launch blocker #9: "Architecture 4 interval coverage/calibration" --
     # empty ({"n_values": 0}, not omitted) for Architectures 1-3, which
     # report no predictive_std at all. Gaussian approximation only.
-    architecture4_calibration = architecture4_calibration_summary(architecture4_standardized_residuals)
+    architecture4_calibration = gaussian_calibration.summary()
     # Secondary fix #4: higher-fidelity empirical-quantile alternative,
     # only populated when calibration_n_samples was actually requested.
     architecture4_empirical_calibration = empirical_coverage.summary(calibration_n_samples or 0)
