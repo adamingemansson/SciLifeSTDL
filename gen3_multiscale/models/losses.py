@@ -36,6 +36,41 @@ def primary_reconstruction_loss(predicted_expression: torch.Tensor, target_expre
     return torch.nn.functional.mse_loss(predicted_expression, target_expression)
 
 
+def rmse_pcc_reconstruction_loss(
+    predicted_expression: torch.Tensor,
+    target_expression: torch.Tensor,
+    *,
+    pcc_weight: float = 0.1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Full-panel RMSE plus a bounded mean per-gene correlation penalty.
+
+    Constant genes contribute zero correlation rather than NaN.  This is a
+    training objective only; reported PCC/RMSE still come from the shared
+    evaluator and are not replaced by these differentiable approximations.
+    """
+    if predicted_expression.shape != target_expression.shape:
+        raise ValueError("predicted_expression and target_expression must have matching shapes")
+    if pcc_weight < 0:
+        raise ValueError("pcc_weight must be non-negative")
+    mse = torch.nn.functional.mse_loss(predicted_expression, target_expression)
+    rmse = torch.sqrt(mse + 1e-8)
+    pred_centered = predicted_expression - predicted_expression.mean(dim=0, keepdim=True)
+    true_centered = target_expression - target_expression.mean(dim=0, keepdim=True)
+    numerator = (pred_centered * true_centered).sum(dim=0)
+    pred_energy = pred_centered.square().sum(dim=0)
+    true_energy = true_centered.square().sum(dim=0)
+    valid = (pred_energy > 1e-8) & (true_energy > 1e-8)
+    if valid.any():
+        # Select before sqrt: sqrt(0)'s undefined derivative can produce
+        # NaN gradients even when a later torch.where masks its value.
+        denominator = torch.sqrt(pred_energy[valid] * true_energy[valid])
+        correlation = numerator[valid] / denominator
+        pcc_loss = 1.0 - correlation.mean()
+    else:
+        pcc_loss = rmse.new_zeros(())
+    return rmse + pcc_weight * pcc_loss, rmse, pcc_loss
+
+
 def _query_graph_edges(query_coords: torch.Tensor, k_neighbors: int) -> torch.Tensor:
     """[E, 2] int64 tensor of (i, j) query-query graph edges (i < j, each
     unordered pair listed once) from the same k-NN adjacency
@@ -113,6 +148,8 @@ def combined_reconstruction_loss(
     gradient_weight: float = 0.05,
     k_neighbors: int = 6,
     per_gene_scale: torch.Tensor | None = None,
+    primary_mode: str = "mse",
+    pcc_weight: float = 0.1,
 ) -> dict:
     """The shared deterministic objective, assembled: primary + a small
     weight (default 0.05, the handoff's stated initial value) times the
@@ -120,9 +157,18 @@ def combined_reconstruction_loss(
     so a training loop can log them separately without recomputing."""
     if gradient_weight < 0:
         raise ValueError("gradient_weight must be non-negative")
-    primary = primary_reconstruction_loss(predicted_expression, target_expression)
+    if primary_mode == "mse":
+        primary = primary_reconstruction_loss(predicted_expression, target_expression)
+        extra = {}
+    elif primary_mode == "rmse_pcc":
+        primary, rmse, pcc_loss = rmse_pcc_reconstruction_loss(
+            predicted_expression, target_expression, pcc_weight=pcc_weight,
+        )
+        extra = {"rmse_loss": rmse, "pcc_loss": pcc_loss}
+    else:
+        raise ValueError("primary_mode must be 'mse' or 'rmse_pcc'")
     gradient = spatial_gradient_loss(
         predicted_expression, target_expression, query_coords, k_neighbors=k_neighbors, per_gene_scale=per_gene_scale,
     )
     total = primary + gradient_weight * gradient
-    return {"total": total, "primary": primary, "gradient": gradient}
+    return {"total": total, "primary": primary, "gradient": gradient, **extra}

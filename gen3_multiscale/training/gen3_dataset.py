@@ -141,7 +141,13 @@ class Gen3SampleData:
             )
 
 
-def load_gen3_sample_data(cfg, manifest: dict, sample_id: str) -> Gen3SampleData:
+def load_gen3_sample_data(
+    cfg,
+    manifest: dict,
+    sample_id: str,
+    *,
+    require_dense_wsi: bool | None = None,
+) -> Gen3SampleData:
     """Load and fully verify one manifest sample's real data -- the ONLY
     function in this module (and the real trainer) that reads
     per-spot patches/features from disk, and it does so exactly once."""
@@ -189,8 +195,13 @@ def load_gen3_sample_data(cfg, manifest: dict, sample_id: str) -> Gen3SampleData
     # `data.slide_context_source` was left non-"disabled" in a shared
     # config, even though nothing downstream ever reads the result.
     model_params = cfg.get("model", {}).get("params", {}) or {}
-    architecture_needs_dense_wsi_cache = bool(model_params.get("use_regional_he", False)) or bool(
-        model_params.get("use_global_slide", False)
+    architecture_needs_dense_wsi_cache = (
+        bool(require_dense_wsi)
+        if require_dense_wsi is not None
+        else (
+            bool(model_params.get("use_regional_he", False))
+            or bool(model_params.get("use_global_slide", False))
+        )
     )
     if source != "disabled" and architecture_needs_dense_wsi_cache:
         spot_features_for_slide = None  # dense_wsi_cache path never needs precomputed spot features

@@ -524,6 +524,190 @@ def build_gen5_model_for_inference(
     }
 
 
+def build_gen6_model_for_inference(
+    config: dict, *, gene_names: list[str], device: torch.device,
+    checkpoint_dir: str | Path | None = None, smoke: bool = False,
+    staged_smoke: bool = False, dataset_manifest: dict | None = None,
+    cache_content_by_sample: dict[str, dict] | None = None,
+    allow_code_drift: bool = False,
+) -> tuple[nn.Module, dict]:
+    from gen3_multiscale.gen6.contract import get_gen6_arm_spec
+    from gen3_multiscale.gen6.model_factory import build_gen6_model
+
+    model_cfg = config.get("model") or {}
+    arm = str(model_cfg.get("arm", ""))
+    spec = get_gen6_arm_spec(arm)
+    data_cfg = config.get("data") or {}
+    params = model_cfg.get("params") or {}
+    seed = int((config.get("training") or {}).get("seed", 0))
+    image_dim = int(params.get("image_feature_dim", 1536))
+    gex_dim = int(data_cfg.get("gex_feature_dim", 128))
+    context_dim = params.get("gex_context_embedding_dim")
+    context_dim = int(context_dim) if context_dim else None
+    slide_encoder = None
+    slide_sha = None
+    if spec.uses_gigapath_dense:
+        checkpoint = (config.get("required_fingerprints") or {}).get("gigapath_checkpoint")
+        if checkpoint:
+            from gen3_multiscale.models.slide_encoder import FrozenGigaPathSlideEncoder
+
+            slide_encoder = FrozenGigaPathSlideEncoder(str(checkpoint))
+            slide_sha = slide_encoder.checkpoint_sha256
+    if spec.staged_conditioner:
+        fingerprints = config.get("required_fingerprints") or {}
+        conditioner_path = fingerprints.get("gen6_conditioner_checkpoint")
+        if not conditioner_path and not (smoke and not staged_smoke):
+            raise ValueError(f"{arm} requires required_fingerprints.gen6_conditioner_checkpoint")
+        if conditioner_path:
+            conditioner_identity = checkpoint_module.resolve_checkpoint_identity(conditioner_path)
+            conditioner_config_path = conditioner_identity.resolved_dir / "model_config.json"
+            if not conditioner_config_path.is_file():
+                raise ValueError(f"{conditioner_identity.resolved_dir}: missing model_config.json")
+            conditioner_config = json.loads(conditioner_config_path.read_text())
+            expected_arm = str(params.get("conditioner_arm", ""))
+            actual_arm = str((conditioner_config.get("model") or {}).get("arm", ""))
+            if actual_arm != expected_arm:
+                raise ValueError(f"selected conditioner arm {actual_arm!r} != configured {expected_arm!r}")
+            if dataset_manifest is not None:
+                from gen3_multiscale.training.train import verify_full_checkpoint_identity
+
+                verify_full_checkpoint_identity(
+                    conditioner_identity.resolved_dir, config=conditioner_config,
+                    dataset_manifest=dataset_manifest, gene_names=gene_names,
+                    cache_content_by_sample=cache_content_by_sample,
+                    allow_code_drift=allow_code_drift,
+                )
+            conditioner, _ = build_gen6_model_for_inference(
+                conditioner_config, gene_names=gene_names, device=device,
+                checkpoint_dir=str(conditioner_identity.resolved_dir), smoke=smoke,
+                staged_smoke=staged_smoke, dataset_manifest=dataset_manifest,
+                cache_content_by_sample=cache_content_by_sample,
+                allow_code_drift=allow_code_drift,
+            )
+            conditioner_info = {
+                "loaded": True, "checkpoint_dir": str(conditioner_identity.resolved_dir),
+                "checkpoint_sha256": conditioner_identity.weights_sha256,
+                "checkpoint_step": conditioner_identity.step,
+                "checkpoint_bundle_id": conditioner_identity.bundle_dir,
+                "checkpoint_manifest_sha256": conditioner_identity.manifest_sha256,
+            }
+        else:
+            # Package-only smoke: use the explicitly named deterministic arm.
+            smoke_config = json.loads(json.dumps(config))
+            smoke_config["model"]["arm"] = str(params.get("conditioner_arm", "gen6b"))
+            smoke_config["model"]["kind"] = "conditioner"
+            for key in (
+                "conditioner_arm", "gene_basis_rank", "n_flow_blocks", "n_flow_samples",
+                "n_ode_steps", "ot_epsilon", "ot_sinkhorn_iters", "latent_dim",
+                "wae_hidden_dim", "discriminator_hidden_dim", "adversarial_weight",
+                "discriminator_weight",
+            ):
+                smoke_config["model"]["params"].pop(key, None)
+            conditioner = build_gen6_model(
+                smoke_config, gene_names=gene_names, gex_feature_dim=gex_dim,
+                image_feature_dim=image_dim, gex_context_embedding_dim=context_dim,
+                slide_encoder=slide_encoder, gigapath_checkpoint_sha256=slide_sha, seed=seed,
+            ).to(device)
+            conditioner_info = dict(_UNLOADED_CONDITIONER_INFO)
+        from gen3_multiscale.gen6.generative import Gen6ResidualOTFlowModel, Gen6WAEGANModel
+
+        if spec.generator == "residual_ot_flow":
+            basis_path = fingerprints.get("gene_residual_basis")
+            if not basis_path:
+                if not (smoke and not staged_smoke):
+                    raise ValueError("gen6k requires required_fingerprints.gene_residual_basis")
+                from gen3_multiscale.models.gene_basis import fit_gene_residual_basis
+                import numpy as np
+
+                rank = int(params.get("gene_basis_rank", 8))
+                basis = fit_gene_residual_basis(
+                    np.zeros((rank + 1, len(gene_names)), dtype=np.float32), gene_names, rank=rank,
+                )
+            else:
+                basis = load_gene_residual_basis(basis_path)
+                provenance_path = Path(f"{basis_path}.provenance.json")
+                if not provenance_path.is_file():
+                    raise ValueError(f"Gen6 residual basis provenance is missing: {provenance_path}")
+                provenance = json.loads(provenance_path.read_text())
+                import numpy as np
+                from gen3_multiscale.data.dataset_manifest import gene_panel_hash
+                from gen3_multiscale.training.train import dataset_manifest_fingerprint
+
+                basis_numeric_sha = hashlib.sha256(
+                    np.ascontiguousarray(basis.basis.detach().cpu().numpy()).tobytes()
+                ).hexdigest()
+                expected = {
+                    "kind": "gen6_residual_basis_provenance",
+                    "conditioner_arm": str(params.get("conditioner_arm", "")),
+                    "conditioner_checkpoint_sha256": conditioner_info["checkpoint_sha256"],
+                    "conditioner_checkpoint_step": conditioner_info["checkpoint_step"],
+                    "conditioner_checkpoint_bundle_id": conditioner_info["checkpoint_bundle_id"],
+                    "conditioner_checkpoint_manifest_sha256": conditioner_info["checkpoint_manifest_sha256"],
+                    "gene_residual_basis_sha256": basis_numeric_sha,
+                    "gene_panel_hash": gene_panel_hash(gene_names),
+                }
+                if dataset_manifest is not None:
+                    expected["dataset_manifest_fingerprint"] = dataset_manifest_fingerprint(dataset_manifest)
+                mismatches = {
+                    key: (provenance.get(key), value)
+                    for key, value in expected.items() if provenance.get(key) != value
+                }
+                if mismatches:
+                    raise ValueError(f"Gen6 residual basis provenance mismatch: {mismatches}")
+                if dataset_manifest is not None:
+                    train_ids = sorted(dataset_manifest.get("train_sample_ids") or [])
+                    if sorted(provenance.get("train_sample_ids") or []) != train_ids:
+                        raise ValueError("Gen6 residual basis training sample IDs do not match the manifest")
+                    recorded_cache = provenance.get("cache_content_by_sample") or {}
+                    live_cache = cache_content_by_sample or {}
+                    for sample_id in train_ids:
+                        if sample_id in live_cache and recorded_cache.get(sample_id) != live_cache[sample_id]:
+                            raise ValueError(
+                                f"Gen6 residual basis cache identity mismatch for {sample_id!r}"
+                            )
+            model = Gen6ResidualOTFlowModel(
+                conditioner, basis, gene_names,
+                hidden_dim=int(params.get("hidden_dim", 512)), n_heads=int(params.get("n_heads", 8)),
+                n_flow_blocks=int(params.get("n_flow_blocks", 2)),
+                dense_threshold=int(params.get("dense_threshold", 256)),
+                sparse_k=int(params.get("sparse_k", 10)), chunk_size=int(params.get("chunk_size", 1024)),
+                n_flow_samples=int(params.get("n_flow_samples", 8)),
+                n_ode_steps=int(params.get("n_ode_steps", 20)),
+                ot_epsilon=float(params.get("ot_epsilon", 0.1)),
+                ot_sinkhorn_iters=int(params.get("ot_sinkhorn_iters", 20)),
+            ).to(device)
+        else:
+            model = Gen6WAEGANModel(
+                conditioner, len(gene_names), latent_dim=int(params.get("latent_dim", 256)),
+                hidden_dim=int(params.get("wae_hidden_dim", 1024)),
+                conditioner_hidden_dim=int(params.get("hidden_dim", 512)),
+                discriminator_hidden_dim=int(params.get("discriminator_hidden_dim", 256)),
+                adversarial_weight=float(params.get("adversarial_weight", 0.1)),
+                discriminator_weight=float(params.get("discriminator_weight", 1.0)),
+                pcc_weight=float((config.get("loss") or {}).get("pcc_weight", 0.1)),
+                n_samples=int(params.get("n_flow_samples", 8)),
+            ).to(device)
+    else:
+        model = build_gen6_model(
+            config, gene_names=gene_names, gex_feature_dim=gex_dim,
+            image_feature_dim=image_dim, gex_context_embedding_dim=context_dim,
+            slide_encoder=slide_encoder, gigapath_checkpoint_sha256=slide_sha, seed=seed,
+        ).to(device)
+        conditioner_info = dict(_UNLOADED_CONDITIONER_INFO)
+    resolved = None
+    if checkpoint_dir is not None:
+        resolved = checkpoint_module.resolve_checkpoint_identity(checkpoint_dir)
+        checkpoint_module.verify_gene_names(resolved.resolved_dir, gene_names)
+        checkpoint_module.load_trainable_state(model, resolved.resolved_dir)
+    return model, {
+        "kind": str(model_cfg.get("kind", "")), "conditioner_info": conditioner_info,
+        "gene_basis_info": None, "autoencoder_info": None,
+        "checkpoint_bundle_id": resolved.bundle_dir if resolved else None,
+        "checkpoint_manifest_sha256": resolved.manifest_sha256 if resolved else None,
+        "trainable_weights_sha256": resolved.weights_sha256 if resolved else None,
+    }
+
+
 def build_gen4_or_gen5_model_for_inference(
     config: dict, *, gene_names: list[str], device: torch.device,
     checkpoint_dir: str | Path | None = None, smoke: bool = False, staged_smoke: bool = False,
@@ -538,6 +722,15 @@ def build_gen4_or_gen5_model_for_inference(
     autoencoder_info/checkpoint_*), so a caller never needs to know
     whether it got a Gen4 or Gen5 model back to read identity-binding
     fields for a run manifest."""
+    from gen3_multiscale.gen6.contract import is_gen6_config
+
+    if is_gen6_config(config):
+        return build_gen6_model_for_inference(
+            config, gene_names=gene_names, device=device, checkpoint_dir=checkpoint_dir,
+            smoke=smoke, staged_smoke=staged_smoke, dataset_manifest=dataset_manifest,
+            cache_content_by_sample=cache_content_by_sample,
+            allow_code_drift=allow_code_drift,
+        )
     kind = str((config.get("model") or {}).get("kind", ""))
     if kind == "latent_flow":
         return build_gen5_model_for_inference(
