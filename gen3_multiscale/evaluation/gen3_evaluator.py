@@ -244,6 +244,7 @@ class _EmpiricalCoverageAccumulator:
 def _load_model_for_evaluation(
     config: dict, checkpoint_dir: str | Path, gene_names: list[str], device: torch.device,
     dataset_manifest: dict | None = None, cache_content_by_sample: dict[str, dict] | None = None,
+    allow_code_drift: bool = False,
 ):
     """Construct the real architecture and load a real, already-trained
     checkpoint's trainable weights onto it -- never a random/untrained
@@ -259,6 +260,7 @@ def _load_model_for_evaluation(
     model, info = build_model_for_inference(
         config, gene_names=gene_names, device=device, checkpoint_dir=checkpoint_dir, smoke=False,
         dataset_manifest=dataset_manifest, cache_content_by_sample=cache_content_by_sample,
+        allow_code_drift=allow_code_drift,
     )
     model.eval()
     return model, info
@@ -461,6 +463,7 @@ def evaluate_gen3_checkpoint(
     model, model_info = _load_model_for_evaluation(
         config, pinned_identity.resolved_dir, gene_names, device, dataset_manifest=dataset_manifest,
         cache_content_by_sample=preflight_report.get("cache_content_by_sample"),
+        allow_code_drift=allow_code_drift,
     )
     kind = model_info["kind"]
 

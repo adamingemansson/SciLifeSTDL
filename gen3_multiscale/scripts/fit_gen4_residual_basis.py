@@ -98,6 +98,7 @@ def fit_and_save_gen4_basis(
         smoke=False,
         dataset_manifest=manifest,
         cache_content_by_sample=preflight["cache_content_by_sample"],
+        allow_code_drift=allow_code_drift,
     )
     if info["kind"] != "conditioner":
         raise RuntimeError("resolved model is not a deterministic conditioner")

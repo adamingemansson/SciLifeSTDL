@@ -601,6 +601,7 @@ def build_model_for_inference(
     config: dict, *, gene_names: list[str], device: torch.device,
     checkpoint_dir: str | Path | None = None, smoke: bool = False, staged_smoke: bool = False,
     dataset_manifest: dict | None = None, cache_content_by_sample: dict[str, dict] | None = None,
+    allow_code_drift: bool = False,
 ) -> tuple[torch.nn.Module, dict]:
     """The ONE real model-reconstruction pipeline -- construct the
     architecture (with a real `FrozenGigaPathSlideEncoder` when
@@ -643,7 +644,7 @@ def build_model_for_inference(
         return build_gen4_or_gen5_model_for_inference(
             config, gene_names=gene_names, device=device, checkpoint_dir=checkpoint_dir,
             smoke=smoke, staged_smoke=staged_smoke, dataset_manifest=dataset_manifest,
-            cache_content_by_sample=cache_content_by_sample,
+            cache_content_by_sample=cache_content_by_sample, allow_code_drift=allow_code_drift,
         )
     architecture_id = str((config.get("model") or {}).get("architecture", ""))
     training_cfg = config.get("training") or {}
@@ -2019,6 +2020,7 @@ def run_training(
         config, gene_names=gene_names, device=device, checkpoint_dir=None,
         smoke=smoke, staged_smoke=staged_smoke, dataset_manifest=dataset_manifest,
         cache_content_by_sample=preflight_report.get("cache_content_by_sample"),
+        allow_code_drift=allow_code_drift,
     )
     kind = model_info["kind"]
     # Integration audit item 1: Gen4/Gen5's own normalized model_info
