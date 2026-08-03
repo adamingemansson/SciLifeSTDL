@@ -64,6 +64,29 @@ def test_load_gen3_sample_data_skips_dense_wsi_cache_when_architecture_does_not_
     assert sample_explicit_false.tile_encoder_provenance["dense_wsi"] is None
 
 
+def test_load_gen3_sample_data_explicit_dense_override_beats_inherited_model_flags(tmp_path, monkeypatch):
+    """Adapters with a canonical arm table can state the real cache need.
+
+    This prevents a newly selected model from silently inheriting stale
+    ``use_global_slide`` flags from the comparison config used to prepare it.
+    """
+    cfg, manifest = build_synthetic_gen3_experiment(tmp_path, monkeypatch)
+    sample_id = manifest["train_sample_ids"][0]
+    cfg.model = {"params": {"use_regional_he": False, "use_global_slide": False}}
+    required = load_gen3_sample_data(
+        cfg, manifest, sample_id, require_dense_wsi=True,
+    )
+    assert required.slide_context_record is not None
+    assert required.tile_encoder_provenance["dense_wsi"] is not None
+
+    cfg.model = {"params": {"use_regional_he": True, "use_global_slide": True}}
+    forbidden = load_gen3_sample_data(
+        cfg, manifest, sample_id, require_dense_wsi=False,
+    )
+    assert forbidden.slide_context_record is None
+    assert forbidden.tile_encoder_provenance["dense_wsi"] is None
+
+
 def test_load_gen3_sample_data_rejects_an_unknown_sample_id(tmp_path, monkeypatch):
     cfg, manifest = build_synthetic_gen3_experiment(tmp_path, monkeypatch)
     with pytest.raises(ValueError, match="not a sample"):

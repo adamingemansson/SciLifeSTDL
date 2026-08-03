@@ -116,6 +116,71 @@ def test_run_training_smoke_gen4a_conditioner_kind(tmp_path, monkeypatch):
     assert result["ok"] is True
 
 
+def test_run_training_smoke_gen6b_full_shared_path(tmp_path, monkeypatch):
+    """Gen6 uses the real preflight/dataset/loss/optimizer/validation path."""
+    cfg, manifest, manifest_path, samples = _prepare_experiment(tmp_path, monkeypatch)
+    _write_uni2_caches(cfg, samples, output_dim=_TINY_PARAMS["image_feature_dim"])
+    config = yaml.safe_load((_CONFIG_DIR / "gen4" / "gen4a_conditioner.yaml").read_text())
+    config["experiment_name"] = "gen6b_smoke"
+    config["model"]["arm"] = "gen6b"
+    config["model"]["kind"] = "conditioner"
+    config["model"]["params"].update(_TINY_PARAMS)
+    config["loss"] = {"primary_mode": "rmse_pcc", "pcc_weight": 0.1, "gradient_weight": 0.05}
+    config_path = tmp_path / "gen6b_config.yaml"
+    _write_config(
+        config, config_path, cfg=cfg, manifest_path=manifest_path,
+        checkpoint_dir=tmp_path / "ckpt_gen6b",
+    )
+    result = run_training(str(config_path), smoke=True)
+    assert result["ok"] is True
+    assert result["architecture"] == "gen6b"
+
+
+@pytest.mark.parametrize(
+    ("arm", "kind"), (("gen6k", "flow"), ("gen6l", "wae_gan")),
+)
+def test_run_training_smoke_gen6_staged_generators_use_shared_path(
+    tmp_path, monkeypatch, arm, kind,
+):
+    """Both staged generators execute the common data/optimizer/validation loop.
+
+    Construction-only smoke deliberately substitutes a tiny Gen6-B
+    conditioner and basis, while real or staged smoke still requires exact
+    on-disk checkpoint provenance.
+    """
+    cfg, manifest, manifest_path, samples = _prepare_experiment(tmp_path, monkeypatch)
+    _write_uni2_caches(cfg, samples, output_dim=_TINY_PARAMS["image_feature_dim"])
+    config = yaml.safe_load((_CONFIG_DIR / "gen4" / "gen4a_conditioner.yaml").read_text())
+    config["experiment_name"] = f"{arm}_smoke"
+    config["model"] = {
+        "arm": arm,
+        "kind": kind,
+        "params": {
+            **_TINY_PARAMS,
+            "conditioner_arm": "gen6b",
+            "gene_basis_rank": 3,
+            "n_flow_blocks": 1,
+            "n_flow_samples": 2,
+            "n_ode_steps": 2,
+            "latent_dim": 4,
+            "wae_hidden_dim": 16,
+            "discriminator_hidden_dim": 8,
+        },
+    }
+    config["required_fingerprints"]["gen6_conditioner_checkpoint"] = None
+    if arm == "gen6k":
+        config["required_fingerprints"]["gene_residual_basis"] = None
+    config["loss"] = {"primary_mode": "rmse_pcc", "pcc_weight": 0.1}
+    config_path = tmp_path / f"{arm}_config.yaml"
+    _write_config(
+        config, config_path, cfg=cfg, manifest_path=manifest_path,
+        checkpoint_dir=tmp_path / f"ckpt_{arm}",
+    )
+    result = run_training(str(config_path), smoke=True)
+    assert result["ok"] is True
+    assert result["kind"] == kind
+
+
 def test_run_training_smoke_gen4c_flow_kind(tmp_path, monkeypatch):
     cfg, manifest, manifest_path, samples = _prepare_experiment(tmp_path, monkeypatch)
     _write_uni2_caches(cfg, samples, output_dim=_TINY_PARAMS["image_feature_dim"])

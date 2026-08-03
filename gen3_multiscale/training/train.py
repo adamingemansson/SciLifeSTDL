@@ -789,7 +789,7 @@ def model_kind_for_config(config: dict) -> str:
     kind = model_cfg.get("kind")
     if kind is not None:
         kind = str(kind)
-        if kind not in {"conditioner", "flow", "latent_flow"}:
+        if kind not in {"conditioner", "flow", "latent_flow", "wae_gan"}:
             raise ValueError(f"unsupported model.kind {kind!r}")
         return kind
     return model_kind_for_architecture_id(str(model_cfg.get("architecture", "")))
@@ -852,7 +852,7 @@ def predict_for_metrics(
     `Architecture4`/Gen4's `Gen4ResidualFlowModel` happen to alias their
     own `forward()` to the conditioner pass; relying on that alias is
     exactly the bug this function's genericization fixes)."""
-    if kind in ("flow", "latent_flow"):
+    if kind in ("flow", "latent_flow", "wae_gan"):
         predictive = model.sample_predictive_distribution(inputs, n_samples=n_samples, generator=generator)
         conditioner_expression = predictive.get("deterministic_mean")
         if conditioner_expression is None:
@@ -1025,6 +1025,7 @@ def _validate_numeric_config(training_cfg: dict, loss_cfg: dict) -> None:
         "loss.gradient_weight": (float(loss_cfg.get("gradient_weight", 0.05)), lambda v: v >= 0, "must be non-negative"),
         "loss.k_neighbors": (int(loss_cfg.get("k_neighbors", 6)), lambda v: v > 0, "must be positive"),
         "loss.flow_weight": (float(loss_cfg.get("flow_weight", 1.0)), lambda v: v >= 0, "must be non-negative"),
+        "loss.pcc_weight": (float(loss_cfg.get("pcc_weight", 0.1)), lambda v: v >= 0, "must be non-negative"),
     }
     for name, (value, predicate, message) in checks.items():
         if not predicate(value):
@@ -1037,7 +1038,8 @@ def _validate_numeric_config(training_cfg: dict, loss_cfg: dict) -> None:
 def compute_step_losses(kind: str, model, inputs, target_expression: torch.Tensor,
                          query_coords: torch.Tensor, gradient_weight: float, k_neighbors: int,
                          flow_weight: float = 1.0, per_gene_scale: torch.Tensor | None = None,
-                         flow_generator: torch.Generator | None = None) -> dict:
+                         flow_generator: torch.Generator | None = None,
+                         primary_mode: str = "mse", pcc_weight: float = 0.1) -> dict:
     """Dispatched by `kind` (see `model_kind_for_architecture_id`'s
     docstring, Integration audit finding #1): `"conditioner"` models
     (Gen3 Architectures 1/2/3, Gen4 conditioner arms) share one
@@ -1076,6 +1078,7 @@ def compute_step_losses(kind: str, model, inputs, target_expression: torch.Tenso
         recon = combined_reconstruction_loss(
             out["expression"], target_expression, query_coords,
             gradient_weight=gradient_weight, k_neighbors=k_neighbors, per_gene_scale=per_gene_scale,
+            primary_mode=primary_mode, pcc_weight=pcc_weight,
         )
         total = recon["total"] + flow_weight * out["flow_loss"]
         return {"total": total, "primary": recon["primary"], "gradient": recon["gradient"], "flow_loss": out["flow_loss"]}
@@ -1083,10 +1086,17 @@ def compute_step_losses(kind: str, model, inputs, target_expression: torch.Tenso
         out = model.compute_losses(inputs, target_expression, generator=flow_generator)
         total = flow_weight * out["flow_loss"]
         return {"total": total, "flow_loss": out["flow_loss"]}
+    if kind == "wae_gan":
+        # The shared trainer logs every returned value as a scalar.  The
+        # model also returns its reconstruction for direct component tests,
+        # but that [queries, genes] tensor is a prediction, not a loss term.
+        wae = model.compute_losses(inputs, target_expression, generator=flow_generator)
+        return {name: value for name, value in wae.items() if name != "expression"}
     out = model(inputs)
     return combined_reconstruction_loss(
         out["expression"], target_expression, query_coords,
         gradient_weight=gradient_weight, k_neighbors=k_neighbors, per_gene_scale=per_gene_scale,
+        primary_mode=primary_mode, pcc_weight=pcc_weight,
     )
 
 
@@ -1094,6 +1104,7 @@ def compute_deterministic_reconstruction_losses(
     kind: str, model, inputs, target_expression: torch.Tensor, query_coords: torch.Tensor,
     gradient_weight: float, k_neighbors: int, per_gene_scale: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
+    primary_mode: str = "mse", pcc_weight: float = 0.1,
 ) -> dict:
     """The reconstruction objective used for VALIDATION/model-selection
     (Adam's Step 6 audit #8, then corrected by audit #1 of commit
@@ -1115,11 +1126,13 @@ def compute_deterministic_reconstruction_losses(
     result = combined_reconstruction_loss(
         prediction["expression"], target_expression, query_coords,
         gradient_weight=gradient_weight, k_neighbors=k_neighbors, per_gene_scale=per_gene_scale,
+        primary_mode=primary_mode, pcc_weight=pcc_weight,
     )
     if "conditioner_only_expression" in prediction:
         conditioner_only = combined_reconstruction_loss(
             prediction["conditioner_only_expression"], target_expression, query_coords,
             gradient_weight=gradient_weight, k_neighbors=k_neighbors, per_gene_scale=per_gene_scale,
+            primary_mode=primary_mode, pcc_weight=pcc_weight,
         )
         result = {**result, "conditioner_only_total": conditioner_only["total"]}
     return result
@@ -2236,6 +2249,10 @@ def run_training(
     gradient_weight = float(loss_cfg.get("gradient_weight", 0.05))
     k_neighbors = int(loss_cfg.get("k_neighbors", 6))
     flow_weight = float(loss_cfg.get("flow_weight", 1.0))
+    primary_mode = str(loss_cfg.get("primary_mode", "mse"))
+    if primary_mode not in {"mse", "rmse_pcc"}:
+        raise ValueError("loss.primary_mode must be 'mse' or 'rmse_pcc'")
+    pcc_weight = float(loss_cfg.get("pcc_weight", 0.1))
     gradient_clip_val = float(training_cfg.get("gradient_clip_val", 1.0))
     # Requirement #2 (confirmed real gap): total_steps is the run's
     # ABSOLUTE target step count, not "additional steps after every
@@ -2315,6 +2332,7 @@ def run_training(
                     kind, model, val_inputs, val_target_expression, val_query_coords,
                     gradient_weight=gradient_weight, k_neighbors=k_neighbors, per_gene_scale=gene_scale_tensor,
                     generator=predictive_val_generator,
+                    primary_mode=primary_mode, pcc_weight=pcc_weight,
                 )
                 val_totals.append(float(det_losses["total"]))
                 if "conditioner_only_total" in det_losses:
@@ -2394,6 +2412,7 @@ def run_training(
             kind, model, inputs, target_expression, query_coords,
             gradient_weight=gradient_weight, k_neighbors=k_neighbors, flow_weight=flow_weight,
             per_gene_scale=gene_scale_tensor,
+            primary_mode=primary_mode, pcc_weight=pcc_weight,
         )
         total_loss = losses["total"]
         # Requirement #3 (confirmed real gap): a NaN/Inf loss or gradient

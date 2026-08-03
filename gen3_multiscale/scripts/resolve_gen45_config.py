@@ -59,11 +59,18 @@ def resolve_gen45_config(
     config["evaluation"].update(evaluation_overrides or {})
 
     kind = str((config.get("model") or {}).get("kind"))
-    report = (
-        static_audit_gen5_config(config)
-        if kind == "latent_flow"
-        else static_audit_gen4_config(config)
-    )
+    from gen3_multiscale.gen6.contract import is_gen6_config
+
+    if is_gen6_config(config):
+        from gen3_multiscale.gen6.preflight import static_audit_gen6_config
+
+        report = static_audit_gen6_config(config)
+    else:
+        report = (
+            static_audit_gen5_config(config)
+            if kind == "latent_flow"
+            else static_audit_gen4_config(config)
+        )
     if not report["ready_for_real_training"]:
         raise ValueError(
             "resolved config still has unset launch-critical fields: "

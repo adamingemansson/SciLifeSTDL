@@ -111,6 +111,10 @@ def _availability_sha256(availability: np.ndarray) -> str:
 
 
 def _arm_requirements(config: dict) -> dict[str, bool]:
+    from gen3_multiscale.gen6.contract import is_gen6_config, gen6_cache_requirements
+
+    if is_gen6_config(config):
+        return gen6_cache_requirements(config)
     arm = _resolve_gen4_arm(config)
     if arm not in ARM_TABLE:
         raise ValueError(f"unknown model.arm {arm!r} -- expected one of {sorted(ARM_TABLE)}")
@@ -133,7 +137,9 @@ def _arm_requirements(config: dict) -> dict[str, bool]:
     }
 
 
-def _load_uni2_primary_sample(cfg, manifest: dict, sample_id: str) -> Gen3SampleData:
+def _load_uni2_primary_sample(
+    cfg, manifest: dict, sample_id: str, *, require_dense: bool = True,
+) -> Gen3SampleData:
     """Load a Gen3-compatible sample record whose primary image caches are
     UNI2, not GigaPath.
 
@@ -155,9 +161,11 @@ def _load_uni2_primary_sample(cfg, manifest: dict, sample_id: str) -> Gen3Sample
     spot_record = uni2_spot_cache.load_uni2_spot_features(
         cache_root, sample_id, obs_names, patches, image_source_available,
     )
-    dense_record = uni2_dense_wsi_cache.load_uni2_dense_wsi_context(
-        cfg, sample_id, full_sample_coords.astype(np.float32),
-    )
+    dense_record = None
+    if require_dense:
+        dense_record = uni2_dense_wsi_cache.load_uni2_dense_wsi_context(
+            cfg, sample_id, full_sample_coords.astype(np.float32),
+        )
     coords3d = np.concatenate(
         [full_sample_coords, np.zeros((full_sample_coords.shape[0], 1), dtype=np.float64)],
         axis=1,
@@ -180,7 +188,7 @@ def _load_uni2_primary_sample(cfg, manifest: dict, sample_id: str) -> Gen3Sample
         spatial_adjacency=tuple(build_knn_adjacency(full_sample_coords, k_neighbors=6)),
         slide_context_record=dense_record,
         tile_encoder_provenance={
-            "dense_wsi": dense_record["tile_encoder_provenance"],
+            **({"dense_wsi": dense_record["tile_encoder_provenance"]} if dense_record else {}),
             "spot_features": spot_record["provenance"],
         },
     )
@@ -211,7 +219,13 @@ def load_and_preflight_gen4_samples(
     # dataset.  Construction-only smoke may use stub identities; a real
     # or staged run must have every declared artifact pinned.
     model_kind = str((config.get("model") or {}).get("kind", ""))
-    if model_kind == "latent_flow":
+    from gen3_multiscale.gen6.contract import is_gen6_config
+
+    if is_gen6_config(config):
+        from gen3_multiscale.gen6.preflight import static_audit_gen6_config
+
+        static_report = static_audit_gen6_config(config)
+    elif model_kind == "latent_flow":
         from gen3_multiscale.gen5.preflight import static_audit_gen5_config
 
         static_report = static_audit_gen5_config(config)
@@ -224,9 +238,14 @@ def load_and_preflight_gen4_samples(
             "Gen4/Gen5 config is not ready for real training; unresolved required fingerprints: "
             f"{static_report['unset_required_fingerprints']}"
         )
-    from gen3_multiscale.gen4.preflight import audit_gen4_manifest_cache_coverage
+    if is_gen6_config(config):
+        from gen3_multiscale.gen6.preflight import audit_gen6_manifest_cache_coverage
 
-    modality_report = audit_gen4_manifest_cache_coverage(cache_root, sample_ids, config)
+        modality_report = audit_gen6_manifest_cache_coverage(cache_root, sample_ids, config)
+    else:
+        from gen3_multiscale.gen4.preflight import audit_gen4_manifest_cache_coverage
+
+        modality_report = audit_gen4_manifest_cache_coverage(cache_root, sample_ids, config)
 
     samples: dict[str, Gen3SampleData] = {}
     gigapath_provenance: dict[str, dict] = {}
@@ -240,7 +259,10 @@ def load_and_preflight_gen4_samples(
 
     for sample_id in sample_ids:
         if requirements["uses_uni2_primary"]:
-            sample = _load_uni2_primary_sample(cfg, manifest, sample_id)
+            sample = _load_uni2_primary_sample(
+                cfg, manifest, sample_id,
+                require_dense=requirements.get("uses_uni2_dense", True),
+            )
             identity = {
                 "primary_modality": "uni2",
                 "uni2_spot_features_content_sha256": _array_sha256(sample.precomputed_spot_features),
@@ -250,10 +272,20 @@ def load_and_preflight_gen4_samples(
                 "uni2_spot_features_availability_sha256": _availability_sha256(
                     sample.image_source_available
                 ),
-                "uni2_dense_wsi_context_id": str(sample.slide_context_record["context_id"]),
             }
+            if sample.slide_context_record is not None:
+                identity["uni2_dense_wsi_context_id"] = str(
+                    sample.slide_context_record["context_id"]
+                )
         else:
-            sample = load_gen3_sample_data(cfg, manifest, sample_id)
+            # Gen6 derives this requirement from its canonical arm table.
+            # Do not infer it from inherited model.params: a prepared
+            # component-screen config may intentionally replace the base
+            # model while retaining otherwise matched data settings.
+            sample = load_gen3_sample_data(
+                cfg, manifest, sample_id,
+                require_dense_wsi=requirements["uses_gigapath_dense"],
+            )
             # All non-UNI2-primary arms genuinely consume the GigaPath
             # spot features (directly or as STPath's image tokens).
             gigapath_provenance.update(
@@ -327,7 +359,7 @@ def load_and_preflight_gen4_samples(
     report = {
         "version": 1,
         "kind": "gen4_gen5_consumed_cache_preflight",
-        "arm": _resolve_gen4_arm(config),
+        "arm": str((config.get("model") or {}).get("arm", "")),
         "model_kind": model_kind,
         "n_samples": len(sample_ids),
         "sample_ids": sorted(sample_ids),
@@ -352,21 +384,14 @@ class Gen4SpatialFieldDataset(Gen3SpatialFieldDataset):
         super().__init__(manifest, samples, schedule, strata, **kwargs)
         self.config = config
         self.gene_names = list(gene_names)
-        self.gen4_arm = _resolve_gen4_arm(config)
-        if self.gen4_arm not in ARM_TABLE:
-            raise ValueError(f"unknown model.arm {self.gen4_arm!r} -- expected one of {sorted(ARM_TABLE)}")
-        arm_spec = ARM_TABLE[self.gen4_arm]
+        self.gen4_arm = str((config.get("model") or {}).get("arm", ""))
+        requirements = _arm_requirements(config)
         cache_root = _resolve_cache_root(config)
 
-        uses_uni2_primary = (
-            arm_spec["image_feature_source"] == "precomputed" and arm_spec["global_context_source"] == "uni2_pool"
-        )
-        needs_scfoundation = arm_spec["gex_feature_source"] in ("frozen_context", "hybrid_context")
-        needs_uni2_hybrid = arm_spec["image_feature_source"] == "hybrid_context"
-        needs_sample_organ = (
-            arm_spec["gex_feature_source"] == "stpath_joint"
-            or arm_spec["image_feature_source"] in ("stpath_context", "hybrid_context")
-        )
+        uses_uni2_primary = requirements["uses_uni2_primary"]
+        needs_scfoundation = requirements["uses_scfoundation"]
+        needs_uni2_hybrid = requirements["uses_uni2_hybrid"]
+        needs_sample_organ = requirements["uses_sample_organ"]
         self._precomputed_spot_features: dict[str, np.ndarray] = {}
         self._slide_context: dict[str, dict] = {}
         self._wsi_tile_feature_provenance: dict[str, str | None] = {}
@@ -387,10 +412,11 @@ class Gen4SpatialFieldDataset(Gen3SpatialFieldDataset):
                     cache_root, sample_id, obs_names, sample.patches, sample.image_source_available,
                 )
                 self._precomputed_spot_features[sample_id] = cached["features"]
-                self._slide_context[sample_id] = uni2_dense_wsi_cache.load_uni2_dense_wsi_context(
-                    config, sample_id, sample.full_sample_coords.astype(np.float32),
-                )
-                self._wsi_tile_feature_provenance[sample_id] = "uni2"
+                if requirements.get("uses_uni2_dense", True):
+                    self._slide_context[sample_id] = uni2_dense_wsi_cache.load_uni2_dense_wsi_context(
+                        config, sample_id, sample.full_sample_coords.astype(np.float32),
+                    )
+                    self._wsi_tile_feature_provenance[sample_id] = "uni2"
             elif needs_uni2_hybrid:
                 # Arm 4 (hybrid): a SEPARATE UNI2 spot-feature lookup on
                 # top of the reused GigaPath precomputed_spot_features --
