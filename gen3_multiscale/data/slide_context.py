@@ -423,7 +423,7 @@ def load_slide_context_geometry_only(
             raise ValueError(f"slide context geometry for {sample_id} contains non-finite values")
         if tile_size <= 0 or mask_tile_size <= 0:
             raise ValueError(f"slide context geometry for {sample_id} has an invalid tile size")
-        validate_dense_wsi_tile_geometry(
+        _validate_no_image_slide_geometry(
             sample_id, coords, mask_coords, mask_tile_size, spot_coords,
             wsi_dimensions=wsi_dimensions, cache_label=f"dense WSI geometry cache {path}",
         )
@@ -452,6 +452,62 @@ def load_slide_context_geometry_only(
         "tile_encoder_provenance": None,
         "image_features_loaded": False,
     }
+
+
+def _validate_no_image_slide_geometry(
+    sample_id: str, coords: np.ndarray, mask_coords: np.ndarray, mask_tile_size: float,
+    spot_coords: np.ndarray, *, wsi_dimensions: np.ndarray | None, cache_label: str,
+) -> None:
+    """Self-contained geometry validation for the image-free cache path.
+
+    Kept local to this path so the small no-image evaluator patch remains
+    compatible with the released Gen3 branch, which predates the later
+    shared ``validate_dense_wsi_tile_geometry`` extraction.
+    """
+    if np.unique(coords, axis=0).shape[0] != coords.shape[0]:
+        raise ValueError(f"{cache_label} for {sample_id} contains duplicate tile coordinates")
+    if np.unique(mask_coords, axis=0).shape[0] != mask_coords.shape[0]:
+        raise ValueError(f"{cache_label} for {sample_id} contains duplicate level0 coordinates")
+
+    spot_xy = np.asarray(spot_coords[:, :2], dtype=np.float64)
+    if wsi_dimensions is not None:
+        if wsi_dimensions.shape != (2,) or np.any(wsi_dimensions <= 0):
+            raise ValueError(f"{cache_label} for {sample_id} has invalid wsi_dimensions")
+        inside = (
+            (spot_xy[:, 0] >= 0) & (spot_xy[:, 0] < wsi_dimensions[0])
+            & (spot_xy[:, 1] >= 0) & (spot_xy[:, 1] < wsi_dimensions[1])
+        )
+        outside_fraction = float(np.mean(~inside))
+        x_edge_distance = np.maximum(
+            np.maximum(-spot_xy[:, 0], spot_xy[:, 0] - wsi_dimensions[0]), 0.0,
+        )
+        y_edge_distance = np.maximum(
+            np.maximum(-spot_xy[:, 1], spot_xy[:, 1] - wsi_dimensions[1]), 0.0,
+        )
+        max_outside_distance = float(np.max(np.maximum(x_edge_distance, y_edge_distance)))
+        if outside_fraction > 0.005 or max_outside_distance > mask_tile_size:
+            raise ValueError(
+                f"{(~inside).sum()}/{len(inside)} ST spots fall outside {cache_label}; "
+                f"maximum edge offset is {max_outside_distance:.1f} level-0 pixels"
+            )
+
+    tile_bins = {
+        (int(np.floor(x / mask_tile_size)), int(np.floor(y / mask_tile_size)))
+        for x, y in mask_coords
+    }
+    covered = []
+    for x, y in spot_xy:
+        bx, by = int(np.floor(x / mask_tile_size)), int(np.floor(y / mask_tile_size))
+        covered.append(any(
+            (bx + dx, by + dy) in tile_bins
+            for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+        ))
+    coverage = float(np.mean(covered))
+    if coverage < 0.90:
+        raise ValueError(
+            f"only {coverage:.1%} of {sample_id} ST spots align near retained WSI tissue "
+            f"tiles in {cache_label}"
+        )
 
 
 def _overlaps_query_hole(

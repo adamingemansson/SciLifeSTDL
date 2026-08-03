@@ -87,20 +87,33 @@ def test_harmonic_baseline_prediction_returns_the_right_shape():
 
 
 def test_zero_image_content_removes_every_image_path_but_preserves_expression_and_geometry():
-    from gen3_multiscale.tests._gen4_fixtures import (
-        synthetic_gen4_inputs, with_synthetic_uni2_features, with_synthetic_wsi_context,
-    )
+    from gen3_multiscale.data.example import SpatialFieldInputs
 
-    inputs, _targets = synthetic_gen4_inputs(image_dim=8)
-    inputs = with_synthetic_wsi_context(inputs, image_dim=8)
-    inputs = with_synthetic_uni2_features(inputs, image_dim=8)
+    inputs = SpatialFieldInputs(
+        sample_id="s1", patient_id="p1",
+        observed_barcodes=np.asarray(["o0", "o1", "o2"]),
+        query_barcodes=np.asarray(["q0"]),
+        observed_coords=np.asarray([[0, 0], [1, 0], [2, 0]], dtype=np.float32),
+        query_coords=np.asarray([[1, 1]], dtype=np.float32),
+        observed_full_gene_expression=np.ones((3, 4), dtype=np.float32),
+        observed_gigapath_features=np.ones((3, 8), dtype=np.float32),
+        observed_image_available=np.ones(3, dtype=bool),
+        query_local_neighbor_idx=np.asarray([[0, 1]], dtype=np.int64),
+        boundary_idx=np.asarray([0, 1], dtype=np.int64),
+        boundary_ring=np.asarray([1, 1], dtype=np.int64),
+        query_depth_to_boundary=np.asarray([1], dtype=np.int64),
+        wsi_tile_longnet_coords=np.asarray([[100, 100], [200, 100]], dtype=np.float32),
+        wsi_tile_regional_coords=np.asarray([[-1, 0], [1, 0]], dtype=np.float32),
+        wsi_tile_features=np.ones((2, 8), dtype=np.float32),
+        full_slide_coord_bounds=(-2.0, 2.0, -2.0, 2.0),
+        slide_cache_namespace="no-image-test",
+    )
 
     ablated = zero_image_content(inputs)
 
     assert not np.any(ablated.observed_gigapath_features)
     assert not np.any(ablated.observed_image_available)
     assert not np.any(ablated.wsi_tile_features)
-    assert not np.any(ablated.observed_uni2_features)
     np.testing.assert_array_equal(ablated.observed_full_gene_expression, inputs.observed_full_gene_expression)
     np.testing.assert_array_equal(ablated.observed_coords, inputs.observed_coords)
     np.testing.assert_array_equal(ablated.query_coords, inputs.query_coords)
@@ -111,7 +124,6 @@ def test_zero_image_content_removes_every_image_path_but_preserves_expression_an
     # ablated predictions to be compared from the same dataset item.
     assert np.any(inputs.observed_gigapath_features)
     assert np.any(inputs.wsi_tile_features)
-    assert np.any(inputs.observed_uni2_features)
 
 
 def _build_synchronized_init_dir(tmp_path, manifest):
