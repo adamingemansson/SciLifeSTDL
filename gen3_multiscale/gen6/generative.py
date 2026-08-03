@@ -1,19 +1,28 @@
-"""Staged Gen6 residual-OT-flow and WAE-GAN generators."""
+"""Staged Gen6 learned-latent OT-flow and WAE-GAN generators."""
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 from torch.func import functional_call
 
+from gen3_multiscale.gen5.autoencoder import (
+    ExpressionAutoencoder,
+    verify_expression_autoencoder_gene_names,
+)
 from gen3_multiscale.models.flow import VelocityNetwork, sample_residual_coefficients
-from gen3_multiscale.models.gene_basis import GeneResidualBasis, verify_gene_residual_basis
 from gen3_multiscale.models.losses import rmse_pcc_reconstruction_loss
 
 
 def sinkhorn_barycentric_ot_pairing(
     noise: torch.Tensor, target: torch.Tensor, *, epsilon: float = 0.1, n_iters: int = 20,
 ) -> torch.Tensor:
-    """Entropy-regularized minibatch OT coupling, returned as paired targets."""
+    """Return one OT-barycentric prior-noise row per *fixed* target row.
+
+    Keeping the target row order is essential for conditional flow matching:
+    target ``i`` must remain attached to query coordinates/conditioning ``i``.
+    The OT plan may choose its prior partner, but must never exchange targets
+    between spatial locations.
+    """
     if noise.shape != target.shape or noise.ndim != 2:
         raise ValueError("noise and target must be matching [batch, latent_dim] tensors")
     if epsilon <= 0 or n_iters < 1:
@@ -29,7 +38,7 @@ def sinkhorn_barycentric_ot_pairing(
             log_u = log_mass - torch.logsumexp(log_kernel + log_v[None], dim=1)
             log_v = log_mass - torch.logsumexp(log_kernel + log_u[:, None], dim=0)
         plan = torch.exp(log_kernel + log_u[:, None] + log_v[None])
-        paired = (plan @ target) / plan.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        paired = (plan.T @ noise) / plan.sum(dim=0, keepdim=False).unsqueeze(1).clamp_min(1e-12)
     return paired
 
 
@@ -39,45 +48,48 @@ def minibatch_ot_flow_loss(
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     noise = torch.randn(target.shape, device=target.device, generator=generator)
-    paired_target = sinkhorn_barycentric_ot_pairing(noise, target, epsilon=epsilon, n_iters=n_iters)
+    paired_noise = sinkhorn_barycentric_ot_pairing(noise, target, epsilon=epsilon, n_iters=n_iters)
     t = torch.rand((), device=target.device, generator=generator)
-    x_t = (1 - t) * noise + t * paired_target
+    x_t = (1 - t) * paired_noise + t * target
     velocity = network(x_t, t, coords, conditioning)
-    return nn.functional.mse_loss(velocity, paired_target - noise)
+    return nn.functional.mse_loss(velocity, target - paired_noise)
 
 
-class Gen6ResidualOTFlowModel(nn.Module):
-    def __init__(self, conditioner: nn.Module, gene_basis: GeneResidualBasis,
+class Gen6LatentOTFlowModel(nn.Module):
+    """Frozen Gen6-C conditioner plus OT flow in a learned AE latent space."""
+
+    def __init__(self, conditioner: nn.Module, autoencoder: ExpressionAutoencoder,
                  gene_names: list[str], *, hidden_dim: int = 512, n_heads: int = 8,
                  n_flow_blocks: int = 2, dense_threshold: int = 256,
                  sparse_k: int = 10, chunk_size: int = 1024,
                  n_flow_samples: int = 8, n_ode_steps: int = 20,
                  ot_epsilon: float = 0.1, ot_sinkhorn_iters: int = 20):
         super().__init__()
-        verify_gene_residual_basis(gene_basis, gene_names)
+        verify_expression_autoencoder_gene_names(autoencoder, gene_names)
         self.conditioner = conditioner
-        self.register_buffer("_gene_basis_matrix", gene_basis.basis.clone())
+        self.autoencoder = autoencoder
         self.velocity_network = VelocityNetwork(
-            residual_rank=gene_basis.rank, hidden_dim=hidden_dim, n_heads=n_heads,
+            residual_rank=autoencoder.latent_dim, hidden_dim=hidden_dim, n_heads=n_heads,
             n_blocks=n_flow_blocks, dense_threshold=dense_threshold,
             sparse_k=sparse_k, chunk_size=chunk_size,
         )
         self.n_flow_samples, self.n_ode_steps = int(n_flow_samples), int(n_ode_steps)
         self.ot_epsilon, self.ot_sinkhorn_iters = float(ot_epsilon), int(ot_sinkhorn_iters)
-        self._freeze_conditioner()
+        self._freeze_staged_modules()
 
-    def _freeze_conditioner(self):
+    def _freeze_staged_modules(self):
         self.conditioner.eval()
         for parameter in self.conditioner.parameters():
+            parameter.requires_grad_(False)
+        self.autoencoder.eval()
+        for parameter in self.autoencoder.parameters():
             parameter.requires_grad_(False)
 
     def train(self, mode: bool = True):
         super().train(mode)
         self.conditioner.eval()
+        self.autoencoder.eval()
         return self
-
-    def forward(self, inputs):
-        return self.conditioner(inputs)
 
     def _condition(self, inputs):
         with torch.no_grad():
@@ -89,31 +101,37 @@ class Gen6ResidualOTFlowModel(nn.Module):
         target = torch.as_tensor(target_expression, dtype=mean.dtype, device=mean.device)
         if target.shape != mean.shape or not torch.isfinite(target).all():
             raise ValueError("target_expression must match the finite conditioner output")
-        coefficients = (target - mean) @ self._gene_basis_matrix.T
+        with torch.no_grad():
+            target_latent = self.autoencoder.encode(target)
         coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32, device=mean.device)
         loss = minibatch_ot_flow_loss(
-            self.velocity_network, coefficients, coords, hidden,
+            self.velocity_network, target_latent, coords, hidden,
             epsilon=self.ot_epsilon, n_iters=self.ot_sinkhorn_iters, generator=generator,
         )
-        return {"expression": mean, "query_hidden": hidden, "flow_loss": loss}
-
-    def compute_flow_matching_loss(self, inputs, target_expression, generator=None):
-        return self.compute_losses(inputs, target_expression, generator=generator)["flow_loss"]
+        return {
+            "query_hidden": hidden,
+            "flow_loss": loss,
+            "conditioner_expression_diagnostic_only": mean,
+        }
 
     @torch.no_grad()
     def sample_predictive_distribution(self, inputs, n_samples=None, n_steps=None, generator=None):
         mean, hidden = self._condition(inputs)
         coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32, device=mean.device)
-        coefficients = sample_residual_coefficients(
+        latent_samples = sample_residual_coefficients(
             self.velocity_network, coords.shape[0], coords, hidden,
             n_samples=n_samples or self.n_flow_samples,
             n_steps=n_steps or self.n_ode_steps, generator=generator,
         )
-        samples = mean[None] + coefficients @ self._gene_basis_matrix
+        n_samples_actual, n_query, latent_dim = latent_samples.shape
+        samples = self.autoencoder.decode(
+            latent_samples.reshape(n_samples_actual * n_query, latent_dim)
+        ).reshape(n_samples_actual, n_query, self.autoencoder.n_genes)
         return {
             "expression": samples.mean(0), "predictive_mean": samples.mean(0),
             "predictive_std": samples.std(0, unbiased=False), "predictive_samples": samples,
-            "deterministic_mean": mean,
+            "latent_samples": latent_samples,
+            "conditioner_expression_diagnostic_only": mean,
         }
 
 
@@ -156,13 +174,13 @@ class Gen6WAEGANModel(nn.Module):
     def _condition(self, inputs):
         with torch.no_grad():
             output = self.conditioner(inputs)
-        return output["query_hidden"]
+        return output["expression"], output["query_hidden"]
 
     def _decode(self, z, hidden):
         return self.decoder(torch.cat([z, hidden], dim=-1))
 
     def compute_losses(self, inputs, target_expression, generator=None):
-        hidden = self._condition(inputs)
+        _, hidden = self._condition(inputs)
         target = torch.as_tensor(target_expression, dtype=hidden.dtype, device=hidden.device)
         z_fake = self.encoder(target)
         z_real = torch.randn(z_fake.shape, device=z_fake.device, generator=generator)
@@ -199,13 +217,13 @@ class Gen6WAEGANModel(nn.Module):
         }
 
     def forward(self, inputs):
-        hidden = self._condition(inputs)
+        _, hidden = self._condition(inputs)
         z = torch.zeros(hidden.shape[0], self.latent_dim, dtype=hidden.dtype, device=hidden.device)
         return {"expression": self._decode(z, hidden), "query_hidden": hidden}
 
     @torch.no_grad()
     def sample_predictive_distribution(self, inputs, n_samples=None, generator=None, **_):
-        hidden = self._condition(inputs)
+        conditioner_mean, hidden = self._condition(inputs)
         samples = []
         for _ in range(n_samples or self.n_samples):
             z = torch.randn(hidden.shape[0], self.latent_dim, device=hidden.device, generator=generator)
@@ -218,4 +236,5 @@ class Gen6WAEGANModel(nn.Module):
             "expression": samples.mean(0), "predictive_mean": samples.mean(0),
             "predictive_std": samples.std(0, unbiased=False), "predictive_samples": samples,
             "deterministic_mean": self._decode(zero_latent, hidden),
+            "conditioner_expression_diagnostic_only": conditioner_mean,
         }

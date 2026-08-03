@@ -137,19 +137,20 @@ def test_run_training_smoke_gen6b_full_shared_path(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("arm", "kind"), (("gen6k", "flow"), ("gen6l", "wae_gan")),
+    ("arm", "kind"), (("gen6k", "latent_flow"), ("gen6l", "wae_gan")),
 )
 def test_run_training_smoke_gen6_staged_generators_use_shared_path(
     tmp_path, monkeypatch, arm, kind,
 ):
     """Both staged generators execute the common data/optimizer/validation loop.
 
-    Construction-only smoke deliberately substitutes a tiny Gen6-B
-    conditioner and basis, while real or staged smoke still requires exact
-    on-disk checkpoint provenance.
+    Construction-only smoke deliberately substitutes a tiny Gen6-C
+    conditioner (and a tiny autoencoder for K), while real or staged smoke
+    still requires exact on-disk checkpoint provenance.
     """
     cfg, manifest, manifest_path, samples = _prepare_experiment(tmp_path, monkeypatch)
     _write_uni2_caches(cfg, samples, output_dim=_TINY_PARAMS["image_feature_dim"])
+    _write_scfoundation_cache(cfg, manifest, samples, output_dim=6)
     config = yaml.safe_load((_CONFIG_DIR / "gen4" / "gen4a_conditioner.yaml").read_text())
     config["experiment_name"] = f"{arm}_smoke"
     config["model"] = {
@@ -157,19 +158,29 @@ def test_run_training_smoke_gen6_staged_generators_use_shared_path(
         "kind": kind,
         "params": {
             **_TINY_PARAMS,
-            "conditioner_arm": "gen6b",
-            "gene_basis_rank": 3,
+            "conditioner_arm": "gen6c",
+            "gex_context_embedding_dim": 6,
             "n_flow_blocks": 1,
             "n_flow_samples": 2,
             "n_ode_steps": 2,
             "latent_dim": 4,
+            "ot_epsilon": 0.1,
+            "ot_sinkhorn_iters": 2,
             "wae_hidden_dim": 16,
             "discriminator_hidden_dim": 8,
+            "adversarial_weight": 0.1,
+            "discriminator_weight": 1.0,
         },
     }
-    config["required_fingerprints"]["gen6_conditioner_checkpoint"] = None
+    config["required_fingerprints"].update({
+        "gen6_conditioner_checkpoint": None,
+        "scfoundation_checkpoint": None,
+        "scfoundation_vocab": None,
+        "scfoundation_package_version": None,
+        "scfoundation_preprocessing_spec": None,
+    })
     if arm == "gen6k":
-        config["required_fingerprints"]["gene_residual_basis"] = None
+        config["required_fingerprints"]["expression_autoencoder_checkpoint"] = None
     config["loss"] = {"primary_mode": "rmse_pcc", "pcc_weight": 0.1}
     config_path = tmp_path / f"{arm}_config.yaml"
     _write_config(

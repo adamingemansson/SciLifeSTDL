@@ -26,3 +26,22 @@ def test_auto_scaled_frame_bias_is_translation_and_scale_invariant():
     first = attention._full_bias(coords)
     transformed = attention._full_bias(coords * 5000 + torch.tensor([12000.0, -9000.0]))
     torch.testing.assert_close(first, transformed, rtol=2e-4, atol=2e-4)
+
+
+def test_sparse_geometry_never_materializes_full_pairwise_bias():
+    hidden = torch.randn(12, 12)
+    coords = torch.randn(12, 2)
+    for mode in ("relative_bias", "fourier_attention", "frame_averaging"):
+        attention = Gen6QuerySelfAttention(
+            hidden_dim=12, n_heads=3, dense_threshold=4, sparse_k=3,
+            geometry_mode=mode, coord_scale=0.0,
+        )
+
+        def forbidden(_):
+            raise AssertionError("sparse path materialized full N-by-N bias")
+
+        attention._full_bias = forbidden
+        output, path = attention(hidden, coords)
+        assert path == "sparse"
+        assert output.shape == hidden.shape
+        assert torch.isfinite(output).all()

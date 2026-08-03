@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fit a Gen4 or Gen6 flow residual basis from one selected conditioner.
+"""Fit a Gen4 flow residual basis from one selected Gen4 conditioner.
 
 Only manifest-declared training samples are used. The resulting basis is
 bound to the exact conditioner bundle, dataset, gene panel, masks, and
@@ -51,9 +51,7 @@ def fit_and_save_gen4_basis(
     config = resolved_config(conditioner_config_path)
     model_cfg = config.get("model") or {}
     if model_cfg.get("arm") is None or str(model_cfg.get("kind")) != "conditioner":
-        raise ValueError("basis fitting requires a Gen4/Gen6 conditioner config")
-    declared_arm = str(model_cfg.get("arm"))
-    is_gen6 = declared_arm.startswith("gen6")
+        raise ValueError("basis fitting requires a Gen4 conditioner config")
     if n_masks_per_sample < len(config["masking"]["strata"]):
         raise ValueError("n_masks_per_sample must cover every configured mask stratum")
 
@@ -124,8 +122,8 @@ def fit_and_save_gen4_basis(
     ).hexdigest()
     provenance = {
         "version": 1,
-        "kind": "gen6_residual_basis_provenance" if is_gen6 else "gen4_residual_basis_provenance",
-        "conditioner_arm": declared_arm if is_gen6 else _resolve_gen4_arm(config),
+        "kind": "gen4_residual_basis_provenance",
+        "conditioner_arm": _resolve_gen4_arm(config),
         "conditioner_config_identity_fingerprint": config_identity_fingerprint(config),
         "conditioner_checkpoint_sha256": pinned.weights_sha256,
         "conditioner_checkpoint_step": pinned.step,

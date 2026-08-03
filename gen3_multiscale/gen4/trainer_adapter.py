@@ -594,11 +594,12 @@ def build_gen6_model_for_inference(
         else:
             # Package-only smoke: use the explicitly named deterministic arm.
             smoke_config = json.loads(json.dumps(config))
-            smoke_config["model"]["arm"] = str(params.get("conditioner_arm", "gen6b"))
+            smoke_config["model"]["arm"] = str(params.get("conditioner_arm", "gen6c"))
             smoke_config["model"]["kind"] = "conditioner"
             for key in (
                 "conditioner_arm", "gene_basis_rank", "n_flow_blocks", "n_flow_samples",
                 "n_ode_steps", "ot_epsilon", "ot_sinkhorn_iters", "latent_dim",
+                "autoencoder_hidden_dim",
                 "wae_hidden_dim", "discriminator_hidden_dim", "adversarial_weight",
                 "discriminator_weight",
             ):
@@ -609,64 +610,56 @@ def build_gen6_model_for_inference(
                 slide_encoder=slide_encoder, gigapath_checkpoint_sha256=slide_sha, seed=seed,
             ).to(device)
             conditioner_info = dict(_UNLOADED_CONDITIONER_INFO)
-        from gen3_multiscale.gen6.generative import Gen6ResidualOTFlowModel, Gen6WAEGANModel
+        from gen3_multiscale.gen6.generative import Gen6LatentOTFlowModel, Gen6WAEGANModel
 
-        if spec.generator == "residual_ot_flow":
-            basis_path = fingerprints.get("gene_residual_basis")
-            if not basis_path:
-                if not (smoke and not staged_smoke):
-                    raise ValueError("gen6k requires required_fingerprints.gene_residual_basis")
-                from gen3_multiscale.models.gene_basis import fit_gene_residual_basis
-                import numpy as np
+        autoencoder_info = None
+        if spec.generator == "latent_ot_flow":
+            from gen3_multiscale.gen5.autoencoder import (
+                ExpressionAutoencoder,
+                load_expression_autoencoder_checkpoint,
+                verify_expression_autoencoder_gene_names,
+            )
 
-                rank = int(params.get("gene_basis_rank", 8))
-                basis = fit_gene_residual_basis(
-                    np.zeros((rank + 1, len(gene_names)), dtype=np.float32), gene_names, rank=rank,
-                )
-            else:
-                basis = load_gene_residual_basis(basis_path)
-                provenance_path = Path(f"{basis_path}.provenance.json")
-                if not provenance_path.is_file():
-                    raise ValueError(f"Gen6 residual basis provenance is missing: {provenance_path}")
-                provenance = json.loads(provenance_path.read_text())
-                import numpy as np
-                from gen3_multiscale.data.dataset_manifest import gene_panel_hash
+            autoencoder_path = fingerprints.get("expression_autoencoder_checkpoint")
+            needs_staged = not (smoke and not staged_smoke)
+            if autoencoder_path and needs_staged:
                 from gen3_multiscale.training.train import dataset_manifest_fingerprint
 
-                basis_numeric_sha = hashlib.sha256(
-                    np.ascontiguousarray(basis.basis.detach().cpu().numpy()).tobytes()
-                ).hexdigest()
-                expected = {
-                    "kind": "gen6_residual_basis_provenance",
-                    "conditioner_arm": str(params.get("conditioner_arm", "")),
-                    "conditioner_checkpoint_sha256": conditioner_info["checkpoint_sha256"],
-                    "conditioner_checkpoint_step": conditioner_info["checkpoint_step"],
-                    "conditioner_checkpoint_bundle_id": conditioner_info["checkpoint_bundle_id"],
-                    "conditioner_checkpoint_manifest_sha256": conditioner_info["checkpoint_manifest_sha256"],
-                    "gene_residual_basis_sha256": basis_numeric_sha,
-                    "gene_panel_hash": gene_panel_hash(gene_names),
+                manifest_fp = (
+                    dataset_manifest_fingerprint(dataset_manifest)
+                    if dataset_manifest is not None else None
+                )
+                autoencoder, payload = load_expression_autoencoder_checkpoint(
+                    autoencoder_path, dataset_manifest_fingerprint=manifest_fp,
+                )
+                verify_expression_autoencoder_gene_names(autoencoder, gene_names)
+                configured_latent_dim = int(params.get("latent_dim", payload["latent_dim"]))
+                if configured_latent_dim != int(payload["latent_dim"]):
+                    raise ValueError(
+                        "gen6k model.params.latent_dim does not match the staged "
+                        f"autoencoder ({configured_latent_dim} != {payload['latent_dim']})"
+                    )
+                autoencoder_info = {
+                    "loaded": True, "checkpoint_path": str(autoencoder_path),
+                    "latent_dim": payload["latent_dim"], "hidden_dim": payload["hidden_dim"],
+                    "code_identity": payload.get("code_identity"),
                 }
-                if dataset_manifest is not None:
-                    expected["dataset_manifest_fingerprint"] = dataset_manifest_fingerprint(dataset_manifest)
-                mismatches = {
-                    key: (provenance.get(key), value)
-                    for key, value in expected.items() if provenance.get(key) != value
+            elif needs_staged:
+                raise ValueError(
+                    "gen6k requires required_fingerprints.expression_autoencoder_checkpoint"
+                )
+            else:
+                latent_dim = int(params.get("latent_dim", 8))
+                autoencoder = ExpressionAutoencoder(
+                    len(gene_names), gene_names, latent_dim=latent_dim,
+                    hidden_dim=int(params.get("autoencoder_hidden_dim", 64)),
+                )
+                autoencoder_info = {
+                    "loaded": False, "checkpoint_path": None,
+                    "latent_dim": latent_dim, "hidden_dim": None, "code_identity": None,
                 }
-                if mismatches:
-                    raise ValueError(f"Gen6 residual basis provenance mismatch: {mismatches}")
-                if dataset_manifest is not None:
-                    train_ids = sorted(dataset_manifest.get("train_sample_ids") or [])
-                    if sorted(provenance.get("train_sample_ids") or []) != train_ids:
-                        raise ValueError("Gen6 residual basis training sample IDs do not match the manifest")
-                    recorded_cache = provenance.get("cache_content_by_sample") or {}
-                    live_cache = cache_content_by_sample or {}
-                    for sample_id in train_ids:
-                        if sample_id in live_cache and recorded_cache.get(sample_id) != live_cache[sample_id]:
-                            raise ValueError(
-                                f"Gen6 residual basis cache identity mismatch for {sample_id!r}"
-                            )
-            model = Gen6ResidualOTFlowModel(
-                conditioner, basis, gene_names,
+            model = Gen6LatentOTFlowModel(
+                conditioner, autoencoder, gene_names,
                 hidden_dim=int(params.get("hidden_dim", 512)), n_heads=int(params.get("n_heads", 8)),
                 n_flow_blocks=int(params.get("n_flow_blocks", 2)),
                 dense_threshold=int(params.get("dense_threshold", 256)),
@@ -701,7 +694,7 @@ def build_gen6_model_for_inference(
         checkpoint_module.load_trainable_state(model, resolved.resolved_dir)
     return model, {
         "kind": str(model_cfg.get("kind", "")), "conditioner_info": conditioner_info,
-        "gene_basis_info": None, "autoencoder_info": None,
+        "gene_basis_info": None, "autoencoder_info": autoencoder_info if spec.staged_conditioner else None,
         "checkpoint_bundle_id": resolved.bundle_dir if resolved else None,
         "checkpoint_manifest_sha256": resolved.manifest_sha256 if resolved else None,
         "trainable_weights_sha256": resolved.weights_sha256 if resolved else None,

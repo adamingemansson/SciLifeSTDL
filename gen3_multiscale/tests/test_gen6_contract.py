@@ -3,7 +3,10 @@ import torch
 
 from gen3_multiscale.gen6.contract import GEN6_ARM_SPECS, gen6_cache_requirements, get_gen6_arm_spec
 from gen3_multiscale.gen6.fusion import BidirectionalCrossAttentionFusion, MoMEFusion, SimpleFusion
-from gen3_multiscale.gen6.preflight import audit_gen6_manifest_cache_coverage
+from gen3_multiscale.gen6.preflight import (
+    audit_gen6_manifest_cache_coverage,
+    required_gen6_fingerprints,
+)
 from gen3_multiscale.models.losses import combined_reconstruction_loss
 
 
@@ -23,6 +26,21 @@ def test_full_spatial_field_alone_requires_dense_uni2():
     requirements = gen6_cache_requirements({"model": {"arm": "gen6j"}})
     assert requirements["uses_uni2_primary"]
     assert requirements["uses_uni2_dense"]
+
+
+def test_staged_generators_share_gen6c_and_k_requires_autoencoder():
+    for arm in ("gen6k", "gen6l"):
+        requirements = gen6_cache_requirements({
+            "model": {"arm": arm, "params": {"conditioner_arm": "gen6c"}},
+        })
+        assert requirements["uses_uni2_primary"]
+        assert requirements["uses_scfoundation"]
+    k_required = required_gen6_fingerprints({
+        "model": {"arm": "gen6k", "params": {"conditioner_arm": "gen6c"}},
+    })
+    assert "gen6_conditioner_checkpoint" in k_required
+    assert "expression_autoencoder_checkpoint" in k_required
+    assert "gene_residual_basis" not in k_required
 
 
 def test_factorial_encoder_cache_requirements_are_exact():
@@ -57,6 +75,19 @@ def test_fusion_shapes_and_gradients(fusion_cls):
 def test_mome_missing_image_rows_are_invariant_to_image_values():
     torch.manual_seed(9)
     fusion = MoMEFusion(7, 5, 12)
+    image = torch.randn(4, 7)
+    gene = torch.randn(4, 5)
+    available = torch.tensor([True, False, True, False])
+    first = fusion(image, gene, available)
+    mutated = image.clone()
+    mutated[~available] = torch.randn_like(mutated[~available]) * 1e6
+    second = fusion(mutated, gene, available)
+    torch.testing.assert_close(first[~available], second[~available])
+
+
+def test_cross_attention_missing_image_rows_are_invariant_to_image_values():
+    torch.manual_seed(10)
+    fusion = BidirectionalCrossAttentionFusion(7, 5, 12)
     image = torch.randn(4, 7)
     gene = torch.randn(4, 5)
     available = torch.tensor([True, False, True, False])

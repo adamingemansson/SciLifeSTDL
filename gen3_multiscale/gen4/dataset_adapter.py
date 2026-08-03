@@ -241,7 +241,10 @@ def load_and_preflight_gen4_samples(
     if is_gen6_config(config):
         from gen3_multiscale.gen6.preflight import audit_gen6_manifest_cache_coverage
 
-        modality_report = audit_gen6_manifest_cache_coverage(cache_root, sample_ids, config)
+        modality_report = audit_gen6_manifest_cache_coverage(
+            cache_root, sample_ids, config,
+            require_staged_artifacts=require_resolved_artifacts,
+        )
     else:
         from gen3_multiscale.gen4.preflight import audit_gen4_manifest_cache_coverage
 

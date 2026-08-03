@@ -5,9 +5,10 @@ import torch
 import torch.nn as nn
 
 from gen3_multiscale.gen6.generative import (
-    Gen6ResidualOTFlowModel, Gen6WAEGANModel, sinkhorn_barycentric_ot_pairing,
+    Gen6LatentOTFlowModel, Gen6WAEGANModel, sinkhorn_barycentric_ot_pairing,
 )
-from gen3_multiscale.models.gene_basis import fit_gene_residual_basis
+from gen3_multiscale.gen5.autoencoder import ExpressionAutoencoder
+from gen3_multiscale.training.train import predict_for_metrics
 
 
 class _Conditioner(nn.Module):
@@ -35,11 +36,24 @@ def test_sinkhorn_pairing_shape_finite_and_deterministic():
     torch.testing.assert_close(first, second)
 
 
-def test_residual_ot_flow_updates_flow_but_freezes_conditioner():
+def test_sinkhorn_pairing_keeps_target_row_conditioning_order():
+    # With a very sharp coupling and permuted target rows, the returned
+    # object is the PRIOR partner indexed by target row.  This prevents the
+    # target/coordinate mismatch that would result from returning permuted
+    # targets while leaving conditioning fixed.
+    noise = torch.tensor([[0.0], [10.0], [20.0]])
+    target = torch.tensor([[20.0], [0.0], [10.0]])
+    paired_noise = sinkhorn_barycentric_ot_pairing(
+        noise, target, epsilon=0.01, n_iters=100,
+    )
+    torch.testing.assert_close(paired_noise, target, atol=1e-3, rtol=0.0)
+
+
+def test_latent_ot_flow_updates_flow_but_freezes_conditioner_and_autoencoder():
     genes = [f"g{i}" for i in range(6)]
-    basis = fit_gene_residual_basis(np.random.default_rng(1).normal(size=(20, 6)), genes, rank=3)
-    model = Gen6ResidualOTFlowModel(
-        _Conditioner(), basis, genes, hidden_dim=16, n_heads=4,
+    autoencoder = ExpressionAutoencoder(6, genes, latent_dim=3, hidden_dim=12)
+    model = Gen6LatentOTFlowModel(
+        _Conditioner(), autoencoder, genes, hidden_dim=16, n_heads=4,
         n_flow_blocks=1, dense_threshold=20, n_flow_samples=2, n_ode_steps=2,
     )
     inputs, target = _inputs(), torch.randn(8, 6)
@@ -47,6 +61,7 @@ def test_residual_ot_flow_updates_flow_but_freezes_conditioner():
     loss.backward()
     assert any(p.grad is not None for p in model.velocity_network.parameters())
     assert all(p.grad is None and not p.requires_grad for p in model.conditioner.parameters())
+    assert all(p.grad is None and not p.requires_grad for p in model.autoencoder.parameters())
     prediction = model.sample_predictive_distribution(inputs, generator=torch.Generator().manual_seed(4))
     assert prediction["predictive_mean"].shape == target.shape
 
@@ -65,3 +80,11 @@ def test_wae_gan_one_optimizer_loss_routes_gradients_correctly():
     assert all(p.grad is None and not p.requires_grad for p in model.conditioner.parameters())
     prediction = model.sample_predictive_distribution(inputs, generator=torch.Generator().manual_seed(6))
     assert prediction["predictive_mean"].shape == target.shape
+    expected_conditioner = model.conditioner(inputs)["expression"]
+    torch.testing.assert_close(
+        prediction["conditioner_expression_diagnostic_only"], expected_conditioner,
+    )
+    metrics = predict_for_metrics(
+        "wae_gan", model, inputs, generator=torch.Generator().manual_seed(7),
+    )
+    torch.testing.assert_close(metrics["conditioner_only_expression"], expected_conditioner)

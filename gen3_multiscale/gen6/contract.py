@@ -120,13 +120,13 @@ GEN6_ARM_SPECS: dict[str, Gen6ArmSpec] = {
         uses_uni2_spot=True, uses_uni2_dense=True, uses_scfoundation=True,
     ),
     "gen6k": _spec(
-        "gen6k", "best deterministic conditioner plus output-space minibatch OT flow",
+        "gen6k", "frozen Gen6-C conditioner plus learned-latent minibatch OT flow",
         "selected_conditioner", "selected_conditioner", "staged", "staged",
-        "staged_conditioner", "residual_ot_flow",
-        staged_conditioner=True,
+        "staged_conditioner", "latent_ot_flow",
+        staged_conditioner=True, staged_autoencoder=True,
     ),
     "gen6l": _spec(
-        "gen6l", "best deterministic conditioner plus WAE-GAN expression generator",
+        "gen6l", "frozen Gen6-C conditioner plus WAE-GAN expression generator",
         "selected_conditioner", "selected_conditioner", "staged", "staged",
         "staged_conditioner", "wae_gan",
         staged_conditioner=True,
@@ -152,6 +152,8 @@ def gen6_cache_requirements(config: dict) -> dict[str, bool]:
     spec = get_gen6_arm_spec(arm)
     if spec.staged_conditioner:
         selected = str(((config.get("model") or {}).get("params") or {}).get("conditioner_arm", ""))
+        if selected != "gen6c":
+            raise ValueError("Gen6-K/L must use the shared deterministic control conditioner gen6c")
         selected_spec = get_gen6_arm_spec(selected)
         if selected_spec.staged_conditioner:
             raise ValueError("a staged Gen6 generator must select a deterministic Gen6 conditioner")

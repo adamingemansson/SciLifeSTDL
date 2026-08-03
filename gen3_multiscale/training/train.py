@@ -854,11 +854,11 @@ def predict_for_metrics(
     exactly the bug this function's genericization fixes)."""
     if kind in ("flow", "latent_flow", "wae_gan"):
         predictive = model.sample_predictive_distribution(inputs, n_samples=n_samples, generator=generator)
-        conditioner_expression = predictive.get("deterministic_mean")
+        conditioner_expression = predictive.get(
+            "conditioner_expression_diagnostic_only"
+        )
         if conditioner_expression is None:
-            conditioner_expression = predictive.get(
-                "conditioner_expression_diagnostic_only"
-            )
+            conditioner_expression = predictive.get("deterministic_mean")
         if conditioner_expression is None:
             # Backward-compatible guard for an external flow
             # implementation that follows the sampling API but predates

@@ -73,7 +73,14 @@ class MoMEFusion(nn.Module):
 
 
 class BidirectionalCrossAttentionFusion(nn.Module):
-    """Two directed modality interactions, followed by symmetric fusion."""
+    """Content-dependent two-token image/GEX attention in both directions.
+
+    Each modality query attends over the shared ``[image, gene]`` token
+    set.  Attending to only the opposite modality would provide one key,
+    making softmax identically one and reducing "attention" to a fixed
+    projection.  The two-key formulation preserves the bounded per-spot
+    cost while allowing learned, input-dependent modality selection.
+    """
     def __init__(self, image_dim: int, gene_dim: int, output_dim: int, n_heads: int = 4):
         super().__init__()
         if output_dim % n_heads:
@@ -95,8 +102,19 @@ class BidirectionalCrossAttentionFusion(nn.Module):
             image_token = torch.where(available, image_token, self.missing_image.expand_as(image_token))
         gene_token = self.gene_proj(gene)
         image_q, gene_q = image_token[:, None], gene_token[:, None]
-        image_update, _ = self.image_from_gene(image_q, gene_q, gene_q, need_weights=False)
-        gene_update, _ = self.gene_from_image(gene_q, image_q, image_q, need_weights=False)
+        tokens = torch.stack([image_token, gene_token], dim=1)
+        key_padding_mask = None
+        if image_available is not None:
+            key_padding_mask = torch.stack([
+                ~image_available.to(dtype=torch.bool).reshape(-1),
+                torch.zeros_like(image_available, dtype=torch.bool).reshape(-1),
+            ], dim=1)
+        image_update, _ = self.image_from_gene(
+            image_q, tokens, tokens, key_padding_mask=key_padding_mask, need_weights=False,
+        )
+        gene_update, _ = self.gene_from_image(
+            gene_q, tokens, tokens, key_padding_mask=key_padding_mask, need_weights=False,
+        )
         return self.out(torch.cat([
             (image_q + image_update).squeeze(1),
             (gene_q + gene_update).squeeze(1),

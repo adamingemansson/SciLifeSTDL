@@ -20,12 +20,13 @@ gradient term.
 | gen6h | same encoders/MoME + normalized Fourier relative attention |
 | gen6i | same encoders + bidirectional image/GEX cross-attention |
 | gen6j | MoME + full local/boundary/regional/global spatial field |
-| gen6k | selected frozen Gen6 conditioner + minibatch-OT residual flow |
-| gen6l | selected frozen Gen6 conditioner + conditional WAE-GAN |
+| gen6k | frozen Gen6-C + shared expression autoencoder + minibatch-OT latent flow |
+| gen6l | the same frozen Gen6-C + conditional WAE-GAN |
 
 G6-B:E form the 2x2 encoder comparison.  G6-F:J hold scFoundation+UNI2
-fixed so fusion/geometry changes are attributable.  G6-K:L are staged only
-after a deterministic conditioner is validation-selected.
+fixed so fusion/geometry changes are attributable. G6-K:L deliberately use
+the exact same frozen Gen6-C checkpoint, making Gen6-C the deterministic
+control for both generative additions.
 
 ## Package smoke
 
@@ -86,22 +87,25 @@ only later arms on that GPU queue; it never silently proceeds on the same GPU.
 
 ## Prepare G6-K/L
 
-Fit a basis from the exact validation-selected deterministic checkpoint:
+Train and validate one shared full-expression autoencoder using the existing
+Gen5 command (this is a separate stage and its checkpoint remains frozen in
+Gen6-K):
 
 ```bash
-python -m gen3_multiscale.scripts.fit_gen4_residual_basis \
-  --config /path/selected_gen6_config.yaml \
-  --conditioner-checkpoint-dir /path/checkpoints/gen6X/best \
-  --output-basis-path /path/gen6_residual_basis_rank64.pt \
-  --n-masks-per-sample 20 --rank 64 --device cpu --svd-device cuda
+python -m gen3_multiscale.scripts.train_gen5_autoencoder \
+  --manifest /path/dataset_manifest.json \
+  --output-checkpoint /path/shared_autoencoder.pt \
+  --latent-dim 256 --hidden-dim 1024 --epochs 50 \
+  --batch-size 64 --lr 1e-3 --device cuda --seed 0
 ```
 
-Then prepare both staged generators (no training):
+Then prepare both staged generators from the exact Gen6-C checkpoint (no
+training is started by this command):
 
 ```bash
 python -m gen3_multiscale.scripts.prepare_gen6_generators \
-  --conditioner-checkpoint /path/checkpoints/gen6X/best \
-  --basis /path/gen6_residual_basis_rank64.pt \
+  --conditioner-checkpoint /path/checkpoints/gen6c/best \
+  --autoencoder-checkpoint /path/shared_autoencoder.pt \
   --output-root /path/gen6_generators --hours 8
 ```
 

@@ -1,7 +1,7 @@
 import torch
 
 from gen3_multiscale.gen4.trainer_adapter import build_gen6_model_for_inference
-from gen3_multiscale.gen6.generative import Gen6ResidualOTFlowModel, Gen6WAEGANModel
+from gen3_multiscale.gen6.generative import Gen6LatentOTFlowModel, Gen6WAEGANModel
 
 
 def _config(arm, kind="conditioner", conditioner_arm=None):
@@ -11,7 +11,7 @@ def _config(arm, kind="conditioner", conditioner_arm=None):
         "dense_threshold": 20, "fusion_heads": 4,
     }
     if conditioner_arm:
-        params.update({"conditioner_arm": conditioner_arm, "gene_basis_rank": 3,
+        params.update({"conditioner_arm": conditioner_arm,
                        "latent_dim": 4, "wae_hidden_dim": 16})
     return {
         "model": {"arm": arm, "kind": kind, "params": params},
@@ -31,12 +31,12 @@ def test_shared_inference_adapter_constructs_gen6_conditioner():
 
 def test_construction_only_smoke_builds_both_staged_generator_types():
     flow, flow_info = build_gen6_model_for_inference(
-        _config("gen6k", "flow", "gen6b"), gene_names=[f"g{i}" for i in range(6)],
+        _config("gen6k", "latent_flow", "gen6c"), gene_names=[f"g{i}" for i in range(6)],
         device=torch.device("cpu"), smoke=True,
     )
     wae, wae_info = build_gen6_model_for_inference(
-        _config("gen6l", "wae_gan", "gen6b"), gene_names=[f"g{i}" for i in range(6)],
+        _config("gen6l", "wae_gan", "gen6c"), gene_names=[f"g{i}" for i in range(6)],
         device=torch.device("cpu"), smoke=True,
     )
-    assert isinstance(flow, Gen6ResidualOTFlowModel) and flow_info["kind"] == "flow"
+    assert isinstance(flow, Gen6LatentOTFlowModel) and flow_info["kind"] == "latent_flow"
     assert isinstance(wae, Gen6WAEGANModel) and wae_info["kind"] == "wae_gan"

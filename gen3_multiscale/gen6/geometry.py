@@ -77,14 +77,50 @@ class Gen6QuerySelfAttention(QueryQuerySelfAttention):
         geometry = self._relative_geometry(coords, i_idx, j_idx).view(n, n, 3)
         return self.geometry_bias(geometry).permute(0, 2, 1)
 
+    def _sparse_bias(
+        self, coords: torch.Tensor, neighbor_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute bias only for selected KNN edges, never an N×N tensor."""
+        n, k_neighbors = neighbor_idx.shape
+        if self.frame_bias is None:
+            i_idx = torch.arange(n, device=coords.device)[:, None].expand(-1, k_neighbors)
+            geometry = self._relative_geometry(
+                coords, i_idx.reshape(-1), neighbor_idx.reshape(-1),
+            ).view(n, k_neighbors, 3)
+            return self.geometry_bias(geometry).permute(0, 2, 1)
+
+        frame_coords = coords[:, :2]
+        if self.auto_frame_scale:
+            centered_coords = frame_coords - frame_coords.mean(dim=0, keepdim=True)
+            scale = torch.linalg.norm(centered_coords, dim=-1).amax().clamp_min(1e-6)
+            frame_coords = centered_coords / scale
+        else:
+            frame_coords = frame_coords / float(self.frame_bias.coord_scale)
+        radial = frame_coords[:, None] - frame_coords[neighbor_idx]
+        radial_norm = radial.norm(dim=-1, keepdim=True)
+        centered = radial - radial.mean(dim=1, keepdim=True)
+        cov = torch.einsum("nki,nkj->nij", centered, centered) / float(k_neighbors)
+        _, eigvecs = torch.linalg.eigh(cov)
+        frame_ops = (
+            self.frame_bias.ops.view(1, self.frame_bias.n_frames, 1, 2)
+            * eigvecs.unsqueeze(1)
+        )
+        frame_features = torch.einsum("nofd,nkd->nofk", frame_ops, radial)
+        frame_features = frame_features.permute(0, 1, 3, 2)
+        expanded_norm = radial_norm.unsqueeze(1).expand(
+            n, self.frame_bias.n_frames, k_neighbors, 1,
+        )
+        features = torch.cat([frame_features, expanded_norm], dim=-1)
+        return self.frame_bias.edge_bias(features).mean(dim=1).permute(0, 2, 1)
+
     def forward(self, query_hidden: torch.Tensor, query_coords: torch.Tensor):
         n_query = query_hidden.shape[0]
         q = self.query_proj(query_hidden).view(n_query, self.n_heads, self.head_dim)
         k = self.key_proj(query_hidden).view(n_query, self.n_heads, self.head_dim)
         v = self.value_proj(query_hidden).view(n_query, self.n_heads, self.head_dim)
         scale = 1.0 / math.sqrt(self.head_dim)
-        full_bias = self._full_bias(query_coords)
         if n_query <= self.dense_threshold:
+            full_bias = self._full_bias(query_coords)
             logits = torch.einsum("qhd,khd->qhk", q, k) * scale + full_bias
             weights = logits.softmax(dim=-1)
             output = torch.einsum("qhk,khd->qhd", weights, v)
@@ -96,11 +132,11 @@ class Gen6QuerySelfAttention(QueryQuerySelfAttention):
         neighbor_idx = torch.zeros(n_query, max_neighbors, dtype=torch.long, device=q.device)
         neighbor_mask = torch.zeros(n_query, max_neighbors, dtype=torch.bool, device=q.device)
         for index, neighbors in enumerate(adjacency):
-            if neighbors:
+            if len(neighbors):
                 neighbor_idx[index, :len(neighbors)] = torch.as_tensor(neighbors, device=q.device)
                 neighbor_mask[index, :len(neighbors)] = True
         k_gathered, v_gathered = k[neighbor_idx], v[neighbor_idx]
-        selected_bias = full_bias.gather(2, neighbor_idx[:, None].expand(-1, self.n_heads, -1))
+        selected_bias = self._sparse_bias(query_coords, neighbor_idx)
         logits = torch.einsum("qhd,qkhd->qhk", q, k_gathered) * scale + selected_bias
         logits = logits.masked_fill(~neighbor_mask[:, None], float("-inf"))
         weights = torch.nan_to_num(logits.softmax(dim=-1), nan=0.0)

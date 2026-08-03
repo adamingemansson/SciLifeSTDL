@@ -85,8 +85,8 @@ def prepare_gen6_suite(*, comparison_config: str, manifest: str, output_root: st
         "manifest": str(Path(manifest).resolve()), "hours_per_arm": float(hours),
         "arms": written,
         "stage_two": {
-            "gen6k": "prepare after validation-selecting the best deterministic conditioner",
-            "gen6l": "prepare after the same conditioner is selected; its conditional WAE-GAN is trained from scratch",
+            "gen6k": "freeze Gen6-C and apply learned-latent minibatch-OT flow",
+            "gen6l": "freeze the same Gen6-C checkpoint and train its conditional WAE-GAN",
         },
     }
     (root / "run_plan.json").write_text(json.dumps(plan, indent=2, sort_keys=True))
