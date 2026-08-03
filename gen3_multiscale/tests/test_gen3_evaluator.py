@@ -12,12 +12,31 @@ import torch
 import yaml
 
 from gen3_multiscale.evaluation.gen3_evaluator import (
-    evaluate_gen3_checkpoint, harmonic_baseline_prediction, load_configured_gene_panels,
+    _GaussianCalibrationAccumulator,
+    architecture4_calibration_summary, evaluate_gen3_checkpoint, harmonic_baseline_prediction, load_configured_gene_panels,
     mean_baseline_prediction, nearest_neighbor_baseline_prediction, per_item_reconstruction_metrics,
     save_evaluation_report,
 )
 from gen3_multiscale.tests._step6_fixtures import prepare_step6_experiment, write_step6_train_config
 from gen3_multiscale.training import train as train_module
+
+
+def test_gaussian_calibration_accumulator_matches_unbounded_reference():
+    chunks = [
+        np.asarray([[0.0, 0.5, 2.0], [np.nan, -1.5, -3.0]]),
+        np.asarray([1.0, -1.645, 1.96, np.inf]),
+    ]
+    accumulator = _GaussianCalibrationAccumulator()
+    for chunk in chunks:
+        accumulator.add_item(chunk)
+
+    reference = architecture4_calibration_summary(
+        np.concatenate([chunk.reshape(-1) for chunk in chunks]).tolist()
+    )
+    actual = accumulator.summary()
+    assert actual["n_values"] == reference["n_values"]
+    for key in ("z_mean", "z_std", "coverage_68", "coverage_90", "coverage_95"):
+        assert actual[key] == pytest.approx(reference[key], abs=1e-12)
 
 
 def test_per_item_reconstruction_metrics_reports_pcc_rmse_and_valid_gene_counts():
