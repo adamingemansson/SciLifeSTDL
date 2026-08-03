@@ -14,7 +14,7 @@ import yaml
 from gen3_multiscale.evaluation.gen3_evaluator import (
     evaluate_gen3_checkpoint, harmonic_baseline_prediction, load_configured_gene_panels,
     mean_baseline_prediction, nearest_neighbor_baseline_prediction, per_item_reconstruction_metrics,
-    save_evaluation_report,
+    save_evaluation_report, zero_image_content,
 )
 from gen3_multiscale.tests._step6_fixtures import prepare_step6_experiment, write_step6_train_config
 from gen3_multiscale.training import train as train_module
@@ -84,6 +84,34 @@ def test_harmonic_baseline_prediction_returns_the_right_shape():
     )
     pred = harmonic_baseline_prediction(inputs)
     assert pred.shape == (1, 1)
+
+
+def test_zero_image_content_removes_every_image_path_but_preserves_expression_and_geometry():
+    from gen3_multiscale.tests._gen4_fixtures import (
+        synthetic_gen4_inputs, with_synthetic_uni2_features, with_synthetic_wsi_context,
+    )
+
+    inputs, _targets = synthetic_gen4_inputs(image_dim=8)
+    inputs = with_synthetic_wsi_context(inputs, image_dim=8)
+    inputs = with_synthetic_uni2_features(inputs, image_dim=8)
+
+    ablated = zero_image_content(inputs)
+
+    assert not np.any(ablated.observed_gigapath_features)
+    assert not np.any(ablated.observed_image_available)
+    assert not np.any(ablated.wsi_tile_features)
+    assert not np.any(ablated.observed_uni2_features)
+    np.testing.assert_array_equal(ablated.observed_full_gene_expression, inputs.observed_full_gene_expression)
+    np.testing.assert_array_equal(ablated.observed_coords, inputs.observed_coords)
+    np.testing.assert_array_equal(ablated.query_coords, inputs.query_coords)
+    np.testing.assert_array_equal(ablated.wsi_tile_longnet_coords, inputs.wsi_tile_longnet_coords)
+    np.testing.assert_array_equal(ablated.wsi_tile_regional_coords, inputs.wsi_tile_regional_coords)
+    np.testing.assert_array_equal(ablated.boundary_idx, inputs.boundary_idx)
+    # The original example is not mutated, which permits normal and
+    # ablated predictions to be compared from the same dataset item.
+    assert np.any(inputs.observed_gigapath_features)
+    assert np.any(inputs.wsi_tile_features)
+    assert np.any(inputs.observed_uni2_features)
 
 
 def _build_synchronized_init_dir(tmp_path, manifest):
@@ -271,9 +299,33 @@ def test_evaluate_gen3_checkpoint_reports_model_and_baseline_metrics_on_validati
         assert "n_patients" in arms[arm_name]["pcc"]
         assert "patient_ci95_low" in arms[arm_name]["pcc"]
     assert "secondary_st_fid" not in report  # compute_st_fid_mmd defaults to False
+    assert report["input_ablation"] == {
+        "zero_image_input": False,
+        "image_feature_content": "unmodified",
+        "observed_image_available": "unmodified",
+        "spatial_geometry": "retained",
+    }
 
     saved_path = save_evaluation_report(report, checkpoint_dir / "evaluation_validation.json")
     assert saved_path.is_file()
+
+
+def test_evaluate_gen3_checkpoint_records_zero_image_ablation(tmp_path, monkeypatch):
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    config_path, checkpoint_dir = _train_a_real_checkpoint(tmp_path, cfg, manifest, manifest_path)
+
+    report = evaluate_gen3_checkpoint(
+        str(config_path), checkpoint_dir, split="validation", n_masks_per_sample=2,
+        zero_image_input=True,
+    )
+
+    assert report["input_ablation"] == {
+        "zero_image_input": True,
+        "image_feature_content": "all_zero",
+        "observed_image_available": "all_false",
+        "spatial_geometry": "retained",
+    }
+    assert report["n_items"] > 0
 
 
 def test_evaluate_gen3_checkpoint_report_is_bound_to_the_exact_checkpoint_identity(tmp_path, monkeypatch):
