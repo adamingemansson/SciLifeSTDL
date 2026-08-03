@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -119,6 +120,33 @@ _BASELINE_PREDICTORS = {
     "nearest_neighbor": nearest_neighbor_baseline_prediction,
     "harmonic": harmonic_baseline_prediction,
 }
+
+
+def zero_image_content(inputs):
+    """Return the same spatial-field item with all image *content* removed.
+
+    This is a matched evaluation ablation, not a new architecture.  It
+    preserves observed GEX, the query/observed coordinates, boundary graph,
+    local-neighbour indices, and dense-WSI tile coordinates, while replacing
+    every image feature tensor the model can consume with explicit zeros and
+    marking every observed spot's image as unavailable.  Keeping geometry is
+    deliberate: the resulting score measures what the trained checkpoint can
+    recover from expression plus spatial structure when H&E content is absent.
+
+    ``dataclasses.replace`` preserves a Gen4SpatialFieldInputs subclass too;
+    its separate per-spot UNI2 tensor is zeroed when present so this helper
+    cannot silently leave a second image path active.
+    """
+    updates = {
+        "observed_gigapath_features": np.zeros_like(inputs.observed_gigapath_features),
+        "observed_image_available": np.zeros_like(inputs.observed_image_available, dtype=bool),
+    }
+    if inputs.wsi_tile_features is not None:
+        updates["wsi_tile_features"] = np.zeros_like(inputs.wsi_tile_features)
+    observed_uni2_features = getattr(inputs, "observed_uni2_features", None)
+    if observed_uni2_features is not None:
+        updates["observed_uni2_features"] = np.zeros_like(observed_uni2_features)
+    return replace(inputs, **updates)
 
 
 def load_configured_gene_panels(
@@ -269,6 +297,7 @@ def evaluate_gen3_checkpoint(
     n_masks_per_sample: int = 8, use_best: bool = True, compute_st_fid_mmd: bool = False,
     allow_test: bool = False, device_str: str = "cpu", evaluation_seed: int = 0,
     calibration_n_samples: int | None = None, allow_code_drift: bool = False,
+    zero_image_input: bool = False,
 ) -> dict:
     """The real Step 7 evaluation entrypoint. Runs a REAL, already-trained
     checkpoint over the FIXED, deterministic held-out mask schedule for
@@ -487,6 +516,8 @@ def evaluate_gen3_checkpoint(
     with torch.no_grad():
         for idx in range(len(dataset)):
             inputs, targets = dataset[idx]
+            if zero_image_input:
+                inputs = zero_image_content(inputs)
             true_expression = np.asarray(targets.query_expression, dtype=np.float32)
             patient_ids.append(str(inputs.patient_id))
             item_identity = dataset.item_identity(idx)
@@ -655,7 +686,7 @@ def evaluate_gen3_checkpoint(
     }
 
     report = {
-        "version": 6,
+        "version": 7,
         "kind": "gen3_step7_evaluation_report",
         "config_path": str(config_path),
         "checkpoint_dir": str(checkpoint_dir),
@@ -665,6 +696,12 @@ def evaluate_gen3_checkpoint(
         "n_samples": len(split_ids),
         "n_items": len(dataset),
         "evaluation_seed": int(evaluation_seed),
+        "input_ablation": {
+            "zero_image_input": bool(zero_image_input),
+            "image_feature_content": "all_zero" if zero_image_input else "unmodified",
+            "observed_image_available": "all_false" if zero_image_input else "unmodified",
+            "spatial_geometry": "retained",
+        },
         "cache_preflight_report": preflight_report,
         "per_arm_patient_aggregated_metrics": aggregated,
         "per_arm_paired_delta_vs_model": paired_deltas,
@@ -754,6 +791,11 @@ def main() -> None:
     parser.add_argument("--n-masks-per-sample", type=int, default=8)
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
+        "--zero-image-input", action="store_true",
+        help="Matched image-content ablation: zero per-spot and dense-WSI image features and mark "
+             "observed images unavailable, while retaining GEX, masks, coordinates, and spatial geometry.",
+    )
+    parser.add_argument(
         "--evaluation-seed", type=int, default=0,
         help="Combines with each item's content-derived identity to seed Architecture 4's stochastic "
              "sampling -- two calls with the same seed against the same checkpoint reproduce bit-identical "
@@ -794,6 +836,7 @@ def main() -> None:
             use_best=args.use_best, compute_st_fid_mmd=args.compute_st_fid_mmd, allow_test=args.allow_test,
             device_str=args.device, evaluation_seed=args.evaluation_seed,
             calibration_n_samples=args.calibration_n_samples, allow_code_drift=args.allow_code_drift,
+            zero_image_input=args.zero_image_input,
         )
     except Exception as exc:
         print(f"gen3_evaluator: evaluation FAILED: {exc}", file=sys.stderr)
