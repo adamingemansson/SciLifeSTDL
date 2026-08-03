@@ -2,8 +2,9 @@
 """Train Gen5's shared expression autoencoder on manifest training data.
 
 Expression is staged through a disk-backed matrix and transferred to the
-GPU one mini-batch at a time. Validation/test samples are structurally
-unreachable from this command.
+GPU one mini-batch at a time. Only training samples can reach optimizer
+updates; validation samples are read afterward for an independent
+reconstruction-ceiling diagnostic. Test samples are never read.
 """
 from __future__ import annotations
 
@@ -21,12 +22,15 @@ from gen3_multiscale.data.dataset_manifest import (
     verify_metadata_csv_provenance,
 )
 from gen3_multiscale.data.example_builder import load_expression_for_model_target_space
+from gen3_multiscale.evaluation.metrics import resolve_gene_panels
+from gen3_multiscale.evaluation.train_gene_panels import load_train_derived_gene_panels
 from gen3_multiscale.gen5.autoencoder import save_expression_autoencoder_checkpoint
 from gen3_multiscale.gen5.autoencoder_training import train_expression_autoencoder
 from gen3_multiscale.training.train import (
     _code_commit_hash,
     _worktree_diff_hash,
     dataset_manifest_fingerprint,
+    file_sha256,
 )
 
 
@@ -35,6 +39,7 @@ def _stream_reconstruction_metrics(
     matrices,
     *,
     batch_size: int,
+    gene_panels: dict[str, list[str]] | None = None,
 ) -> dict:
     """Exact full-row RMSE/PCC with O(n_genes) accumulator memory."""
     n_genes = autoencoder.n_genes
@@ -43,9 +48,10 @@ def _stream_reconstruction_metrics(
     sum_true2 = np.zeros(n_genes, dtype=np.float64)
     sum_pred2 = np.zeros(n_genes, dtype=np.float64)
     sum_cross = np.zeros(n_genes, dtype=np.float64)
-    squared_error = 0.0
+    squared_error_by_gene = np.zeros(n_genes, dtype=np.float64)
     n_rows = 0
-    autoencoder = autoencoder.cpu().eval()
+    device = next(autoencoder.parameters()).device
+    autoencoder.eval()
     with torch.no_grad():
         for matrix in matrices:
             matrix = np.asarray(matrix, dtype=np.float32)
@@ -57,11 +63,13 @@ def _stream_reconstruction_metrics(
                 raise ValueError("reconstruction matrix contains non-finite values")
             for start in range(0, matrix.shape[0], batch_size):
                 true = matrix[start:start + batch_size]
-                pred = autoencoder(torch.as_tensor(true)).cpu().numpy()
+                pred = autoencoder(
+                    torch.as_tensor(true, dtype=torch.float32, device=device)
+                ).cpu().numpy()
                 true64 = true.astype(np.float64, copy=False)
                 pred64 = pred.astype(np.float64, copy=False)
                 delta = pred64 - true64
-                squared_error += float(np.sum(delta * delta))
+                squared_error_by_gene += np.sum(delta * delta, axis=0)
                 sum_true += np.sum(true64, axis=0)
                 sum_pred += np.sum(pred64, axis=0)
                 sum_true2 += np.sum(true64 * true64, axis=0)
@@ -77,13 +85,29 @@ def _stream_reconstruction_metrics(
     valid = denominator > 0
     pcc = np.full(n_genes, np.nan, dtype=np.float64)
     pcc[valid] = covariance[valid] / denominator[valid]
-    return {
+    report = {
         "n_rows": int(n_rows),
         "n_genes": int(n_genes),
-        "rmse": float(np.sqrt(squared_error / (n_rows * n_genes))),
+        "rmse": float(np.sqrt(np.sum(squared_error_by_gene) / (n_rows * n_genes))),
         "pcc_mean": float(np.nanmean(pcc)),
         "n_valid_pcc_genes": int(np.sum(valid)),
     }
+    if gene_panels:
+        panel_indices, panel_metadata = resolve_gene_panels(
+            list(autoencoder.gene_names), gene_panels,
+        )
+        report["gene_panels"] = {
+            panel_name: {
+                "pcc_mean": float(np.nanmean(pcc[idx])),
+                "rmse": float(
+                    np.sqrt(np.sum(squared_error_by_gene[idx]) / (n_rows * len(idx)))
+                ),
+                "n_valid_pcc_genes": int(np.sum(valid[idx])),
+                **panel_metadata[panel_name],
+            }
+            for panel_name, idx in panel_indices.items()
+        }
+    return report
 
 
 def train_from_manifest(
@@ -98,6 +122,7 @@ def train_from_manifest(
     weight_decay: float = 0.0,
     device: str = "cpu",
     seed: int = 0,
+    train_gene_panel_artifact: str | None = None,
 ) -> dict:
     manifest = load_dataset_manifest(manifest_path)
     verify_metadata_csv_provenance(manifest)
@@ -105,6 +130,21 @@ def train_from_manifest(
     if not train_ids:
         raise ValueError("dataset manifest has no training samples")
     gene_names = list(manifest["gene_panel"])
+    gene_panels = None
+    train_panel_identity = None
+    if train_gene_panel_artifact:
+        panel_artifact = load_train_derived_gene_panels(
+            train_gene_panel_artifact, manifest,
+        )
+        gene_panels = dict(panel_artifact["panels"])
+        train_panel_identity = {
+            "path": str(train_gene_panel_artifact),
+            "artifact_sha256": panel_artifact["artifact_sha256"],
+            "dataset_manifest_fingerprint": panel_artifact[
+                "dataset_manifest_fingerprint"
+            ],
+            "method": panel_artifact["method"],
+        }
     n_rows = sum(len(manifest["samples"][sid]["barcodes"]) for sid in train_ids)
     if n_rows < 2:
         raise ValueError("training split contains fewer than two spots")
@@ -148,6 +188,7 @@ def train_from_manifest(
             autoencoder,
             [np.asarray(expression[:diagnostic_rows])],
             batch_size=batch_size,
+            gene_panels=gene_panels,
         )
     finally:
         # Drop the memmap before unlinking on Windows-like semantics too.
@@ -174,6 +215,7 @@ def train_from_manifest(
         autoencoder,
         _validation_matrices(),
         batch_size=batch_size,
+        gene_panels=gene_panels,
     )
 
     code_identity = f"{_code_commit_hash()}:{_worktree_diff_hash()}"
@@ -189,12 +231,14 @@ def train_from_manifest(
     report = {
         "kind": "gen5_expression_autoencoder_training_report",
         "checkpoint_path": str(output_path),
+        "checkpoint_sha256": file_sha256(output_path),
         "dataset_manifest_fingerprint": manifest_fp,
         "train_sample_ids": sorted(train_ids),
         "n_rows": n_rows,
         "n_genes": len(gene_names),
         "latent_dim": latent_dim,
         "hidden_dim": hidden_dim,
+        "train_gene_panel_artifact": train_panel_identity,
         "training": {
             "n_epochs": training_report.n_epochs,
             "final_train_loss": training_report.final_train_loss,
@@ -225,6 +269,14 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--train-gene-panel-artifact",
+        help=(
+            "Optional immutable training-derived panel artifact. When given, "
+            "the reconstruction ceiling report also includes the same HVG-50/200 "
+            "views used by Gen3/Gen4/Gen5 evaluation."
+        ),
+    )
     args = parser.parse_args()
     report = train_from_manifest(
         args.manifest,
@@ -237,6 +289,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         device=args.device,
         seed=args.seed,
+        train_gene_panel_artifact=args.train_gene_panel_artifact,
     )
     print(json.dumps(report, indent=2))
 
