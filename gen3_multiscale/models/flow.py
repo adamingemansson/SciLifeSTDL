@@ -173,15 +173,25 @@ def sample_residual_coefficients(
     was_training = velocity_network.training
     velocity_network.eval()
     try:
-        samples = []
-        for _ in range(n_samples):
-            x = torch.randn(n_query, rank, generator=generator, device=device)
-            t = torch.zeros((), device=device)
-            for _step in range(n_steps):
-                velocity = velocity_network(x, t, query_coords, conditioning_hidden)
-                x = x + velocity * dt
-                t = t + dt
-            samples.append(x)
-        return torch.stack(samples, dim=0)
+        # The draws are independent fields, but the previous implementation
+        # integrated them in a Python loop and therefore performed
+        # ``n_samples * n_steps`` separate network calls.  ``vmap`` keeps
+        # each sample's spatial attention isolated while executing all draws
+        # as one batched network call per ODE step.  This preserves the model
+        # and sampling contract while reducing the default evaluation path
+        # from 160 to 20 velocity-network calls per mask.
+        x = torch.randn(
+            n_samples, n_query, rank, generator=generator, device=device,
+        )
+        t = torch.zeros((), device=device)
+        for _step in range(n_steps):
+            velocity = torch.vmap(
+                lambda sample: velocity_network(
+                    sample, t, query_coords, conditioning_hidden,
+                )
+            )(x)
+            x = x + velocity * dt
+            t = t + dt
+        return x
     finally:
         velocity_network.train(was_training)

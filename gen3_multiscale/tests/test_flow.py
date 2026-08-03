@@ -104,6 +104,37 @@ def test_sampling_is_reproducible_with_a_fixed_generator():
     assert torch.allclose(samples_a, samples_b)
 
 
+def test_vectorized_sampling_matches_independent_serial_fields():
+    """Vectorizing the sample axis must not allow attention to mix fields."""
+    torch.manual_seed(4)
+    net = VelocityNetwork(
+        residual_rank=4, hidden_dim=16, n_heads=2, n_blocks=1,
+        dense_threshold=4, sparse_k=3,
+    ).eval()
+    coords = torch.randn(7, 2)
+    conditioning = torch.randn(7, 16)
+    n_samples, n_steps = 3, 4
+    seed = 19
+
+    vectorized = sample_residual_coefficients(
+        net, 7, coords, conditioning, n_samples=n_samples, n_steps=n_steps,
+        generator=torch.Generator().manual_seed(seed),
+    )
+
+    generator = torch.Generator().manual_seed(seed)
+    initial = torch.randn(n_samples, 7, 4, generator=generator)
+    serial = []
+    for sample in initial:
+        x = sample
+        t = torch.zeros(())
+        for _ in range(n_steps):
+            x = x + net(x, t, coords, conditioning) / n_steps
+            t = t + 1.0 / n_steps
+        serial.append(x)
+
+    assert torch.allclose(vectorized, torch.stack(serial), atol=1e-5, rtol=1e-5)
+
+
 def test_sampling_runs_in_eval_mode_and_restores_the_callers_training_mode():
     """Real bug caught while testing: dropout was active during sampling,
     which draws from the global torch RNG on every forward call and
