@@ -8,6 +8,7 @@ seaborn
 jupyterlab
 torch
 torchvision
+tensorboard
 pytorch-lightning
 anndata
 scanpy

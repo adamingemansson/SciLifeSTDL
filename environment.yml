@@ -17,6 +17,7 @@ dependencies:
   - jupyterlab
   - pytorch
   - torchvision
+  - tensorboard
   - pytorch-cuda=12.1   # remove/adjust if no GPU or different CUDA version
   - pytorch-lightning
   - anndata
