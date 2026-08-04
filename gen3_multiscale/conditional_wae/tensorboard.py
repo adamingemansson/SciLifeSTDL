@@ -333,3 +333,26 @@ class ConditionalWAETensorBoardLogger:
     def close(self) -> None:
         self.writer.flush()
         self.writer.close()
+
+
+class ConditionalFlowTensorBoardLogger(ConditionalWAETensorBoardLogger):
+    """The same bounded MK diagnostics with flow-specific training scalars."""
+
+    def add_train_scalars(self, step: int, losses: dict, *, grad_norm,
+                          learning_rate=None) -> None:
+        values = {
+            "train/total": losses["total"],
+            "train/reconstruction": losses["reconstruction_loss"],
+            "train/reconstruction_rmse": losses["reconstruction_rmse"],
+            "train/reconstruction_pcc_loss": losses["reconstruction_pcc_loss"],
+            "train/conditional_mean": losses["conditional_mean_loss"],
+            "train/conditional_mean_rmse": losses["conditional_mean_rmse"],
+            "train/flow": losses["flow_loss"],
+            "train/gradient_norm": grad_norm,
+        }
+        if learning_rate is not None:
+            values["train/learning_rate"] = learning_rate
+        for tag, value in values.items():
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu().item()
+            self.writer.add_scalar(tag, float(value), int(step))

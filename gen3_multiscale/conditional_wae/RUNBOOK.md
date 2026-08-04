@@ -88,6 +88,15 @@ inference input and cannot affect validation loss or checkpoint selection.
 Projector computes PCA/UMAP interactively; the spatial PCA maps preserve the
 original spot coordinates so clusters can be related back to tissue regions.
 
+## Matched latent-flow extension
+
+The four directly matched conditional-flow arms live in
+`gen3_multiscale/conditional_flow/`. They keep this WAE suite's conditioner,
+target encoder, expression decoder, inputs, masks, losses and diagnostics, but
+replace MMD/GAN prior matching with ordinary or Sinkhorn-OT conditional flow
+matching. See `gen3_multiscale/conditional_flow/RUNBOOK.md` for the immutable
+arm definitions and commands.
+
 Launch TensorBoard on the server with any free port, for example:
 
 ```bash
