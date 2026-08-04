@@ -107,7 +107,7 @@ def evaluate_conditional_wae(
 
     panels = load_configured_gene_panels(config, dataset_manifest)
     _indices, panel_metadata = resolve_gene_panels(gene_names, panels) if panels else ({}, {})
-    arm_names = ("model", "image_only")
+    arm_names = ("model", "conditional_mean")
     items = {arm: [] for arm in arm_names}
     panel_items = {arm: {panel: [] for panel in panels} for arm in arm_names}
     patient_ids = []
@@ -128,20 +128,20 @@ def evaluate_conditional_wae(
             )
             true = np.asarray(target, dtype=np.float32)
             model_pred = prediction["predictive_mean"].detach().cpu().numpy().astype(np.float32)
-            image_pred = prediction["image_only_expression"].detach().cpu().numpy().astype(np.float32)
+            mean_pred = prediction["conditional_mean_expression"].detach().cpu().numpy().astype(np.float32)
             model_metrics = per_item_reconstruction_metrics(model_pred, true)
-            image_metrics = per_item_reconstruction_metrics(image_pred, true)
+            mean_metrics = per_item_reconstruction_metrics(mean_pred, true)
             items["model"].append(model_metrics)
-            items["image_only"].append(image_metrics)
+            items["conditional_mean"].append(mean_metrics)
             record = {
                 **identity,
                 "patient_id": patient_id,
                 "model": model_metrics,
-                "image_only": image_metrics,
+                "conditional_mean": mean_metrics,
             }
             if panels:
                 record["gene_panels"] = {}
-                for arm, prediction_array in (("model", model_pred), ("image_only", image_pred)):
+                for arm, prediction_array in (("model", model_pred), ("conditional_mean", mean_pred)):
                     metrics = gene_panel_metrics(prediction_array, true, gene_names, panels)
                     record["gene_panels"][arm] = metrics
                     for panel, panel_metric in metrics.items():

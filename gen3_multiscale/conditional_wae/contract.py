@@ -48,7 +48,7 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
     if not training.get("checkpoint_dir"):
         raise ValueError("training.checkpoint_dir is required")
     loss = config.get("loss") or {}
-    for field in ("pcc_weight", "regularizer_weight", "image_mean_weight"):
+    for field in ("pcc_weight", "regularizer_weight", "conditional_mean_weight"):
         if float(loss.get(field, -1)) < 0:
             raise ValueError(f"loss.{field} must be non-negative")
     return {

@@ -81,7 +81,7 @@ def prepare_conditional_wae_suite(
         config["loss"] = {
             "pcc_weight": 0.1,
             "regularizer_weight": 0.1,
-            "image_mean_weight": 1.0,
+            "conditional_mean_weight": 1.0,
         }
         config["training"].update({
             "checkpoint_dir": str(root / "checkpoints" / arm),

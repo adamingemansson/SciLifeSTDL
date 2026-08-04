@@ -31,7 +31,9 @@ class _ImageSpatialBlock(nn.Module):
         super().__init__()
         self.norm_attention = nn.LayerNorm(hidden_dim)
         self.sparse_k = int(sparse_k)
-        self.cached_attention = _CachedGeometrySelfAttention(hidden_dim, n_heads)
+        self.cached_attention = _CachedGeometrySelfAttention(
+            hidden_dim, n_heads, dense_threshold=dense_threshold,
+        )
         self.norm_ffn = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4), nn.GELU(), nn.Dropout(dropout),
@@ -67,13 +69,17 @@ class _ImageSpatialBlock(nn.Module):
 
 
 class _CachedGeometrySelfAttention(nn.Module):
-    """Architecture-1 sparse attention using a sample-cached geometry graph."""
+    """Architecture-1 dense/sparse attention with a cached sparse graph."""
 
-    def __init__(self, hidden_dim: int, n_heads: int):
+    def __init__(self, hidden_dim: int, n_heads: int, *, dense_threshold: int):
         super().__init__()
+        if dense_threshold < 1:
+            raise ValueError("dense_threshold must be positive")
         self.hidden_dim = hidden_dim
         self.n_heads = n_heads
         self.head_dim = hidden_dim // n_heads
+        self.dense_threshold = int(dense_threshold)
+        self.last_attention_mode: str | None = None
         self.query_proj = nn.Linear(hidden_dim, hidden_dim)
         self.key_proj = nn.Linear(hidden_dim, hidden_dim)
         self.value_proj = nn.Linear(hidden_dim, hidden_dim)
@@ -85,6 +91,21 @@ class _CachedGeometrySelfAttention(nn.Module):
         n, k_neighbors = neighbor_indices.shape
         if hidden.shape[0] != n or coords.shape != (n, 2) or neighbor_mask.shape != (n, k_neighbors):
             raise ValueError("cached adjacency must align with hidden rows and coordinates")
+        if n <= self.dense_threshold:
+            # Use the same projections/geometry bias as the sparse path,
+            # but expose every slide row to every other row. This makes the
+            # configured Architecture-1 dense/sparse threshold real while
+            # retaining the sample-cached graph for larger slides.
+            neighbor_indices = torch.arange(
+                n, dtype=torch.long, device=hidden.device,
+            )[None, :].expand(n, -1)
+            neighbor_mask = torch.ones(
+                n, n, dtype=torch.bool, device=hidden.device,
+            )
+            k_neighbors = n
+            self.last_attention_mode = "dense"
+        else:
+            self.last_attention_mode = "sparse"
         q = self.query_proj(hidden).view(n, self.n_heads, self.head_dim)
         k = self.key_proj(hidden).view(n, self.n_heads, self.head_dim)
         v = self.value_proj(hidden).view(n, self.n_heads, self.head_dim)
@@ -230,7 +251,7 @@ class ConditionalWAE(nn.Module):
                  autoencoder_hidden_dim: int = 1024,
                  discriminator_hidden_dim: int = 256,
                  regularizer_weight: float = 0.1,
-                 image_mean_weight: float = 1.0,
+                 conditional_mean_weight: float = 1.0,
                  pcc_weight: float = 0.1,
                  n_inference_samples: int = 8):
         super().__init__()
@@ -238,13 +259,13 @@ class ConditionalWAE(nn.Module):
             raise ValueError("regularizer must be 'mmd' or 'gan'")
         if n_genes < 1 or latent_dim < 1 or n_inference_samples < 1:
             raise ValueError("n_genes, latent_dim and n_inference_samples must be positive")
-        if regularizer_weight < 0 or image_mean_weight < 0 or pcc_weight < 0:
+        if regularizer_weight < 0 or conditional_mean_weight < 0 or pcc_weight < 0:
             raise ValueError("loss weights must be non-negative")
         self.n_genes = int(n_genes)
         self.latent_dim = int(latent_dim)
         self.regularizer = regularizer
         self.regularizer_weight = float(regularizer_weight)
-        self.image_mean_weight = float(image_mean_weight)
+        self.conditional_mean_weight = float(conditional_mean_weight)
         self.pcc_weight = float(pcc_weight)
         self.n_inference_samples = int(n_inference_samples)
         self.image_conditioner = image_conditioner
@@ -254,7 +275,7 @@ class ConditionalWAE(nn.Module):
         self.expression_encoder = ExpressionEncoder(
             n_genes, latent_dim=latent_dim, hidden_dim=autoencoder_hidden_dim,
         )
-        self.image_mean_head = nn.Sequential(
+        self.conditional_mean_head = nn.Sequential(
             nn.LayerNorm(context_dim), nn.Linear(context_dim, autoencoder_hidden_dim),
             nn.GELU(), nn.Linear(autoencoder_hidden_dim, n_genes),
         )
@@ -290,9 +311,9 @@ class ConditionalWAE(nn.Module):
     def decode(self, z: torch.Tensor, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if z.shape != (context.shape[0], self.latent_dim):
             raise ValueError("z must have one configured-width row per image-context row")
-        image_mean = self.image_mean_head(context)
+        conditional_mean = self.conditional_mean_head(context)
         residual = self.residual_decoder(torch.cat([context, z], dim=-1))
-        return image_mean + residual, image_mean
+        return conditional_mean + residual, conditional_mean
 
     def compute_generator_losses(self, inputs: FullImageExpressionInputs,
                                  target_expression, *, generator=None) -> dict:
@@ -305,14 +326,14 @@ class ConditionalWAE(nn.Module):
         prior = torch.randn(
             encoded.shape, dtype=encoded.dtype, device=encoded.device, generator=generator,
         )
-        reconstruction, image_mean = self.decode(encoded, context)
+        reconstruction, conditional_mean = self.decode(encoded, context)
         reconstruction_loss, reconstruction_rmse, reconstruction_pcc = (
             rmse_pcc_reconstruction_loss(
                 reconstruction, target, pcc_weight=self.pcc_weight,
             )
         )
-        image_mean_loss, image_mean_rmse, image_mean_pcc = rmse_pcc_reconstruction_loss(
-            image_mean, target, pcc_weight=self.pcc_weight,
+        conditional_mean_loss, conditional_mean_rmse, conditional_mean_pcc = rmse_pcc_reconstruction_loss(
+            conditional_mean, target, pcc_weight=self.pcc_weight,
         )
         if self.regularizer == "mmd":
             prior_loss = imq_mmd(encoded, prior)
@@ -328,20 +349,20 @@ class ConditionalWAE(nn.Module):
                 logits, torch.ones_like(logits),
             )
         total = (
-            reconstruction_loss + self.image_mean_weight * image_mean_loss
+            reconstruction_loss + self.conditional_mean_weight * conditional_mean_loss
             + self.regularizer_weight * prior_loss
         )
         return {
             "total": total,
             "expression": reconstruction,
-            "image_only_expression": image_mean,
+            "conditional_mean_expression": conditional_mean,
             "latent": encoded,
             "reconstruction_loss": reconstruction_loss,
             "reconstruction_rmse": reconstruction_rmse,
             "reconstruction_pcc_loss": reconstruction_pcc,
-            "image_mean_loss": image_mean_loss,
-            "image_mean_rmse": image_mean_rmse,
-            "image_mean_pcc_loss": image_mean_pcc,
+            "conditional_mean_loss": conditional_mean_loss,
+            "conditional_mean_rmse": conditional_mean_rmse,
+            "conditional_mean_pcc_loss": conditional_mean_pcc,
             "prior_loss": prior_loss,
         }
 
@@ -370,8 +391,8 @@ class ConditionalWAE(nn.Module):
 
     def forward(self, inputs: FullImageExpressionInputs) -> dict:
         context = self.image_conditioner(inputs)
-        image_mean = self.image_mean_head(context)
-        return {"expression": image_mean, "image_context": context}
+        conditional_mean = self.conditional_mean_head(context)
+        return {"expression": conditional_mean, "image_context": context}
 
     @torch.no_grad()
     def sample_predictive_distribution(self, inputs: FullImageExpressionInputs,
@@ -390,12 +411,12 @@ class ConditionalWAE(nn.Module):
             prediction, _ = self.decode(z, context)
             samples.append(prediction)
         stacked = torch.stack(samples)
-        image_mean = self.image_mean_head(context)
+        conditional_mean = self.conditional_mean_head(context)
         return {
             "expression": stacked.mean(0),
             "predictive_mean": stacked.mean(0),
             "predictive_std": stacked.std(0, unbiased=False),
             "predictive_samples": stacked,
-            "image_only_expression": image_mean,
+            "conditional_mean_expression": conditional_mean,
             "image_context": context,
         }

@@ -66,7 +66,7 @@ def _build_model(config: dict, n_genes: int) -> ConditionalWAE:
         autoencoder_hidden_dim=int(params["autoencoder_hidden_dim"]),
         discriminator_hidden_dim=int(params["discriminator_hidden_dim"]),
         regularizer_weight=float(loss["regularizer_weight"]),
-        image_mean_weight=float(loss["image_mean_weight"]),
+        conditional_mean_weight=float(loss["conditional_mean_weight"]),
         pcc_weight=float(loss["pcc_weight"]),
         n_inference_samples=int(params["n_inference_samples"]),
     )
@@ -124,10 +124,19 @@ def _stable_seed(seed: int, identity: dict) -> int:
     return int(digest[:16], 16) % (2**63)
 
 
+def _checkpoint_resume_state(checkpoint_dir: Path) -> tuple[bool, dict | None]:
+    """Distinguish a real bundle from preflight-only root metadata."""
+    has_checkpoint = (checkpoint_dir / "latest_bundle.json").is_file()
+    old_manifest = checkpoint_module.load_checkpoint_run_manifest(checkpoint_dir)
+    if has_checkpoint and old_manifest is None:
+        raise ValueError("conditional-WAE checkpoint has no bundle-bound run manifest")
+    return has_checkpoint, old_manifest
+
+
 @torch.no_grad()
 def _validate(model: ConditionalWAE, dataset, *, device: torch.device, seed: int) -> dict:
     model.eval()
-    totals, rmses, pcc_losses, image_rmses = [], [], [], []
+    totals, rmses, pcc_losses, conditional_mean_rmses = [], [], [], []
     for index in range(len(dataset)):
         inputs, target, identity = dataset[index]
         target_tensor = torch.as_tensor(target, dtype=torch.float32, device=device)
@@ -136,19 +145,19 @@ def _validate(model: ConditionalWAE, dataset, *, device: torch.device, seed: int
         total, rmse, pcc_loss = rmse_pcc_reconstruction_loss(
             prediction["predictive_mean"], target_tensor, pcc_weight=model.pcc_weight,
         )
-        image_total, image_rmse, _ = rmse_pcc_reconstruction_loss(
-            prediction["image_only_expression"], target_tensor, pcc_weight=model.pcc_weight,
+        _mean_total, mean_rmse, _ = rmse_pcc_reconstruction_loss(
+            prediction["conditional_mean_expression"], target_tensor, pcc_weight=model.pcc_weight,
         )
         totals.append(float(total))
         rmses.append(float(rmse))
         pcc_losses.append(float(pcc_loss))
-        image_rmses.append(float(image_rmse))
+        conditional_mean_rmses.append(float(mean_rmse))
     model.train()
     return {
         "total": float(np.mean(totals)),
         "rmse": float(np.mean(rmses)),
         "pcc_loss": float(np.mean(pcc_losses)),
-        "image_only_rmse": float(np.mean(image_rmses)),
+        "conditional_mean_rmse": float(np.mean(conditional_mean_rmses)),
         "n_items": len(dataset),
     }
 
@@ -243,9 +252,10 @@ def run_conditional_wae_training(
     run_manifest = _manifest(config, dataset_manifest, preflight_report)
     resume_step = 0
     if not smoke:
-        old_manifest = checkpoint_module.load_checkpoint_run_manifest(checkpoint_dir)
+        has_checkpoint, old_manifest = _checkpoint_resume_state(checkpoint_dir)
         if old_manifest is not None:
             _verify_resume(old_manifest, run_manifest, allow_code_drift=allow_code_drift)
+        if has_checkpoint:
             checkpoint_module.verify_gene_names(checkpoint_dir, gene_names)
             checkpoint_module.load_trainable_state(model, checkpoint_dir)
             if not checkpoint_module.load_optimizer_and_rng_state(
@@ -315,7 +325,7 @@ def run_conditional_wae_training(
             pieces = [
                 f"total={float(losses['total'].detach()):.6f}",
                 f"reconstruction={float(losses['reconstruction_loss'].detach()):.6f}",
-                f"image_only={float(losses['image_mean_loss'].detach()):.6f}",
+                f"conditional_mean={float(losses['conditional_mean_loss'].detach()):.6f}",
                 f"prior={float(losses['prior_loss'].detach()):.6f}",
                 f"grad_norm={float(generator_grad_norm):.4f}",
             ]
@@ -326,7 +336,8 @@ def run_conditional_wae_training(
             entry = {"step": step, **_validate(model, validation_dataset, device=device, seed=seed)}
             print(
                 f"[step {step}] validation: total={entry['total']:.6f}, "
-                f"rmse={entry['rmse']:.6f}, image_only_rmse={entry['image_only_rmse']:.6f}",
+                f"rmse={entry['rmse']:.6f}, "
+                f"conditional_mean_rmse={entry['conditional_mean_rmse']:.6f}",
                 flush=True,
             )
             if not smoke:

@@ -14,15 +14,17 @@ inside a hole. The supervisor tasks keep target-region H&E visible:
 - `regularizer=gan`: the same model with an adversarial latent discriminator.
 
 Everything else is shared: Architecture-1-derived image tokenization and
-spatial attention, expression encoder, image-only mean head, conditional
-residual decoder, RMSE+PCC reconstruction loss, data split and evaluation.
+spatial attention, expression encoder, deterministic conditional-mean head,
+conditional residual decoder, RMSE+PCC reconstruction loss, data split and evaluation.
 
 The input schema can contain compact observed surrounding-GEX rows for Task II,
 but validates that their indices exactly exclude every query row. During training only,
 real query GEX is encoded to `z` and used as the reconstruction target. At
 inference, `z` is sampled from `N(0,I)` and combined with the legal context. The
-image-only mean head is trained explicitly to reduce the risk that the decoder
-ignores H&E and simply copies information through the latent code.
+conditional-mean head is trained explicitly to reduce the risk that the decoder
+ignores its legal conditioning inputs and simply copies information through the
+latent code. For Task I this branch is H&E-only; for Task II it uses H&E plus
+the permitted surrounding ST context.
 
 Architecture 1's weighted GEX token branch is active only for Task II's legal
 surrounding ST context. Its gene-transport head is replaced by the conditional
@@ -64,5 +66,5 @@ python -m gen3_multiscale.scripts.run_conditional_wae_suite \
 
 The evaluator always predicts from legal inference inputs and sampled prior
 latents; it never selects a checkpoint using target-encoded reconstruction.
-It reports the sampled conditional model and the explicit image-only mean head
-separately, including configured HVG-50/HVG-200 panels.
+It reports the sampled conditional model and the explicit deterministic
+conditional-mean head separately, including configured HVG-50/HVG-200 panels.

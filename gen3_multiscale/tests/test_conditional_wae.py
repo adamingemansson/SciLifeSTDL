@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import pytest
 import torch
@@ -13,6 +14,7 @@ from gen3_multiscale.conditional_wae import (
 )
 from gen3_multiscale.conditional_wae.contract import static_audit_conditional_wae_config
 from gen3_multiscale.data.boundary_graph import build_knn_adjacency
+from gen3_multiscale.training import train_conditional_wae
 
 
 def _inputs(n=12, image_dim=16):
@@ -163,6 +165,20 @@ def test_mmd_variant_routes_gradients_and_inference_never_needs_gex():
     assert model(inputs)["expression"].shape == target.shape
 
 
+def test_configured_dense_sparse_attention_switch_is_real():
+    model = _model("mmd")  # dense_threshold=20 in the shared test model
+    model(_inputs(n=12))
+    assert {
+        block.cached_attention.last_attention_mode
+        for block in model.image_conditioner.blocks
+    } == {"dense"}
+    model(_inputs(n=21))
+    assert {
+        block.cached_attention.last_attention_mode
+        for block in model.image_conditioner.blocks
+    } == {"sparse"}
+
+
 def test_gan_variant_separates_discriminator_and_generator_gradients():
     model = _model("gan")
     inputs, target = _inputs(), torch.randn(12, 7)
@@ -196,7 +212,7 @@ def test_static_contract_distinguishes_full_he_tasks():
         },
         "data": {"gen3_manifest_path": "manifest.json", "tile_encoder_revision": "abc"},
         "training": {"checkpoint_dir": "checkpoints"},
-        "loss": {"pcc_weight": 0.1, "regularizer_weight": 0.1, "image_mean_weight": 1.0},
+        "loss": {"pcc_weight": 0.1, "regularizer_weight": 0.1, "conditional_mean_weight": 1.0},
     }
     report = static_audit_conditional_wae_config(base)
     assert report["query_he_visible"] is True
@@ -205,3 +221,22 @@ def test_static_contract_distinguishes_full_he_tasks():
     base["model"]["image_mode"] = "target_zero"
     with pytest.raises(ValueError, match="full_visible"):
         static_audit_conditional_wae_config(base)
+
+
+def test_precheckpoint_root_manifest_is_not_mistaken_for_resumable_weights(tmp_path):
+    payload = {"kind": "conditional_wae_supervisor_run"}
+    (tmp_path / "run_manifest.json").write_text(json.dumps(payload))
+    has_checkpoint, old_manifest = train_conditional_wae._checkpoint_resume_state(tmp_path)
+    assert has_checkpoint is False
+    assert old_manifest == payload
+
+
+def test_checkpoint_pointer_without_bound_manifest_fails_closed(tmp_path, monkeypatch):
+    (tmp_path / "latest_bundle.json").write_text("{}")
+    monkeypatch.setattr(
+        train_conditional_wae.checkpoint_module,
+        "load_checkpoint_run_manifest",
+        lambda _path: None,
+    )
+    with pytest.raises(ValueError, match="bundle-bound run manifest"):
+        train_conditional_wae._checkpoint_resume_state(tmp_path)
