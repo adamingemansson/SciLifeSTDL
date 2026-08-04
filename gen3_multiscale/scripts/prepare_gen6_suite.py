@@ -16,6 +16,8 @@ from pathlib import Path
 
 import yaml
 
+from gen3_multiscale.data.dataset_manifest import load_dataset_manifest
+from gen3_multiscale.evaluation.train_gene_panels import load_train_derived_gene_panels
 from gen3_multiscale.gen6.contract import GEN6_ARM_SPECS
 from gen3_multiscale.gen6.preflight import static_audit_gen6_config
 
@@ -35,8 +37,9 @@ def _pairs(values: list[str]) -> dict[str, str]:
     return result
 
 
-def prepare_gen6_suite(*, comparison_config: str, manifest: str, output_root: str,
-                       fingerprints: dict[str, str], hours: float = 8.0) -> dict:
+def prepare_gen6_suite(*, comparison_config: str, manifest: str, train_gene_panels: str,
+                       output_root: str, fingerprints: dict[str, str],
+                       hours: float = 8.0) -> dict:
     if hours <= 0:
         raise ValueError("hours must be positive")
     root = Path(output_root)
@@ -47,6 +50,19 @@ def prepare_gen6_suite(*, comparison_config: str, manifest: str, output_root: st
         raise ValueError(
             "--comparison-config must be a resolved deterministic conditioner config; "
             "flow/latent-flow configs carry staged parameters that are not a matched Gen6 base"
+        )
+    dataset_manifest = load_dataset_manifest(manifest)
+    panel_path = Path(train_gene_panels).resolve()
+    panel_artifact = load_train_derived_gene_panels(panel_path, dataset_manifest)
+    required_panels = {
+        "train_log1p_variance_top50",
+        "train_log1p_variance_top200",
+    }
+    missing_panels = sorted(required_panels - set(panel_artifact["panels"]))
+    if missing_panels:
+        raise ValueError(
+            "Gen6 evaluation requires train-derived HVG-50 and HVG-200 panels; "
+            f"artifact is missing {missing_panels}"
         )
     root.mkdir(parents=True)
     (root / "configs").mkdir()
@@ -69,6 +85,8 @@ def prepare_gen6_suite(*, comparison_config: str, manifest: str, output_root: st
         config.setdefault("loss", {})
         config["loss"].update({"primary_mode": "rmse_pcc", "pcc_weight": 0.1})
         config["data"]["gen3_manifest_path"] = str(manifest)
+        config.setdefault("evaluation", {})
+        config["evaluation"]["train_gene_panel_artifact"] = str(panel_path)
         config["training"]["checkpoint_dir"] = str(root / "checkpoints" / arm)
         config["training"]["total_steps"] = 100_000_000
         config["training"]["max_wall_clock_hours"] = float(hours)
@@ -83,6 +101,11 @@ def prepare_gen6_suite(*, comparison_config: str, manifest: str, output_root: st
         "kind": "gen6_deterministic_component_screen",
         "comparison_config": str(Path(comparison_config).resolve()),
         "manifest": str(Path(manifest).resolve()), "hours_per_arm": float(hours),
+        "train_gene_panels": {
+            "path": str(panel_path),
+            "artifact_sha256": panel_artifact["artifact_sha256"],
+            "panels": sorted(panel_artifact["panels"]),
+        },
         "arms": written,
         "stage_two": {
             "gen6k": "freeze Gen6-C and apply learned-latent minibatch-OT flow",
@@ -101,12 +124,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--comparison-config", required=True)
     parser.add_argument("--manifest", required=True)
+    parser.add_argument("--train-gene-panels", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--fingerprint", action="append", default=[])
     parser.add_argument("--hours", type=float, default=8.0)
     args = parser.parse_args()
     plan = prepare_gen6_suite(
         comparison_config=args.comparison_config, manifest=args.manifest,
+        train_gene_panels=args.train_gene_panels,
         output_root=args.output_root, fingerprints=_pairs(args.fingerprint), hours=args.hours,
     )
     print(json.dumps(plan, indent=2, sort_keys=True))
