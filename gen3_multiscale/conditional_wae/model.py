@@ -1,0 +1,401 @@
+"""Matched conditional WAE-MMD and WAE-GAN models for H&E-to-GEX.
+
+The conditioner reuses Architecture 1's image projection, Fourier coordinates,
+relative-geometry attention, and (for Task II only) weighted surrounding-GEX
+encoding. It intentionally replaces Architecture 1's gene-transport output
+head with the conditional WAE decoder.
+"""
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn as nn
+from torch.func import functional_call
+
+from gen3_multiscale.conditional_wae.inputs import (
+    FullImageExpressionInputs,
+    validate_full_image_expression_inputs,
+)
+from gen3_multiscale.gen5.autoencoder import ExpressionEncoder
+from gen3_multiscale.data.boundary_graph import build_knn_adjacency
+from gen3_multiscale.models.attention import RelativeGeometryBias
+from gen3_multiscale.models.losses import rmse_pcc_reconstruction_loss
+from gen3_multiscale.models.gene_encoder import WeightedGeneExpressionEncoder
+from gen3_multiscale.models.tokens import SpotTokenProjection
+
+
+class _ImageSpatialBlock(nn.Module):
+    def __init__(self, hidden_dim: int, n_heads: int, dense_threshold: int,
+                 sparse_k: int, dropout: float):
+        super().__init__()
+        self.norm_attention = nn.LayerNorm(hidden_dim)
+        self.sparse_k = int(sparse_k)
+        self.cached_attention = _CachedGeometrySelfAttention(hidden_dim, n_heads)
+        self.norm_ffn = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+        )
+
+    def forward(self, hidden: torch.Tensor, coords: torch.Tensor,
+                neighbor_indices: torch.Tensor | None,
+                neighbor_mask: torch.Tensor | None) -> torch.Tensor:
+        normalized = self.norm_attention(hidden)
+        if neighbor_indices is None:
+            if len(coords) == 1:
+                adjacency = [[0]]
+            else:
+                adjacency = build_knn_adjacency(
+                    coords.detach().cpu().numpy(),
+                    k_neighbors=min(self.sparse_k, len(coords) - 1),
+                )
+            width = max(len(neighbors) for neighbors in adjacency)
+            neighbor_indices = torch.zeros(
+                len(adjacency), width, dtype=torch.long, device=coords.device,
+            )
+            neighbor_mask = torch.zeros(
+                len(adjacency), width, dtype=torch.bool, device=coords.device,
+            )
+            for row, neighbors in enumerate(adjacency):
+                count = len(neighbors)
+                neighbor_indices[row, :count] = torch.as_tensor(neighbors, device=coords.device)
+                neighbor_mask[row, :count] = True
+        update = self.cached_attention(normalized, coords, neighbor_indices, neighbor_mask)
+        hidden = hidden + update
+        return hidden + self.ffn(self.norm_ffn(hidden))
+
+
+class _CachedGeometrySelfAttention(nn.Module):
+    """Architecture-1 sparse attention using a sample-cached geometry graph."""
+
+    def __init__(self, hidden_dim: int, n_heads: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.n_heads = n_heads
+        self.head_dim = hidden_dim // n_heads
+        self.query_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.key_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.value_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.geometry_bias = RelativeGeometryBias(n_heads)
+
+    def forward(self, hidden: torch.Tensor, coords: torch.Tensor,
+                neighbor_indices: torch.Tensor, neighbor_mask: torch.Tensor) -> torch.Tensor:
+        n, k_neighbors = neighbor_indices.shape
+        if hidden.shape[0] != n or coords.shape != (n, 2) or neighbor_mask.shape != (n, k_neighbors):
+            raise ValueError("cached adjacency must align with hidden rows and coordinates")
+        q = self.query_proj(hidden).view(n, self.n_heads, self.head_dim)
+        k = self.key_proj(hidden).view(n, self.n_heads, self.head_dim)
+        v = self.value_proj(hidden).view(n, self.n_heads, self.head_dim)
+        row_indices = torch.arange(n, device=hidden.device)[:, None].expand(-1, k_neighbors)
+        delta = coords[neighbor_indices] - coords[row_indices]
+        distance = torch.linalg.norm(delta, dim=-1, keepdim=True)
+        bias = self.geometry_bias(torch.cat([delta, distance], dim=-1)).permute(0, 2, 1)
+        gathered_k = k[neighbor_indices]
+        gathered_v = v[neighbor_indices]
+        logits = torch.einsum("nhd,nkhd->nhk", q, gathered_k) / math.sqrt(self.head_dim)
+        logits = (logits + bias).masked_fill(~neighbor_mask[:, None, :], float("-inf"))
+        weights = torch.nan_to_num(torch.softmax(logits, dim=-1), nan=0.0)
+        output = torch.einsum("nhk,nkhd->nhd", weights, gathered_v)
+        return self.out_proj(output.reshape(n, self.hidden_dim))
+
+
+class Architecture1ImageConditioner(nn.Module):
+    """Architecture-1-derived conditioner with full visible H&E.
+
+    In task I, ``observed_expression`` is absent and every GEX feature is
+    zero/unavailable. In task II, only surrounding GEX rows are supplied;
+    query GEX is structurally absent. H&E remains visible at query locations
+    in both tasks (except genuinely missing source patches).
+    """
+
+    def __init__(self, n_genes: int, image_feature_dim: int = 1536,
+                 gex_feature_dim: int = 256, hidden_dim: int = 512,
+                 n_heads: int = 8, n_blocks: int = 4,
+                 dense_threshold: int = 256, sparse_k: int = 10,
+                 coord_dim: int = 64, image_proj_dim: int = 256,
+                 gex_proj_dim: int = 256, modality_flag_dim: int = 16,
+                 dropout: float = 0.1):
+        super().__init__()
+        if hidden_dim % n_heads:
+            raise ValueError("hidden_dim must be divisible by n_heads")
+        if n_blocks < 1:
+            raise ValueError("n_blocks must be positive")
+        self.image_feature_dim = int(image_feature_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.n_genes = int(n_genes)
+        self.gex_feature_dim = int(gex_feature_dim)
+        self.gene_encoder = WeightedGeneExpressionEncoder(n_genes, gex_feature_dim)
+        self.spot_token = SpotTokenProjection(
+            hidden_dim=hidden_dim, image_feature_dim=image_feature_dim,
+            image_proj_dim=image_proj_dim, gex_feature_dim=gex_feature_dim,
+            gex_proj_dim=gex_proj_dim, coord_dim=coord_dim,
+            n_modality_flags=2, modality_flag_dim=modality_flag_dim,
+        )
+        self.blocks = nn.ModuleList([
+            _ImageSpatialBlock(hidden_dim, n_heads, dense_threshold, sparse_k, dropout)
+            for _ in range(n_blocks)
+        ])
+
+    def forward(self, inputs: FullImageExpressionInputs) -> torch.Tensor:
+        validate_full_image_expression_inputs(inputs)
+        device = next(self.parameters()).device
+        image = torch.as_tensor(inputs.image_features, dtype=torch.float32, device=device)
+        coords = torch.as_tensor(inputs.coords, dtype=torch.float32, device=device)
+        available = torch.as_tensor(
+            inputs.image_available, dtype=torch.float32, device=device,
+        ).unsqueeze(-1)
+        query_mask = torch.as_tensor(inputs.query_mask, dtype=torch.bool, device=device)
+        neighbor_indices = (
+            torch.as_tensor(inputs.neighbor_indices, dtype=torch.long, device=device)
+            if inputs.neighbor_indices is not None else None
+        )
+        neighbor_mask = (
+            torch.as_tensor(inputs.neighbor_mask, dtype=torch.bool, device=device)
+            if inputs.neighbor_mask is not None else None
+        )
+        if image.shape[1] != self.image_feature_dim:
+            raise ValueError(
+                f"image feature width {image.shape[1]} != configured {self.image_feature_dim}"
+            )
+        if inputs.observed_expression is None:
+            gex_features = torch.zeros(
+                image.shape[0], self.gex_feature_dim, dtype=image.dtype, device=device,
+            )
+            expression_available = torch.zeros_like(available)
+        else:
+            expression = torch.as_tensor(
+                inputs.observed_expression, dtype=torch.float32, device=device,
+            )
+            if expression.shape[1] != self.n_genes:
+                raise ValueError(
+                    f"observed expression width {expression.shape[1]} != configured {self.n_genes}"
+                )
+            expression_indices = torch.as_tensor(
+                inputs.observed_expression_indices, dtype=torch.long, device=device,
+            )
+            gex_features = torch.zeros(
+                image.shape[0], self.gex_feature_dim, dtype=image.dtype, device=device,
+            )
+            gex_features.index_copy_(0, expression_indices, self.gene_encoder(expression))
+            expression_available = torch.as_tensor(
+                inputs.expression_available, dtype=torch.float32, device=device,
+            ).unsqueeze(-1)
+        hidden = self.spot_token(
+            image_features=image,
+            gex_features=gex_features,
+            coords=coords,
+            boundary_ring=torch.zeros(image.shape[0], dtype=torch.long, device=device),
+            modality_flags=torch.cat([available, expression_available], dim=-1),
+        )
+        for block in self.blocks:
+            hidden = block(hidden, coords, neighbor_indices, neighbor_mask)
+        return hidden[query_mask]
+
+
+def imq_mmd(encoded: torch.Tensor, prior: torch.Tensor,
+            scales: tuple[float, ...] = (0.1, 0.2, 0.5, 1.0, 2.0)) -> torch.Tensor:
+    """Biased, non-negative inverse-multiquadratic MMD for WAE training."""
+    if encoded.ndim != 2 or encoded.shape != prior.shape:
+        raise ValueError("encoded and prior must be matching [N, latent_dim] tensors")
+    if encoded.shape[0] < 2:
+        raise ValueError("MMD requires at least two rows")
+    if not scales or any(scale <= 0 for scale in scales):
+        raise ValueError("MMD scales must be positive")
+
+    def kernel(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        distance = torch.cdist(left, right).square()
+        result = torch.zeros_like(distance)
+        for scale in scales:
+            constant = 2.0 * encoded.shape[1] * float(scale)
+            result = result + constant / (constant + distance)
+        return result
+
+    value = kernel(encoded, encoded).mean() + kernel(prior, prior).mean()
+    value = value - 2.0 * kernel(encoded, prior).mean()
+    return value.clamp_min(0.0)
+
+
+class ConditionalWAE(nn.Module):
+    """Conditional full-expression WAE with either MMD or GAN prior matching.
+
+    Both variants share the exact conditioner, encoder, image-mean head and
+    conditional residual decoder. Only the aggregate-posterior regularizer
+    differs, making the comparison interpretable.
+    """
+
+    def __init__(self, n_genes: int, image_conditioner: Architecture1ImageConditioner,
+                 *, regularizer: str, latent_dim: int = 256,
+                 autoencoder_hidden_dim: int = 1024,
+                 discriminator_hidden_dim: int = 256,
+                 regularizer_weight: float = 0.1,
+                 image_mean_weight: float = 1.0,
+                 pcc_weight: float = 0.1,
+                 n_inference_samples: int = 8):
+        super().__init__()
+        if regularizer not in {"mmd", "gan"}:
+            raise ValueError("regularizer must be 'mmd' or 'gan'")
+        if n_genes < 1 or latent_dim < 1 or n_inference_samples < 1:
+            raise ValueError("n_genes, latent_dim and n_inference_samples must be positive")
+        if regularizer_weight < 0 or image_mean_weight < 0 or pcc_weight < 0:
+            raise ValueError("loss weights must be non-negative")
+        self.n_genes = int(n_genes)
+        self.latent_dim = int(latent_dim)
+        self.regularizer = regularizer
+        self.regularizer_weight = float(regularizer_weight)
+        self.image_mean_weight = float(image_mean_weight)
+        self.pcc_weight = float(pcc_weight)
+        self.n_inference_samples = int(n_inference_samples)
+        self.image_conditioner = image_conditioner
+        if image_conditioner.n_genes != n_genes:
+            raise ValueError("image_conditioner and ConditionalWAE must use the same n_genes")
+        context_dim = image_conditioner.hidden_dim
+        self.expression_encoder = ExpressionEncoder(
+            n_genes, latent_dim=latent_dim, hidden_dim=autoencoder_hidden_dim,
+        )
+        self.image_mean_head = nn.Sequential(
+            nn.LayerNorm(context_dim), nn.Linear(context_dim, autoencoder_hidden_dim),
+            nn.GELU(), nn.Linear(autoencoder_hidden_dim, n_genes),
+        )
+        self.residual_decoder = nn.Sequential(
+            nn.Linear(context_dim + latent_dim, autoencoder_hidden_dim),
+            nn.GELU(), nn.LayerNorm(autoencoder_hidden_dim),
+            nn.Linear(autoencoder_hidden_dim, autoencoder_hidden_dim), nn.GELU(),
+            nn.Linear(autoencoder_hidden_dim, n_genes),
+        )
+        self.discriminator = (
+            nn.Sequential(
+                nn.Linear(latent_dim, discriminator_hidden_dim), nn.GELU(),
+                nn.Linear(discriminator_hidden_dim, discriminator_hidden_dim), nn.GELU(),
+                nn.Linear(discriminator_hidden_dim, 1),
+            )
+            if regularizer == "gan" else None
+        )
+
+    def _target(self, inputs: FullImageExpressionInputs, target_expression, *,
+                device: torch.device, dtype: torch.dtype, n_rows: int) -> torch.Tensor:
+        target = torch.as_tensor(target_expression, dtype=dtype, device=device)
+        query_mask = torch.as_tensor(inputs.query_mask, dtype=torch.bool, device=device)
+        if target.shape == (query_mask.shape[0], self.n_genes):
+            target = target[query_mask]
+        if target.shape != (n_rows, self.n_genes):
+            raise ValueError(
+                f"target_expression must be [{n_rows}, {self.n_genes}], got {tuple(target.shape)}"
+            )
+        if not torch.isfinite(target).all():
+            raise ValueError("target_expression must be finite")
+        return target
+
+    def decode(self, z: torch.Tensor, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if z.shape != (context.shape[0], self.latent_dim):
+            raise ValueError("z must have one configured-width row per image-context row")
+        image_mean = self.image_mean_head(context)
+        residual = self.residual_decoder(torch.cat([context, z], dim=-1))
+        return image_mean + residual, image_mean
+
+    def compute_generator_losses(self, inputs: FullImageExpressionInputs,
+                                 target_expression, *, generator=None) -> dict:
+        context = self.image_conditioner(inputs)
+        target = self._target(
+            inputs, target_expression, device=context.device, dtype=context.dtype,
+            n_rows=context.shape[0],
+        )
+        encoded = self.expression_encoder(target)
+        prior = torch.randn(
+            encoded.shape, dtype=encoded.dtype, device=encoded.device, generator=generator,
+        )
+        reconstruction, image_mean = self.decode(encoded, context)
+        reconstruction_loss, reconstruction_rmse, reconstruction_pcc = (
+            rmse_pcc_reconstruction_loss(
+                reconstruction, target, pcc_weight=self.pcc_weight,
+            )
+        )
+        image_mean_loss, image_mean_rmse, image_mean_pcc = rmse_pcc_reconstruction_loss(
+            image_mean, target, pcc_weight=self.pcc_weight,
+        )
+        if self.regularizer == "mmd":
+            prior_loss = imq_mmd(encoded, prior)
+        else:
+            detached_state = {
+                name: value.detach() for name, value in self.discriminator.named_parameters()
+            }
+            detached_state.update({
+                name: value for name, value in self.discriminator.named_buffers()
+            })
+            logits = functional_call(self.discriminator, detached_state, (encoded,))
+            prior_loss = nn.functional.binary_cross_entropy_with_logits(
+                logits, torch.ones_like(logits),
+            )
+        total = (
+            reconstruction_loss + self.image_mean_weight * image_mean_loss
+            + self.regularizer_weight * prior_loss
+        )
+        return {
+            "total": total,
+            "expression": reconstruction,
+            "image_only_expression": image_mean,
+            "latent": encoded,
+            "reconstruction_loss": reconstruction_loss,
+            "reconstruction_rmse": reconstruction_rmse,
+            "reconstruction_pcc_loss": reconstruction_pcc,
+            "image_mean_loss": image_mean_loss,
+            "image_mean_rmse": image_mean_rmse,
+            "image_mean_pcc_loss": image_mean_pcc,
+            "prior_loss": prior_loss,
+        }
+
+    def compute_discriminator_loss(self, target_expression, *, generator=None) -> torch.Tensor:
+        if self.discriminator is None:
+            raise RuntimeError("discriminator loss is only defined for regularizer='gan'")
+        device = next(self.expression_encoder.parameters()).device
+        target = torch.as_tensor(target_expression, dtype=torch.float32, device=device)
+        if target.ndim != 2 or target.shape[1] != self.n_genes or not torch.isfinite(target).all():
+            raise ValueError("target_expression must be finite [N, n_genes]")
+        with torch.no_grad():
+            encoded = self.expression_encoder(target)
+        prior = torch.randn(
+            encoded.shape, dtype=encoded.dtype, device=encoded.device, generator=generator,
+        )
+        real_logits = self.discriminator(prior)
+        encoded_logits = self.discriminator(encoded.detach())
+        return (
+            nn.functional.binary_cross_entropy_with_logits(
+                real_logits, torch.ones_like(real_logits),
+            )
+            + nn.functional.binary_cross_entropy_with_logits(
+                encoded_logits, torch.zeros_like(encoded_logits),
+            )
+        )
+
+    def forward(self, inputs: FullImageExpressionInputs) -> dict:
+        context = self.image_conditioner(inputs)
+        image_mean = self.image_mean_head(context)
+        return {"expression": image_mean, "image_context": context}
+
+    @torch.no_grad()
+    def sample_predictive_distribution(self, inputs: FullImageExpressionInputs,
+                                       n_samples: int | None = None,
+                                       generator=None) -> dict:
+        context = self.image_conditioner(inputs)
+        count = int(n_samples or self.n_inference_samples)
+        if count < 1:
+            raise ValueError("n_samples must be positive")
+        samples = []
+        for _ in range(count):
+            z = torch.randn(
+                context.shape[0], self.latent_dim,
+                dtype=context.dtype, device=context.device, generator=generator,
+            )
+            prediction, _ = self.decode(z, context)
+            samples.append(prediction)
+        stacked = torch.stack(samples)
+        image_mean = self.image_mean_head(context)
+        return {
+            "expression": stacked.mean(0),
+            "predictive_mean": stacked.mean(0),
+            "predictive_std": stacked.std(0, unbiased=False),
+            "predictive_samples": stacked,
+            "image_only_expression": image_mean,
+            "image_context": context,
+        }
