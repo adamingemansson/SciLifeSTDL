@@ -40,7 +40,7 @@ def prepare_conditional_wae_suite(
         raise ValueError(f"train-derived panel artifact is missing {missing}")
 
     root.mkdir(parents=True)
-    for name in ("configs", "checkpoints", "logs"):
+    for name in ("configs", "checkpoints", "logs", "tensorboard"):
         (root / name).mkdir()
     written = {}
     architecture1_params = dict((base.get("model") or {}).get("params") or {})
@@ -78,6 +78,19 @@ def prepare_conditional_wae_suite(
         config["data"]["gen3_manifest_path"] = str(manifest_path)
         config.setdefault("evaluation", {})
         config["evaluation"]["train_gene_panel_artifact"] = str(panel_path)
+        config["evaluation"]["tensorboard"] = {
+            "enabled": True,
+            "log_dir": str(root / "tensorboard" / arm),
+            # Scalars are written at every existing log/evaluation boundary.
+            # Expensive Projector/maps reuse every fifth validation pass.
+            "snapshot_every_n_evals": 5,
+            "embedding_max_points": 5000,
+            "embedding_max_points_per_item": 64,
+            "thumbnail_max_points": 512,
+            "thumbnail_size": 48,
+            "max_spatial_samples": 4,
+            "spatial_gene_count": 2,
+        }
         config["loss"] = {
             "pcc_weight": 0.1,
             "regularizer_weight": 0.1,

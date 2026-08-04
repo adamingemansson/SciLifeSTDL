@@ -13,6 +13,11 @@ from gen3_multiscale.conditional_wae import (
     imq_mmd,
 )
 from gen3_multiscale.conditional_wae.contract import static_audit_conditional_wae_config
+from gen3_multiscale.conditional_wae.tensorboard import (
+    ConditionalWAESnapshotAccumulator,
+    ConditionalWAETensorBoardLogger,
+    METADATA_HEADER,
+)
 from gen3_multiscale.data.boundary_graph import build_knn_adjacency
 from gen3_multiscale.training import train_conditional_wae
 
@@ -240,3 +245,76 @@ def test_checkpoint_pointer_without_bound_manifest_fails_closed(tmp_path, monkey
     )
     with pytest.raises(ValueError, match="bundle-bound run manifest"):
         train_conditional_wae._checkpoint_resume_state(tmp_path)
+
+
+def test_tensorboard_snapshot_is_bounded_aligned_and_has_he_thumbnails(monkeypatch, tmp_path):
+    inputs = _inputs(n=7)
+    target = torch.arange(49, dtype=torch.float32).reshape(7, 7)
+    sample = SimpleNamespace(
+        sample_id="slide", patient_id="patient-1",
+        full_sample_coords=np.stack([np.arange(7), np.arange(7) + 10], axis=1),
+        image_source_available=np.ones(7, dtype=bool),
+        patches=np.full((7, 8, 8, 3), 128, dtype=np.uint8),
+        adata=SimpleNamespace(obs_names=np.asarray([f"spot-{i}" for i in range(7)])),
+    )
+    accumulator = ConditionalWAESnapshotAccumulator(
+        sample_records={"slide": {"organ": "kidney"}},
+        gene_names=[f"g{i}" for i in range(7)], logged_gene_indices=[1, 3],
+        max_points=5, max_points_per_item=3, thumbnail_max_points=2,
+        thumbnail_size=4,
+    )
+    prediction = {
+        "predictive_mean": target + 1,
+        "image_context": torch.arange(42, dtype=torch.float32).reshape(7, 6),
+    }
+    identity = {"stratum": "medium", "query_fingerprint": "fixed-mask"}
+    accumulator.add(
+        inputs=inputs, target=target, identity=identity, prediction=prediction,
+        posterior_z=torch.arange(35, dtype=torch.float32).reshape(7, 5), sample=sample,
+    )
+    accumulator.add(
+        inputs=inputs, target=target, identity=identity, prediction=prediction,
+        posterior_z=torch.arange(35, dtype=torch.float32).reshape(7, 5), sample=sample,
+    )
+    arrays = accumulator.arrays()
+    assert accumulator.n_points == 5
+    assert arrays["posterior_z"].shape == (5, 5)
+    assert arrays["context"].shape == (5, 6)
+    assert arrays["prediction_genes"].shape == (5, 2)
+    assert arrays["thumbnails"].shape == (2, 3, 4, 4)
+    assert len(accumulator.metadata) == 5
+    assert accumulator.metadata[0][METADATA_HEADER.index("organ")] == "kidney"
+
+    class FakeWriter:
+        def __init__(self):
+            self.scalars = []
+            self.embeddings = []
+
+        def add_scalar(self, *args):
+            self.scalars.append(args)
+
+        def add_embedding(self, *args, **kwargs):
+            self.embeddings.append((args, kwargs))
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    writer = FakeWriter()
+    logger = ConditionalWAETensorBoardLogger(tmp_path, writer=writer)
+    monkeypatch.setattr(logger, "_add_spatial_figures", lambda *_args: None)
+    losses = _model("mmd").compute_generator_losses(
+        _inputs(), torch.randn(12, 7), generator=torch.Generator().manual_seed(7),
+    )
+    logger.add_train_scalars(10, losses, grad_norm=1.0, learning_rate=1e-4)
+    logger.add_validation_scalars(10, {
+        "total": 1.0, "rmse": 0.5, "pcc_loss": 0.8, "conditional_mean_rmse": 0.6,
+    })
+    logger.add_snapshot(10, accumulator)
+    assert {entry[0] for entry in writer.scalars} >= {
+        "train/total", "train/prior", "validation/total", "validation/rmse",
+    }
+    assert len(writer.embeddings) == 4
+    assert sum("label_img" in kwargs for _args, kwargs in writer.embeddings) == 2

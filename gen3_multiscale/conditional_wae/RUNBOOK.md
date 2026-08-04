@@ -68,3 +68,29 @@ The evaluator always predicts from legal inference inputs and sampled prior
 latents; it never selects a checkpoint using target-encoded reconstruction.
 It reports the sampled conditional model and the explicit deterministic
 conditional-mean head separately, including configured HVG-50/HVG-200 panels.
+
+## TensorBoard diagnostics
+
+Generated suite configs enable direct TensorBoard logging under
+`SUITE_ROOT/tensorboard/ARM`. Scalars are written at the existing training and
+validation boundaries. Every fifth validation reuses that same validation pass
+to record a fixed, bounded cohort (at most 5,000 query spots):
+
+- conditional-context and held-out target-posterior embeddings for Projector;
+- sample, patient, organ, mask stratum, barcode and raw coordinate metadata;
+- a 512-point subset with aligned, downsampled H&E patch thumbnails;
+- per-slide context/posterior PCA maps, predictive-RMSE maps, and target versus
+  prediction maps for two train-derived HVG genes.
+
+The `posterior_z_target_diagnostic` embedding deliberately uses held-out target
+GEX to inspect representation structure. It is diagnostic only: it is never an
+inference input and cannot affect validation loss or checkpoint selection.
+Projector computes PCA/UMAP interactively; the spatial PCA maps preserve the
+original spot coordinates so clusters can be related back to tissue regions.
+
+Launch TensorBoard on the server with any free port, for example:
+
+```bash
+python -m tensorboard.main --logdir /path/to/SUITE_ROOT/tensorboard \
+  --host 127.0.0.1 --port 38435 --load_fast=false
+```

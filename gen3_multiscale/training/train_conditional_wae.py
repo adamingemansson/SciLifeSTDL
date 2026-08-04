@@ -20,8 +20,13 @@ from gen3_multiscale.conditional_wae import (
     ConditionalWAE,
 )
 from gen3_multiscale.conditional_wae.contract import static_audit_conditional_wae_config
+from gen3_multiscale.conditional_wae.tensorboard import (
+    ConditionalWAESnapshotAccumulator,
+    ConditionalWAETensorBoardLogger,
+)
 from gen3_multiscale.config_identity import config_identity_fingerprint, resolved_config
 from gen3_multiscale.data.dataset_manifest import gene_panel_hash, load_dataset_manifest
+from gen3_multiscale.evaluation.train_gene_panels import load_train_derived_gene_panels
 from gen3_multiscale.models.losses import rmse_pcc_reconstruction_loss
 from gen3_multiscale.training import checkpoint as checkpoint_module
 from gen3_multiscale.training.gen3_dataset import Gen3SpatialFieldDataset, build_gen3_mask_schedule
@@ -134,7 +139,9 @@ def _checkpoint_resume_state(checkpoint_dir: Path) -> tuple[bool, dict | None]:
 
 
 @torch.no_grad()
-def _validate(model: ConditionalWAE, dataset, *, device: torch.device, seed: int) -> dict:
+def _validate(model: ConditionalWAE, dataset, *, device: torch.device, seed: int,
+              snapshot: ConditionalWAESnapshotAccumulator | None = None,
+              samples: dict | None = None) -> dict:
     model.eval()
     totals, rmses, pcc_losses, conditional_mean_rmses = [], [], [], []
     for index in range(len(dataset)):
@@ -152,6 +159,17 @@ def _validate(model: ConditionalWAE, dataset, *, device: torch.device, seed: int
         rmses.append(float(rmse))
         pcc_losses.append(float(pcc_loss))
         conditional_mean_rmses.append(float(mean_rmse))
+        if snapshot is not None and not snapshot.full:
+            if samples is None or inputs.sample_id not in samples:
+                raise ValueError("TensorBoard snapshot requires the aligned validation sample")
+            # Held-out target GEX is encoded only for a diagnostic Projector view.
+            # It is never fed to sample_predictive_distribution or model selection.
+            posterior_z = model.expression_encoder(target_tensor)
+            snapshot.add(
+                inputs=inputs, target=target_tensor, identity=identity,
+                prediction=prediction, posterior_z=posterior_z,
+                sample=samples[inputs.sample_id],
+            )
     model.train()
     return {
         "total": float(np.mean(totals)),
@@ -160,6 +178,19 @@ def _validate(model: ConditionalWAE, dataset, *, device: torch.device, seed: int
         "conditional_mean_rmse": float(np.mean(conditional_mean_rmses)),
         "n_items": len(dataset),
     }
+
+
+def _tensorboard_gene_indices(config: dict, dataset_manifest: dict,
+                              gene_names: list[str], count: int) -> list[int]:
+    if count < 1:
+        return []
+    artifact_path = (config.get("evaluation") or {}).get("train_gene_panel_artifact")
+    if not artifact_path:
+        return list(range(min(count, len(gene_names))))
+    artifact = load_train_derived_gene_panels(artifact_path, dataset_manifest)
+    panel = artifact["panels"].get("train_log1p_variance_top50") or []
+    positions = {gene: index for index, gene in enumerate(gene_names)}
+    return [positions[gene] for gene in panel[:count]]
 
 
 def run_conditional_wae_training(
@@ -278,6 +309,14 @@ def run_conditional_wae_training(
     history_path = checkpoint_dir / "validation_history.json"
     history = json.loads(history_path.read_text()) if history_path.is_file() and not smoke else []
     best_total = min((entry["total"] for entry in history), default=float("inf"))
+    tensorboard_cfg = dict((config.get("evaluation") or {}).get("tensorboard") or {})
+    tensorboard_logger = None
+    if bool(tensorboard_cfg.get("enabled", False)) and not smoke:
+        tensorboard_logger = ConditionalWAETensorBoardLogger(
+            tensorboard_cfg["log_dir"],
+            max_spatial_samples=int(tensorboard_cfg.get("max_spatial_samples", 4)),
+        )
+        print(f"TensorBoard logging: {tensorboard_cfg['log_dir']}", flush=True)
     started = time.time()
     step = resume_step
     completion_reason = "total_steps_reached"
@@ -332,14 +371,55 @@ def run_conditional_wae_training(
             if discriminator_loss is not None:
                 pieces.append(f"discriminator={float(discriminator_loss.detach()):.6f}")
             print(f"[step {step}] train: " + ", ".join(pieces), flush=True)
+            if tensorboard_logger is not None:
+                tensorboard_logger.add_train_scalars(
+                    step, losses, grad_norm=generator_grad_norm,
+                    discriminator_loss=discriminator_loss,
+                    learning_rate=optimizer.param_groups[0]["lr"],
+                )
         if validation_dataset is not None and (smoke or step % eval_every == 0):
-            entry = {"step": step, **_validate(model, validation_dataset, device=device, seed=seed)}
+            snapshot = None
+            if tensorboard_logger is not None:
+                snapshot_every = max(1, int(tensorboard_cfg.get("snapshot_every_n_evals", 5)))
+                evaluation_number = max(1, step // eval_every)
+                if (evaluation_number - 1) % snapshot_every == 0:
+                    logged_gene_indices = _tensorboard_gene_indices(
+                        config, dataset_manifest, gene_names,
+                        int(tensorboard_cfg.get("spatial_gene_count", 2)),
+                    )
+                    snapshot = ConditionalWAESnapshotAccumulator(
+                        sample_records={
+                            sample_id: dataset_manifest["samples"][sample_id]
+                            for sample_id in validation_ids
+                        },
+                        gene_names=gene_names,
+                        logged_gene_indices=logged_gene_indices,
+                        max_points=int(tensorboard_cfg.get("embedding_max_points", 5000)),
+                        max_points_per_item=int(
+                            tensorboard_cfg.get("embedding_max_points_per_item", 64)
+                        ),
+                        thumbnail_max_points=int(
+                            tensorboard_cfg.get("thumbnail_max_points", 512)
+                        ),
+                        thumbnail_size=int(tensorboard_cfg.get("thumbnail_size", 48)),
+                    )
+            entry = {
+                "step": step,
+                **_validate(
+                    model, validation_dataset, device=device, seed=seed,
+                    snapshot=snapshot, samples=validation_samples,
+                ),
+            }
             print(
                 f"[step {step}] validation: total={entry['total']:.6f}, "
                 f"rmse={entry['rmse']:.6f}, "
                 f"conditional_mean_rmse={entry['conditional_mean_rmse']:.6f}",
                 flush=True,
             )
+            if tensorboard_logger is not None:
+                tensorboard_logger.add_validation_scalars(step, entry)
+                if snapshot is not None:
+                    tensorboard_logger.add_snapshot(step, snapshot)
             if not smoke:
                 history.append(entry)
                 _atomic_json(history, history_path)
@@ -374,6 +454,8 @@ def run_conditional_wae_training(
         "completion_reason": completion_reason,
         "checkpoint_dir": str(checkpoint_dir),
     }
+    if tensorboard_logger is not None:
+        tensorboard_logger.close()
     print(f"conditional WAE training finished: {summary}", flush=True)
     return summary
 
