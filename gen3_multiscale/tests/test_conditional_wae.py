@@ -20,6 +20,10 @@ from gen3_multiscale.conditional_wae.tensorboard import (
 )
 from gen3_multiscale.data.boundary_graph import build_knn_adjacency
 from gen3_multiscale.training import train_conditional_wae
+from gen3_multiscale.scripts.prepare_conditional_wae_suite import (
+    _absolutize_existing_source_paths,
+    _source_repository_root,
+)
 
 
 def _inputs(n=12, image_dim=16):
@@ -318,3 +322,24 @@ def test_tensorboard_snapshot_is_bounded_aligned_and_has_he_thumbnails(monkeypat
     }
     assert len(writer.embeddings) == 4
     assert sum("label_img" in kwargs for _args, kwargs in writer.embeddings) == 2
+
+
+def test_suite_absolutizes_only_existing_paths_from_comparison_repository(tmp_path):
+    source = tmp_path / "source"
+    comparison = source / "gen3_multiscale" / "results" / "run" / "config.yaml"
+    comparison.parent.mkdir(parents=True)
+    comparison.write_text("model: {}\n")
+    asset = source / "data" / "raw" / "hest1k"
+    asset.mkdir(parents=True)
+
+    assert _source_repository_root(comparison) == source.resolve()
+    payload = {
+        "data": {"hest_data_dir": "data/raw/hest1k", "missing": "data/not-created"},
+        "device": "cuda",
+        "revision": "d517a8dd",
+    }
+    resolved = _absolutize_existing_source_paths(payload, source)
+    assert resolved["data"]["hest_data_dir"] == str(asset.resolve())
+    assert resolved["data"]["missing"] == "data/not-created"
+    assert resolved["device"] == "cuda"
+    assert resolved["revision"] == "d517a8dd"

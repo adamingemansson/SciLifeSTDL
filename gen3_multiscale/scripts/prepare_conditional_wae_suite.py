@@ -18,6 +18,39 @@ from gen3_multiscale.data.dataset_manifest import load_dataset_manifest
 from gen3_multiscale.evaluation.train_gene_panels import load_train_derived_gene_panels
 
 
+def _source_repository_root(comparison_config: str | Path) -> Path:
+    """Locate the repository against which relative resolved paths were valid."""
+    path = Path(comparison_config).resolve()
+    for candidate in path.parents:
+        if (candidate / "gen3_multiscale").is_dir():
+            return candidate
+    raise ValueError(
+        f"cannot locate source repository root above comparison config {path}"
+    )
+
+
+def _absolutize_existing_source_paths(value, source_root: Path):
+    """Preserve source-config asset semantics when writing into another worktree.
+
+    Only strings whose source-root-relative target actually exists are changed;
+    ordinary enum/name/hash strings remain untouched.
+    """
+    if isinstance(value, dict):
+        return {
+            key: _absolutize_existing_source_paths(item, source_root)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_absolutize_existing_source_paths(item, source_root) for item in value]
+    if isinstance(value, str):
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            candidate = source_root / path
+            if candidate.exists():
+                return str(candidate.resolve())
+    return value
+
+
 def prepare_conditional_wae_suite(
     *, comparison_config: str, manifest: str, train_gene_panels: str,
     output_root: str, hours: float = 8.0,
@@ -27,7 +60,9 @@ def prepare_conditional_wae_suite(
     root = Path(output_root)
     if root.exists():
         raise FileExistsError(f"{root} already exists; suite roots are immutable")
+    source_root = _source_repository_root(comparison_config)
     base = yaml.safe_load(Path(comparison_config).read_text())
+    base = _absolutize_existing_source_paths(base, source_root)
     if str((base.get("model") or {}).get("architecture", "")) != "1":
         raise ValueError("--comparison-config must be a resolved Gen3 Architecture 1 config")
     manifest_path = Path(manifest).resolve()
