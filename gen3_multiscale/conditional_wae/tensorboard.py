@@ -199,7 +199,7 @@ class ConditionalWAETensorBoardLogger:
     """Write scalars, Projector cohorts, H&E thumbnails and spatial maps."""
 
     def __init__(self, log_dir: str | Path, *, writer=None,
-                 max_spatial_samples: int = 4):
+                 max_spatial_samples: int = 4, purge_step: int | None = None):
         self.log_dir = Path(log_dir)
         self.max_spatial_samples = int(max_spatial_samples)
         if self.max_spatial_samples < 1:
@@ -211,7 +211,10 @@ class ConditionalWAETensorBoardLogger:
                 raise RuntimeError(
                     "TensorBoard logging is enabled but tensorboard is not installed"
                 ) from exc
-            writer = SummaryWriter(log_dir=str(self.log_dir))
+            writer = SummaryWriter(
+                log_dir=str(self.log_dir),
+                purge_step=(int(purge_step) if purge_step is not None else None),
+            )
         self.writer = writer
 
     def add_train_scalars(self, step: int, losses: dict, *, grad_norm,

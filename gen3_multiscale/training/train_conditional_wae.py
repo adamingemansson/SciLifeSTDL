@@ -354,6 +354,7 @@ def run_conditional_wae_training(
         tensorboard_logger = ConditionalWAETensorBoardLogger(
             tensorboard_cfg["log_dir"],
             max_spatial_samples=int(tensorboard_cfg.get("max_spatial_samples", 4)),
+            purge_step=(resume_step if resume_step > 0 else None),
         )
         print(f"TensorBoard logging: {tensorboard_cfg['log_dir']}", flush=True)
     started = time.time()
