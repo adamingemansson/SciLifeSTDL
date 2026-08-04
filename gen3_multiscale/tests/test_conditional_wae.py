@@ -251,6 +251,40 @@ def test_checkpoint_pointer_without_bound_manifest_fails_closed(tmp_path, monkey
         train_conditional_wae._checkpoint_resume_state(tmp_path)
 
 
+def test_training_item_selection_deterministically_skips_single_spot_masks(monkeypatch):
+    items = [
+        ("one", np.zeros((1, 7), dtype=np.float32), {"mask": "one"}),
+        ("valid", np.zeros((3, 7), dtype=np.float32), {"mask": "valid"}),
+    ]
+    monkeypatch.setattr(
+        train_conditional_wae,
+        "deterministic_train_index_for_step",
+        lambda *_args, **_kwargs: 0,
+    )
+    inputs, target, identity, skipped = (
+        train_conditional_wae._select_train_item_with_minimum_queries(
+            items, step=3200, seed=0,
+        )
+    )
+    assert inputs == "valid"
+    assert target.shape == (3, 7)
+    assert identity == {"mask": "valid"}
+    assert skipped == 1
+
+
+def test_training_item_selection_fails_if_every_mask_is_undersized(monkeypatch):
+    items = [("one", np.zeros((1, 7), dtype=np.float32), {})]
+    monkeypatch.setattr(
+        train_conditional_wae,
+        "deterministic_train_index_for_step",
+        lambda *_args, **_kwargs: 0,
+    )
+    with pytest.raises(ValueError, match="no eligible mask"):
+        train_conditional_wae._select_train_item_with_minimum_queries(
+            items, step=0, seed=0,
+        )
+
+
 def test_tensorboard_snapshot_is_bounded_aligned_and_has_he_thumbnails(monkeypatch, tmp_path):
     inputs = _inputs(n=7)
     target = torch.arange(49, dtype=torch.float32).reshape(7, 7)

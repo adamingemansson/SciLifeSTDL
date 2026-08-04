@@ -34,13 +34,14 @@ from gen3_multiscale.training.train import (
     _code_commit_hash,
     _worktree_diff_hash,
     dataset_manifest_fingerprint,
-    deterministic_train_index_for_step,
     expected_tile_encoder_provenance,
     save_best_checkpoint_bundle,
 )
 from gen3_multiscale.training.train_conditional_wae import (
     _atomic_json,
     _checkpoint_resume_state,
+    _configure_cpu_threads,
+    _select_train_item_with_minimum_queries,
     _stable_seed,
     _tensorboard_gene_indices,
     _validate,
@@ -129,6 +130,8 @@ def run_conditional_flow_training(
     config = resolved_config(config_path)
     static_audit_conditional_flow_config(config)
     data_cfg, training_cfg = config["data"], config["training"]
+    cpu_threads = _configure_cpu_threads(training_cfg)
+    print(f"CPU thread cap: {cpu_threads}", flush=True)
     dataset_manifest = load_dataset_manifest(data_cfg["gen3_manifest_path"])
     train_ids = list(dataset_manifest["train_sample_ids"])
     validation_ids = list(dataset_manifest["validation_sample_ids"])
@@ -245,11 +248,18 @@ def run_conditional_flow_training(
             if (time.time() - started) / 3600 >= max_hours:
                 completion_reason = "wall_clock_limit_reached"
                 break
-            index = deterministic_train_index_for_step(step, len(train_dataset), seed)
-            inputs, target, _identity = train_dataset[index]
+            inputs, target, _identity, skipped_small_masks = (
+                _select_train_item_with_minimum_queries(
+                    train_dataset, step=step, seed=seed,
+                )
+            )
             target_tensor = torch.as_tensor(target, dtype=torch.float32, device=device)
-            if target_tensor.shape[0] < 2:
-                raise ValueError("conditional flow requires at least two query spots per mask")
+            if skipped_small_masks and (step == resume_step or step % log_every == 0):
+                print(
+                    f"[step {step}] skipped {skipped_small_masks} undersized mask(s) "
+                    "before selecting a mask with at least two query spots",
+                    flush=True,
+                )
             optimizer.zero_grad(set_to_none=True)
             losses = model.compute_losses(
                 inputs, target_tensor,

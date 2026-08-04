@@ -48,6 +48,43 @@ def _atomic_json(payload, path: Path) -> None:
     os.replace(temporary, path)
 
 
+def _configure_cpu_threads(training_cfg: dict) -> int:
+    """Apply the explicit per-trainer CPU cap before data/model work starts."""
+    cpu_threads = int(
+        os.environ.get(
+            "SCILIFESTDL_CPU_THREADS",
+            training_cfg.get("cpu_threads", 8),
+        )
+    )
+    if cpu_threads < 1:
+        raise ValueError("training.cpu_threads must be at least 1")
+    torch.set_num_threads(cpu_threads)
+    return cpu_threads
+
+
+def _select_train_item_with_minimum_queries(
+    dataset,
+    *,
+    step: int,
+    seed: int,
+    minimum_query_spots: int = 2,
+):
+    """Deterministically bypass masks too small for latent distribution losses."""
+    n_items = len(dataset)
+    if n_items < 1:
+        raise ValueError("conditional latent training dataset is empty")
+    start = deterministic_train_index_for_step(step, n_items, seed)
+    for offset in range(n_items):
+        index = (start + offset) % n_items
+        inputs, target, identity = dataset[index]
+        if np.asarray(target).shape[0] >= minimum_query_spots:
+            return inputs, target, identity, offset
+    raise ValueError(
+        "conditional latent training requires at least two query spots, but no "
+        "eligible mask exists in the dataset"
+    )
+
+
 def _build_model(config: dict, n_genes: int) -> ConditionalWAE:
     model_cfg = config["model"]
     params = model_cfg["params"]
@@ -199,6 +236,8 @@ def run_conditional_wae_training(
     config = resolved_config(config_path)
     static_audit_conditional_wae_config(config)
     data_cfg, training_cfg = config["data"], config["training"]
+    cpu_threads = _configure_cpu_threads(training_cfg)
+    print(f"CPU thread cap: {cpu_threads}", flush=True)
     dataset_manifest = load_dataset_manifest(data_cfg["gen3_manifest_path"])
     train_ids = list(dataset_manifest["train_sample_ids"])
     validation_ids = list(dataset_manifest["validation_sample_ids"])
@@ -325,11 +364,18 @@ def run_conditional_wae_training(
         if (time.time() - started) / 3600 >= max_hours:
             completion_reason = "wall_clock_limit_reached"
             break
-        index = deterministic_train_index_for_step(step, len(train_dataset), seed)
-        inputs, target, _identity = train_dataset[index]
+        inputs, target, _identity, skipped_small_masks = (
+            _select_train_item_with_minimum_queries(
+                train_dataset, step=step, seed=seed,
+            )
+        )
         target_tensor = torch.as_tensor(target, dtype=torch.float32, device=device)
-        if target_tensor.shape[0] < 2:
-            raise ValueError("conditional WAE requires at least two query spots per mask")
+        if skipped_small_masks and (step == resume_step or step % log_every == 0):
+            print(
+                f"[step {step}] skipped {skipped_small_masks} undersized mask(s) "
+                "before selecting a mask with at least two query spots",
+                flush=True,
+            )
         discriminator_loss = None
         if model.discriminator is not None:
             optimizer.zero_grad(set_to_none=True)
