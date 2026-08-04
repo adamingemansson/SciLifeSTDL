@@ -46,6 +46,7 @@ Pass the exact identities already used to build the caches:
 python -m gen3_multiscale.scripts.prepare_gen6_suite \
   --comparison-config /path/resolved_comparison.yaml \
   --manifest /path/dataset_manifest.json \
+  --train-gene-panels /path/train_gene_panels.json \
   --output-root gen3_multiscale/results/gen6_screen_$(date -u +%Y%m%dT%H%M%SZ) \
   --hours 8 \
   --fingerprint uni2_checkpoint=/path/pytorch_model.bin \
@@ -61,8 +62,9 @@ python -m gen3_multiscale.scripts.prepare_gen6_suite \
   --fingerprint stpath_gene_vocab=/path/symbol2ensembl.json
 ```
 
-Preflight fails before model construction if any required cache, fingerprint,
-shape or provenance is missing.
+Preparation verifies that the train-derived panel artifact matches the manifest
+and contains both HVG-50 and HVG-200. Preflight fails before model construction
+if any required cache, fingerprint, shape or provenance is missing.
 
 ## Launch four concurrent GPU queues
 
