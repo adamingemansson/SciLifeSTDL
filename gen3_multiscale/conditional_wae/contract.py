@@ -44,6 +44,13 @@ ARM_SPECS = {
     # data.gene_coexpression_basis_path differ.
     "wae_he_gan_coexpression_control": ConditionalWAEArmSpec("he_to_st", "gan", False),
     "wae_he_gan_coexpression": ConditionalWAEArmSpec("he_to_st", "gan", False),
+    # Histology-structure (deterministic multiscale morphology) context
+    # injection ablation: same immutable task/regularizer/
+    # include_observed_gex contract as "wae_he_gan" -- only
+    # model.params.use_histology_context and data.use_histology_features
+    # differ.
+    "wae_he_gan_histology_control": ConditionalWAEArmSpec("he_to_st", "gan", False),
+    "wae_he_gan_histology": ConditionalWAEArmSpec("he_to_st", "gan", False),
 }
 
 _VALID_FILM_LAYERS = frozenset({"first", "second"})
@@ -85,6 +92,12 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
         raise ValueError(
             "model.params.use_gene_coexpression_refinement requires data.gene_coexpression_basis_path"
         )
+    use_histology_context = bool(params.get("use_histology_context", False))
+    if use_histology_context and not bool(data.get("use_histology_features", False)):
+        raise ValueError(
+            "model.params.use_histology_context requires data.use_histology_features to also be true, "
+            "or the dataset would never load the features this arm's conditioner expects"
+        )
     if not data.get("gen3_manifest_path"):
         raise ValueError("data.gen3_manifest_path must point to an immutable manifest")
     image_encoder = str(data.get("image_encoder", "gigapath"))
@@ -113,4 +126,5 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
         "surrounding_gex_visible": spec.include_observed_gex,
         "image_encoder": image_encoder,
         "use_gene_coexpression_refinement": use_gene_coexpression_refinement,
+        "use_histology_context": use_histology_context,
     }

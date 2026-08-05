@@ -119,6 +119,12 @@ def build_conditional_wae_example(
         if normalized_coords.shape != (n, 2) or not np.isfinite(normalized_coords).all():
             raise ValueError("normalized_coords must be finite [N, 2]")
 
+    histology_features = getattr(sample, "precomputed_histology_features", None)
+    if histology_features is not None:
+        histology_features = np.asarray(histology_features, dtype=np.float32)
+        if histology_features.shape[0] != n:
+            raise ValueError("sample histology features are not row-aligned with the rest of the sample")
+
     inputs = FullImageExpressionInputs(
         sample_id=str(sample.sample_id),
         image_features=features,
@@ -130,6 +136,7 @@ def build_conditional_wae_example(
         expression_available=expression_available,
         neighbor_indices=(padded_adjacency[0] if padded_adjacency is not None else None),
         neighbor_mask=(padded_adjacency[1] if padded_adjacency is not None else None),
+        histology_features=histology_features,
     )
     validate_full_image_expression_inputs(inputs)
     return inputs, target

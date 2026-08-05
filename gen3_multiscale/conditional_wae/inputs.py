@@ -27,6 +27,7 @@ class FullImageExpressionInputs:
     expression_available: np.ndarray | torch.Tensor | None = None  # [N] bool
     neighbor_indices: np.ndarray | torch.Tensor | None = None  # [N, K] cached geometry graph
     neighbor_mask: np.ndarray | torch.Tensor | None = None  # [N, K] bool
+    histology_features: np.ndarray | torch.Tensor | None = None  # [N, histology_features.FEATURE_DIM]
 
 
 def validate_full_image_expression_inputs(inputs: FullImageExpressionInputs) -> None:
@@ -47,6 +48,12 @@ def validate_full_image_expression_inputs(inputs: FullImageExpressionInputs) -> 
         raise ValueError("query_mask must be boolean [N] with at least one query")
     if not torch.isfinite(features).all() or not torch.isfinite(coords).all():
         raise ValueError("image_features and coords must be finite")
+    if inputs.histology_features is not None:
+        histology_features = torch.as_tensor(inputs.histology_features)
+        if histology_features.ndim != 2 or histology_features.shape[0] != n:
+            raise ValueError(f"histology_features must be [{n}, histology_feature_dim]")
+        if not torch.isfinite(histology_features).all():
+            raise ValueError("histology_features must be finite")
     if (inputs.neighbor_indices is None) != (inputs.neighbor_mask is None):
         raise ValueError("neighbor_indices and neighbor_mask must be supplied together")
     if inputs.neighbor_indices is not None:

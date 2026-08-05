@@ -66,6 +66,7 @@ import torch
 
 from gen3_multiscale.data import example_builder, novae_graph, slide_context, spot_feature_cache
 from gen3_multiscale.data import mask_fingerprint
+from gen3_multiscale.conditional_wae import histology_cache
 from gen3_multiscale.gen4 import uni2_spot_cache
 from gen3_multiscale.data.boundary_graph import (
     EmptyBoundaryError,
@@ -99,6 +100,7 @@ class Gen3SampleData:
     slide_context_record: dict | None
     tile_encoder_provenance: dict  # {"dense_wsi": {...} | None, "spot_features": {...}}
     spatial_adjacency: tuple[np.ndarray, ...] | None = None  # canonical graph, built once per sample
+    precomputed_histology_features: np.ndarray | None = None  # VERIFIED via histology_cache.load_gen3_histology_features; None unless data.use_histology_features
 
     def __post_init__(self):
         if self.spatial_adjacency is None:
@@ -224,6 +226,16 @@ def load_gen3_sample_data(
         if slide_context_record is not None:
             dense_wsi_provenance = slide_context_record.get("tile_encoder_provenance")
 
+    # Opt-in, strictly additive: existing configs never set this, so
+    # `precomputed_histology_features` stays None for every arm except
+    # the histology-structure ablation (same default-off discipline as
+    # `image_encoder`/`encoder_conditioning`).
+    precomputed_histology_features = None
+    if bool(cfg.data.get("use_histology_features", False)):
+        precomputed_histology_features = histology_cache.load_gen3_histology_features(
+            cfg, sample_id, obs_names, full_sample_coords, patches, image_source_available,
+        )
+
     return Gen3SampleData(
         sample_id=sample_id,
         patient_id=str(record["patient_id"]),
@@ -245,6 +257,7 @@ def load_gen3_sample_data(
             "dense_wsi": dense_wsi_provenance,
             "spot_features": spot_record["tile_encoder_provenance"],
         },
+        precomputed_histology_features=precomputed_histology_features,
     )
 
 

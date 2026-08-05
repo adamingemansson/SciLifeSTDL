@@ -21,6 +21,8 @@ from gen3_multiscale.conditional_wae import (
 )
 from gen3_multiscale.conditional_wae.coexpression import load_conditional_wae_gene_coexpression_basis
 from gen3_multiscale.conditional_wae.contract import static_audit_conditional_wae_config
+from gen3_multiscale.conditional_wae.histology_context import HistologyContextInjector
+from gen3_multiscale.conditional_wae.histology_features import FEATURE_DIM as HISTOLOGY_FEATURE_DIM
 from gen3_multiscale.conditional_wae.film_diagnostics import compute_film_diagnostics
 from gen3_multiscale.conditional_wae.reference_projection import ensure_reference_gex_projection
 from gen3_multiscale.conditional_wae.tensorboard import (
@@ -182,6 +184,8 @@ def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = N
         sparse_k=int(params["sparse_k"]),
         dropout=float(params.get("dropout", 0.1)),
     )
+    if bool(params.get("use_histology_context", False)):
+        conditioner = HistologyContextInjector(conditioner, histology_feature_dim=HISTOLOGY_FEATURE_DIM)
     loss = config["loss"]
     gene_coexpression_basis = None
     if bool(params.get("use_gene_coexpression_refinement", False)):
