@@ -133,3 +133,34 @@ def test_matched_except_declared_allows_only_declared_film_fields():
     control = {"model": {"params": {"film_layers": ["first", "second"], "latent_dim": 256}}}
     other = {"model": {"params": {"film_layers": ["first"], "latent_dim": 256}}}
     suite_module._assert_matched_except_declared(control, other, "wae_he_gan_film_first_only")
+
+
+def test_prepare_applies_a_custom_latent_dim_uniformly_across_all_four_arms(tmp_path):
+    comparison_config = _write_comparison_config(tmp_path)
+    manifest = _write_manifest(tmp_path)
+    panels = tmp_path / "panels.json"
+    panels.write_text("{}")
+    output_root = tmp_path / "suite"
+
+    suite_module.prepare_wae_gan_film_ablation_suite(
+        comparison_config=str(comparison_config), manifest=str(manifest),
+        train_gene_panels=str(panels), output_root=str(output_root),
+        hours=8.0, gpus=(0, 2, 3, 5), cpu_threads=12, latent_dim=128,
+    )
+    for arm in suite_module.ARM_ORDER:
+        config = yaml.safe_load((output_root / "configs" / f"{arm}.yaml").read_text())
+        assert config["model"]["params"]["latent_dim"] == 128
+        assert config["model"]["params"]["autoencoder_hidden_dim"] == 1024  # unaffected
+
+
+def test_prepare_rejects_a_non_positive_latent_dim(tmp_path):
+    comparison_config = _write_comparison_config(tmp_path)
+    manifest = _write_manifest(tmp_path)
+    panels = tmp_path / "panels.json"
+    panels.write_text("{}")
+    with pytest.raises(ValueError, match="latent_dim"):
+        suite_module.prepare_wae_gan_film_ablation_suite(
+            comparison_config=str(comparison_config), manifest=str(manifest),
+            train_gene_panels=str(panels), output_root=str(tmp_path / "suite"),
+            latent_dim=0,
+        )

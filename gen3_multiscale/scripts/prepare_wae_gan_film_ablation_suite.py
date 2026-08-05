@@ -46,7 +46,7 @@ _ARM_FILM_PARAMS = {
 def prepare_wae_gan_film_ablation_suite(
     *, comparison_config: str, manifest: str, train_gene_panels: str,
     output_root: str, hours: float = 8.0, gpus: tuple[int, ...] = (0, 2, 3, 5),
-    cpu_threads: int = 12,
+    cpu_threads: int = 12, latent_dim: int = 256,
 ) -> dict:
     if hours <= 0:
         raise ValueError("hours must be positive")
@@ -54,6 +54,8 @@ def prepare_wae_gan_film_ablation_suite(
         raise ValueError(f"gpus must list {len(ARM_ORDER)} unique GPU ids, one per arm")
     if cpu_threads < 1:
         raise ValueError("cpu_threads must be at least 1")
+    if latent_dim < 1:
+        raise ValueError("latent_dim must be positive")
     root = Path(output_root)
     if root.exists():
         raise FileExistsError(f"{root} already exists; suite roots are immutable")
@@ -88,10 +90,11 @@ def prepare_wae_gan_film_ablation_suite(
         )
     }
     # Matches wae_he_gan_control exactly -- same architecture/dims as the
-    # existing production WAE-GAN control arm.
+    # existing production WAE-GAN control arm, except latent_dim which is
+    # an explicit caller-chosen override (defaults to control's 256).
     shared_params.update({
         "gex_feature_dim": int((base.get("data") or {}).get("gex_feature_dim", 256)),
-        "latent_dim": 256,
+        "latent_dim": int(latent_dim),
         "autoencoder_hidden_dim": 1024,
         "discriminator_hidden_dim": 256,
         "n_inference_samples": 8,
@@ -227,6 +230,7 @@ def main() -> None:
     parser.add_argument("--hours", type=float, default=8.0)
     parser.add_argument("--gpus", default="0,2,3,5", help="comma-separated GPU ids, one per arm")
     parser.add_argument("--cpu-threads", type=int, default=12)
+    parser.add_argument("--latent-dim", type=int, default=256)
     args = parser.parse_args()
     gpus = tuple(int(value) for value in args.gpus.split(","))
     plan = prepare_wae_gan_film_ablation_suite(
@@ -237,6 +241,7 @@ def main() -> None:
         hours=args.hours,
         gpus=gpus,
         cpu_threads=args.cpu_threads,
+        latent_dim=args.latent_dim,
     )
     print(json.dumps(plan, indent=2, sort_keys=True))
 
