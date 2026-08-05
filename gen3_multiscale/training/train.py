@@ -1525,7 +1525,7 @@ def save_run_manifest(run_manifest: dict, path: str | Path) -> Path:
 
 def save_best_checkpoint_bundle(
     model, config: dict, gene_names: list[str], best_dir: str | Path, *, step: int, val_loss: float,
-    run_manifest: dict,
+    run_manifest: dict, extra_metadata: dict | None = None,
 ) -> Path:
     """`best/` as a real transactional `checkpoint.py` bundle -- Codex
     re-audit of commit f7bb8a1, launch blocker #3: "Replace mutable
@@ -1554,7 +1554,8 @@ def save_best_checkpoint_bundle(
     artifact, never meant to resume TRAINING from."""
     checkpoint_module.save_checkpoint(
         model, config, gene_names, best_dir, step=step,
-        extra_metadata={"total": float(val_loss)}, keep_last=2, run_manifest=run_manifest,
+        extra_metadata={"total": float(val_loss), **(extra_metadata or {})},
+        keep_last=2, run_manifest=run_manifest,
     )
     return Path(best_dir)
 

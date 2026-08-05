@@ -16,6 +16,14 @@ ARM_SPECS = {
     "wae_he_gan": ConditionalWAEArmSpec("he_to_st", "gan", False),
     "wae_he_st_mmd": ConditionalWAEArmSpec("he_plus_st_to_st", "mmd", True),
     "wae_he_st_gan": ConditionalWAEArmSpec("he_plus_st_to_st", "gan", True),
+    # Training-hyperparameter ablation arms (accumulation / lr / compact
+    # dims). Same immutable task/regularizer/include_observed_gex contract
+    # as "wae_he_gan" -- only training.* and model.params.* differ between
+    # them, which this static contract does not govern.
+    "wae_he_gan_control": ConditionalWAEArmSpec("he_to_st", "gan", False),
+    "wae_he_gan_accum8": ConditionalWAEArmSpec("he_to_st", "gan", False),
+    "wae_he_gan_lr3e5": ConditionalWAEArmSpec("he_to_st", "gan", False),
+    "wae_he_gan_small": ConditionalWAEArmSpec("he_to_st", "gan", False),
 }
 
 

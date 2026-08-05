@@ -358,6 +358,151 @@ def test_tensorboard_snapshot_is_bounded_aligned_and_has_he_thumbnails(monkeypat
     assert sum("label_img" in kwargs for _args, kwargs in writer.embeddings) == 2
 
 
+def _accumulation_optimizer(model):
+    generator_parameters = [
+        parameter for name, parameter in model.named_parameters()
+        if not name.startswith("discriminator.")
+    ]
+    parameter_groups = [{"params": generator_parameters, "name": "generator"}]
+    if model.discriminator is not None:
+        parameter_groups.append(
+            {"params": list(model.discriminator.parameters()), "name": "discriminator"}
+        )
+    optimizer = torch.optim.AdamW(parameter_groups, lr=1e-3, weight_decay=0.0)
+    return optimizer, generator_parameters
+
+
+def test_generator_accumulation_takes_one_step_and_averages_not_sums_gradients():
+    model = _model("mmd")
+    optimizer, generator_parameters = _accumulation_optimizer(model)
+    inputs, target = _inputs(), torch.randn(12, 7)
+
+    reference = model.compute_generator_losses(
+        inputs, target, generator=torch.Generator().manual_seed(5 + 2 * 3 + 1),
+    )
+    reference["total"].backward()
+    reference_grad = next(model.image_conditioner.blocks[0].parameters()).grad.clone()
+    model.zero_grad(set_to_none=True)
+
+    micro_batches = [(3, inputs, target)] * 4
+    _accumulated_losses, grad_norm = train_conditional_wae.accumulate_and_step_generator(
+        model, optimizer, generator_parameters, micro_batches,
+        gradient_accumulation_steps=4, clip_value=1e6, seed=5,
+    )
+    accumulated_grad = next(model.image_conditioner.blocks[0].parameters()).grad
+    torch.testing.assert_close(accumulated_grad, reference_grad)
+    assert grad_norm > 0
+    parameter_steps = {
+        int(optimizer.state[p]["step"]) for p in generator_parameters if p in optimizer.state
+    }
+    assert parameter_steps == {1}
+
+
+def test_discriminator_accumulation_takes_one_step_independent_of_generator():
+    model = _model("gan")
+    optimizer, generator_parameters = _accumulation_optimizer(model)
+    target = torch.randn(12, 7)
+
+    reference_loss = model.compute_discriminator_loss(
+        target, generator=torch.Generator().manual_seed(9 + 2 * 2),
+    )
+    reference_loss.backward()
+    reference_grad = next(model.discriminator.parameters()).grad.clone()
+    model.zero_grad(set_to_none=True)
+
+    micro_batches = [(2, None, target)] * 5
+    loss_value, grad_norm = train_conditional_wae.accumulate_and_step_discriminator(
+        model, optimizer, micro_batches,
+        gradient_accumulation_steps=5, clip_value=1e6, seed=9,
+    )
+    accumulated_grad = next(model.discriminator.parameters()).grad
+    torch.testing.assert_close(accumulated_grad, reference_grad)
+    assert grad_norm > 0
+    assert loss_value == pytest.approx(float(reference_loss.detach()))
+    discriminator_params = list(model.discriminator.parameters())
+    assert {
+        int(optimizer.state[p]["step"]) for p in discriminator_params if p in optimizer.state
+    } == {1}
+    assert all(p not in optimizer.state for p in generator_parameters)
+
+
+def test_generator_accumulation_still_enforces_query_gex_leakage_contract():
+    model = _model("gan")
+    optimizer, generator_parameters = _accumulation_optimizer(model)
+    base = _inputs()
+    query = np.ones(12, dtype=bool)
+    leaking = FullImageExpressionInputs(
+        base.sample_id, base.image_features, base.coords, base.image_available,
+        query, np.ones((12, 7), dtype=np.float32), np.arange(12), np.ones(12, dtype=bool),
+    )
+    target = torch.randn(12, 7)
+    with pytest.raises(ValueError, match="target-expression leakage"):
+        train_conditional_wae.accumulate_and_step_generator(
+            model, optimizer, generator_parameters, [(0, leaking, target)],
+            gradient_accumulation_steps=1, clip_value=1.0, seed=0,
+        )
+
+
+def test_accumulation_functions_reject_non_positive_steps_and_empty_batches():
+    model = _model("gan")
+    optimizer, generator_parameters = _accumulation_optimizer(model)
+    inputs, target = _inputs(), torch.randn(12, 7)
+    micro_batches = [(0, inputs, target)]
+    for kwargs in (
+        {"gradient_accumulation_steps": 0, "clip_value": 1.0, "seed": 0},
+    ):
+        with pytest.raises(ValueError, match="positive integer"):
+            train_conditional_wae.accumulate_and_step_generator(
+                model, optimizer, generator_parameters, micro_batches, **kwargs,
+            )
+        with pytest.raises(ValueError, match="positive integer"):
+            train_conditional_wae.accumulate_and_step_discriminator(
+                model, optimizer, micro_batches, **kwargs,
+            )
+    with pytest.raises(ValueError, match="non-empty"):
+        train_conditional_wae.accumulate_and_step_generator(
+            model, optimizer, generator_parameters, [],
+            gradient_accumulation_steps=1, clip_value=1.0, seed=0,
+        )
+    with pytest.raises(ValueError, match="non-empty"):
+        train_conditional_wae.accumulate_and_step_discriminator(
+            model, optimizer, [], gradient_accumulation_steps=1, clip_value=1.0, seed=0,
+        )
+
+
+def test_compact_dimensions_reach_the_constructed_layers():
+    config = {
+        "model": {
+            "arm": "wae_he_gan_small", "kind": "conditional_wae",
+            "task": "he_to_st", "regularizer": "gan",
+            "include_observed_gex": False, "image_mode": "full_visible",
+            "params": {
+                "image_feature_dim": 16, "gex_feature_dim": 6,
+                "hidden_dim": 256, "n_heads": 4, "n_blocks": 2,
+                "dense_threshold": 400, "sparse_k": 32, "dropout": 0.1,
+                "latent_dim": 128, "autoencoder_hidden_dim": 512,
+                "discriminator_hidden_dim": 256, "n_inference_samples": 8,
+            },
+        },
+        "loss": {"pcc_weight": 0.1, "regularizer_weight": 0.1, "conditional_mean_weight": 1.0},
+    }
+    model = train_conditional_wae._build_model(config, n_genes=7)
+    assert model.latent_dim == 128
+    assert model.image_conditioner.hidden_dim == 256
+    assert len(model.image_conditioner.blocks) == 2
+    assert model.expression_encoder.net[0].out_features == 512
+    assert model.expression_encoder.net[-1].out_features == 128
+    assert model.residual_decoder[0].in_features == 256 + 128
+    assert model.residual_decoder[0].out_features == 512
+    assert model.discriminator[0].in_features == 128
+    assert model.discriminator[0].out_features == 256
+    inputs, target = _inputs(n=12, image_dim=16), torch.randn(12, 7)
+    losses = model.compute_generator_losses(
+        inputs, target, generator=torch.Generator().manual_seed(0),
+    )
+    assert losses["latent"].shape == (12, 128)
+
+
 def test_suite_absolutizes_only_existing_paths_from_comparison_repository(tmp_path):
     source = tmp_path / "source"
     comparison = source / "gen3_multiscale" / "results" / "run" / "config.yaml"

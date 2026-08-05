@@ -166,11 +166,15 @@ def evaluate_conditional_wae(
         }
         for panel in panels
     }
+    evaluated_training_state = checkpoint_module.load_training_state(requested_checkpoint)
     report = {
         "version": 1,
         "kind": "conditional_wae_supervisor_evaluation",
         "config_path": str(config_path),
         "checkpoint_dir": str(requested_checkpoint),
+        "checkpoint_step": evaluated_training_state.get("step"),
+        "checkpoint_masks_seen": evaluated_training_state.get("masks_seen"),
+        "checkpoint_validation_total": evaluated_training_state.get("total"),
         "split": split,
         "n_samples": len(split_ids),
         "n_items": len(dataset),

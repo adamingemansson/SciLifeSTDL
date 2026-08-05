@@ -85,6 +85,84 @@ def _select_train_item_with_minimum_queries(
     )
 
 
+def accumulate_and_step_discriminator(
+    model: ConditionalWAE, optimizer: torch.optim.Optimizer,
+    micro_batches: list[tuple[int, object, torch.Tensor]], *,
+    gradient_accumulation_steps: int, clip_value: float, seed: int,
+) -> tuple[float, float]:
+    """One discriminator optimizer update accumulated over every micro-
+    batch in `micro_batches` (each `(mask_index, inputs, target_tensor)`).
+
+    Dividing each micro-batch's loss by `gradient_accumulation_steps`
+    BEFORE `.backward()` makes the SUM of those N accumulated backward
+    calls equal the MEAN gradient over the N masks, not their sum --
+    `optimizer.step()` therefore applies a mean-magnitude update
+    regardless of how many masks were accumulated, matching the
+    fixed-`lr` semantics every other arm already assumes. Caller
+    guarantees `model.discriminator is not None`. Returns
+    `(mean_loss, grad_norm)`; raises RuntimeError on any non-finite
+    value, exactly like the pre-accumulation single-mask code did."""
+    if gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be a positive integer")
+    if not micro_batches:
+        raise ValueError("micro_batches must be non-empty")
+    optimizer.zero_grad(set_to_none=True)
+    loss_accum = 0.0
+    for mask_index, _inputs, target_tensor in micro_batches:
+        micro_loss = model.compute_discriminator_loss(
+            target_tensor,
+            generator=torch.Generator(device=target_tensor.device).manual_seed(seed + 2 * mask_index),
+        )
+        if not torch.isfinite(micro_loss):
+            raise RuntimeError(f"non-finite discriminator loss at mask_index={mask_index}")
+        (micro_loss / gradient_accumulation_steps).backward()
+        loss_accum += float(micro_loss.detach()) / gradient_accumulation_steps
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.discriminator.parameters(), clip_value)
+    if not torch.isfinite(grad_norm):
+        raise RuntimeError("non-finite discriminator gradient")
+    optimizer.step()
+    return loss_accum, float(grad_norm)
+
+
+def accumulate_and_step_generator(
+    model: ConditionalWAE, optimizer: torch.optim.Optimizer, generator_parameters: list,
+    micro_batches: list[tuple[int, object, torch.Tensor]], *,
+    gradient_accumulation_steps: int, clip_value: float, seed: int,
+) -> tuple[dict[str, float], float]:
+    """The generator-side counterpart of `accumulate_and_step_discriminator`
+    -- same mean-not-sum normalization, same one-optimizer-update-per-call
+    contract. Returns `(accumulated_scalar_losses, grad_norm)`, where
+    `accumulated_scalar_losses` is every scalar entry `compute_generator_
+    losses` returns (its non-scalar `expression`/`conditional_mean_
+    expression`/`latent` tensors are dropped, not loggable loss
+    components), each the mean over `micro_batches`."""
+    if gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be a positive integer")
+    if not micro_batches:
+        raise ValueError("micro_batches must be non-empty")
+    optimizer.zero_grad(set_to_none=True)
+    accumulated_losses: dict[str, float] = {}
+    for mask_index, inputs, target_tensor in micro_batches:
+        losses = model.compute_generator_losses(
+            inputs, target_tensor,
+            generator=torch.Generator(device=target_tensor.device).manual_seed(seed + 2 * mask_index + 1),
+        )
+        if not torch.isfinite(losses["total"]):
+            raise RuntimeError(f"non-finite generator loss at mask_index={mask_index}")
+        (losses["total"] / gradient_accumulation_steps).backward()
+        for key, value in losses.items():
+            if key in ("expression", "conditional_mean_expression", "latent"):
+                continue
+            accumulated_losses[key] = (
+                accumulated_losses.get(key, 0.0) + float(value.detach()) / gradient_accumulation_steps
+            )
+    grad_norm = torch.nn.utils.clip_grad_norm_(generator_parameters, clip_value)
+    if not torch.isfinite(grad_norm) or grad_norm <= 0:
+        raise RuntimeError(f"invalid generator gradient norm {grad_norm}")
+    optimizer.step()
+    return accumulated_losses, float(grad_norm)
+
+
 def _build_model(config: dict, n_genes: int) -> ConditionalWAE:
     model_cfg = config["model"]
     params = model_cfg["params"]
@@ -345,9 +423,38 @@ def run_conditional_wae_training(
     checkpoint_every = max(1, int(training_cfg.get("checkpoint_every_n_steps", 2000)))
     keep_last = int(training_cfg.get("checkpoint_keep_last", 2))
     clip_value = float(training_cfg.get("gradient_clip_val", 1.0))
+    # Adam's four-arm WAE-GAN ablation: `gradient_accumulation_steps`
+    # (default 1, matching every existing config's real behavior exactly)
+    # accumulates N VALID masks' gradients -- normalized to a MEAN, not a
+    # sum, by dividing each micro-batch loss by N before `.backward()`,
+    # so the N accumulated `.backward()` calls sum to the mean gradient
+    # -- before one `optimizer.step()` each for the discriminator and the
+    # generator. `masks_seen` is the fine-grained, resumable counter of
+    # valid masks actually consumed (never counting masks
+    # `_select_train_item_with_minimum_queries` itself skipped for being
+    # undersized); `step` remains the optimizer-update counter exactly as
+    # before, unaffected by accumulation, since every existing piece of
+    # resume/wall-clock/checkpoint-cadence logic is already expressed in
+    # terms of it. With `gradient_accumulation_steps=1`, `masks_seen`
+    # tracks `step` exactly and the per-mask RNG seeds below reduce to
+    # the pre-accumulation formula bit-for-bit -- accumulation is
+    # strictly additive, not a behavior change for existing configs.
+    gradient_accumulation_steps = int(training_cfg.get("gradient_accumulation_steps", 1))
+    if gradient_accumulation_steps < 1:
+        raise ValueError("training.gradient_accumulation_steps must be a positive integer")
     history_path = checkpoint_dir / "validation_history.json"
     history = json.loads(history_path.read_text()) if history_path.is_file() and not smoke else []
     best_total = min((entry["total"] for entry in history), default=float("inf"))
+    best_step = next(
+        (entry["step"] for entry in history if entry["total"] == best_total), None,
+    ) if history else None
+    if not smoke and resume_step > 0:
+        prior_training_state = checkpoint_module.load_training_state(checkpoint_dir)
+        # Old checkpoints (pre-accumulation) never recorded masks_seen;
+        # they are exactly `resume_step` masks in, one mask per step.
+        masks_seen = int(prior_training_state.get("masks_seen", resume_step))
+    else:
+        masks_seen = 0
     tensorboard_cfg = dict((config.get("evaluation") or {}).get("tensorboard") or {})
     tensorboard_logger = None
     if bool(tensorboard_cfg.get("enabled", False)) and not smoke:
@@ -365,64 +472,71 @@ def run_conditional_wae_training(
         if (time.time() - started) / 3600 >= max_hours:
             completion_reason = "wall_clock_limit_reached"
             break
-        inputs, target, _identity, skipped_small_masks = (
-            _select_train_item_with_minimum_queries(
-                train_dataset, step=step, seed=seed,
+        # One mask per micro-batch, reused for BOTH its discriminator and
+        # generator loss contribution -- exactly mirroring the pre-
+        # accumulation contract (one step, one mask, both losses), just
+        # repeated `gradient_accumulation_steps` times before either
+        # optimizer.step() fires. `masks_seen` is captured PER micro-batch
+        # (not reconstructed after the fact) so the RNG seed below is
+        # exact and collision-free across every mask this run ever draws.
+        skipped_small_masks_total = 0
+        micro_batches: list[tuple[int, object, torch.Tensor]] = []
+        for _ in range(gradient_accumulation_steps):
+            m_inputs, m_target, _identity, skipped = _select_train_item_with_minimum_queries(
+                train_dataset, step=masks_seen, seed=seed,
             )
-        )
-        target_tensor = torch.as_tensor(target, dtype=torch.float32, device=device)
-        if skipped_small_masks and (step == resume_step or step % log_every == 0):
+            skipped_small_masks_total += skipped
+            m_target_tensor = torch.as_tensor(m_target, dtype=torch.float32, device=device)
+            micro_batches.append((masks_seen, m_inputs, m_target_tensor))
+            masks_seen += 1
+
+        discriminator_loss_value = None
+        discriminator_grad_norm = None
+        if model.discriminator is not None:
+            try:
+                discriminator_loss_value, discriminator_grad_norm = accumulate_and_step_discriminator(
+                    model, optimizer, micro_batches,
+                    gradient_accumulation_steps=gradient_accumulation_steps,
+                    clip_value=clip_value, seed=seed,
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(f"[step {step}] {exc}") from exc
+
+        try:
+            accumulated_losses, generator_grad_norm = accumulate_and_step_generator(
+                model, optimizer, generator_parameters, micro_batches,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                clip_value=clip_value, seed=seed,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(f"[step {step}] {exc}") from exc
+        step += 1
+        if skipped_small_masks_total and (step - 1 == resume_step or step % log_every == 0):
             print(
-                f"[step {step}] skipped {skipped_small_masks} undersized mask(s) "
-                "before selecting a mask with at least two query spots",
+                f"[step {step}] skipped {skipped_small_masks_total} undersized mask(s) across "
+                f"{gradient_accumulation_steps} accumulated mask(s)",
                 flush=True,
             )
-        discriminator_loss = None
-        if model.discriminator is not None:
-            optimizer.zero_grad(set_to_none=True)
-            discriminator_loss = model.compute_discriminator_loss(
-                target_tensor,
-                generator=torch.Generator(device=device).manual_seed(seed + 2 * step),
-            )
-            if not torch.isfinite(discriminator_loss):
-                raise RuntimeError(f"[step {step}] non-finite discriminator loss")
-            discriminator_loss.backward()
-            discriminator_grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.discriminator.parameters(), clip_value,
-            )
-            if not torch.isfinite(discriminator_grad_norm):
-                raise RuntimeError(f"[step {step}] non-finite discriminator gradient")
-            optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        losses = model.compute_generator_losses(
-            inputs,
-            target_tensor,
-            generator=torch.Generator(device=device).manual_seed(seed + 2 * step + 1),
-        )
-        if not torch.isfinite(losses["total"]):
-            raise RuntimeError(f"[step {step}] non-finite generator loss")
-        losses["total"].backward()
-        generator_grad_norm = torch.nn.utils.clip_grad_norm_(generator_parameters, clip_value)
-        if not torch.isfinite(generator_grad_norm) or generator_grad_norm <= 0:
-            raise RuntimeError(f"[step {step}] invalid generator gradient norm {generator_grad_norm}")
-        optimizer.step()
-        step += 1
         if smoke or step % log_every == 0:
             pieces = [
-                f"total={float(losses['total'].detach()):.6f}",
-                f"reconstruction={float(losses['reconstruction_loss'].detach()):.6f}",
-                f"conditional_mean={float(losses['conditional_mean_loss'].detach()):.6f}",
-                f"prior={float(losses['prior_loss'].detach()):.6f}",
+                f"total={accumulated_losses['total']:.6f}",
+                f"reconstruction={accumulated_losses['reconstruction_loss']:.6f}",
+                f"conditional_mean={accumulated_losses['conditional_mean_loss']:.6f}",
+                f"prior={accumulated_losses['prior_loss']:.6f}",
                 f"grad_norm={float(generator_grad_norm):.4f}",
+                f"masks_seen={masks_seen}",
             ]
-            if discriminator_loss is not None:
-                pieces.append(f"discriminator={float(discriminator_loss.detach()):.6f}")
+            if discriminator_loss_value is not None:
+                pieces.append(f"discriminator={discriminator_loss_value:.6f}")
             print(f"[step {step}] train: " + ", ".join(pieces), flush=True)
             if tensorboard_logger is not None:
                 tensorboard_logger.add_train_scalars(
-                    step, losses, grad_norm=generator_grad_norm,
-                    discriminator_loss=discriminator_loss,
+                    step, accumulated_losses, grad_norm=generator_grad_norm,
+                    discriminator_loss=discriminator_loss_value,
+                    discriminator_grad_norm=discriminator_grad_norm,
                     learning_rate=optimizer.param_groups[0]["lr"],
+                    masks_seen=masks_seen,
+                    gradient_accumulation_steps=gradient_accumulation_steps,
                 )
         if validation_dataset is not None and (smoke or step % eval_every == 0):
             snapshot = None
@@ -452,6 +566,7 @@ def run_conditional_wae_training(
                     )
             entry = {
                 "step": step,
+                "masks_seen": masks_seen,
                 **_validate(
                     model, validation_dataset, device=device, seed=seed,
                     snapshot=snapshot, samples=validation_samples,
@@ -460,11 +575,15 @@ def run_conditional_wae_training(
             print(
                 f"[step {step}] validation: total={entry['total']:.6f}, "
                 f"rmse={entry['rmse']:.6f}, "
-                f"conditional_mean_rmse={entry['conditional_mean_rmse']:.6f}",
+                f"conditional_mean_rmse={entry['conditional_mean_rmse']:.6f}, "
+                f"masks_seen={masks_seen}",
                 flush=True,
             )
             if tensorboard_logger is not None:
-                tensorboard_logger.add_validation_scalars(step, entry)
+                tensorboard_logger.add_validation_scalars(
+                    step, entry, best_total=min(best_total, entry["total"]),
+                    best_step=(step if entry["total"] <= best_total else best_step),
+                )
                 if snapshot is not None:
                     tensorboard_logger.add_snapshot(step, snapshot)
             if not smoke:
@@ -472,21 +591,23 @@ def run_conditional_wae_training(
                 _atomic_json(history, history_path)
                 if entry["total"] < best_total:
                     best_total = entry["total"]
+                    best_step = step
                     save_best_checkpoint_bundle(
                         model, config, gene_names, checkpoint_dir / "best",
                         step=step, val_loss=entry["total"], run_manifest=run_manifest,
+                        extra_metadata={"masks_seen": masks_seen},
                     )
         if not smoke and step % checkpoint_every == 0 and step < step_target:
             checkpoint_module.save_checkpoint(
                 model, config, gene_names, checkpoint_dir, step,
-                extra_metadata={"completion_reason": "in_progress"},
+                extra_metadata={"completion_reason": "in_progress", "masks_seen": masks_seen},
                 keep_last=keep_last, optimizer=optimizer, rng=loop_rng,
                 run_manifest=run_manifest,
             )
     if not smoke and step > resume_step:
         checkpoint_module.save_checkpoint(
             model, config, gene_names, checkpoint_dir, step,
-            extra_metadata={"completion_reason": completion_reason},
+            extra_metadata={"completion_reason": completion_reason, "masks_seen": masks_seen},
             keep_last=keep_last, optimizer=optimizer, rng=loop_rng,
             run_manifest=run_manifest,
         )
@@ -497,6 +618,10 @@ def run_conditional_wae_training(
         "task": config["model"]["task"],
         "regularizer": config["model"]["regularizer"],
         "final_step": step,
+        "masks_seen": masks_seen,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "best_step": best_step,
+        "best_total": (best_total if best_total != float("inf") else None),
         "elapsed_seconds": time.time() - started,
         "completion_reason": completion_reason,
         "checkpoint_dir": str(checkpoint_dir),

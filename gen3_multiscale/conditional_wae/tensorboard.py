@@ -218,7 +218,9 @@ class ConditionalWAETensorBoardLogger:
         self.writer = writer
 
     def add_train_scalars(self, step: int, losses: dict, *, grad_norm,
-                          discriminator_loss=None, learning_rate=None) -> None:
+                          discriminator_loss=None, discriminator_grad_norm=None,
+                          learning_rate=None, masks_seen=None,
+                          gradient_accumulation_steps=None) -> None:
         values = {
             "train/total": losses["total"],
             "train/reconstruction": losses["reconstruction_loss"],
@@ -231,16 +233,37 @@ class ConditionalWAETensorBoardLogger:
         }
         if discriminator_loss is not None:
             values["train/discriminator"] = discriminator_loss
+        if discriminator_grad_norm is not None:
+            values["train/discriminator_grad_norm"] = discriminator_grad_norm
         if learning_rate is not None:
             values["train/learning_rate"] = learning_rate
         for tag, value in values.items():
             if isinstance(value, torch.Tensor):
                 value = value.detach().cpu().item()
             self.writer.add_scalar(tag, float(value), int(step))
+        # Adam's four-arm WAE-GAN ablation: gradient_accumulation_steps
+        # changes how many raw masks one optimizer step represents, so
+        # `masks_seen` is logged as its own scalar (plotted against the
+        # SAME optimizer-step x-axis every other train/* tag uses) --
+        # comparing arms with different accumulation by masks_seen means
+        # reading this tag, not just the x-axis, which only ever counts
+        # optimizer steps.
+        if masks_seen is not None:
+            self.writer.add_scalar("train/masks_seen", float(masks_seen), int(step))
+        self.writer.add_scalar("train/optimizer_step", float(step), int(step))
+        if gradient_accumulation_steps is not None:
+            self.writer.add_scalar(
+                "train/gradient_accumulation_steps", float(gradient_accumulation_steps), int(step),
+            )
 
-    def add_validation_scalars(self, step: int, entry: dict) -> None:
+    def add_validation_scalars(self, step: int, entry: dict, *,
+                               best_total: float | None = None, best_step: int | None = None) -> None:
         for key in ("total", "rmse", "pcc_loss", "conditional_mean_rmse"):
             self.writer.add_scalar(f"validation/{key}", float(entry[key]), int(step))
+        if best_total is not None:
+            self.writer.add_scalar("validation/best_total", float(best_total), int(step))
+        if best_step is not None:
+            self.writer.add_scalar("validation/best_step", float(best_step), int(step))
 
     def add_snapshot(self, step: int, snapshot: ConditionalWAESnapshotAccumulator) -> None:
         arrays = snapshot.arrays()
