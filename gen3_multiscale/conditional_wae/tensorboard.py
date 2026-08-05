@@ -12,6 +12,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from gen3_multiscale.conditional_wae.reference_projection import assign_clusters, project_onto_reference
+
 
 METADATA_HEADER = [
     "sample_id", "patient_id", "organ", "stratum", "query_fingerprint",
@@ -48,6 +50,22 @@ def _pca_rgb(values: np.ndarray) -> np.ndarray:
             rgb[:, channel] = np.clip((rgb[:, channel] - low) / (high - low), 0.0, 1.0)
         else:
             rgb[:, channel] = 0.5
+    return rgb
+
+
+def _fixed_pca_rgb(pca_coords: np.ndarray, pc_ranges: np.ndarray) -> np.ndarray:
+    """RGB from up to 3 PCA coordinates, scaled by FIXED, persisted ranges --
+    never percentile-rescaled per call like `_pca_rgb` above. A color change
+    between snapshots then only ever reflects a real change in the
+    underlying coordinates, not a re-fit/re-oriented/re-scaled basis."""
+    pca_coords = np.asarray(pca_coords, dtype=np.float32)
+    pc_ranges = np.asarray(pc_ranges, dtype=np.float32)
+    n_components = min(3, pca_coords.shape[1])
+    rgb = np.full((len(pca_coords), 3), 0.5, dtype=np.float32)
+    for channel in range(n_components):
+        low, high = pc_ranges[channel]
+        if high > low:
+            rgb[:, channel] = np.clip((pca_coords[:, channel] - low) / (high - low), 0.0, 1.0)
     return rgb
 
 
@@ -264,6 +282,131 @@ class ConditionalWAETensorBoardLogger:
             self.writer.add_scalar("validation/best_total", float(best_total), int(step))
         if best_step is not None:
             self.writer.add_scalar("validation/best_step", float(best_step), int(step))
+
+    def add_whole_slide_scalars(self, step: int, aggregated_metrics: dict, *,
+                                whole_slide_total: float, best_whole_slide_total: float | None = None,
+                                best_whole_slide_step: int | None = None) -> None:
+        """`aggregated_metrics` is a mean-over-slides `{arm: {panel: {pcc,
+        rmse, auc}}}` dict (see train_conditional_wae._aggregate_whole_slide_metrics).
+        Diagnostic only -- never read back for loss or checkpoint selection
+        beyond `whole_slide_total`, itself a diagnostic-only secondary
+        criterion (see best_whole_slide/ in the checkpoint dir)."""
+        for arm, panels in aggregated_metrics.items():
+            for panel, values in panels.items():
+                for metric_name, value in values.items():
+                    if value is None or not np.isfinite(value):
+                        continue
+                    self.writer.add_scalar(
+                        f"whole_slide/{arm}/{panel}/{metric_name}", float(value), int(step),
+                    )
+        self.writer.add_scalar("whole_slide/total", float(whole_slide_total), int(step))
+        if best_whole_slide_total is not None:
+            self.writer.add_scalar(
+                "whole_slide/best_total", float(best_whole_slide_total), int(step),
+            )
+        if best_whole_slide_step is not None:
+            self.writer.add_scalar(
+                "whole_slide/best_step", float(best_whole_slide_step), int(step),
+            )
+
+    def add_whole_slide_spatial_maps(
+        self, step: int, sample_id: str, coords: np.ndarray, true_gex: np.ndarray,
+        predicted_gex: np.ndarray, gene_names: list[str], reference_projection: dict,
+    ) -> None:
+        """Whole-slide spatial diagnostics: PC1/PC2/PC3 as three SEPARATE
+        maps with a fixed diverging scale + explained variance in the
+        title (primary), an RGB composite from the same frozen basis
+        (secondary), and a fixed-cluster categorical map -- for both true
+        and predicted GEX, so they are directly visually comparable. Every
+        tissue spot is plotted (whole-slide coverage is already 100%, so
+        there is no query-only subset to distinguish from a background
+        lattice). `reference_projection` MUST be the same frozen basis
+        (reference_projection.ensure_reference_gex_projection) across every
+        step/architecture/WAE dimensionality being compared."""
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        coords = np.asarray(coords, dtype=np.float32)
+        pc_ranges = np.asarray(reference_projection["pc_ranges"], dtype=np.float32)
+        explained = np.asarray(reference_projection["explained_variance_ratio"], dtype=np.float32)
+        n_clusters = int(reference_projection["n_clusters"])
+        n_components = pc_ranges.shape[0]
+
+        for label, gex in (("true", true_gex), ("predicted", predicted_gex)):
+            pca_coords = project_onto_reference(gex, gene_names, reference_projection)
+            for component in range(n_components):
+                low, high = pc_ranges[component]
+                fig, ax = plt.subplots(figsize=(5, 5), constrained_layout=True)
+                scatter = ax.scatter(
+                    coords[:, 0], coords[:, 1], c=pca_coords[:, component],
+                    cmap="RdBu_r", vmin=low, vmax=high, s=8,
+                )
+                fig.colorbar(scatter, ax=ax)
+                ax.invert_yaxis()
+                ax.set_aspect("equal", adjustable="datalim")
+                ax.set_title(
+                    f"{sample_id}: {label} PC{component + 1} "
+                    f"(explained variance {explained[component]:.1%})"
+                )
+                ax.set_axis_off()
+                self.writer.add_figure(
+                    f"whole_slide/{sample_id}/{label}/pc{component + 1}", fig, step, close=True,
+                )
+
+            rgb = _fixed_pca_rgb(pca_coords, pc_ranges)
+            fig, ax = plt.subplots(figsize=(5, 5), constrained_layout=True)
+            ax.scatter(coords[:, 0], coords[:, 1], c=rgb, s=8)
+            ax.invert_yaxis()
+            ax.set_aspect("equal", adjustable="datalim")
+            ax.set_title(f"{sample_id}: {label} PCA RGB composite (fixed scale, secondary)")
+            ax.set_axis_off()
+            self.writer.add_figure(
+                f"whole_slide/{sample_id}/{label}/pca_rgb_composite", fig, step, close=True,
+            )
+
+            clusters = assign_clusters(pca_coords, reference_projection)
+            fig, ax = plt.subplots(figsize=(5, 5), constrained_layout=True)
+            scatter = ax.scatter(
+                coords[:, 0], coords[:, 1], c=clusters, cmap="tab10",
+                vmin=0, vmax=max(9, n_clusters - 1), s=8,
+            )
+            fig.colorbar(scatter, ax=ax, ticks=range(n_clusters))
+            ax.invert_yaxis()
+            ax.set_aspect("equal", adjustable="datalim")
+            ax.set_title(f"{sample_id}: {label} fixed clusters")
+            ax.set_axis_off()
+            self.writer.add_figure(
+                f"whole_slide/{sample_id}/{label}/clusters", fig, step, close=True,
+            )
+        self.writer.flush()
+
+    def add_film_diagnostics(self, step: int, diagnostics: dict) -> None:
+        """Collapse-watching scalars/histograms for a FiLM-conditioned
+        encoder's validation cohort. Diagnostic only."""
+        self.writer.add_scalar(
+            "film/posterior_effective_rank", float(diagnostics["effective_rank"]), int(step),
+        )
+        self.writer.add_scalar(
+            "film/posterior_active_dimensions", float(diagnostics["active_dimensions"]), int(step),
+        )
+        self.writer.add_scalar(
+            "film/predictive_std_mean", float(diagnostics["predictive_std_mean"]), int(step),
+        )
+        self.writer.add_scalar(
+            "film/stochastic_vs_conditional_mean_diff",
+            float(diagnostics["stochastic_vs_conditional_mean_diff"]), int(step),
+        )
+        self.writer.add_histogram(
+            "film/latent_dim_mean", np.asarray(diagnostics["latent_dim_mean"]), int(step),
+        )
+        self.writer.add_histogram(
+            "film/latent_dim_std", np.asarray(diagnostics["latent_dim_std"]), int(step),
+        )
+        for layer, (gamma, beta) in diagnostics["gamma_beta"].items():
+            self.writer.add_histogram(f"film/gamma_{layer}", np.asarray(gamma), int(step))
+            self.writer.add_histogram(f"film/beta_{layer}", np.asarray(beta), int(step))
+        self.writer.flush()
 
     def add_snapshot(self, step: int, snapshot: ConditionalWAESnapshotAccumulator) -> None:
         arrays = snapshot.arrays()

@@ -14,6 +14,7 @@ from gen3_multiscale.conditional_wae import (
     imq_mmd,
 )
 from gen3_multiscale.conditional_wae.contract import static_audit_conditional_wae_config
+from gen3_multiscale.conditional_wae.film_diagnostics import compute_film_diagnostics
 from gen3_multiscale.conditional_wae.tensorboard import (
     ConditionalWAESnapshotAccumulator,
     ConditionalWAETensorBoardLogger,
@@ -148,6 +149,62 @@ def test_encode_posterior_requires_inputs_when_film_active_but_not_otherwise():
 
     plain_model = _model("mmd")
     assert plain_model.encode_posterior(target).shape == (12, 5)
+
+
+def _film_batch(model, n=8):
+    inputs, target = _inputs(n=n), torch.randn(n, 7)
+    context = model.image_conditioner(inputs)
+    posterior_z = model.encode_posterior(target, inputs=inputs)
+    prediction = model.sample_predictive_distribution(inputs, generator=torch.Generator().manual_seed(0))
+    return posterior_z, context, prediction
+
+
+def test_compute_film_diagnostics_requires_a_film_encoder():
+    model = _model("mmd")
+    posterior_z, context, prediction = _film_batch(_film_model(regularizer="mmd"))
+    with pytest.raises(ValueError, match="encoder_conditioning='film'"):
+        compute_film_diagnostics(
+            model, posterior_z, context, prediction["predictive_std"],
+            prediction["predictive_mean"], prediction["conditional_mean_expression"],
+        )
+
+
+def test_compute_film_diagnostics_requires_at_least_two_rows():
+    model = _film_model(regularizer="mmd")
+    posterior_z, context, prediction = _film_batch(model, n=1)
+    with pytest.raises(ValueError, match="at least two"):
+        compute_film_diagnostics(
+            model, posterior_z, context, prediction["predictive_std"],
+            prediction["predictive_mean"], prediction["conditional_mean_expression"],
+        )
+
+
+def test_compute_film_diagnostics_reports_effective_rank_and_active_dims_within_latent_dim():
+    model = _film_model(regularizer="mmd")
+    posterior_z, context, prediction = _film_batch(model, n=10)
+    diagnostics = compute_film_diagnostics(
+        model, posterior_z, context, prediction["predictive_std"],
+        prediction["predictive_mean"], prediction["conditional_mean_expression"],
+    )
+    assert 0.0 <= diagnostics["effective_rank"] <= model.latent_dim
+    assert 0 <= diagnostics["active_dimensions"] <= model.latent_dim
+    assert diagnostics["latent_dim"] == model.latent_dim
+    assert diagnostics["latent_dim_mean"].shape == (model.latent_dim,)
+    assert diagnostics["latent_dim_std"].shape == (model.latent_dim,)
+    assert diagnostics["predictive_std_mean"] >= 0.0
+    assert diagnostics["stochastic_vs_conditional_mean_diff"] >= 0.0
+
+
+def test_compute_film_diagnostics_reports_gamma_beta_only_for_active_layers():
+    model = _film_model(film_layers=("first",), regularizer="mmd")
+    posterior_z, context, prediction = _film_batch(model, n=6)
+    diagnostics = compute_film_diagnostics(
+        model, posterior_z, context, prediction["predictive_std"],
+        prediction["predictive_mean"], prediction["conditional_mean_expression"],
+    )
+    assert set(diagnostics["gamma_beta"]) == {"first"}
+    gamma, beta = diagnostics["gamma_beta"]["first"]
+    assert gamma.shape == beta.shape == (6, model.expression_encoder.linear1.out_features)
 
 
 def test_build_model_wires_film_config_into_the_constructed_encoder():
@@ -646,3 +703,83 @@ def test_suite_absolutizes_only_existing_paths_from_comparison_repository(tmp_pa
     assert resolved["data"]["missing"] == "data/not-created"
     assert resolved["device"] == "cuda"
     assert resolved["revision"] == "d517a8dd"
+
+
+def _whole_slide_sample(n=15, genes=7, image_dim=16, seed=0, sample_id="slide"):
+    rng = np.random.default_rng(seed)
+    coords = np.stack([np.arange(n), (np.arange(n) * 5) % 4], axis=1).astype(np.float64)
+    return SimpleNamespace(
+        sample_id=sample_id,
+        precomputed_spot_features=rng.normal(size=(n, image_dim)).astype(np.float32),
+        image_source_available=np.ones(n, dtype=bool),
+        full_sample_coords=coords,
+        adata=SimpleNamespace(
+            X=rng.normal(size=(n, genes)).astype(np.float32),
+            var_names=[f"g{i}" for i in range(genes)],
+        ),
+    )
+
+
+def test_aggregate_whole_slide_metrics_averages_across_slides_ignoring_nan_auc():
+    per_slide_metrics = [
+        {"per_arm": {"model": {"all_genes": {"pcc": 0.2, "rmse": 1.0, "auc": 0.6}}}},
+        {"per_arm": {"model": {"all_genes": {"pcc": 0.4, "rmse": 2.0, "auc": float("nan")}}}},
+    ]
+    aggregated = train_conditional_wae._aggregate_whole_slide_metrics(per_slide_metrics)
+    assert aggregated["model"]["all_genes"]["pcc"] == pytest.approx(0.3)
+    assert aggregated["model"]["all_genes"]["rmse"] == pytest.approx(1.5)
+    assert aggregated["model"]["all_genes"]["auc"] == pytest.approx(0.6)
+
+
+def test_aggregate_whole_slide_metrics_rejects_empty_list():
+    with pytest.raises(ValueError, match="non-empty"):
+        train_conditional_wae._aggregate_whole_slide_metrics([])
+
+
+def test_select_whole_slide_sample_ids_is_bounded_and_deterministic():
+    validation_ids = ["S9", "S1", "S5", "S2", "S8", "S3"]
+    selected = train_conditional_wae._select_whole_slide_sample_ids(validation_ids, 2)
+    assert selected == ["S1", "S2"]  # sorted, then capped -- never grows with more slides
+    assert train_conditional_wae._select_whole_slide_sample_ids(validation_ids, 100) == sorted(validation_ids)
+
+
+def test_select_whole_slide_sample_ids_rejects_non_positive_max_slides():
+    with pytest.raises(ValueError, match="max_slides"):
+        train_conditional_wae._select_whole_slide_sample_ids(["S0"], 0)
+
+
+def test_film_gamma_beta_genuinely_affect_the_encoder_after_training_moves_the_weights():
+    """Distinguishes real FiLM conditioning from a no-op: at init (gamma=1,
+    beta=0) two different contexts must give IDENTICAL output (see
+    test_film_encoder_output_is_identical_across_contexts_at_init); once the
+    generators' weights are non-zero, two different contexts must give
+    DIFFERENT output for the SAME expression."""
+    encoder = FiLMConditionedExpressionEncoder(7, context_dim=24, latent_dim=5, hidden_dim=20)
+    with torch.no_grad():
+        for film in (encoder.film_first, encoder.film_second):
+            film.to_gamma_beta.weight.normal_(mean=0.0, std=1.0)
+            film.to_gamma_beta.bias.normal_(mean=0.0, std=1.0)
+    expression = torch.randn(6, 7)
+    context_a = torch.randn(6, 24)
+    context_b = torch.randn(6, 24) * 5.0
+    output_a = encoder(expression, context_a)
+    output_b = encoder(expression, context_b)
+    assert not torch.allclose(output_a, output_b)
+
+
+def test_run_whole_slide_validation_computes_metrics_and_a_comparable_total():
+    genes = [f"g{i}" for i in range(7)]
+    model = _model("mmd")
+    samples = {"S0": _whole_slide_sample(n=13, seed=1, sample_id="S0"),
+               "S1": _whole_slide_sample(n=9, seed=2, sample_id="S1")}
+    aggregated, total, per_slide_predictions = train_conditional_wae._run_whole_slide_validation(
+        model, samples, ["S0", "S1"], genes, {"panelA": ["g0", "g1"]},
+        chunk_size=4, n_samples=2, seed=0, device=torch.device("cpu"),
+    )
+    for arm in ("model", "conditional_mean"):
+        assert set(aggregated[arm]) == {"all_genes", "panelA"}
+        for panel in aggregated[arm].values():
+            assert set(panel) == {"pcc", "rmse", "auc"}
+    assert np.isfinite(total)
+    assert len(per_slide_predictions) == 2
+    assert per_slide_predictions[0]["sample_id"] == "S0"

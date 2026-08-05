@@ -20,12 +20,16 @@ from gen3_multiscale.conditional_wae import (
     ConditionalWAE,
 )
 from gen3_multiscale.conditional_wae.contract import static_audit_conditional_wae_config
+from gen3_multiscale.conditional_wae.film_diagnostics import compute_film_diagnostics
+from gen3_multiscale.conditional_wae.reference_projection import ensure_reference_gex_projection
 from gen3_multiscale.conditional_wae.tensorboard import (
     ConditionalWAESnapshotAccumulator,
     ConditionalWAETensorBoardLogger,
 )
+from gen3_multiscale.conditional_wae.whole_slide import predict_whole_slide, whole_slide_metrics
 from gen3_multiscale.config_identity import config_identity_fingerprint, resolved_config
 from gen3_multiscale.data.dataset_manifest import gene_panel_hash, load_dataset_manifest
+from gen3_multiscale.evaluation.gen3_evaluator import load_configured_gene_panels
 from gen3_multiscale.evaluation.train_gene_panels import load_train_derived_gene_panels
 from gen3_multiscale.models.losses import rmse_pcc_reconstruction_loss
 from gen3_multiscale.training import checkpoint as checkpoint_module
@@ -259,9 +263,12 @@ def _checkpoint_resume_state(checkpoint_dir: Path) -> tuple[bool, dict | None]:
 @torch.no_grad()
 def _validate(model: ConditionalWAE, dataset, *, device: torch.device, seed: int,
               snapshot: ConditionalWAESnapshotAccumulator | None = None,
-              samples: dict | None = None) -> dict:
+              samples: dict | None = None, collect_film_diagnostics: bool = False) -> dict:
     model.eval()
     totals, rmses, pcc_losses, conditional_mean_rmses = [], [], [], []
+    collect_film = collect_film_diagnostics and model.encoder_conditioning == "film"
+    film_posterior_z, film_context = [], []
+    film_predictive_std, film_predictive_mean, film_conditional_mean = [], [], []
     for index in range(len(dataset)):
         inputs, target, identity = dataset[index]
         target_tensor = torch.as_tensor(target, dtype=torch.float32, device=device)
@@ -277,25 +284,106 @@ def _validate(model: ConditionalWAE, dataset, *, device: torch.device, seed: int
         rmses.append(float(rmse))
         pcc_losses.append(float(pcc_loss))
         conditional_mean_rmses.append(float(mean_rmse))
+        posterior_z = None
+        if (snapshot is not None and not snapshot.full) or collect_film:
+            # Held-out target GEX is encoded only for a diagnostic Projector/
+            # collapse view. It is never fed to sample_predictive_distribution
+            # or model selection.
+            posterior_z = model.encode_posterior(target_tensor, inputs=inputs)
         if snapshot is not None and not snapshot.full:
             if samples is None or inputs.sample_id not in samples:
                 raise ValueError("TensorBoard snapshot requires the aligned validation sample")
-            # Held-out target GEX is encoded only for a diagnostic Projector view.
-            # It is never fed to sample_predictive_distribution or model selection.
-            posterior_z = model.encode_posterior(target_tensor, inputs=inputs)
             snapshot.add(
                 inputs=inputs, target=target_tensor, identity=identity,
                 prediction=prediction, posterior_z=posterior_z,
                 sample=samples[inputs.sample_id],
             )
+        if collect_film:
+            film_posterior_z.append(posterior_z.detach())
+            film_context.append(prediction["image_context"].detach())
+            film_predictive_std.append(prediction["predictive_std"].detach())
+            film_predictive_mean.append(prediction["predictive_mean"].detach())
+            film_conditional_mean.append(prediction["conditional_mean_expression"].detach())
     model.train()
-    return {
+    result = {
         "total": float(np.mean(totals)),
         "rmse": float(np.mean(rmses)),
         "pcc_loss": float(np.mean(pcc_losses)),
         "conditional_mean_rmse": float(np.mean(conditional_mean_rmses)),
         "n_items": len(dataset),
     }
+    if collect_film and film_posterior_z:
+        result["film_diagnostics"] = compute_film_diagnostics(
+            model, torch.cat(film_posterior_z, dim=0), torch.cat(film_context, dim=0),
+            torch.cat(film_predictive_std, dim=0), torch.cat(film_predictive_mean, dim=0),
+            torch.cat(film_conditional_mean, dim=0),
+        )
+    return result
+
+
+def _select_whole_slide_sample_ids(validation_ids: list[str], max_slides: int) -> list[str]:
+    """Deterministic, memory-bounded slide selection for whole-slide
+    validation/spatial-map logging -- never more than `max_slides`
+    regardless of how many validation slides exist."""
+    if max_slides < 1:
+        raise ValueError("max_slides must be positive")
+    return sorted(str(sample_id) for sample_id in validation_ids)[:max_slides]
+
+
+def _aggregate_whole_slide_metrics(per_slide_metrics: list[dict]) -> dict:
+    """Mean-over-slides {arm: {panel: {pcc, rmse, auc}}}. A slide/panel
+    combination with an undefined AUC (all-zero or all-nonzero true
+    expression) is excluded from that one average rather than zeroed."""
+    if not per_slide_metrics:
+        raise ValueError("per_slide_metrics must be non-empty")
+    aggregated: dict[str, dict[str, dict[str, float]]] = {}
+    for arm in per_slide_metrics[0]["per_arm"]:
+        aggregated[arm] = {}
+        for panel in per_slide_metrics[0]["per_arm"][arm]:
+            aggregated[arm][panel] = {}
+            for metric_name in ("pcc", "rmse", "auc"):
+                values = [
+                    slide["per_arm"][arm][panel][metric_name] for slide in per_slide_metrics
+                ]
+                finite = [value for value in values if value is not None and np.isfinite(value)]
+                aggregated[arm][panel][metric_name] = (
+                    float(np.mean(finite)) if finite else float("nan")
+                )
+    return aggregated
+
+
+def _run_whole_slide_validation(
+    model: ConditionalWAE, samples: dict, sample_ids: list[str], gene_names: list[str],
+    panels: dict, *, chunk_size: int, n_samples: int | None, seed: int, device: torch.device,
+) -> tuple[dict, float, list[dict]]:
+    """Returns (aggregated_metrics, whole_slide_total, per_slide_predictions).
+    `whole_slide_total` uses the SAME rmse_pcc_reconstruction_loss shape as
+    masked validation's `total`, pooled over every predicted spot across
+    `sample_ids`, purely so it is directly comparable in scale -- it is
+    diagnostic-only and never read by checkpoint selection beyond the
+    separate best_whole_slide/. `per_slide_predictions` is the raw
+    predict_whole_slide() output per sample, reused for spatial-map logging
+    so the model is never re-run just to plot what was already computed."""
+    per_slide_metrics = []
+    per_slide_predictions = []
+    pooled_predictions, pooled_targets = [], []
+    for sample_id in sample_ids:
+        sample = samples[sample_id]
+        prediction = predict_whole_slide(
+            model, sample, chunk_size=chunk_size, n_samples=n_samples, seed=seed,
+        )
+        per_slide_metrics.append(whole_slide_metrics(prediction, gene_names, panels))
+        per_slide_predictions.append(prediction)
+        pooled_predictions.append(prediction["predictive_mean"])
+        pooled_targets.append(
+            torch.as_tensor(prediction["target"], dtype=torch.float32, device=device)
+        )
+    aggregated = _aggregate_whole_slide_metrics(per_slide_metrics)
+    total, _rmse, _pcc = rmse_pcc_reconstruction_loss(
+        torch.cat(pooled_predictions, dim=0), torch.cat(pooled_targets, dim=0),
+        pcc_weight=model.pcc_weight,
+    )
+    return aggregated, float(total), per_slide_predictions
 
 
 def _tensorboard_gene_indices(config: dict, dataset_manifest: dict,
@@ -467,6 +555,51 @@ def run_conditional_wae_training(
             purge_step=(resume_step if resume_step > 0 else None),
         )
         print(f"TensorBoard logging: {tensorboard_cfg['log_dir']}", flush=True)
+
+    # GPT-relayed diagnostics request: whole-slide (every-spot) validation,
+    # diagnostic-only. best_masked (the existing best/) stays the ONLY
+    # checkpoint the evaluator/cross-arm comparison ever reads; best_whole_slide
+    # is a separate, secondary bundle nothing downstream consumes automatically.
+    whole_slide_cfg = dict((config.get("evaluation") or {}).get("whole_slide_validation") or {})
+    whole_slide_enabled = bool(whole_slide_cfg.get("enabled", False))
+    if whole_slide_enabled and config["model"]["task"] != "he_to_st":
+        raise ValueError(
+            "evaluation.whole_slide_validation is only meaningful for task='he_to_st' "
+            "(it hardcodes include_observed_gex=False and predicts every spot as query)"
+        )
+    whole_slide_every_n_evals = max(1, int(whole_slide_cfg.get("every_n_evals", 5)))
+    whole_slide_max_slides = max(1, int(whole_slide_cfg.get("max_slides", 2)))
+    whole_slide_chunk_size = max(1, int(whole_slide_cfg.get("chunk_size", 2048)))
+    whole_slide_n_samples = whole_slide_cfg.get("n_samples")
+    whole_slide_panels = load_configured_gene_panels(config, dataset_manifest) if whole_slide_enabled else {}
+    whole_slide_sample_ids = (
+        _select_whole_slide_sample_ids(validation_ids, whole_slide_max_slides)
+        if whole_slide_enabled else []
+    )
+    best_whole_slide_total = float("inf")
+    best_whole_slide_step = None
+    if whole_slide_enabled and not smoke:
+        prior_whole_slide_state = checkpoint_module.load_training_state(checkpoint_dir / "best_whole_slide")
+        if "whole_slide_total" in prior_whole_slide_state:
+            best_whole_slide_total = float(prior_whole_slide_state["whole_slide_total"])
+            best_whole_slide_step = int(prior_whole_slide_state["step"])
+    whole_slide_reference_projection = None
+    if whole_slide_enabled and tensorboard_logger is not None:
+        reference_projection_path = whole_slide_cfg.get("reference_projection_path")
+        if not reference_projection_path:
+            raise ValueError(
+                "evaluation.whole_slide_validation.reference_projection_path is required "
+                "when whole-slide validation and TensorBoard are both enabled -- one shared "
+                "path lets every arm/dimensionality in a suite reuse the SAME frozen basis"
+            )
+        whole_slide_reference_projection = ensure_reference_gex_projection(
+            reference_projection_path, validation_samples, whole_slide_sample_ids, gene_names,
+            n_components=int(whole_slide_cfg.get("reference_pca_components", 3)),
+            n_clusters=int(whole_slide_cfg.get("reference_n_clusters", 6)),
+            seed=int(whole_slide_cfg.get("reference_seed", seed)),
+            max_points=int(whole_slide_cfg.get("reference_max_points", 20_000)),
+        )
+
     started = time.time()
     step = resume_step
     completion_reason = "total_steps_reached"
@@ -567,13 +700,19 @@ def run_conditional_wae_training(
                         ),
                         thumbnail_size=int(tensorboard_cfg.get("thumbnail_size", 48)),
                     )
+            validation_result = _validate(
+                model, validation_dataset, device=device, seed=seed,
+                snapshot=snapshot, samples=validation_samples,
+                collect_film_diagnostics=(tensorboard_logger is not None),
+            )
+            # film_diagnostics contains numpy arrays (not JSON-serializable)
+            # and is diagnostic-only -- logged to TensorBoard below, never
+            # persisted into validation_history.json/checkpoint resume state.
+            film_diagnostics = validation_result.pop("film_diagnostics", None)
             entry = {
                 "step": step,
                 "masks_seen": masks_seen,
-                **_validate(
-                    model, validation_dataset, device=device, seed=seed,
-                    snapshot=snapshot, samples=validation_samples,
-                ),
+                **validation_result,
             }
             print(
                 f"[step {step}] validation: total={entry['total']:.6f}, "
@@ -589,6 +728,8 @@ def run_conditional_wae_training(
                 )
                 if snapshot is not None:
                     tensorboard_logger.add_snapshot(step, snapshot)
+                if film_diagnostics is not None:
+                    tensorboard_logger.add_film_diagnostics(step, film_diagnostics)
             if not smoke:
                 history.append(entry)
                 _atomic_json(history, history_path)
@@ -600,6 +741,48 @@ def run_conditional_wae_training(
                         step=step, val_loss=entry["total"], run_manifest=run_manifest,
                         extra_metadata={"masks_seen": masks_seen},
                     )
+            if whole_slide_enabled:
+                evaluation_number = max(1, step // eval_every)
+                if smoke or (evaluation_number - 1) % whole_slide_every_n_evals == 0:
+                    aggregated_whole_slide, whole_slide_total, whole_slide_predictions = (
+                        _run_whole_slide_validation(
+                            model, validation_samples, whole_slide_sample_ids, gene_names,
+                            whole_slide_panels, chunk_size=whole_slide_chunk_size,
+                            n_samples=whole_slide_n_samples, seed=seed, device=device,
+                        )
+                    )
+                    print(
+                        f"[step {step}] whole-slide validation: total={whole_slide_total:.6f} "
+                        f"over {len(whole_slide_sample_ids)} slide(s)",
+                        flush=True,
+                    )
+                    if tensorboard_logger is not None:
+                        tensorboard_logger.add_whole_slide_scalars(
+                            step, aggregated_whole_slide, whole_slide_total=whole_slide_total,
+                            best_whole_slide_total=min(best_whole_slide_total, whole_slide_total),
+                            best_whole_slide_step=(
+                                step if whole_slide_total <= best_whole_slide_total else best_whole_slide_step
+                            ),
+                        )
+                        if whole_slide_reference_projection is not None:
+                            for prediction in whole_slide_predictions:
+                                tensorboard_logger.add_whole_slide_spatial_maps(
+                                    step, prediction["sample_id"], prediction["coords"],
+                                    prediction["target"],
+                                    prediction["predictive_mean"].detach().cpu().numpy(),
+                                    gene_names, whole_slide_reference_projection,
+                                )
+                    if not smoke and whole_slide_total < best_whole_slide_total:
+                        best_whole_slide_total = whole_slide_total
+                        best_whole_slide_step = step
+                        save_best_checkpoint_bundle(
+                            model, config, gene_names, checkpoint_dir / "best_whole_slide",
+                            step=step, val_loss=whole_slide_total, run_manifest=run_manifest,
+                            extra_metadata={
+                                "masks_seen": masks_seen, "whole_slide_total": whole_slide_total,
+                                "kind": "whole_slide_diagnostic_only",
+                            },
+                        )
         if not smoke and step % checkpoint_every == 0 and step < step_target:
             checkpoint_module.save_checkpoint(
                 model, config, gene_names, checkpoint_dir, step,
