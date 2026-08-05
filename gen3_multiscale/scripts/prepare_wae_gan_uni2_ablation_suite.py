@@ -237,7 +237,10 @@ def main() -> None:
         help="Optional override for where the uni2 arm looks up its spot-feature cache "
              "(gen3_uni2_spot_feature_cache_dir). Defaults to the same hest_cache_dir/"
              "hest_data_dir convention the GigaPath cache already uses -- set this only if the "
-             "UNI2 cache lives under a different root (e.g. built from a different checkout).",
+             "UNI2 cache lives under a different root (e.g. built from a different checkout). "
+             "IMPORTANT: pass the PARENT of uni2_gen3_spot_cache/, not that directory itself -- "
+             "e.g. for a cache at /data/.../hest1k/uni2_gen3_spot_cache/, pass /data/.../hest1k "
+             "(the loader appends uni2_gen3_spot_cache/<sample_id>.npz itself).",
     )
     parser.add_argument("--hours", type=float, default=8.0)
     parser.add_argument("--gpus", default="0,2", help="comma-separated GPU ids, one per arm")

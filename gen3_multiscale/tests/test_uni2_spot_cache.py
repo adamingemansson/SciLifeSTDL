@@ -216,3 +216,73 @@ def test_load_gen3_uni2_spot_features_rejects_a_cache_with_a_malformed_provenanc
     # -- but the Gen3/MK-specific loader must fail closed.
     with pytest.raises(ValueError, match="preprocessing_spec"):
         load_gen3_uni2_spot_features(cfg, "S0", barcodes, patches, availability)
+
+
+def test_load_gen3_uni2_spot_features_rejects_a_missing_cache_without_rebuilding(tmp_path):
+    """No cache has ever been written for this sample -- the loader must
+    fail closed with a clear message, never silently construct an
+    encoder or fall back to a build path."""
+    cfg = OmegaConf.create({"data": {"hest_data_dir": str(tmp_path / "hest1k")}})
+    barcodes, patches, availability = _synthetic_sample()
+    with pytest.raises(FileNotFoundError, match="missing"):
+        load_gen3_uni2_spot_features(cfg, "S0", barcodes, patches, availability)
+
+
+def test_load_gen3_uni2_spot_features_rejects_a_corrupt_cache_missing_required_fields(tmp_path):
+    """A cache file that exists but is missing required provenance/data
+    fields (e.g. truncated write, wrong builder version) must fail
+    closed, not be silently accepted with defaults."""
+    cfg = OmegaConf.create({"data": {"hest_data_dir": str(tmp_path / "hest1k")}})
+    barcodes, patches, availability = _synthetic_sample()
+    path = cfg_cache_root(cfg) / "uni2_gen3_spot_cache" / "S0.npz"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, features=np.zeros((5, 1536), dtype=np.float32), barcodes=barcodes)
+    with pytest.raises(ValueError, match="missing fields"):
+        load_gen3_uni2_spot_features(cfg, "S0", barcodes, patches, availability)
+
+
+def test_load_gen3_uni2_spot_features_rejects_a_barcode_order_mismatch(tmp_path):
+    cfg = OmegaConf.create({"data": {"hest_data_dir": str(tmp_path / "hest1k")}})
+    barcodes, patches, availability = _synthetic_sample()
+    encoder = _RealShapedStubUNI2Encoder()
+    build_uni2_spot_feature_cache(cfg_cache_root(cfg), "S0", barcodes, patches, availability, encoder)
+
+    reordered = barcodes[::-1].copy()
+    with pytest.raises(ValueError, match="mismatch"):
+        load_gen3_uni2_spot_features(cfg, "S0", reordered, patches[::-1].copy(), availability[::-1].copy())
+
+
+def test_gigapath_default_path_behavior_is_unaffected_by_the_uni2_addition(tmp_path, monkeypatch):
+    """Regression: adding the uni2 branch must not change GigaPath's own
+    (pre-existing, separately audited) spot-feature cache module at all."""
+    import sys
+    import types
+
+    import torch.nn as nn
+
+    from gen3_multiscale.data.spot_feature_cache import (
+        build_gen3_spot_feature_cache, load_gen3_spot_features,
+    )
+
+    def _fake_load(revision=None):
+        assert revision is not None
+        return nn.Linear(4, 4)
+
+    def _fake_encode(tile_encoder, tensor):
+        means = tensor.mean(dim=(1, 2, 3)).view(tensor.shape[0], 1)
+        return means.expand(tensor.shape[0], 1536).clone()
+
+    fake_timm = types.ModuleType("timm")
+    fake_timm.__version__ = "0.0.0-test-stub"
+    monkeypatch.setitem(sys.modules, "timm", fake_timm)
+    monkeypatch.setattr("src.models.conditioning._load_gigapath_tile_encoder", _fake_load)
+    monkeypatch.setattr("src.models.conditioning._gigapath_preprocess_and_encode", _fake_encode)
+
+    cfg = OmegaConf.create({"data": {"hest_data_dir": str(tmp_path / "hest1k")}})
+    barcodes, patches, availability = _synthetic_sample()
+    build_gen3_spot_feature_cache(
+        cfg, "S0", barcodes, patches, availability, tile_encoder_revision=_VALID_REVISION, device="cpu",
+    )
+    loaded = load_gen3_spot_features(cfg, "S0", barcodes, patches, availability)
+    assert loaded["features"].shape == (5, 1536)
+    assert loaded["tile_encoder_provenance"]["hf_repo_id"] == "prov-gigapath/prov-gigapath"
