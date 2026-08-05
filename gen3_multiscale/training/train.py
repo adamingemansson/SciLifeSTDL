@@ -68,17 +68,30 @@ from gen3_multiscale.training.gen3_preflight import load_and_preflight_samples, 
 def expected_tile_encoder_provenance(config: dict) -> dict:
     """The experiment-declared expected provenance
     `tile_encoder_preflight.require_consistent_tile_encoder_provenance`
-    requires -- sourced from `data.tile_encoder_revision`, never
+    (or, for `data.image_encoder="uni2"`, `gen4.uni2_spot_cache.require_
+    consistent_uni2_tile_encoder_provenance`) requires -- sourced from
+    `data.tile_encoder_revision`/`data.uni2_pinned_revision`, never
     inferred from whichever cache happens to load first."""
     data_cfg = config.get("data") or {}
-    revision = data_cfg.get("tile_encoder_revision")
-    if not revision:
-        raise ValueError(
-            "data.tile_encoder_revision must be set to the experiment's pinned, immutable "
-            "Hugging Face commit SHA -- see scripts/precompute_gigapath_wsi_tiles.py's own "
-            "--tile-encoder-revision for how it is resolved"
-        )
-    return {"hf_repo_id": "prov-gigapath/prov-gigapath", "hf_revision": str(revision), "schema_version": 1}
+    image_encoder = str(data_cfg.get("image_encoder", "gigapath"))
+    if image_encoder == "gigapath":
+        revision = data_cfg.get("tile_encoder_revision")
+        if not revision:
+            raise ValueError(
+                "data.tile_encoder_revision must be set to the experiment's pinned, immutable "
+                "Hugging Face commit SHA -- see scripts/precompute_gigapath_wsi_tiles.py's own "
+                "--tile-encoder-revision for how it is resolved"
+            )
+        return {"hf_repo_id": "prov-gigapath/prov-gigapath", "hf_revision": str(revision), "schema_version": 1}
+    if image_encoder == "uni2":
+        revision = data_cfg.get("uni2_pinned_revision")
+        if not revision:
+            raise ValueError(
+                "data.uni2_pinned_revision must be set to the experiment's pinned, immutable "
+                "MahmoodLab/UNI2-h Hugging Face commit SHA"
+            )
+        return {"pinned_revision": str(revision), "schema_version": 1}
+    raise ValueError(f"data.image_encoder must be 'gigapath' or 'uni2', got {image_encoder!r}")
 
 
 def maybe_build_slide_encoder(config: dict):

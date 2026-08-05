@@ -32,9 +32,16 @@ ARM_SPECS = {
     "wae_he_gan_film_first_only": ConditionalWAEArmSpec("he_to_st", "gan", False),
     "wae_he_gan_film_last_only": ConditionalWAEArmSpec("he_to_st", "gan", False),
     "wae_he_gan_film_shared": ConditionalWAEArmSpec("he_to_st", "gan", False),
+    # Image-encoder backbone ablation: same immutable task/regularizer/
+    # include_observed_gex contract as "wae_he_gan" -- only
+    # data.image_encoder (and its matching pinned-revision field) differs,
+    # which this static contract does not govern beyond the checks below.
+    "wae_he_gan_uni2_control": ConditionalWAEArmSpec("he_to_st", "gan", False),
+    "wae_he_gan_uni2": ConditionalWAEArmSpec("he_to_st", "gan", False),
 }
 
 _VALID_FILM_LAYERS = frozenset({"first", "second"})
+_VALID_IMAGE_ENCODERS = frozenset({"gigapath", "uni2"})
 
 
 def static_audit_conditional_wae_config(config: dict) -> dict:
@@ -69,8 +76,15 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
     data = config.get("data") or {}
     if not data.get("gen3_manifest_path"):
         raise ValueError("data.gen3_manifest_path must point to an immutable manifest")
-    if not data.get("tile_encoder_revision"):
-        raise ValueError("data.tile_encoder_revision must be pinned")
+    image_encoder = str(data.get("image_encoder", "gigapath"))
+    if image_encoder not in _VALID_IMAGE_ENCODERS:
+        raise ValueError(f"data.image_encoder must be one of {sorted(_VALID_IMAGE_ENCODERS)}")
+    if image_encoder == "gigapath":
+        if not data.get("tile_encoder_revision"):
+            raise ValueError("data.tile_encoder_revision must be pinned")
+    else:
+        if not data.get("uni2_pinned_revision"):
+            raise ValueError("data.uni2_pinned_revision must be pinned")
     training = config.get("training") or {}
     if not training.get("checkpoint_dir"):
         raise ValueError("training.checkpoint_dir is required")
@@ -86,4 +100,5 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
         "query_he_visible": True,
         "query_gex_visible": False,
         "surrounding_gex_visible": spec.include_observed_gex,
+        "image_encoder": image_encoder,
     }

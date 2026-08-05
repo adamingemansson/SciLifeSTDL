@@ -66,6 +66,7 @@ import torch
 
 from gen3_multiscale.data import example_builder, novae_graph, slide_context, spot_feature_cache
 from gen3_multiscale.data import mask_fingerprint
+from gen3_multiscale.gen4 import uni2_spot_cache
 from gen3_multiscale.data.boundary_graph import (
     EmptyBoundaryError,
     build_knn_adjacency,
@@ -174,9 +175,21 @@ def load_gen3_sample_data(
     # Mandatory requirement #2: the COMPLETE verified spot-feature cache
     # record -- barcodes, availability, AND features loaded and checked
     # together, never a bare features array obtained any other way.
-    spot_record = spot_feature_cache.load_gen3_spot_features(
-        cfg, sample_id, obs_names, patches, image_source_available,
-    )
+    # `data.image_encoder` selects which frozen tile encoder's cache to
+    # load -- defaults to "gigapath" so every existing config that never
+    # sets this field is completely unaffected (strict superset, same
+    # discipline as `encoder_conditioning="none"` in conditional_wae).
+    image_encoder = str(cfg.data.get("image_encoder", "gigapath"))
+    if image_encoder == "gigapath":
+        spot_record = spot_feature_cache.load_gen3_spot_features(
+            cfg, sample_id, obs_names, patches, image_source_available,
+        )
+    elif image_encoder == "uni2":
+        spot_record = uni2_spot_cache.load_gen3_uni2_spot_features(
+            cfg, sample_id, obs_names, patches, image_source_available,
+        )
+    else:
+        raise ValueError(f"data.image_encoder must be 'gigapath' or 'uni2', got {image_encoder!r}")
 
     dense_wsi_provenance = None
     slide_context_record = None

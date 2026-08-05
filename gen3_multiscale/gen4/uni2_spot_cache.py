@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,122 @@ _REQUIRED_FIELDS = {
     "uni2_checkpoint_sha256", "uni2_pinned_revision", "uni2_package_version",
     "uni2_preprocessing_spec", "uni2_output_dim", "uni2_schema_version",
 }
+
+# Must match FrozenUNI2TileEncoder's own identity exactly (uni2_encoder.py):
+# UNI2-h is only ever constructed as vit_giant_patch14_224 with its
+# documented non-default args, so both the preprocessing spec string and
+# the output dim are fixed, not caller-configurable -- a provenance dict
+# claiming anything else did not come from a real FrozenUNI2TileEncoder.
+_EXPECTED_UNI2_PREPROCESSING_SPEC = (
+    "uni2_tile_v2:vit_giant_patch14_224:resize224_bicubic_antialias:imagenet_norm"
+)
+_EXPECTED_UNI2_OUTPUT_DIM = 1536
+_SUPPORTED_UNI2_SCHEMA_VERSIONS = {1}
+_HF_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# The six fields that identify one UNI2 tile-encoder build -- the UNI2
+# analogue of tile_encoder_preflight.py's GigaPath-only
+# `_PROVENANCE_FIELDS`. Kept here (not in tile_encoder_preflight.py, which
+# is a verbatim copy of src/data/slide_context.py's own GigaPath-only
+# discipline) so this module stays the single, self-contained source of
+# UNI2 provenance semantics.
+_PROVENANCE_FIELDS = (
+    "checkpoint_sha256", "pinned_revision", "package_version",
+    "preprocessing_spec", "output_dim", "schema_version",
+)
+
+
+def validate_uni2_tile_encoder_provenance(source: str, provenance: dict) -> None:
+    """Fail-closed validation of a real UNI2 tile-encoder provenance dict
+    (the same shape `FrozenUNI2TileEncoder.identity`/`build_uni2_spot_
+    feature_cache` produces): an immutable 40-hex-char pinned commit SHA,
+    a well-formed 64-hex-char checkpoint digest, a nonblank package
+    version, the exact current preprocessing spec, the expected output
+    dim, and a supported schema version. Mirrors `data/slide_context.py::
+    validate_tile_encoder_provenance`'s discipline for GigaPath, applied
+    to UNI2's own field set -- `source` is a human-readable identifier
+    (e.g. a file path) used only in error messages."""
+    if not _HF_COMMIT_SHA_RE.match(str(provenance.get("pinned_revision", ""))):
+        raise ValueError(
+            f"{source} uni2_pinned_revision={provenance.get('pinned_revision')!r} is not a full "
+            "40-character lowercase hex Hugging Face commit SHA -- rebuild with a pinned, "
+            "immutable --uni2-pinned-revision"
+        )
+    if not _SHA256_HEX_RE.match(str(provenance.get("checkpoint_sha256", ""))):
+        raise ValueError(
+            f"{source} uni2_checkpoint_sha256={provenance.get('checkpoint_sha256')!r} is not a "
+            "well-formed 64-character lowercase hex sha256 digest"
+        )
+    if not str(provenance.get("package_version", "")).strip():
+        raise ValueError(f"{source} uni2_package_version must be nonblank")
+    if provenance.get("preprocessing_spec") != _EXPECTED_UNI2_PREPROCESSING_SPEC:
+        raise ValueError(
+            f"{source} uni2_preprocessing_spec={provenance.get('preprocessing_spec')!r}, expected "
+            f"{_EXPECTED_UNI2_PREPROCESSING_SPEC!r}"
+        )
+    if int(provenance.get("output_dim", -1)) != _EXPECTED_UNI2_OUTPUT_DIM:
+        raise ValueError(
+            f"{source} uni2_output_dim={provenance.get('output_dim')!r}, expected "
+            f"{_EXPECTED_UNI2_OUTPUT_DIM}"
+        )
+    if int(provenance.get("schema_version", -1)) not in _SUPPORTED_UNI2_SCHEMA_VERSIONS:
+        raise ValueError(
+            f"{source} uni2_schema_version={provenance.get('schema_version')!r} is not supported "
+            f"(supported: {sorted(_SUPPORTED_UNI2_SCHEMA_VERSIONS)})"
+        )
+
+
+def require_consistent_uni2_tile_encoder_provenance(
+    provenance_by_source: dict[str, dict],
+    expected_provenance: dict,
+) -> None:
+    """UNI2 analogue of `tile_encoder_preflight.require_consistent_tile_
+    encoder_provenance`: every provenance dict in `provenance_by_source`
+    is individually validated (`validate_uni2_tile_encoder_provenance`),
+    then required to be identical across every entry, then required to
+    exactly match `expected_provenance` field-by-field for every field it
+    specifies. `expected_provenance` is mandatory and must declare at
+    least `pinned_revision` -- an omitted or empty one would let every
+    cache in an experiment consistently agree with each other while ALL
+    being built from the wrong UNI2 checkpoint, which this gate would
+    then never catch."""
+    if not provenance_by_source:
+        raise ValueError("require_consistent_uni2_tile_encoder_provenance: no provenance entries given")
+    if not expected_provenance or "pinned_revision" not in expected_provenance:
+        raise ValueError(
+            "require_consistent_uni2_tile_encoder_provenance: expected_provenance must declare at "
+            "least pinned_revision -- an omitted or empty expected_provenance would let every "
+            "cache in this experiment consistently agree on the WRONG UNI2 checkpoint without "
+            "this gate ever noticing"
+        )
+    for source, provenance in provenance_by_source.items():
+        missing_fields = [field for field in _PROVENANCE_FIELDS if field not in provenance]
+        if missing_fields:
+            raise ValueError(
+                f"UNI2 tile-encoder provenance for {source!r} is missing field(s) {missing_fields} "
+                "-- refusing to preflight-check an incomplete provenance record"
+            )
+        validate_uni2_tile_encoder_provenance(f"preflight entry {source!r}", provenance)
+
+    reference_source, reference = next(iter(provenance_by_source.items()))
+    for source, provenance in provenance_by_source.items():
+        for field in _PROVENANCE_FIELDS:
+            if provenance.get(field) != reference.get(field):
+                raise ValueError(
+                    f"UNI2 tile-encoder provenance mismatch: {source}.{field}={provenance.get(field)!r} "
+                    f"!= {reference_source}.{field}={reference.get(field)!r} -- every spot-feature "
+                    "cache used in one experiment must share the exact same UNI2 checkpoint identity"
+                )
+    for field in _PROVENANCE_FIELDS:
+        if field not in expected_provenance:
+            continue  # expected_provenance may deliberately pin only a subset of fields
+        if reference.get(field) != expected_provenance[field]:
+            raise ValueError(
+                f"UNI2 tile-encoder provenance mismatch: every cache has {field}="
+                f"{reference.get(field)!r}, but the experiment config declares an expected "
+                f"{field}={expected_provenance[field]!r}"
+            )
 
 
 def _cache_path(cache_root: str | Path, sample_id: str) -> Path:
@@ -141,16 +258,72 @@ def load_uni2_spot_features(
     if real_content_hash != str(cached["patch_content_sha256"]):
         raise ValueError(f"UNI2 spot-feature cache {path} patch content mismatch -- rebuild it")
 
+    provenance = {
+        "checkpoint_sha256": str(cached["uni2_checkpoint_sha256"]),
+        "pinned_revision": str(cached["uni2_pinned_revision"]),
+        "package_version": str(cached["uni2_package_version"]),
+        "preprocessing_spec": str(cached["uni2_preprocessing_spec"]),
+        "output_dim": output_dim,
+        "schema_version": int(np.asarray(cached["uni2_schema_version"]).item()),
+    }
+    # Deliberately NOT strict-validated here (validate_uni2_tile_encoder_
+    # provenance is only applied in load_gen3_uni2_spot_features below) --
+    # this is Gen4's existing, separately-audited general-purpose loader,
+    # exercised by its own StubUNI2Encoder-based tests whose stub identity
+    # values (e.g. non-hex "stub"-prefixed digests) are deliberately not
+    # real-UNI2-shaped. Strict format validation only applies to the
+    # Gen3/MK-specific path below, which is real-checkpoint-only by
+    # construction (FrozenUNI2TileEncoder never accepts a stub).
+
     return {
         "features": features,
         "barcodes": real_barcodes,
         "image_source_available": real_availability,
-        "provenance": {
-            "checkpoint_sha256": str(cached["uni2_checkpoint_sha256"]),
-            "pinned_revision": str(cached["uni2_pinned_revision"]),
-            "package_version": str(cached["uni2_package_version"]),
-            "preprocessing_spec": str(cached["uni2_preprocessing_spec"]),
-            "output_dim": output_dim,
-            "schema_version": int(np.asarray(cached["uni2_schema_version"]).item()),
-        },
+        "provenance": provenance,
+    }
+
+
+def cfg_cache_root(cfg) -> Path:
+    """Mirrors `data/spot_feature_cache.py::_cache_path`'s cache-root
+    resolution exactly (a distinct config key, so a GigaPath and a UNI2
+    cache root can be configured independently, but falling back to the
+    SAME `hest_cache_dir`/`hest_data_dir` default GigaPath uses -- if an
+    experiment's UNI2 cache was already built under that shared root by
+    another checkout, it is found automatically with no override
+    needed)."""
+    configured = cfg.data.get("gen3_uni2_spot_feature_cache_dir")
+    if configured:
+        return Path(str(configured))
+    cache_root = cfg.data.get("hest_cache_dir", cfg.data.hest_data_dir)
+    return Path(str(cache_root))
+
+
+def load_gen3_uni2_spot_features(
+    cfg,
+    sample_id: str,
+    barcodes: np.ndarray,
+    patches: np.ndarray,
+    image_source_available: np.ndarray,
+) -> dict:
+    """Config-driven wrapper around `load_uni2_spot_features` -- resolves
+    the cache root from `cfg` the same way `data/spot_feature_cache.py::
+    load_gen3_spot_features` resolves the GigaPath cache root, and
+    renames the `"provenance"` key to `"tile_encoder_provenance"` so
+    `gen3_dataset.py::load_gen3_sample_data` can treat either encoder's
+    loader result uniformly. Unlike the general-purpose `load_uni2_spot_
+    features` above, this Gen3/MK-specific entry point additionally
+    requires the cache's provenance to be well-formed real-UNI2-shaped
+    (`validate_uni2_tile_encoder_provenance`) -- the real trainer/
+    evaluator must never silently accept a cache built from a stub or a
+    malformed checkpoint identity."""
+    cache_root = cfg_cache_root(cfg)
+    loaded = load_uni2_spot_features(cache_root, sample_id, barcodes, patches, image_source_available)
+    validate_uni2_tile_encoder_provenance(
+        f"Gen3 UNI2 spot-feature cache ({sample_id})", loaded["provenance"],
+    )
+    return {
+        "features": loaded["features"],
+        "barcodes": loaded["barcodes"],
+        "image_source_available": loaded["image_source_available"],
+        "tile_encoder_provenance": loaded["provenance"],
     }

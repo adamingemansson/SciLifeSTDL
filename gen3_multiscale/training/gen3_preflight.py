@@ -24,6 +24,7 @@ import numpy as np
 
 from gen3_multiscale.data.dataset_manifest import verify_metadata_csv_provenance
 from gen3_multiscale.data.tile_encoder_preflight import require_consistent_tile_encoder_provenance
+from gen3_multiscale.gen4.uni2_spot_cache import require_consistent_uni2_tile_encoder_provenance
 from gen3_multiscale.training.gen3_dataset import Gen3SampleData, load_gen3_sample_data
 
 
@@ -163,6 +164,15 @@ def load_and_preflight_samples(
     require_dense_wsi = bool(model_params.get("use_regional_he", False)) or bool(
         model_params.get("use_global_slide", False)
     )
+    image_encoder = str(cfg.data.get("image_encoder", "gigapath"))
+    if image_encoder not in {"gigapath", "uni2"}:
+        raise ValueError(f"data.image_encoder must be 'gigapath' or 'uni2', got {image_encoder!r}")
+    if image_encoder == "uni2" and require_dense_wsi:
+        raise ValueError(
+            "data.image_encoder='uni2' combined with use_regional_he/use_global_slide is not "
+            "supported -- dense-WSI regional/global context only has a GigaPath tile-encoder "
+            "path in this codebase"
+        )
 
     samples: dict[str, Gen3SampleData] = {}
     provenance_by_source: dict[str, dict] = {}
@@ -178,7 +188,10 @@ def load_and_preflight_samples(
     coverage = verify_cache_coverage(
         expected_cache_source_labels(sample_ids, require_dense_wsi=require_dense_wsi), provenance_by_source.keys(),
     )
-    require_consistent_tile_encoder_provenance(provenance_by_source, expected_tile_encoder_provenance)
+    if image_encoder == "gigapath":
+        require_consistent_tile_encoder_provenance(provenance_by_source, expected_tile_encoder_provenance)
+    else:
+        require_consistent_uni2_tile_encoder_provenance(provenance_by_source, expected_tile_encoder_provenance)
 
     report = {
         "version": 2,
