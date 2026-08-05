@@ -291,6 +291,100 @@ def test_run_training_stops_at_the_wall_clock_limit_and_saves_a_checkpoint(tmp_p
     assert (checkpoint_dir / "trainable_weights.pt").is_file()
 
 
+def test_run_training_stops_early_when_validation_never_improves_by_min_delta(tmp_path, monkeypatch):
+    """Gen6-B stability audit, Phase 2. `eval_every_n_steps=1` (the
+    fixture default) means every training step validates. An absurdly
+    large `min_delta` (1e6) makes EVERY validation after the first fail
+    to count as an improvement regardless of the real (small, finite,
+    non-negative) reconstruction loss actually produced -- so this drives
+    a real, deterministic early stop through the actual trainer without
+    mocking the loss computation itself. With `patience_validations=2`:
+    validation #1 sets the best (n_since=0), #2 is not an improvement
+    (n_since=1), #3 is not an improvement (n_since=2 >= patience) -> stop
+    with completion_reason='early_stopping' at final_step=3, well before
+    the configured total_steps=100."""
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
+    config_path = tmp_path / "config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_early_stop"
+    _write_config(
+        cfg, manifest_path, config_path, architecture="1", checkpoint_dir=checkpoint_dir,
+        synchronized_init_dir=str(sync_dir), checkpoint_every_n_steps=1,
+    )
+    config = yaml.safe_load(config_path.read_text())
+    config["training"]["total_steps"] = 100
+    config["training"]["early_stopping"] = {
+        "monitor": "validation_total", "mode": "min",
+        "patience_validations": 2, "min_delta": 1_000_000.0,
+    }
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+
+    summary = train_module.run_training(str(config_path), smoke=False)
+    assert summary["completion_reason"] == "early_stopping"
+    assert summary["final_step"] == 3
+    assert summary["early_stopping"]["should_stop"] is True
+    assert summary["early_stopping"]["best_step"] == 1
+    assert summary["early_stopping"]["n_since_improvement"] == 2
+
+    # Best checkpoint is still kept, and the final bundle records WHY it
+    # stopped, exactly like the wall-clock case above.
+    assert (checkpoint_dir / "best" / "trainable_weights.pt").is_file()
+    from gen3_multiscale.training import checkpoint as checkpoint_module
+
+    training_state = checkpoint_module.load_training_state(checkpoint_dir)
+    assert training_state["completion_reason"] == "early_stopping"
+    assert training_state["early_stopping"]["should_stop"] is True
+
+
+def test_run_training_without_early_stopping_config_runs_to_total_steps_unaffected(tmp_path, monkeypatch):
+    """Backward-compatibility guarantee: a config that never mentions
+    `training.early_stopping` behaves exactly as before this feature
+    existed -- it runs to `total_steps`, never early_stopping."""
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
+    config_path = tmp_path / "config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_no_early_stop"
+    _write_config(
+        cfg, manifest_path, config_path, architecture="1", checkpoint_dir=checkpoint_dir,
+        synchronized_init_dir=str(sync_dir), checkpoint_every_n_steps=1,
+    )
+    config = yaml.safe_load(config_path.read_text())
+    config["training"]["total_steps"] = 3
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+
+    summary = train_module.run_training(str(config_path), smoke=False)
+    assert summary["completion_reason"] == "completed_total_steps"
+    assert summary["final_step"] == 3
+    assert summary["early_stopping"] is None
+
+
+def test_run_training_logs_to_tensorboard_when_configured(tmp_path, monkeypatch):
+    """Phase 3 requirement: a separate TensorBoard run per training run,
+    updated as training progresses. Exercises the real writer (skipped if
+    the optional `tensorboard` package is not installed in this
+    environment) rather than mocking it, so a broken tag name or a writer
+    call with the wrong argument types would actually fail this test."""
+    pytest.importorskip("tensorboard")
+    cfg, manifest, manifest_path = _prepare(tmp_path, monkeypatch)
+    sync_dir = _build_synchronized_init_dir(tmp_path, manifest)
+    config_path = tmp_path / "config.yaml"
+    checkpoint_dir = tmp_path / "ckpt_tensorboard"
+    tensorboard_dir = tmp_path / "tb"
+    _write_config(
+        cfg, manifest_path, config_path, architecture="1", checkpoint_dir=checkpoint_dir,
+        synchronized_init_dir=str(sync_dir), checkpoint_every_n_steps=1,
+    )
+    config = yaml.safe_load(config_path.read_text())
+    config["training"]["total_steps"] = 2
+    config["training"]["tensorboard"] = {"log_dir": str(tensorboard_dir)}
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+
+    summary = train_module.run_training(str(config_path), smoke=False)
+    assert summary["completion_reason"] == "completed_total_steps"
+    event_files = list(tensorboard_dir.rglob("events.out.tfevents.*"))
+    assert event_files, f"no TensorBoard event file was written under {tensorboard_dir}"
+
+
 def test_run_training_smoke_learning_gate_fails_on_a_frozen_model(tmp_path, monkeypatch):
     """Regression test: requirement #4's smoke learning gate must catch a
     model that is NOT actually learning even when loss/gradients are both

@@ -59,6 +59,10 @@ from gen3_multiscale.data.dataset_manifest import gene_panel_hash, load_dataset_
 from gen3_multiscale.models import model_factory
 from gen3_multiscale.models.losses import combined_reconstruction_loss
 from gen3_multiscale.training import checkpoint as checkpoint_module
+from gen3_multiscale.training.core_tensorboard import (
+    CoreTrainerTensorBoardLogger, resolve_core_tensorboard_config,
+)
+from gen3_multiscale.training.early_stopping import early_stopping_status, resolve_early_stopping_config
 from gen3_multiscale.training.gen3_dataset import (
     Gen3SpatialFieldDataset, build_gen3_mask_schedule, gen3_identity_collate,
 )
@@ -2267,6 +2271,15 @@ def run_training(
     checkpoint_every_n_steps = max(1, int(training_cfg.get("checkpoint_every_n_steps", 2000)))
     checkpoint_keep_last = int(training_cfg.get("checkpoint_keep_last", 2))
     eval_every_n_steps = int(training_cfg.get("eval_every_n_steps", 2000))
+    # Resolved once from `training.early_stopping` / `training.tensorboard`.
+    # Both are opt-in: absent or falsy means this run behaves exactly as it
+    # always has (wall-clock limit and total_steps are the only ways it
+    # stops; nothing is logged to TensorBoard). `config_identity_fingerprint`
+    # already covers these fields, so changing either between resumes is
+    # caught by the existing `verify_resume_consistency` fail-closed check
+    # above -- no separate drift check is needed here.
+    early_stopping_cfg = resolve_early_stopping_config(training_cfg)
+    tensorboard_cfg = resolve_core_tensorboard_config(training_cfg)
 
     validation_history_path = checkpoint_dir / "validation_history.json"
     validation_history = (
@@ -2391,132 +2404,173 @@ def run_training(
     completion_reason = "completed_smoke_step" if smoke else "completed_total_steps"
     start_time = time.time()
     dataset_len = len(train_dataset)
-    while step < step_target:
-        elapsed_hours = (time.time() - start_time) / 3600.0
-        # Requirement #1: honor the configured wall-clock budget -- a
-        # real run must stop, save a final checkpoint, and record WHY it
-        # stopped, rather than running to total_steps regardless of how
-        # long that actually takes.
-        if elapsed_hours >= max_wall_clock_hours:
-            completion_reason = "wall_clock_limit_reached"
-            break
-
-        idx = deterministic_train_index_for_step(step, dataset_len, seed)
-        inputs, targets = train_dataset[idx]
-
-        target_expression = torch.as_tensor(targets.query_expression, dtype=torch.float32, device=device)
-        query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32, device=device)
-
-        optimizer.zero_grad(set_to_none=True)
-        losses = compute_step_losses(
-            kind, model, inputs, target_expression, query_coords,
-            gradient_weight=gradient_weight, k_neighbors=k_neighbors, flow_weight=flow_weight,
-            per_gene_scale=gene_scale_tensor,
-            primary_mode=primary_mode, pcc_weight=pcc_weight,
+    tensorboard_logger = None
+    if tensorboard_cfg is not None and not smoke:
+        tensorboard_logger = CoreTrainerTensorBoardLogger(
+            tensorboard_cfg["log_dir"], purge_step=(resume_step if resume_step > 0 else None),
         )
-        total_loss = losses["total"]
-        # Requirement #3 (confirmed real gap): a NaN/Inf loss or gradient
-        # must FAIL the run, not silently skip the step and eventually
-        # return ok: true -- a run that "completes" while quietly
-        # skipping every unstable step is a false success, not a real
-        # one.
-        if not torch.isfinite(total_loss):
-            raise RuntimeError(
-                f"[step {step}] non-finite total loss ({float(total_loss.detach())!r}) -- "
-                "failing the run rather than skipping this step"
-            )
-        pre_step_params = (
-            {name: p.detach().clone() for name, p in model.named_parameters() if p.requires_grad} if smoke else None
-        )
-        total_loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_val)
-        if not torch.isfinite(grad_norm):
-            raise RuntimeError(
-                f"[step {step}] non-finite gradient norm ({float(grad_norm)!r}) -- "
-                "failing the run rather than skipping this step"
-            )
-        optimizer.step()
+        print(f"TensorBoard logging: {tensorboard_cfg['log_dir']}", flush=True)
+    early_stopping_state: dict | None = None
+    try:
+        while step < step_target:
+            elapsed_hours = (time.time() - start_time) / 3600.0
+            # Requirement #1: honor the configured wall-clock budget -- a
+            # real run must stop, save a final checkpoint, and record WHY it
+            # stopped, rather than running to total_steps regardless of how
+            # long that actually takes.
+            if elapsed_hours >= max_wall_clock_hours:
+                completion_reason = "wall_clock_limit_reached"
+                break
 
-        # Requirement #4: a real learning gate for smoke -- a finite
-        # gradient norm alone does not prove the model is actually
-        # trainable (a disconnected graph, a frozen backbone with zero
-        # trainable parameters, or lr=0 could all still produce a finite,
-        # zero grad_norm and a spuriously "passing" smoke run). Smoke
-        # must additionally see a strictly POSITIVE gradient norm and at
-        # least one trainable parameter that ACTUALLY changed value.
-        if smoke:
-            if not (grad_norm > 0):
+            idx = deterministic_train_index_for_step(step, dataset_len, seed)
+            inputs, targets = train_dataset[idx]
+
+            target_expression = torch.as_tensor(targets.query_expression, dtype=torch.float32, device=device)
+            query_coords = torch.as_tensor(inputs.query_coords, dtype=torch.float32, device=device)
+
+            optimizer.zero_grad(set_to_none=True)
+            losses = compute_step_losses(
+                kind, model, inputs, target_expression, query_coords,
+                gradient_weight=gradient_weight, k_neighbors=k_neighbors, flow_weight=flow_weight,
+                per_gene_scale=gene_scale_tensor,
+                primary_mode=primary_mode, pcc_weight=pcc_weight,
+            )
+            total_loss = losses["total"]
+            # Requirement #3 (confirmed real gap): a NaN/Inf loss or gradient
+            # must FAIL the run, not silently skip the step and eventually
+            # return ok: true -- a run that "completes" while quietly
+            # skipping every unstable step is a false success, not a real
+            # one.
+            if not torch.isfinite(total_loss):
                 raise RuntimeError(
-                    f"[step {step}] smoke learning gate failed: gradient norm is {float(grad_norm)!r}, "
-                    "not strictly positive -- this model is not receiving a real training signal"
+                    f"[step {step}] non-finite total loss ({float(total_loss.detach())!r}) -- "
+                    "failing the run rather than skipping this step"
                 )
-            changed = any(
-                not torch.equal(p.detach(), pre_step_params[name])
-                for name, p in model.named_parameters() if p.requires_grad
+            pre_step_params = (
+                {name: p.detach().clone() for name, p in model.named_parameters() if p.requires_grad} if smoke else None
             )
-            if not changed:
+            total_loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_val)
+            if not torch.isfinite(grad_norm):
                 raise RuntimeError(
-                    f"[step {step}] smoke learning gate failed: optimizer.step() produced zero "
-                    "measurable change in any trainable parameter -- this model is not learning"
+                    f"[step {step}] non-finite gradient norm ({float(grad_norm)!r}) -- "
+                    "failing the run rather than skipping this step"
                 )
+            optimizer.step()
 
-        # Codex re-audit of commit 90f853e, launch blocker #7: "Fix
-        # completed-step semantics. After optimizer.step(), increment
-        # completed_steps, then log/validate/checkpoint using that
-        # value." The prior code logged/validated using `step`'s PRE-
-        # increment value (0-indexed: the step whose DATA this iteration
-        # just trained on) but labeled periodic/final checkpoints with
-        # `step`'s POST-increment value (1-indexed: the count of
-        # completed updates) -- "step 2000" therefore meant two DIFFERENT
-        # actual model states depending on whether it came from
-        # validation/best-checkpoint-selection or from a periodic
-        # checkpoint save. `completed_steps` (the count of optimizer
-        # updates actually applied so far, including this one) is now
-        # THE single value used everywhere a step gets logged, validated
-        # against, or used to label a saved checkpoint.
-        completed_steps = step + 1
+            # Requirement #4: a real learning gate for smoke -- a finite
+            # gradient norm alone does not prove the model is actually
+            # trainable (a disconnected graph, a frozen backbone with zero
+            # trainable parameters, or lr=0 could all still produce a finite,
+            # zero grad_norm and a spuriously "passing" smoke run). Smoke
+            # must additionally see a strictly POSITIVE gradient norm and at
+            # least one trainable parameter that ACTUALLY changed value.
+            if smoke:
+                if not (grad_norm > 0):
+                    raise RuntimeError(
+                        f"[step {step}] smoke learning gate failed: gradient norm is {float(grad_norm)!r}, "
+                        "not strictly positive -- this model is not receiving a real training signal"
+                    )
+                changed = any(
+                    not torch.equal(p.detach(), pre_step_params[name])
+                    for name, p in model.named_parameters() if p.requires_grad
+                )
+                if not changed:
+                    raise RuntimeError(
+                        f"[step {step}] smoke learning gate failed: optimizer.step() produced zero "
+                        "measurable change in any trainable parameter -- this model is not learning"
+                    )
 
-        if completed_steps % log_every_n_steps == 0 or smoke:
-            _log_step(completed_steps, "train", losses, extra=f", grad_norm={float(grad_norm):.4f}")
+            # Codex re-audit of commit 90f853e, launch blocker #7: "Fix
+            # completed-step semantics. After optimizer.step(), increment
+            # completed_steps, then log/validate/checkpoint using that
+            # value." The prior code logged/validated using `step`'s PRE-
+            # increment value (0-indexed: the step whose DATA this iteration
+            # just trained on) but labeled periodic/final checkpoints with
+            # `step`'s POST-increment value (1-indexed: the count of
+            # completed updates) -- "step 2000" therefore meant two DIFFERENT
+            # actual model states depending on whether it came from
+            # validation/best-checkpoint-selection or from a periodic
+            # checkpoint save. `completed_steps` (the count of optimizer
+            # updates actually applied so far, including this one) is now
+            # THE single value used everywhere a step gets logged, validated
+            # against, or used to label a saved checkpoint.
+            completed_steps = step + 1
 
-        if val_loader is not None and (smoke or (completed_steps % eval_every_n_steps == 0)):
-            entry = _run_validation(completed_steps)
-            if entry is not None:
-                validation_history.append(entry)
-                _save_json_atomic(validation_history, validation_history_path)
-                if entry["total"] < best_val_loss:
-                    best_val_loss = entry["total"]
-                    if not smoke:
-                        save_best_checkpoint_bundle(
-                            model, config, gene_names, checkpoint_dir / "best",
-                            step=completed_steps, val_loss=entry["total"], run_manifest=run_manifest,
-                        )
+            if completed_steps % log_every_n_steps == 0 or smoke:
+                _log_step(completed_steps, "train", losses, extra=f", grad_norm={float(grad_norm):.4f}")
+                if tensorboard_logger is not None:
+                    tensorboard_logger.add_train_scalars(
+                        completed_steps, losses, grad_norm=grad_norm,
+                        learning_rate=optimizer.param_groups[0]["lr"],
+                    )
 
-        # Codex re-audit of commit 90f853e, launch blocker #1/#7: the
-        # trainer used to ALSO save an unconditional final checkpoint
-        # after the loop, regardless of whether the last in-loop
-        # iteration had already just saved one at the exact same step --
-        # whenever the natural end of training coincided with
-        # `checkpoint_every_n_steps`, the SAME step got saved twice.
-        # `completed_steps < step_target` skips the in-loop save exactly
-        # when this iteration is ALSO the run's natural final step (that
-        # save is the post-loop one below, which additionally carries the
-        # real, final `completion_reason` -- the periodic save here only
-        # ever records "in_progress").
-        if (not smoke) and completed_steps % checkpoint_every_n_steps == 0 and completed_steps < step_target:
+            if val_loader is not None and (smoke or (completed_steps % eval_every_n_steps == 0)):
+                entry = _run_validation(completed_steps)
+                if entry is not None:
+                    validation_history.append(entry)
+                    _save_json_atomic(validation_history, validation_history_path)
+                    if tensorboard_logger is not None:
+                        tensorboard_logger.add_validation_scalars(completed_steps, entry)
+                    if entry["total"] < best_val_loss:
+                        best_val_loss = entry["total"]
+                        if not smoke:
+                            save_best_checkpoint_bundle(
+                                model, config, gene_names, checkpoint_dir / "best",
+                                step=completed_steps, val_loss=entry["total"], run_manifest=run_manifest,
+                            )
+                    # Requirement (Phase 2, Gen6-B stability audit): early
+                    # stopping is recomputed FROM the just-updated
+                    # `validation_history`, never from a separately
+                    # incremented counter -- see early_stopping.py's own
+                    # docstring for why this makes the decision correct
+                    # across any number of resumes for free. Disabled
+                    # (early_stopping_cfg is None) means this block never
+                    # runs and behavior is byte-for-byte unchanged from
+                    # before this feature existed.
+                    if early_stopping_cfg is not None and not smoke:
+                        early_stopping_state = early_stopping_status(validation_history, early_stopping_cfg)
+                        if tensorboard_logger is not None:
+                            tensorboard_logger.add_early_stopping_status(completed_steps, early_stopping_state)
+                        if early_stopping_state["should_stop"]:
+                            completion_reason = "early_stopping"
+                            step = completed_steps
+                            break
+
+            # Codex re-audit of commit 90f853e, launch blocker #1/#7: the
+            # trainer used to ALSO save an unconditional final checkpoint
+            # after the loop, regardless of whether the last in-loop
+            # iteration had already just saved one at the exact same step --
+            # whenever the natural end of training coincided with
+            # `checkpoint_every_n_steps`, the SAME step got saved twice.
+            # `completed_steps < step_target` skips the in-loop save exactly
+            # when this iteration is ALSO the run's natural final step (that
+            # save is the post-loop one below, which additionally carries the
+            # real, final `completion_reason` -- the periodic save here only
+            # ever records "in_progress").
+            if (not smoke) and completed_steps % checkpoint_every_n_steps == 0 and completed_steps < step_target:
+                checkpoint_module.save_checkpoint(
+                    model, config, gene_names, checkpoint_dir, completed_steps,
+                    extra_metadata={
+                        "n_skipped_nonfinite": n_skipped_nonfinite, "completion_reason": "in_progress",
+                        **({"early_stopping": early_stopping_state} if early_stopping_state is not None else {}),
+                    },
+                    keep_last=checkpoint_keep_last, optimizer=optimizer, rng=sample_rng, run_manifest=run_manifest,
+                )
+            step = completed_steps
+
+        if not smoke and step > resume_step:
             checkpoint_module.save_checkpoint(
-                model, config, gene_names, checkpoint_dir, completed_steps,
-                extra_metadata={"n_skipped_nonfinite": n_skipped_nonfinite, "completion_reason": "in_progress"},
+                model, config, gene_names, checkpoint_dir, step,
+                extra_metadata={
+                    "n_skipped_nonfinite": n_skipped_nonfinite, "completion_reason": completion_reason,
+                    **({"early_stopping": early_stopping_state} if early_stopping_state is not None else {}),
+                },
                 keep_last=checkpoint_keep_last, optimizer=optimizer, rng=sample_rng, run_manifest=run_manifest,
             )
-        step = completed_steps
-
-    if not smoke and step > resume_step:
-        checkpoint_module.save_checkpoint(
-            model, config, gene_names, checkpoint_dir, step,
-            extra_metadata={"n_skipped_nonfinite": n_skipped_nonfinite, "completion_reason": completion_reason},
-            keep_last=checkpoint_keep_last, optimizer=optimizer, rng=sample_rng, run_manifest=run_manifest,
-        )
+    finally:
+        if tensorboard_logger is not None:
+            tensorboard_logger.close()
 
     elapsed = time.time() - start_time
     summary = {
@@ -2524,6 +2578,7 @@ def run_training(
         "final_step": step,
         "n_skipped_nonfinite": n_skipped_nonfinite, "elapsed_seconds": elapsed,
         "completion_reason": completion_reason, "checkpoint_dir": str(checkpoint_dir),
+        "early_stopping": early_stopping_state,
     }
     print(f"training run finished: {summary}", flush=True)
     return summary
