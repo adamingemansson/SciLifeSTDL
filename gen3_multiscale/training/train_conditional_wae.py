@@ -19,6 +19,7 @@ from gen3_multiscale.conditional_wae import (
     ConditionalWAEMaskedGEXDataset,
     ConditionalWAE,
 )
+from gen3_multiscale.conditional_wae.coexpression import load_conditional_wae_gene_coexpression_basis
 from gen3_multiscale.conditional_wae.contract import static_audit_conditional_wae_config
 from gen3_multiscale.conditional_wae.film_diagnostics import compute_film_diagnostics
 from gen3_multiscale.conditional_wae.reference_projection import ensure_reference_gex_projection
@@ -167,7 +168,7 @@ def accumulate_and_step_generator(
     return accumulated_losses, float(grad_norm)
 
 
-def _build_model(config: dict, n_genes: int) -> ConditionalWAE:
+def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = None) -> ConditionalWAE:
     model_cfg = config["model"]
     params = model_cfg["params"]
     conditioner = Architecture1ImageConditioner(
@@ -182,6 +183,20 @@ def _build_model(config: dict, n_genes: int) -> ConditionalWAE:
         dropout=float(params.get("dropout", 0.1)),
     )
     loss = config["loss"]
+    gene_coexpression_basis = None
+    if bool(params.get("use_gene_coexpression_refinement", False)):
+        if gene_names is None:
+            raise ValueError(
+                "model.params.use_gene_coexpression_refinement requires _build_model's gene_names argument"
+            )
+        basis_path = config["data"].get("gene_coexpression_basis_path")
+        if not basis_path:
+            raise ValueError(
+                "model.params.use_gene_coexpression_refinement requires data.gene_coexpression_basis_path"
+            )
+        gene_coexpression_basis, _basis_metadata = load_conditional_wae_gene_coexpression_basis(
+            basis_path, gene_names,
+        )
     return ConditionalWAE(
         n_genes,
         conditioner,
@@ -196,6 +211,7 @@ def _build_model(config: dict, n_genes: int) -> ConditionalWAE:
         encoder_conditioning=str(params.get("encoder_conditioning", "none")),
         film_layers=tuple(params.get("film_layers", ("first", "second"))),
         film_shared_generator=bool(params.get("film_shared_generator", False)),
+        gene_coexpression_basis=gene_coexpression_basis,
     )
 
 
@@ -471,7 +487,7 @@ def run_conditional_wae_training(
     loop_rng = random.Random(seed)
     device = torch.device(training_cfg.get("device", "cuda") if torch.cuda.is_available() else "cpu")
     gene_names = list(dataset_manifest["gene_panel"])
-    model = _build_model(config, len(gene_names)).to(device)
+    model = _build_model(config, len(gene_names), gene_names=gene_names).to(device)
     generator_parameters = [
         parameter for name, parameter in model.named_parameters()
         if not name.startswith("discriminator.")

@@ -13,10 +13,12 @@ import torch
 import torch.nn as nn
 from torch.func import functional_call
 
+from gen3_multiscale.conditional_wae.coexpression import GeneCoexpressionRefinement
 from gen3_multiscale.conditional_wae.inputs import (
     FullImageExpressionInputs,
     validate_full_image_expression_inputs,
 )
+from gen3_multiscale.models.gene_basis import GeneResidualBasis
 from gen3_multiscale.gen5.autoencoder import ExpressionEncoder
 from gen3_multiscale.data.boundary_graph import build_knn_adjacency
 from gen3_multiscale.models.attention import RelativeGeometryBias
@@ -329,7 +331,8 @@ class ConditionalWAE(nn.Module):
                  n_inference_samples: int = 8,
                  encoder_conditioning: str = "none",
                  film_layers: tuple[str, ...] = ("first", "second"),
-                 film_shared_generator: bool = False):
+                 film_shared_generator: bool = False,
+                 gene_coexpression_basis: GeneResidualBasis | None = None):
         super().__init__()
         if regularizer not in {"mmd", "gan"}:
             raise ValueError("regularizer must be 'mmd' or 'gan'")
@@ -378,6 +381,11 @@ class ConditionalWAE(nn.Module):
             )
             if regularizer == "gan" else None
         )
+        self.coexpression_refinement = None
+        if gene_coexpression_basis is not None:
+            if gene_coexpression_basis.n_genes != n_genes:
+                raise ValueError("gene_coexpression_basis and ConditionalWAE must use the same n_genes")
+            self.coexpression_refinement = GeneCoexpressionRefinement(gene_coexpression_basis)
 
     def _target(self, inputs: FullImageExpressionInputs, target_expression, *,
                 device: torch.device, dtype: torch.dtype, n_rows: int) -> torch.Tensor:
@@ -398,7 +406,14 @@ class ConditionalWAE(nn.Module):
             raise ValueError("z must have one configured-width row per image-context row")
         conditional_mean = self.conditional_mean_head(context)
         residual = self.residual_decoder(torch.cat([context, z], dim=-1))
-        return conditional_mean + residual, conditional_mean
+        reconstruction = conditional_mean + residual
+        # The coexpression refinement (when enabled) only ever nudges the
+        # ordinary full-gene prediction -- conditional_mean, the base
+        # image-only prediction reported and compared throughout this
+        # project, is deliberately never touched by it.
+        if self.coexpression_refinement is not None:
+            reconstruction = self.coexpression_refinement(reconstruction)
+        return reconstruction, conditional_mean
 
     def _encode_target(self, target: torch.Tensor, context: torch.Tensor | None) -> torch.Tensor:
         if self.encoder_conditioning == "film":

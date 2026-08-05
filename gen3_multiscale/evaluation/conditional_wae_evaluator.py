@@ -101,7 +101,7 @@ def evaluate_conditional_wae(
     gene_names = list(dataset_manifest["gene_panel"])
     checkpoint_module.verify_gene_names(requested_checkpoint, gene_names)
     device = torch.device(device_name if torch.cuda.is_available() else "cpu")
-    model = _build_model(config, len(gene_names)).to(device)
+    model = _build_model(config, len(gene_names), gene_names=gene_names).to(device)
     checkpoint_module.load_trainable_state(model, requested_checkpoint)
     model.eval()
 

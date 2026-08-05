@@ -38,6 +38,12 @@ ARM_SPECS = {
     # which this static contract does not govern beyond the checks below.
     "wae_he_gan_uni2_control": ConditionalWAEArmSpec("he_to_st", "gan", False),
     "wae_he_gan_uni2": ConditionalWAEArmSpec("he_to_st", "gan", False),
+    # Gene-coexpression decoder-side refinement ablation: same immutable
+    # task/regularizer/include_observed_gex contract as "wae_he_gan" --
+    # only model.params.use_gene_coexpression_refinement and
+    # data.gene_coexpression_basis_path differ.
+    "wae_he_gan_coexpression_control": ConditionalWAEArmSpec("he_to_st", "gan", False),
+    "wae_he_gan_coexpression": ConditionalWAEArmSpec("he_to_st", "gan", False),
 }
 
 _VALID_FILM_LAYERS = frozenset({"first", "second"})
@@ -73,7 +79,12 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
             raise ValueError(f"model.params.film_layers must be a non-empty subset of {_VALID_FILM_LAYERS}")
         if bool(params.get("film_shared_generator", False)) and film_layers != _VALID_FILM_LAYERS:
             raise ValueError("model.params.film_shared_generator requires film_layers to include both layers")
+    use_gene_coexpression_refinement = bool(params.get("use_gene_coexpression_refinement", False))
     data = config.get("data") or {}
+    if use_gene_coexpression_refinement and not data.get("gene_coexpression_basis_path"):
+        raise ValueError(
+            "model.params.use_gene_coexpression_refinement requires data.gene_coexpression_basis_path"
+        )
     if not data.get("gen3_manifest_path"):
         raise ValueError("data.gen3_manifest_path must point to an immutable manifest")
     image_encoder = str(data.get("image_encoder", "gigapath"))
@@ -101,4 +112,5 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
         "query_gex_visible": False,
         "surrounding_gex_visible": spec.include_observed_gex,
         "image_encoder": image_encoder,
+        "use_gene_coexpression_refinement": use_gene_coexpression_refinement,
     }
