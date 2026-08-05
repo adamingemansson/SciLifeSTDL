@@ -8,6 +8,7 @@ from gen3_multiscale.conditional_wae import (
     Architecture1ImageConditioner,
     ConditionalWAEMaskedGEXDataset,
     ConditionalWAE,
+    FiLMConditionedExpressionEncoder,
     FullImageExpressionInputs,
     build_conditional_wae_example,
     imq_mmd,
@@ -48,6 +49,129 @@ def _model(regularizer):
         regularizer=regularizer, latent_dim=5, autoencoder_hidden_dim=20,
         discriminator_hidden_dim=12, n_inference_samples=3,
     )
+
+
+def _film_model(*, film_layers=("first", "second"), shared=False, regularizer="gan"):
+    return ConditionalWAE(
+        7,
+        Architecture1ImageConditioner(
+            7, image_feature_dim=16, gex_feature_dim=6,
+            hidden_dim=24, n_heads=4, n_blocks=1,
+            dense_threshold=20, sparse_k=3, dropout=0.0,
+        ),
+        regularizer=regularizer, latent_dim=5, autoencoder_hidden_dim=20,
+        discriminator_hidden_dim=12, n_inference_samples=3,
+        encoder_conditioning="film", film_layers=film_layers, film_shared_generator=shared,
+    )
+
+
+def test_film_encoder_output_is_identical_across_contexts_at_init():
+    encoder = FiLMConditionedExpressionEncoder(7, context_dim=24, latent_dim=5, hidden_dim=20)
+    expression = torch.randn(6, 7)
+    context_a = torch.randn(6, 24)
+    context_b = torch.randn(6, 24) * 10.0
+    torch.testing.assert_close(encoder(expression, context_a), encoder(expression, context_b))
+
+
+def test_film_layer_selection_only_builds_the_requested_generators():
+    both = FiLMConditionedExpressionEncoder(7, 24, film_layers=("first", "second"))
+    assert both.film_first is not None and both.film_second is not None
+    first_only = FiLMConditionedExpressionEncoder(7, 24, film_layers=("first",))
+    assert first_only.film_first is not None and first_only.film_second is None
+    last_only = FiLMConditionedExpressionEncoder(7, 24, film_layers=("second",))
+    assert last_only.film_first is None and last_only.film_second is not None
+
+
+def test_film_shared_generator_ties_both_layers_to_one_module():
+    shared = FiLMConditionedExpressionEncoder(7, 24, film_layers=("first", "second"), shared_film_generator=True)
+    assert shared.film_first is shared.film_second
+    independent = FiLMConditionedExpressionEncoder(7, 24, film_layers=("first", "second"), shared_film_generator=False)
+    assert independent.film_first is not independent.film_second
+
+
+def test_film_shared_generator_requires_both_layers():
+    with pytest.raises(ValueError, match="both layers"):
+        FiLMConditionedExpressionEncoder(7, 24, film_layers=("first",), shared_film_generator=True)
+
+
+def test_film_layers_rejects_invalid_or_empty_values():
+    with pytest.raises(ValueError, match="film_layers"):
+        FiLMConditionedExpressionEncoder(7, 24, film_layers=())
+    with pytest.raises(ValueError, match="film_layers"):
+        FiLMConditionedExpressionEncoder(7, 24, film_layers=("bogus",))
+
+
+def test_film_variant_routes_gradients_into_the_film_generators():
+    model = _film_model(regularizer="mmd")
+    inputs, target = _inputs(), torch.randn(12, 7)
+    losses = model.compute_generator_losses(
+        inputs, target, generator=torch.Generator().manual_seed(1),
+    )
+    losses["total"].backward()
+    encoder = model.expression_encoder
+    assert encoder.film_first.to_gamma_beta.weight.grad is not None
+    assert encoder.film_second.to_gamma_beta.weight.grad is not None
+    assert any(parameter.grad is not None for parameter in model.image_conditioner.parameters())
+    assert any(parameter.grad is not None for parameter in model.residual_decoder.parameters())
+
+
+def test_film_variant_discriminator_loss_requires_inputs():
+    model = _film_model(regularizer="gan")
+    target = torch.randn(12, 7)
+    with pytest.raises(ValueError, match="requires 'inputs'"):
+        model.compute_discriminator_loss(target, generator=torch.Generator().manual_seed(2))
+    loss = model.compute_discriminator_loss(
+        target, inputs=_inputs(), generator=torch.Generator().manual_seed(2),
+    )
+    assert torch.isfinite(loss)
+
+
+def test_film_variant_still_enforces_query_gex_leakage_contract():
+    model = _film_model(regularizer="gan")
+    base = _inputs()
+    query = np.ones(12, dtype=bool)
+    leaking = FullImageExpressionInputs(
+        base.sample_id, base.image_features, base.coords, base.image_available,
+        query, np.ones((12, 7), dtype=np.float32), np.arange(12), np.ones(12, dtype=bool),
+    )
+    with pytest.raises(ValueError, match="target-expression leakage"):
+        model.compute_generator_losses(leaking, torch.randn(12, 7), generator=torch.Generator().manual_seed(3))
+
+
+def test_encode_posterior_requires_inputs_when_film_active_but_not_otherwise():
+    film_model = _film_model(regularizer="mmd")
+    target = torch.randn(12, 7)
+    with pytest.raises(ValueError, match="requires 'inputs'"):
+        film_model.encode_posterior(target)
+    posterior = film_model.encode_posterior(target, inputs=_inputs())
+    assert posterior.shape == (12, 5)
+
+    plain_model = _model("mmd")
+    assert plain_model.encode_posterior(target).shape == (12, 5)
+
+
+def test_build_model_wires_film_config_into_the_constructed_encoder():
+    config = {
+        "model": {
+            "arm": "wae_he_gan_film_first_only", "kind": "conditional_wae",
+            "task": "he_to_st", "regularizer": "gan",
+            "include_observed_gex": False, "image_mode": "full_visible",
+            "params": {
+                "image_feature_dim": 16, "gex_feature_dim": 6,
+                "hidden_dim": 24, "n_heads": 4, "n_blocks": 1,
+                "dense_threshold": 20, "sparse_k": 3, "dropout": 0.1,
+                "latent_dim": 5, "autoencoder_hidden_dim": 20,
+                "discriminator_hidden_dim": 12, "n_inference_samples": 3,
+                "encoder_conditioning": "film", "film_layers": ["first"],
+                "film_shared_generator": False,
+            },
+        },
+        "loss": {"pcc_weight": 0.1, "regularizer_weight": 0.1, "conditional_mean_weight": 1.0},
+    }
+    model = train_conditional_wae._build_model(config, n_genes=7)
+    assert isinstance(model.expression_encoder, FiLMConditionedExpressionEncoder)
+    assert model.expression_encoder.film_first is not None
+    assert model.expression_encoder.film_second is None
 
 
 def test_inputs_forbid_hidden_image_content_in_unavailable_rows():

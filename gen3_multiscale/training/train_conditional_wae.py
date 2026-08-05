@@ -108,9 +108,9 @@ def accumulate_and_step_discriminator(
         raise ValueError("micro_batches must be non-empty")
     optimizer.zero_grad(set_to_none=True)
     loss_accum = 0.0
-    for mask_index, _inputs, target_tensor in micro_batches:
+    for mask_index, micro_inputs, target_tensor in micro_batches:
         micro_loss = model.compute_discriminator_loss(
-            target_tensor,
+            target_tensor, inputs=micro_inputs,
             generator=torch.Generator(device=target_tensor.device).manual_seed(seed + 2 * mask_index),
         )
         if not torch.isfinite(micro_loss):
@@ -189,6 +189,9 @@ def _build_model(config: dict, n_genes: int) -> ConditionalWAE:
         conditional_mean_weight=float(loss["conditional_mean_weight"]),
         pcc_weight=float(loss["pcc_weight"]),
         n_inference_samples=int(params["n_inference_samples"]),
+        encoder_conditioning=str(params.get("encoder_conditioning", "none")),
+        film_layers=tuple(params.get("film_layers", ("first", "second"))),
+        film_shared_generator=bool(params.get("film_shared_generator", False)),
     )
 
 
@@ -279,7 +282,7 @@ def _validate(model: ConditionalWAE, dataset, *, device: torch.device, seed: int
                 raise ValueError("TensorBoard snapshot requires the aligned validation sample")
             # Held-out target GEX is encoded only for a diagnostic Projector view.
             # It is never fed to sample_predictive_distribution or model selection.
-            posterior_z = model.expression_encoder(target_tensor)
+            posterior_z = model.encode_posterior(target_tensor, inputs=inputs)
             snapshot.add(
                 inputs=inputs, target=target_tensor, identity=identity,
                 prediction=prediction, posterior_z=posterior_z,

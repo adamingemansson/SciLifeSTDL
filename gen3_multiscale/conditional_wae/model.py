@@ -238,6 +238,79 @@ def imq_mmd(encoded: torch.Tensor, prior: torch.Tensor,
     return value.clamp_min(0.0)
 
 
+class _FiLMGenerator(nn.Module):
+    """Maps image context to a per-feature (gamma, beta) pair, zero-initialized
+    so `gamma=1, beta=0` regardless of context -- FiLM(h) = h at construction,
+    identical to no conditioning at all until training moves the weights."""
+
+    def __init__(self, context_dim: int, feature_dim: int):
+        super().__init__()
+        self.feature_dim = int(feature_dim)
+        self.to_gamma_beta = nn.Linear(context_dim, 2 * self.feature_dim)
+        nn.init.zeros_(self.to_gamma_beta.weight)
+        nn.init.zeros_(self.to_gamma_beta.bias)
+
+    def forward(self, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        gamma_beta = self.to_gamma_beta(context)
+        gamma, beta = gamma_beta[..., : self.feature_dim], gamma_beta[..., self.feature_dim :]
+        return 1.0 + gamma, beta
+
+
+class FiLMConditionedExpressionEncoder(nn.Module):
+    """Same two-hidden-layer + projection shape as ExpressionEncoder, but the
+    requested hidden layer(s) are FiLM-modulated by image context: the
+    encoding of target expression becomes a function of both the expression
+    AND the image, q(z | expression, context), instead of q(z | expression)
+    alone. `film_layers` selects which of {"first", "second"} hidden layers
+    receive FiLM; `shared_film_generator` ties the two layers' (gamma, beta)
+    generators into one module instead of independent ones."""
+
+    _VALID_LAYERS = frozenset({"first", "second"})
+
+    def __init__(self, n_genes: int, context_dim: int, *, latent_dim: int = 256,
+                 hidden_dim: int = 1024, film_layers: tuple[str, ...] = ("first", "second"),
+                 shared_film_generator: bool = False):
+        super().__init__()
+        chosen = frozenset(film_layers)
+        if not chosen or not chosen.issubset(self._VALID_LAYERS):
+            raise ValueError(f"film_layers must be a non-empty subset of {self._VALID_LAYERS}, got {film_layers}")
+        if shared_film_generator and chosen != self._VALID_LAYERS:
+            raise ValueError("shared_film_generator requires film_layers to include both layers")
+        self.film_layers = chosen
+        self.linear1 = nn.Linear(n_genes, hidden_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.projection = nn.Linear(hidden_dim, latent_dim)
+        self.activation = nn.GELU()
+
+        if shared_film_generator:
+            shared = _FiLMGenerator(context_dim, hidden_dim)
+            self.film_first, self.film_second = shared, shared
+        else:
+            self.film_first = _FiLMGenerator(context_dim, hidden_dim) if "first" in chosen else None
+            self.film_second = _FiLMGenerator(context_dim, hidden_dim) if "second" in chosen else None
+
+    def forward(self, expression: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        if expression.ndim != 2:
+            raise ValueError(f"expression must be [N, n_genes], got shape {tuple(expression.shape)}")
+        if context.shape[0] != expression.shape[0]:
+            raise ValueError("context must have one row per expression row")
+        hidden = self.norm1(self.linear1(expression))
+        if self.film_first is not None:
+            gamma, beta = self.film_first(context)
+            hidden = gamma * hidden + beta
+        hidden = self.activation(hidden)
+
+        hidden = self.norm2(self.linear2(hidden))
+        if self.film_second is not None:
+            gamma, beta = self.film_second(context)
+            hidden = gamma * hidden + beta
+        hidden = self.activation(hidden)
+
+        return self.projection(hidden)
+
+
 class ConditionalWAE(nn.Module):
     """Conditional full-expression WAE with either MMD or GAN prior matching.
 
@@ -253,7 +326,10 @@ class ConditionalWAE(nn.Module):
                  regularizer_weight: float = 0.1,
                  conditional_mean_weight: float = 1.0,
                  pcc_weight: float = 0.1,
-                 n_inference_samples: int = 8):
+                 n_inference_samples: int = 8,
+                 encoder_conditioning: str = "none",
+                 film_layers: tuple[str, ...] = ("first", "second"),
+                 film_shared_generator: bool = False):
         super().__init__()
         if regularizer not in {"mmd", "gan"}:
             raise ValueError("regularizer must be 'mmd' or 'gan'")
@@ -261,6 +337,8 @@ class ConditionalWAE(nn.Module):
             raise ValueError("n_genes, latent_dim and n_inference_samples must be positive")
         if regularizer_weight < 0 or conditional_mean_weight < 0 or pcc_weight < 0:
             raise ValueError("loss weights must be non-negative")
+        if encoder_conditioning not in {"none", "film"}:
+            raise ValueError("encoder_conditioning must be 'none' or 'film'")
         self.n_genes = int(n_genes)
         self.latent_dim = int(latent_dim)
         self.regularizer = regularizer
@@ -268,13 +346,20 @@ class ConditionalWAE(nn.Module):
         self.conditional_mean_weight = float(conditional_mean_weight)
         self.pcc_weight = float(pcc_weight)
         self.n_inference_samples = int(n_inference_samples)
+        self.encoder_conditioning = encoder_conditioning
         self.image_conditioner = image_conditioner
         if image_conditioner.n_genes != n_genes:
             raise ValueError("image_conditioner and ConditionalWAE must use the same n_genes")
         context_dim = image_conditioner.hidden_dim
-        self.expression_encoder = ExpressionEncoder(
-            n_genes, latent_dim=latent_dim, hidden_dim=autoencoder_hidden_dim,
-        )
+        if encoder_conditioning == "film":
+            self.expression_encoder = FiLMConditionedExpressionEncoder(
+                n_genes, context_dim, latent_dim=latent_dim, hidden_dim=autoencoder_hidden_dim,
+                film_layers=film_layers, shared_film_generator=film_shared_generator,
+            )
+        else:
+            self.expression_encoder = ExpressionEncoder(
+                n_genes, latent_dim=latent_dim, hidden_dim=autoencoder_hidden_dim,
+            )
         self.conditional_mean_head = nn.Sequential(
             nn.LayerNorm(context_dim), nn.Linear(context_dim, autoencoder_hidden_dim),
             nn.GELU(), nn.Linear(autoencoder_hidden_dim, n_genes),
@@ -315,6 +400,25 @@ class ConditionalWAE(nn.Module):
         residual = self.residual_decoder(torch.cat([context, z], dim=-1))
         return conditional_mean + residual, conditional_mean
 
+    def _encode_target(self, target: torch.Tensor, context: torch.Tensor | None) -> torch.Tensor:
+        if self.encoder_conditioning == "film":
+            if context is None:
+                raise ValueError("encoder_conditioning='film' requires image context to encode target expression")
+            return self.expression_encoder(target, context)
+        return self.expression_encoder(target)
+
+    def encode_posterior(self, target_expression, inputs: FullImageExpressionInputs | None = None) -> torch.Tensor:
+        """Diagnostic-only q(z | target expression[, image context]). Never
+        used for training loss or eval metrics -- exists for TensorBoard
+        Projector snapshots, which are allowed to see real target GEX since
+        they never feed back into a prediction."""
+        device = next(self.expression_encoder.parameters()).device
+        target = torch.as_tensor(target_expression, dtype=torch.float32, device=device)
+        if self.encoder_conditioning == "film" and inputs is None:
+            raise ValueError("encoder_conditioning='film' requires 'inputs' to encode the posterior")
+        context = self.image_conditioner(inputs) if self.encoder_conditioning == "film" else None
+        return self._encode_target(target, context)
+
     def compute_generator_losses(self, inputs: FullImageExpressionInputs,
                                  target_expression, *, generator=None) -> dict:
         context = self.image_conditioner(inputs)
@@ -322,7 +426,7 @@ class ConditionalWAE(nn.Module):
             inputs, target_expression, device=context.device, dtype=context.dtype,
             n_rows=context.shape[0],
         )
-        encoded = self.expression_encoder(target)
+        encoded = self._encode_target(target, context)
         prior = torch.randn(
             encoded.shape, dtype=encoded.dtype, device=encoded.device, generator=generator,
         )
@@ -366,15 +470,19 @@ class ConditionalWAE(nn.Module):
             "prior_loss": prior_loss,
         }
 
-    def compute_discriminator_loss(self, target_expression, *, generator=None) -> torch.Tensor:
+    def compute_discriminator_loss(self, target_expression, *, generator=None,
+                                   inputs: FullImageExpressionInputs | None = None) -> torch.Tensor:
         if self.discriminator is None:
             raise RuntimeError("discriminator loss is only defined for regularizer='gan'")
+        if self.encoder_conditioning == "film" and inputs is None:
+            raise ValueError("encoder_conditioning='film' requires 'inputs' to compute the discriminator loss")
         device = next(self.expression_encoder.parameters()).device
         target = torch.as_tensor(target_expression, dtype=torch.float32, device=device)
         if target.ndim != 2 or target.shape[1] != self.n_genes or not torch.isfinite(target).all():
             raise ValueError("target_expression must be finite [N, n_genes]")
         with torch.no_grad():
-            encoded = self.expression_encoder(target)
+            context = self.image_conditioner(inputs) if self.encoder_conditioning == "film" else None
+            encoded = self._encode_target(target, context)
         prior = torch.randn(
             encoded.shape, dtype=encoded.dtype, device=encoded.device, generator=generator,
         )

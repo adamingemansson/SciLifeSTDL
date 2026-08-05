@@ -24,7 +24,17 @@ ARM_SPECS = {
     "wae_he_gan_accum8": ConditionalWAEArmSpec("he_to_st", "gan", False),
     "wae_he_gan_lr3e5": ConditionalWAEArmSpec("he_to_st", "gan", False),
     "wae_he_gan_small": ConditionalWAEArmSpec("he_to_st", "gan", False),
+    # FiLM-conditioned-encoder architecture ablation arms. Same immutable
+    # task/regularizer/include_observed_gex contract as "wae_he_gan" --
+    # only model.params.encoder_conditioning/film_layers/film_shared_generator
+    # differ, which this static contract does not govern beyond shape checks.
+    "wae_he_gan_film_control": ConditionalWAEArmSpec("he_to_st", "gan", False),
+    "wae_he_gan_film_first_only": ConditionalWAEArmSpec("he_to_st", "gan", False),
+    "wae_he_gan_film_last_only": ConditionalWAEArmSpec("he_to_st", "gan", False),
+    "wae_he_gan_film_shared": ConditionalWAEArmSpec("he_to_st", "gan", False),
 }
+
+_VALID_FILM_LAYERS = frozenset({"first", "second"})
 
 
 def static_audit_conditional_wae_config(config: dict) -> dict:
@@ -47,6 +57,15 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
     for field in ("latent_dim", "hidden_dim", "gex_feature_dim", "autoencoder_hidden_dim"):
         if int(params.get(field, 0)) < 1:
             raise ValueError(f"model.params.{field} must be positive")
+    encoder_conditioning = params.get("encoder_conditioning", "none")
+    if encoder_conditioning not in {"none", "film"}:
+        raise ValueError("model.params.encoder_conditioning must be 'none' or 'film'")
+    if encoder_conditioning == "film":
+        film_layers = frozenset(params.get("film_layers", ("first", "second")))
+        if not film_layers or not film_layers.issubset(_VALID_FILM_LAYERS):
+            raise ValueError(f"model.params.film_layers must be a non-empty subset of {_VALID_FILM_LAYERS}")
+        if bool(params.get("film_shared_generator", False)) and film_layers != _VALID_FILM_LAYERS:
+            raise ValueError("model.params.film_shared_generator requires film_layers to include both layers")
     data = config.get("data") or {}
     if not data.get("gen3_manifest_path"):
         raise ValueError("data.gen3_manifest_path must point to an immutable manifest")
