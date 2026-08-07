@@ -63,6 +63,14 @@ ARM_ORDER = (
     "wae_he_mmd_geneencoder_omiclip_mlp_nofilm",
 )
 
+# OmiCLIP's real, fixed CoCa ViT-L/14 image-embedding width
+# (gen4/omiclip_encoder.py::_OUTPUT_DIM) -- NEVER copy image_feature_dim
+# from --comparison-config here: that config is a GigaPath/UNI2-shaped
+# Architecture 1 config (both happen to share width 1536), and
+# conditional_wae/model.py enforces image.shape[1] == image_feature_dim
+# with a hard runtime error, not a silent reshape.
+_OMICLIP_IMAGE_FEATURE_DIM = 768
+
 
 def prepare_wae_mmd_geneencoder_omiclip_ablation_suite(
     *, comparison_config: str, manifest: str, train_gene_panels: str,
@@ -112,6 +120,7 @@ def prepare_wae_mmd_geneencoder_omiclip_ablation_suite(
         )
     }
     shared_params.update({
+        "image_feature_dim": _OMICLIP_IMAGE_FEATURE_DIM,
         "gex_feature_dim": int((base.get("data") or {}).get("gex_feature_dim", 256)),
         "latent_dim": int(latent_dim),
         "autoencoder_hidden_dim": 1024,

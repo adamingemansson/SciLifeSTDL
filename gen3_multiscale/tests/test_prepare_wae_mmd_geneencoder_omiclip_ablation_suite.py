@@ -79,6 +79,11 @@ def test_prepare_writes_the_four_factorial_arms_with_the_right_overrides(tmp_pat
         assert arm_config["model"]["params"]["latent_dim"] == 64
         assert arm_config["data"]["image_encoder"] == "omiclip"
         assert arm_config["data"]["omiclip_pinned_revision"] == OMICLIP_REVISION
+        # Real bug caught before launch: the comparison-config fixture below sets
+        # image_feature_dim=1536 (GigaPath/UNI2's shared width) -- OmiCLIP is 768,
+        # and conditional_wae/model.py hard-errors on a mismatched width, so this
+        # must never be silently inherited from the comparison config.
+        assert arm_config["model"]["params"]["image_feature_dim"] == 768
 
     scf_film = configs["wae_he_mmd_geneencoder_omiclip_scfoundation_film"]
     assert scf_film["model"]["params"]["gene_encoder_source"] == "frozen_table"
