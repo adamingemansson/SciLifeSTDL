@@ -145,7 +145,14 @@ def static_audit_gen4_config(config: dict) -> dict:
     }
 
 
-def audit_uni2_cache_matches_config(cache_root: str | Path, sample_id: str, config: dict, *, require_exists: bool = False) -> dict:
+def audit_uni2_cache_matches_config(
+    cache_root: str | Path,
+    sample_id: str,
+    config: dict,
+    *,
+    require_exists: bool = False,
+    artifact_file_sha256: dict[str, str] | None = None,
+) -> dict:
     """If a UNI2 spot-feature cache already exists for this sample, its
     recorded FULL identity (output_dim, revision, checkpoint content
     hash, package version, preprocessing spec) must match the config's
@@ -197,7 +204,10 @@ def audit_uni2_cache_matches_config(cache_root: str | Path, sample_id: str, conf
         checkpoint_path = Path(str(declared_checkpoint_path))
         if not checkpoint_path.is_file():
             raise FileNotFoundError(f"required_fingerprints.uni2_checkpoint={checkpoint_path} does not exist")
-        expected_checkpoint_sha256 = _sha256_file(checkpoint_path)
+        expected_checkpoint_sha256 = (
+            (artifact_file_sha256 or {}).get("uni2_checkpoint")
+            or _sha256_file(checkpoint_path)
+        )
         if expected_checkpoint_sha256 != actual_checkpoint_sha256:
             mismatches.append(
                 f"uni2_checkpoint content sha256: config file={expected_checkpoint_sha256} cache={actual_checkpoint_sha256}"
@@ -211,7 +221,14 @@ def audit_uni2_cache_matches_config(cache_root: str | Path, sample_id: str, conf
     }
 
 
-def audit_scfoundation_cache_matches_config(cache_root: str | Path, sample_id: str, config: dict, *, require_exists: bool = False) -> dict:
+def audit_scfoundation_cache_matches_config(
+    cache_root: str | Path,
+    sample_id: str,
+    config: dict,
+    *,
+    require_exists: bool = False,
+    artifact_file_sha256: dict[str, str] | None = None,
+) -> dict:
     """Same discipline as audit_uni2_cache_matches_config, applied to
     scFoundation's own FULL identity (output_dim, vocabulary sha256,
     checkpoint content hash, package version, preprocessing spec)."""
@@ -247,7 +264,10 @@ def audit_scfoundation_cache_matches_config(cache_root: str | Path, sample_id: s
     if declared_vocab:
         vocab_path = Path(str(declared_vocab))
         if vocab_path.is_file():
-            expected_vocab_sha256 = _sha256_file(vocab_path)
+            expected_vocab_sha256 = (
+                (artifact_file_sha256 or {}).get("scfoundation_vocab")
+                or _sha256_file(vocab_path)
+            )
             if expected_vocab_sha256 != actual_vocab_sha256:
                 mismatches.append(
                     f"scfoundation_vocab content sha256: config file={expected_vocab_sha256} cache={actual_vocab_sha256}"
@@ -261,7 +281,10 @@ def audit_scfoundation_cache_matches_config(cache_root: str | Path, sample_id: s
         checkpoint_path = Path(str(declared_checkpoint_path))
         if not checkpoint_path.is_file():
             raise FileNotFoundError(f"required_fingerprints.scfoundation_checkpoint={checkpoint_path} does not exist")
-        expected_checkpoint_sha256 = _sha256_file(checkpoint_path)
+        expected_checkpoint_sha256 = (
+            (artifact_file_sha256 or {}).get("scfoundation_checkpoint")
+            or _sha256_file(checkpoint_path)
+        )
         if expected_checkpoint_sha256 != actual_checkpoint_sha256:
             mismatches.append(
                 f"scfoundation_checkpoint content sha256: config file={expected_checkpoint_sha256} cache={actual_checkpoint_sha256}"
@@ -275,7 +298,14 @@ def audit_scfoundation_cache_matches_config(cache_root: str | Path, sample_id: s
     }
 
 
-def audit_uni2_dense_cache_matches_config(cache_root: str | Path, sample_id: str, config: dict, *, require_exists: bool = False) -> dict:
+def audit_uni2_dense_cache_matches_config(
+    cache_root: str | Path,
+    sample_id: str,
+    config: dict,
+    *,
+    require_exists: bool = False,
+    artifact_file_sha256: dict[str, str] | None = None,
+) -> dict:
     """Same discipline as `audit_uni2_cache_matches_config`, applied to
     the UNI2 dense-WSI cache arm A/C's `global_context_source=
     "uni2_pool"` consumes (`gen4.uni2_dense_wsi_cache`). Resolves the
@@ -327,7 +357,10 @@ def audit_uni2_dense_cache_matches_config(cache_root: str | Path, sample_id: str
         checkpoint_path = Path(str(declared_checkpoint_path))
         if not checkpoint_path.is_file():
             raise FileNotFoundError(f"required_fingerprints.uni2_checkpoint={checkpoint_path} does not exist")
-        expected_checkpoint_sha256 = _sha256_file(checkpoint_path)
+        expected_checkpoint_sha256 = (
+            (artifact_file_sha256 or {}).get("uni2_checkpoint")
+            or _sha256_file(checkpoint_path)
+        )
         if expected_checkpoint_sha256 != actual_checkpoint_sha256:
             mismatches.append(
                 f"uni2_checkpoint content sha256: config file={expected_checkpoint_sha256} cache={actual_checkpoint_sha256}"
@@ -371,15 +404,55 @@ def audit_gen4_manifest_cache_coverage(cache_root: str | Path, sample_ids: list[
     modalities = _ARM_CACHE_MODALITIES.get(arm)
     if modalities is None:
         raise ValueError(f"unknown model.arm {arm!r} -- expected one of {sorted(_ARM_CACHE_MODALITIES)}")
-    checked = {"arm": arm, "modalities": sorted(modalities), "n_samples": len(sample_ids), "samples": {}}
+    # Large external checkpoints can be several GiB.  The per-sample
+    # helpers intentionally verify their numeric content, but hashing the
+    # same immutable file once for every sample (and, for UNI2, once for
+    # both the spot and dense cache) turns a 56-sample preflight into
+    # hundreds of GiB of redundant disk reads.  Compute each configured
+    # artifact hash once and thread it through every exact comparison.
+    fingerprints = config.get("required_fingerprints") or {}
+    artifact_file_sha256: dict[str, str] = {}
+    for name in ("uni2_checkpoint", "scfoundation_checkpoint", "scfoundation_vocab"):
+        raw_path = fingerprints.get(name)
+        if not raw_path:
+            continue
+        path = Path(str(raw_path))
+        if path.is_file():
+            artifact_file_sha256[name] = _sha256_file(path)
+
+    checked = {
+        "arm": arm,
+        "modalities": sorted(modalities),
+        "n_samples": len(sample_ids),
+        "artifact_file_sha256": artifact_file_sha256,
+        "samples": {},
+    }
     for sample_id in sample_ids:
         sample_report = {}
         if "uni2" in modalities:
-            sample_report["uni2"] = audit_uni2_cache_matches_config(cache_root, sample_id, config, require_exists=True)
+            sample_report["uni2"] = audit_uni2_cache_matches_config(
+                cache_root,
+                sample_id,
+                config,
+                require_exists=True,
+                artifact_file_sha256=artifact_file_sha256,
+            )
         if "uni2_dense" in modalities:
-            sample_report["uni2_dense"] = audit_uni2_dense_cache_matches_config(cache_root, sample_id, config, require_exists=True)
+            sample_report["uni2_dense"] = audit_uni2_dense_cache_matches_config(
+                cache_root,
+                sample_id,
+                config,
+                require_exists=True,
+                artifact_file_sha256=artifact_file_sha256,
+            )
         if "scfoundation" in modalities:
-            sample_report["scfoundation"] = audit_scfoundation_cache_matches_config(cache_root, sample_id, config, require_exists=True)
+            sample_report["scfoundation"] = audit_scfoundation_cache_matches_config(
+                cache_root,
+                sample_id,
+                config,
+                require_exists=True,
+                artifact_file_sha256=artifact_file_sha256,
+            )
         checked["samples"][sample_id] = sample_report
     return checked
 

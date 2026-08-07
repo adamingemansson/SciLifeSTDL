@@ -1844,7 +1844,8 @@ def _log_step(step: int, split: str, losses: dict, extra: str = "") -> None:
 
 
 def run_training(
-    config_path: str, smoke: bool = False, staged_smoke: bool = False, allow_code_drift: bool = False,
+    config_path: str, smoke: bool = False, staged_smoke: bool = False,
+    allow_code_drift: bool = False, disable_early_stopping: bool = False,
 ) -> dict:
     """The real Step 6 training entrypoint. Returns a small summary dict
     (never a live model/optimizer -- those are process-local); a caller
@@ -2278,7 +2279,10 @@ def run_training(
     # already covers these fields, so changing either between resumes is
     # caught by the existing `verify_resume_consistency` fail-closed check
     # above -- no separate drift check is needed here.
-    early_stopping_cfg = resolve_early_stopping_config(training_cfg)
+    early_stopping_cfg = (
+        None if disable_early_stopping
+        else resolve_early_stopping_config(training_cfg)
+    )
     tensorboard_cfg = resolve_core_tensorboard_config(training_cfg)
 
     validation_history_path = checkpoint_dir / "validation_history.json"
@@ -2600,8 +2604,20 @@ def main() -> None:
              "than the one it was last saved under. Codex re-audit of commit 90f853e, launch blocker #10. "
              "Recorded in the new run_manifest.json's code_drift_acknowledged field -- never a silent bypass.",
     )
+    parser.add_argument(
+        "--disable-early-stopping",
+        action="store_true",
+        help="Operational continuation override: retain the checkpoint-bound config "
+             "but disable validation-based termination for this process.",
+    )
     args = parser.parse_args()
-    run_training(args.config, smoke=args.smoke, staged_smoke=args.staged_smoke, allow_code_drift=args.allow_code_drift)
+    run_training(
+        args.config,
+        smoke=args.smoke,
+        staged_smoke=args.staged_smoke,
+        allow_code_drift=args.allow_code_drift,
+        disable_early_stopping=args.disable_early_stopping,
+    )
 
 
 if __name__ == "__main__":
