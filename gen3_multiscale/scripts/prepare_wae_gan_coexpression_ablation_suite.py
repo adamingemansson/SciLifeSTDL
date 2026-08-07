@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Write two matched gene-coexpression-refinement ablation configs: the
-existing decoder (no coexpression component) vs. one with the small,
-zero-init-safe `GeneCoexpressionRefinement` module enabled.
+"""Write three matched gene-coexpression-refinement ablation configs: the
+existing decoder (no coexpression component) vs. TWO treatment arms with
+the small, zero-init-safe `GeneCoexpressionRefinement` module enabled,
+differing only in where its basis comes from -- fit from-scratch on this
+project's own training expression (`wae_he_gan_coexpression`), or derived
+from scFoundation's pretrained gene embeddings instead
+(`wae_he_gan_coexpression_scfoundation`). Both treatment arms are compared
+against the SAME control, so any difference between them isolates "does
+the basis source matter," not just "does a coexpression prior help at
+all."
 
-Both arms share IDENTICAL training hyperparameters and model dimensions
-(matching wae_he_gan_control exactly: lr=1e-4, no gradient accumulation,
-full latent/hidden dims) and the same task/regularizer/
+All three arms share IDENTICAL training hyperparameters and model
+dimensions (matching wae_he_gan_control exactly: lr=1e-4, no gradient
+accumulation, full latent/hidden dims) and the same task/regularizer/
 include_observed_gex/dataset/masking/losses/seed/image-encoder as every
 other WAE-GAN arm. Only `model.params.use_gene_coexpression_refinement`
 (and its matching `data.gene_coexpression_basis_path`) differs between
@@ -13,9 +20,10 @@ arms -- this is a decoder-side-structure ablation, not a training-
 hyperparameter, conditioning-design, or backbone ablation. Never starts
 training.
 
-Requires a gene-coexpression basis to already exist (see
-scripts/fit_conditional_wae_gene_coexpression_basis.py) -- neither this
-script nor training itself ever fits one.
+Requires BOTH gene-coexpression bases to already exist (see
+scripts/fit_conditional_wae_gene_coexpression_basis.py and
+scripts/fit_conditional_wae_gene_coexpression_basis_from_scfoundation.py)
+-- neither this script nor training itself ever fits one.
 """
 from __future__ import annotations
 
@@ -36,13 +44,17 @@ from gen3_multiscale.scripts.prepare_conditional_wae_suite import (
     whole_slide_validation_block,
 )
 
-ARM_ORDER = ("wae_he_gan_coexpression_control", "wae_he_gan_coexpression")
+ARM_ORDER = (
+    "wae_he_gan_coexpression_control", "wae_he_gan_coexpression", "wae_he_gan_coexpression_scfoundation",
+)
+_TREATMENT_ARMS = ARM_ORDER[1:]
 
 
 def prepare_wae_gan_coexpression_ablation_suite(
     *, comparison_config: str, manifest: str, train_gene_panels: str,
-    output_root: str, gene_coexpression_basis_path: str, hours: float = 8.0,
-    gpus: tuple[int, ...] = (0, 2), cpu_threads: int = 12,
+    output_root: str, gene_coexpression_basis_path: str,
+    scfoundation_gene_coexpression_basis_path: str, hours: float = 8.0,
+    gpus: tuple[int, ...] = (0, 2, 3), cpu_threads: int = 12,
 ) -> dict:
     if hours <= 0:
         raise ValueError("hours must be positive")
@@ -52,6 +64,14 @@ def prepare_wae_gan_coexpression_ablation_suite(
         raise ValueError("cpu_threads must be at least 1")
     if not gene_coexpression_basis_path:
         raise ValueError("gene_coexpression_basis_path must be set to an already-fit basis artifact")
+    if not scfoundation_gene_coexpression_basis_path:
+        raise ValueError(
+            "scfoundation_gene_coexpression_basis_path must be set to an already-fit basis artifact"
+        )
+    basis_path_by_arm = {
+        "wae_he_gan_coexpression": str(gene_coexpression_basis_path),
+        "wae_he_gan_coexpression_scfoundation": str(scfoundation_gene_coexpression_basis_path),
+    }
     root = Path(output_root)
     if root.exists():
         raise FileExistsError(f"{root} already exists; suite roots are immutable")
@@ -117,7 +137,7 @@ def prepare_wae_gan_coexpression_ablation_suite(
             ]
         else:
             params["use_gene_coexpression_refinement"] = True
-            config["data"]["gene_coexpression_basis_path"] = str(gene_coexpression_basis_path)
+            config["data"]["gene_coexpression_basis_path"] = basis_path_by_arm[arm]
             config["documented_divergences"] = [
                 "model.arm", "model.params.use_gene_coexpression_refinement",
                 "data.gene_coexpression_basis_path",
@@ -165,10 +185,14 @@ def prepare_wae_gan_coexpression_ablation_suite(
             "checkpoint_dir": config["training"]["checkpoint_dir"],
         }
 
-    # Matched-except-declared-fields invariant.
+    # Matched-except-declared-fields invariant: BOTH treatment arms
+    # compared against the SAME control, so a difference between them can
+    # only be attributed to the basis source, never an incidental drift
+    # relative to control.
     control_config = yaml.safe_load((root / "configs" / "wae_he_gan_coexpression_control.yaml").read_text())
-    treatment_config = yaml.safe_load((root / "configs" / "wae_he_gan_coexpression.yaml").read_text())
-    _assert_matched_except_declared(control_config, treatment_config, "wae_he_gan_coexpression")
+    for arm in _TREATMENT_ARMS:
+        treatment_config = yaml.safe_load((root / "configs" / f"{arm}.yaml").read_text())
+        _assert_matched_except_declared(control_config, treatment_config, arm)
 
     plan = {
         "kind": "wae_gan_coexpression_ablation_suite",
@@ -179,6 +203,7 @@ def prepare_wae_gan_coexpression_ablation_suite(
         "cpu_threads_per_arm": int(cpu_threads),
         "gpus": list(gpus),
         "gene_coexpression_basis_path": str(gene_coexpression_basis_path),
+        "scfoundation_gene_coexpression_basis_path": str(scfoundation_gene_coexpression_basis_path),
         "arms": written,
     }
     (root / "run_plan.json").write_text(json.dumps(plan, indent=2, sort_keys=True))
@@ -226,11 +251,16 @@ def main() -> None:
     parser.add_argument("--output-root", required=True)
     parser.add_argument(
         "--gene-coexpression-basis-path", required=True,
-        help="MANDATORY: path to an already-fit gene coexpression basis artifact "
+        help="MANDATORY: path to an already-fit from-scratch gene coexpression basis artifact "
              "(scripts/fit_conditional_wae_gene_coexpression_basis.py).",
     )
+    parser.add_argument(
+        "--scfoundation-gene-coexpression-basis-path", required=True,
+        help="MANDATORY: path to an already-fit scFoundation-derived gene coexpression basis "
+             "artifact (scripts/fit_conditional_wae_gene_coexpression_basis_from_scfoundation.py).",
+    )
     parser.add_argument("--hours", type=float, default=8.0)
-    parser.add_argument("--gpus", default="0,2", help="comma-separated GPU ids, one per arm")
+    parser.add_argument("--gpus", default="0,2,3", help="comma-separated GPU ids, one per arm")
     parser.add_argument("--cpu-threads", type=int, default=12)
     args = parser.parse_args()
     gpus = tuple(int(value) for value in args.gpus.split(","))
@@ -240,6 +270,7 @@ def main() -> None:
         train_gene_panels=args.train_gene_panels,
         output_root=args.output_root,
         gene_coexpression_basis_path=args.gene_coexpression_basis_path,
+        scfoundation_gene_coexpression_basis_path=args.scfoundation_gene_coexpression_basis_path,
         hours=args.hours,
         gpus=gpus,
         cpu_threads=args.cpu_threads,

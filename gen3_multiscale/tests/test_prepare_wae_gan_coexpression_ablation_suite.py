@@ -44,22 +44,32 @@ def _stub_train_gene_panels(monkeypatch):
     )
 
 
-def test_prepare_writes_a_control_and_a_coexpression_arm_with_the_right_overrides(tmp_path):
+def _basis_paths(tmp_path):
+    basis_path = tmp_path / "basis.pt"
+    basis_path.write_text("stub")
+    scfoundation_basis_path = tmp_path / "basis_scfoundation.pt"
+    scfoundation_basis_path.write_text("stub")
+    return basis_path, scfoundation_basis_path
+
+
+def test_prepare_writes_a_control_and_two_treatment_arms_with_the_right_overrides(tmp_path):
     comparison_config = _write_comparison_config(tmp_path)
     manifest = _write_manifest(tmp_path)
     panels = tmp_path / "panels.json"
     panels.write_text("{}")
     output_root = tmp_path / "suite"
-    basis_path = tmp_path / "basis.pt"
-    basis_path.write_text("stub")
+    basis_path, scfoundation_basis_path = _basis_paths(tmp_path)
 
     plan = suite_module.prepare_wae_gan_coexpression_ablation_suite(
         comparison_config=str(comparison_config), manifest=str(manifest),
         train_gene_panels=str(panels), output_root=str(output_root),
-        gene_coexpression_basis_path=str(basis_path), hours=8.0, gpus=(0, 2), cpu_threads=12,
+        gene_coexpression_basis_path=str(basis_path),
+        scfoundation_gene_coexpression_basis_path=str(scfoundation_basis_path),
+        hours=8.0, gpus=(0, 2, 3), cpu_threads=12,
     )
 
     assert set(plan["arms"]) == set(suite_module.ARM_ORDER)
+    assert len(suite_module.ARM_ORDER) == 3
     configs = {
         arm: yaml.safe_load((output_root / "configs" / f"{arm}.yaml").read_text())
         for arm in suite_module.ARM_ORDER
@@ -71,22 +81,32 @@ def test_prepare_writes_a_control_and_a_coexpression_arm_with_the_right_override
     assert control["training"]["lr"] == 1e-4
     assert control["training"]["device"] == "cuda:0"
 
-    treatment = configs["wae_he_gan_coexpression"]
-    assert treatment["model"]["params"]["use_gene_coexpression_refinement"] is True
-    assert treatment["data"]["gene_coexpression_basis_path"] == str(basis_path)
-    assert treatment["training"]["lr"] == 1e-4  # training hyperparams held fixed
-    assert treatment["training"]["device"] == "cuda:2"
+    self_fit = configs["wae_he_gan_coexpression"]
+    assert self_fit["model"]["params"]["use_gene_coexpression_refinement"] is True
+    assert self_fit["data"]["gene_coexpression_basis_path"] == str(basis_path)
+    assert self_fit["training"]["lr"] == 1e-4  # training hyperparams held fixed
+    assert self_fit["training"]["device"] == "cuda:2"
 
-    for arm_config in (control, treatment):
+    scfoundation = configs["wae_he_gan_coexpression_scfoundation"]
+    assert scfoundation["model"]["params"]["use_gene_coexpression_refinement"] is True
+    assert scfoundation["data"]["gene_coexpression_basis_path"] == str(scfoundation_basis_path)
+    assert scfoundation["training"]["lr"] == 1e-4
+    assert scfoundation["training"]["device"] == "cuda:3"
+
+    for arm_config in (control, self_fit, scfoundation):
         whole_slide = arm_config["evaluation"]["whole_slide_validation"]
         assert whole_slide["enabled"] is True
         assert whole_slide["max_slides"] == 2  # covers every validation_sample_ids entry
-    assert control["evaluation"]["whole_slide_validation"] == treatment["evaluation"]["whole_slide_validation"]
+    assert (
+        control["evaluation"]["whole_slide_validation"]
+        == self_fit["evaluation"]["whole_slide_validation"]
+        == scfoundation["evaluation"]["whole_slide_validation"]
+    )
 
     checkpoint_dirs = {config["training"]["checkpoint_dir"] for config in configs.values()}
     log_dirs = {config["evaluation"]["tensorboard"]["log_dir"] for config in configs.values()}
-    assert len(checkpoint_dirs) == 2
-    assert len(log_dirs) == 2
+    assert len(checkpoint_dirs) == 3
+    assert len(log_dirs) == 3
 
     pointer = tmp_path / "LATEST_WAE_GAN_COEXPRESSION_ABLATION_SUITE_ROOT.txt"
     assert pointer.read_text().strip() == str(output_root.resolve())
@@ -99,11 +119,13 @@ def test_prepare_refuses_to_overwrite_an_existing_suite_root(tmp_path):
     panels.write_text("{}")
     output_root = tmp_path / "suite"
     output_root.mkdir()
+    basis_path, scfoundation_basis_path = _basis_paths(tmp_path)
     with pytest.raises(FileExistsError):
         suite_module.prepare_wae_gan_coexpression_ablation_suite(
             comparison_config=str(comparison_config), manifest=str(manifest),
             train_gene_panels=str(panels), output_root=str(output_root),
-            gene_coexpression_basis_path=str(tmp_path / "basis.pt"),
+            gene_coexpression_basis_path=str(basis_path),
+            scfoundation_gene_coexpression_basis_path=str(scfoundation_basis_path),
         )
 
 
@@ -112,11 +134,14 @@ def test_prepare_rejects_wrong_gpu_count(tmp_path):
     manifest = _write_manifest(tmp_path)
     panels = tmp_path / "panels.json"
     panels.write_text("{}")
+    basis_path, scfoundation_basis_path = _basis_paths(tmp_path)
     with pytest.raises(ValueError, match="gpus"):
         suite_module.prepare_wae_gan_coexpression_ablation_suite(
             comparison_config=str(comparison_config), manifest=str(manifest),
             train_gene_panels=str(panels), output_root=str(tmp_path / "suite"),
-            gene_coexpression_basis_path=str(tmp_path / "basis.pt"), gpus=(0, 1, 2),
+            gene_coexpression_basis_path=str(basis_path),
+            scfoundation_gene_coexpression_basis_path=str(scfoundation_basis_path),
+            gpus=(0, 1),
         )
 
 
@@ -125,11 +150,28 @@ def test_prepare_rejects_a_blank_basis_path(tmp_path):
     manifest = _write_manifest(tmp_path)
     panels = tmp_path / "panels.json"
     panels.write_text("{}")
+    _basis_path, scfoundation_basis_path = _basis_paths(tmp_path)
     with pytest.raises(ValueError, match="gene_coexpression_basis_path"):
         suite_module.prepare_wae_gan_coexpression_ablation_suite(
             comparison_config=str(comparison_config), manifest=str(manifest),
             train_gene_panels=str(panels), output_root=str(tmp_path / "suite"),
             gene_coexpression_basis_path="",
+            scfoundation_gene_coexpression_basis_path=str(scfoundation_basis_path),
+        )
+
+
+def test_prepare_rejects_a_blank_scfoundation_basis_path(tmp_path):
+    comparison_config = _write_comparison_config(tmp_path)
+    manifest = _write_manifest(tmp_path)
+    panels = tmp_path / "panels.json"
+    panels.write_text("{}")
+    basis_path, _scfoundation_basis_path = _basis_paths(tmp_path)
+    with pytest.raises(ValueError, match="scfoundation_gene_coexpression_basis_path"):
+        suite_module.prepare_wae_gan_coexpression_ablation_suite(
+            comparison_config=str(comparison_config), manifest=str(manifest),
+            train_gene_panels=str(panels), output_root=str(tmp_path / "suite"),
+            gene_coexpression_basis_path=str(basis_path),
+            scfoundation_gene_coexpression_basis_path="",
         )
 
 

@@ -41,9 +41,16 @@ ARM_SPECS = {
     # Gene-coexpression decoder-side refinement ablation: same immutable
     # task/regularizer/include_observed_gex contract as "wae_he_gan" --
     # only model.params.use_gene_coexpression_refinement and
-    # data.gene_coexpression_basis_path differ.
+    # data.gene_coexpression_basis_path differ. Two treatment arms share
+    # one control: "wae_he_gan_coexpression" (basis fit from-scratch on
+    # this project's own training expression) and
+    # "wae_he_gan_coexpression_scfoundation" (basis derived from
+    # scFoundation's pretrained gene embeddings instead) -- the basis
+    # SOURCE is opaque to this contract; both feed the identical
+    # GeneResidualBasis/GeneCoexpressionRefinement machinery.
     "wae_he_gan_coexpression_control": ConditionalWAEArmSpec("he_to_st", "gan", False),
     "wae_he_gan_coexpression": ConditionalWAEArmSpec("he_to_st", "gan", False),
+    "wae_he_gan_coexpression_scfoundation": ConditionalWAEArmSpec("he_to_st", "gan", False),
     # Histology-structure (deterministic multiscale morphology) context
     # injection ablation: same immutable task/regularizer/
     # include_observed_gex contract as "wae_he_gan" -- only

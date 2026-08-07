@@ -37,6 +37,17 @@ _REQUIRED_METADATA_FIELDS = {
     "kind", "train_sample_ids", "normalization", "rank", "n_residual_rows",
     "fit_seed", "residual_content_sha256",
 }
+# Loaded generically by _build_model for EVERY coexpression-refinement arm,
+# regardless of which source fit the basis (from-scratch SVD on training
+# expression, scFoundation pretrained embeddings, or any future source) --
+# so load-time validation only enforces the minimal common contract every
+# source's save function is required to populate. Each source's OWN save
+# function still enforces its own richer, source-specific required fields
+# at write time (see save_conditional_wae_gene_coexpression_basis's
+# `required_fields` parameter) -- this is a strict relaxation of what used
+# to be enforced at load time, not a weakening of what gets checked at
+# fit/save time.
+_REQUIRED_METADATA_FIELDS_COMMON = {"kind", "rank", "fit_seed"}
 
 
 def fit_conditional_wae_gene_coexpression_basis(
@@ -107,12 +118,22 @@ def fit_conditional_wae_gene_coexpression_basis(
     return basis, metadata
 
 
-def save_conditional_wae_gene_coexpression_basis(basis: GeneResidualBasis, metadata: dict, path: str | Path) -> Path:
+def save_conditional_wae_gene_coexpression_basis(
+    basis: GeneResidualBasis, metadata: dict, path: str | Path,
+    *, required_fields: frozenset[str] = frozenset(_REQUIRED_METADATA_FIELDS),
+) -> Path:
     """Atomic write, mirroring `gene_basis.save_gene_residual_basis` --
     the basis tensor, its own gene-order hash, AND the fitting metadata
     (training sample ids, normalization, rank, artifact hashes) all in
-    one file, so a loader can never see one without the other."""
-    missing = _REQUIRED_METADATA_FIELDS - set(metadata)
+    one file, so a loader can never see one without the other.
+
+    `required_fields` defaults to this module's own from-scratch-SVD
+    provenance contract; a different basis SOURCE (e.g.
+    coexpression_scfoundation.py) passes its own required set here so
+    each source's save step still enforces its own real provenance,
+    even though load_conditional_wae_gene_coexpression_basis below
+    validates only the minimal common contract shared by every source."""
+    missing = set(required_fields) - set(metadata)
     if missing:
         raise ValueError(f"metadata is missing required field(s): {sorted(missing)}")
     path = Path(path)
@@ -162,7 +183,7 @@ def load_conditional_wae_gene_coexpression_basis(
         raise ValueError(f"gene coexpression basis {path} basis shape does not match its saved gene_names")
 
     metadata = dict(payload["metadata"])
-    missing_meta = _REQUIRED_METADATA_FIELDS - set(metadata)
+    missing_meta = _REQUIRED_METADATA_FIELDS_COMMON - set(metadata)
     if missing_meta:
         raise ValueError(f"gene coexpression basis {path} metadata is missing field(s): {sorted(missing_meta)}")
     if int(metadata["rank"]) != basis.rank:

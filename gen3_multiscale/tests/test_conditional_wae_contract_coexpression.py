@@ -53,3 +53,15 @@ def test_wae_he_gan_coexpression_arm_is_recognized():
     config = _base_config(arm="wae_he_gan_coexpression", use_gene_coexpression_refinement=True)
     config["data"]["gene_coexpression_basis_path"] = "/path/to/basis.pt"
     static_audit_conditional_wae_config(config)  # must not raise
+
+
+def test_wae_he_gan_coexpression_scfoundation_arm_is_recognized():
+    config = _base_config(arm="wae_he_gan_coexpression_scfoundation", use_gene_coexpression_refinement=True)
+    config["data"]["gene_coexpression_basis_path"] = "/path/to/basis_scfoundation.pt"
+    static_audit_conditional_wae_config(config)  # must not raise
+
+
+def test_wae_he_gan_coexpression_scfoundation_also_requires_a_basis_path():
+    config = _base_config(arm="wae_he_gan_coexpression_scfoundation", use_gene_coexpression_refinement=True)
+    with pytest.raises(ValueError, match="gene_coexpression_basis_path"):
+        static_audit_conditional_wae_config(config)
