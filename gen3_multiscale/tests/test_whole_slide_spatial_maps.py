@@ -92,6 +92,45 @@ def test_add_whole_slide_spatial_maps_logs_per_gene_figures_when_gene_indices_gi
     assert "whole_slide/slideA/genes/G1" not in tags
 
 
+def test_add_whole_slide_spatial_maps_logs_a_real_pcc_scalar_per_gene(tmp_path):
+    projection = _projection()
+    writer = FakeWriter()
+    logger = ConditionalWAETensorBoardLogger(tmp_path, writer=writer)
+    coords = np.stack([np.arange(6), np.arange(6)], axis=1).astype(np.float32)
+    true_gex = np.random.default_rng(2).normal(size=(6, 4)).astype(np.float32)
+    predicted_gex = true_gex + 0.1  # a fixed offset -- perfect correlation, PCC == 1
+
+    logger.add_whole_slide_spatial_maps(
+        10, "slideA", coords, true_gex, predicted_gex, GENES, projection, gene_indices=[0, 2],
+    )
+    scalars_by_tag = {tag: (value, step) for tag, value, step in writer.scalars}
+    assert "whole_slide/slideA/genes/G0/pcc" in scalars_by_tag
+    assert "whole_slide/slideA/genes/G2/pcc" in scalars_by_tag
+    assert "whole_slide/slideA/genes/G1/pcc" not in scalars_by_tag  # G1 wasn't in gene_indices
+    value, step = scalars_by_tag["whole_slide/slideA/genes/G0/pcc"]
+    assert value == pytest.approx(1.0, abs=1e-4)
+    assert step == 10
+
+
+def test_add_whole_slide_spatial_maps_skips_pcc_for_a_constant_truth_gene(tmp_path):
+    """Matches evaluation.metrics.pearson_per_gene's convention: a
+    truth-constant gene has undefined correlation and must not silently
+    log a fabricated value (e.g. 0 or NaN plotted as if real)."""
+    projection = _projection()
+    writer = FakeWriter()
+    logger = ConditionalWAETensorBoardLogger(tmp_path, writer=writer)
+    coords = np.stack([np.arange(6), np.arange(6)], axis=1).astype(np.float32)
+    true_gex = np.random.default_rng(2).normal(size=(6, 4)).astype(np.float32)
+    true_gex[:, 0] = 3.0  # G0 is constant across every spot
+    predicted_gex = true_gex + 0.1
+
+    logger.add_whole_slide_spatial_maps(
+        10, "slideA", coords, true_gex, predicted_gex, GENES, projection, gene_indices=[0],
+    )
+    tags = {tag for tag, *_rest in writer.scalars}
+    assert "whole_slide/slideA/genes/G0/pcc" not in tags
+
+
 def test_add_whole_slide_spatial_maps_omits_gene_figures_by_default(tmp_path):
     projection = _projection()
     writer = FakeWriter()

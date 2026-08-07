@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from gen3_multiscale.conditional_wae.reference_projection import assign_clusters, project_onto_reference
+from gen3_multiscale.evaluation.metrics import pearson_per_gene
 
 
 METADATA_HEADER = [
@@ -329,7 +330,12 @@ class ConditionalWAETensorBoardLogger:
         predicted/absolute-error value for each given gene column over
         every spot on the slide -- the whole-slide analogue of
         `_add_spatial_figures`'s per-gene panel, which only ever covers
-        the masked validation query subset."""
+        the masked validation query subset. Each such gene also gets a
+        scalar `whole_slide/{sample_id}/genes/{gene}/pcc` (this slide's
+        real per-gene Pearson correlation, same convention as
+        evaluation.metrics.pearson_per_gene: undefined/skipped when the
+        true values are constant) so PCC can be tracked as a line chart
+        over training steps alongside watching the spatial maps evolve."""
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
@@ -394,6 +400,11 @@ class ConditionalWAETensorBoardLogger:
                 gene = gene_names[gene_index]
                 true_values = true_gex[:, gene_index]
                 predicted_values = predicted_gex[:, gene_index]
+                gene_pcc = float(
+                    pearson_per_gene(predicted_values[:, None], true_values[:, None])[0]
+                )
+                if np.isfinite(gene_pcc):
+                    self.writer.add_scalar(f"whole_slide/{sample_id}/genes/{gene}/pcc", gene_pcc, step)
                 low = float(min(true_values.min(), predicted_values.min()))
                 high = float(max(true_values.max(), predicted_values.max()))
                 fig, axes = plt.subplots(1, 3, figsize=(12, 4), constrained_layout=True)
