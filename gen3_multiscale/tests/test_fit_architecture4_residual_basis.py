@@ -231,6 +231,54 @@ def test_fit_and_save_architecture4_basis_leaves_no_residual_memmap_file_behind(
     assert leftover == []
 
 
+def test_failed_svd_retains_verified_residuals_and_retry_reuses_then_cleans_them(tmp_path, monkeypatch):
+    """A failed numerical decomposition must not discard hours of valid
+    Architecture 3 inference.  The retry may reuse the matrix only after
+    its full scientific identity and content hash are verified."""
+    import gen3_multiscale.scripts.fit_architecture4_residual_basis as fit_module
+
+    cfg, manifest, manifest_path = prepare_step6_experiment(tmp_path, monkeypatch)
+    arch3_config_path, arch3_checkpoint_dir = _train_a_real_architecture3_checkpoint(
+        tmp_path, cfg, manifest, manifest_path,
+    )
+    output_basis_path = tmp_path / "gene_residual_basis_retry.pt"
+    real_fit = fit_module.fit_gene_residual_basis
+
+    def fail_svd(*_args, **_kwargs):
+        raise RuntimeError("synthetic SVD failure")
+
+    monkeypatch.setattr(fit_module, "fit_gene_residual_basis", fail_svd)
+    with pytest.raises(RuntimeError, match="synthetic SVD failure"):
+        fit_and_save_architecture4_basis(
+            str(arch3_config_path), str(arch3_checkpoint_dir), str(output_basis_path),
+            n_masks_per_sample=2, rank=4,
+        )
+
+    residual_paths = [
+        path for path in tmp_path.glob("*.residuals.tmp.*.npy")
+        if not path.name.endswith(".provenance.json")
+    ]
+    assert len(residual_paths) == 1
+    residual_path = residual_paths[0]
+    assert Path(f"{residual_path}.provenance.json").is_file()
+
+    monkeypatch.setattr(fit_module, "fit_gene_residual_basis", real_fit)
+
+    def residual_inference_must_not_run(*_args, **_kwargs):
+        raise AssertionError("verified residual retry unexpectedly recomputed Architecture 3 inference")
+
+    monkeypatch.setattr(fit_module, "compute_training_residuals", residual_inference_must_not_run)
+    provenance = fit_and_save_architecture4_basis(
+        str(arch3_config_path), str(arch3_checkpoint_dir), str(output_basis_path),
+        n_masks_per_sample=2, rank=4, reuse_residuals_path=str(residual_path),
+    )
+
+    assert provenance["n_residual_rows"] > 0
+    assert output_basis_path.is_file()
+    assert not residual_path.exists()
+    assert not Path(f"{residual_path}.provenance.json").exists()
+
+
 def test_compute_training_residuals_writes_a_real_disk_backed_memmap(tmp_path, monkeypatch):
     import numpy as np
 

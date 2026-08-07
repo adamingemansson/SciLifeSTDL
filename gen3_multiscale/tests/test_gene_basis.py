@@ -90,3 +90,30 @@ def test_rejects_non_finite_residuals():
     residuals[0, 0] = np.nan
     with pytest.raises(ValueError, match="non-finite"):
         fit_gene_residual_basis(residuals, [f"g{i}" for i in range(10)], rank=4)
+
+
+def test_rejects_unavailable_cuda_svd(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="CUDA is unavailable"):
+        fit_gene_residual_basis(
+            _residuals(), [f"g{i}" for i in range(10)], rank=4, svd_device="cuda"
+        )
+
+
+def test_randomized_svd_uses_explicit_qr_normalization_and_bounded_iterations(monkeypatch):
+    import sklearn.utils.extmath
+
+    captured = {}
+    real_randomized_svd = sklearn.utils.extmath.randomized_svd
+
+    def recording_randomized_svd(*args, **kwargs):
+        captured.update(kwargs)
+        return real_randomized_svd(*args, **kwargs)
+
+    monkeypatch.setattr(sklearn.utils.extmath, "randomized_svd", recording_randomized_svd)
+    fit_gene_residual_basis(_residuals(), [f"g{i}" for i in range(10)], rank=4)
+
+    assert captured["power_iteration_normalizer"] == "QR"
+    assert captured["n_iter"] == 4
+    assert captured["n_oversamples"] == 16
+    assert captured["random_state"] == 0

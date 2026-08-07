@@ -177,3 +177,30 @@ def test_streaming_reconstruction_metrics_match_in_memory_metrics():
     assert streaming["n_valid_pcc_genes"] == 6
     assert streaming["rmse"] == pytest.approx(direct.rmse, rel=1e-6)
     assert streaming["pcc_mean"] == pytest.approx(direct.pcc_mean, rel=1e-6)
+
+
+def test_streaming_reconstruction_metrics_reports_matching_hvg_views():
+    from gen3_multiscale.scripts.train_gen5_autoencoder import _stream_reconstruction_metrics
+
+    expression = synthetic_expression(n_rows=20, n_genes=6)
+    autoencoder = tiny_autoencoder(n_genes=6, latent_dim=4)
+    report = _stream_reconstruction_metrics(
+        autoencoder,
+        [expression],
+        batch_size=4,
+        gene_panels={"train_log1p_variance_top2": ["g1", "g4"]},
+    )
+    with torch.no_grad():
+        prediction = autoencoder(torch.as_tensor(expression)).numpy()
+    from gen3_multiscale.evaluation.metrics import gene_panel_metrics
+
+    expected = gene_panel_metrics(
+        prediction,
+        expression,
+        [f"g{i}" for i in range(6)],
+        {"train_log1p_variance_top2": ["g1", "g4"]},
+    )["train_log1p_variance_top2"]
+    actual = report["gene_panels"]["train_log1p_variance_top2"]
+    assert actual["pcc_mean"] == pytest.approx(expected["pcc"], rel=1e-6)
+    assert actual["rmse"] == pytest.approx(expected["rmse"], rel=1e-6)
+    assert actual["evaluated_count"] == 2

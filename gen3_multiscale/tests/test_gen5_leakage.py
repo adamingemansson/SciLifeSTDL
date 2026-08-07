@@ -29,13 +29,17 @@ def test_conditioner_deterministic_mean_never_enters_the_prediction():
     """Structural proof: neither compute_losses' nor
     sample_predictive_distribution's source ever reads
     conditioner_out["expression"] into anything the caller can use as a
-    prediction. compute_losses is allowed to carry it through as an
-    explicitly-named diagnostic-only field (never combined with the flow
-    loss); sample_predictive_distribution must not reference it at all."""
+    prediction. Both methods may carry it through only in an explicitly
+    named diagnostic-only field, never combine it with the flow loss,
+    generated latent, or decoded prediction."""
     sample_source = inspect.getsource(Gen5LatentFlowModel.sample_predictive_distribution)
     lines_after = sample_source.split("conditioner_out = self.conditioner(inputs)", 1)[1]
-    assert 'conditioner_out["expression"]' not in lines_after
-    assert "conditioner_out['expression']" not in lines_after
+    sample_uses = [
+        line for line in lines_after.splitlines()
+        if 'conditioner_out["expression"]' in line
+        or "conditioner_out['expression']" in line
+    ]
+    assert all("diagnostic_only" in line for line in sample_uses)
 
     losses_source = inspect.getsource(Gen5LatentFlowModel.compute_losses)
     lines_after = losses_source.split("conditioner_out = self.conditioner(inputs)", 1)[1]

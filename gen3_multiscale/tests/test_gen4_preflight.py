@@ -204,3 +204,44 @@ def test_audit_gen4_manifest_cache_coverage_resolves_a_gen5_style_arm(tmp_path):
     report = audit_gen4_manifest_cache_coverage(tmp_path, ["s1"], config)
     assert report["arm"] == "gen4a"
     assert set(report["modalities"]) == {"uni2", "uni2_dense"}
+
+
+def test_manifest_cache_coverage_hashes_large_artifacts_only_once(tmp_path, monkeypatch):
+    """External weights are content-verified once per preflight, not once
+    per sample.  This is a runtime property, not a weakened cache check."""
+    config = yaml.safe_load((_CONFIG_DIR / "gen4b_conditioner.yaml").read_text())
+    gene_names = [f"g{i}" for i in range(4)]
+    encoder = StubSCFoundationEncoder(gene_names, output_dim=7)
+    config["model"]["params"]["gex_context_embedding_dim"] = 7
+    checkpoint = tmp_path / "scfoundation.ckpt"
+    vocab = tmp_path / "vocab.tsv"
+    checkpoint.write_bytes(b"checkpoint")
+    vocab.write_bytes(b"vocab")
+    config["required_fingerprints"].update({
+        "scfoundation_checkpoint": str(checkpoint),
+        "scfoundation_vocab": str(vocab),
+        "scfoundation_package_version": encoder.identity.package_version,
+        "scfoundation_preprocessing_spec": encoder.identity.preprocessing_spec,
+    })
+    barcodes = np.array(["a", "b"])
+    expression = np.zeros((2, 4), dtype=np.float32)
+    for sample_id in ("s1", "s2", "s3"):
+        build_scfoundation_spot_feature_cache(
+            tmp_path, sample_id, barcodes, expression, "hash123", encoder,
+        )
+
+    calls = []
+
+    def fake_hash(path):
+        calls.append(Path(path))
+        return (
+            encoder.identity.checkpoint_sha256
+            if Path(path) == checkpoint
+            else encoder.identity.pinned_revision
+        )
+
+    monkeypatch.setattr("gen3_multiscale.gen4.preflight._sha256_file", fake_hash)
+    report = audit_gen4_manifest_cache_coverage(tmp_path, ["s1", "s2", "s3"], config)
+    assert report["n_samples"] == 3
+    assert calls.count(checkpoint) == 1
+    assert calls.count(vocab) == 1

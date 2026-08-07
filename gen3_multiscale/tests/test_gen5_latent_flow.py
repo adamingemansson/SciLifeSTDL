@@ -150,6 +150,43 @@ def test_autoencoder_parameters_are_frozen_on_construction():
     assert not any(p.requires_grad for p in model.autoencoder.parameters())
 
 
+def test_metric_prediction_reuses_the_sampling_conditioner_pass():
+    """Validation/evaluation must not run the large frozen conditioner
+    twice merely to report its secondary deterministic diagnostic."""
+    from gen3_multiscale.training.train import predict_for_metrics
+
+    autoencoder = tiny_autoencoder(n_genes=N_GENES, latent_dim=LATENT_DIM)
+    inputs, _targets = synthetic_gen4_inputs(
+        n_genes=N_GENES, gex_dim=GEX_DIM, image_dim=IMAGE_DIM,
+    )
+    model = Gen5LatentFlowModel(
+        n_genes=N_GENES,
+        gene_names=GENE_NAMES,
+        gex_feature_dim=GEX_DIM,
+        image_feature_dim=IMAGE_DIM,
+        autoencoder=autoencoder,
+        use_regional_he=False,
+        global_context_source="none",
+        n_flow_blocks=1,
+        n_flow_samples=2,
+        n_ode_steps=2,
+        **GEN5_MODEL_KWARGS,
+    ).eval()
+    calls = []
+    handle = model.conditioner.register_forward_hook(lambda *_args: calls.append(1))
+    try:
+        prediction = predict_for_metrics(
+            "latent_flow",
+            model,
+            inputs,
+            generator=torch.Generator().manual_seed(1),
+        )
+    finally:
+        handle.remove()
+    assert len(calls) == 1
+    assert prediction["conditioner_only_expression"].shape == prediction["expression"].shape
+
+
 def test_freeze_conditioner_disables_gradients():
     autoencoder = tiny_autoencoder(n_genes=N_GENES, latent_dim=LATENT_DIM)
     model = Gen5LatentFlowModel(
