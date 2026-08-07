@@ -94,8 +94,13 @@ class FrozenOmiCLIPTileEncoder(nn.Module):
         # (github.com/GuangyuWangLab2021/Loki/blob/main/src/loki/utils.py) exactly --
         # `create_model_from_pretrained` (2-tuple: model, eval-only preprocess), not
         # `create_model_and_transforms` (3-tuple incl. a train-time transform we never use).
+        # weights_only=False: this checkpoint predates PyTorch 2.6's weights_only=True
+        # default and contains a plain numpy.core.multiarray.scalar the default
+        # safe-globals allowlist rejects. Safe here -- checkpoint_path is already
+        # required to be a real, already-downloaded local file (never fetched by this
+        # class), and its sha256 is recorded in this encoder's own identity below.
         model, eval_preprocess = open_clip.create_model_from_pretrained(
-            model_name, pretrained=str(path), device="cpu",
+            model_name, pretrained=str(path), device="cpu", weights_only=False,
         )
         if not hasattr(model, "encode_image"):
             raise RuntimeError(
