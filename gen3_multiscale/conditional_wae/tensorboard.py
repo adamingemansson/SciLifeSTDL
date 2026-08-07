@@ -54,6 +54,26 @@ def _pca_rgb(values: np.ndarray) -> np.ndarray:
     return rgb
 
 
+def _pca_2d(values: np.ndarray) -> np.ndarray:
+    """Deterministic 2-component PCA (no fixed/persisted basis -- this is a
+    per-snapshot diagnostic view of the CURRENT latent geometry, not a
+    quantity compared across steps like `_fixed_pca_rgb`'s spatial maps
+    are). Reuses `_pca_rgb`'s own SVD-based projection machinery, just
+    keeping 2 components instead of 3 and skipping the RGB rescale."""
+    values = np.asarray(values, dtype=np.float32)
+    if values.ndim != 2 or not len(values):
+        raise ValueError("PCA values must be a non-empty rank-2 matrix")
+    if not np.isfinite(values).all():
+        raise ValueError("PCA values must be finite")
+    centered = values - values.mean(axis=0, keepdims=True)
+    rank = min(2, centered.shape[0], centered.shape[1])
+    projected = np.zeros((len(values), 2), dtype=np.float32)
+    if rank:
+        _u, _s, vh = np.linalg.svd(centered, full_matrices=False)
+        projected[:, :rank] = centered @ vh[:rank].T
+    return projected
+
+
 def _fixed_pca_rgb(pca_coords: np.ndarray, pc_ranges: np.ndarray) -> np.ndarray:
     """RGB from up to 3 PCA coordinates, scaled by FIXED, persisted ranges --
     never percentile-rescaled per call like `_pca_rgb` above. A color change
@@ -277,30 +297,35 @@ class ConditionalWAETensorBoardLogger:
 
     def add_validation_scalars(self, step: int, entry: dict, *,
                                best_total: float | None = None, best_step: int | None = None) -> None:
-        for key in ("total", "rmse", "pcc_loss", "conditional_mean_rmse"):
+        for key in ("total", "rmse", "pcc_loss"):
             self.writer.add_scalar(f"validation/{key}", float(entry[key]), int(step))
         if best_total is not None:
             self.writer.add_scalar("validation/best_total", float(best_total), int(step))
         if best_step is not None:
             self.writer.add_scalar("validation/best_step", float(best_step), int(step))
 
-    def add_whole_slide_scalars(self, step: int, aggregated_metrics: dict, *,
-                                whole_slide_total: float, best_whole_slide_total: float | None = None,
-                                best_whole_slide_step: int | None = None) -> None:
-        """`aggregated_metrics` is a mean-over-slides `{arm: {panel: {pcc,
-        rmse, auc}}}` dict (see train_conditional_wae._aggregate_whole_slide_metrics).
-        Diagnostic only -- never read back for loss or checkpoint selection
-        beyond `whole_slide_total`, itself a diagnostic-only secondary
-        criterion (see best_whole_slide/ in the checkpoint dir)."""
-        for arm, panels in aggregated_metrics.items():
-            for panel, values in panels.items():
-                for metric_name, value in values.items():
-                    if value is None or not np.isfinite(value):
-                        continue
-                    self.writer.add_scalar(
-                        f"whole_slide/{arm}/{panel}/{metric_name}", float(value), int(step),
-                    )
+    def add_whole_slide_scalars(
+        self, step: int, *, whole_slide_total: float, whole_slide_rmse: float, whole_slide_pcc_loss: float,
+        whole_slide_hvg50_pcc_loss: float | None = None,
+        best_whole_slide_total: float | None = None, best_whole_slide_step: int | None = None,
+    ) -> None:
+        """Same total/rmse/pcc_loss shape as `add_validation_scalars`, pooled
+        over every predicted whole-slide spot. Diagnostic only -- never read
+        back for loss or checkpoint selection beyond `whole_slide_total`,
+        itself a diagnostic-only secondary criterion (see best_whole_slide/
+        in the checkpoint dir). `whole_slide_hvg50_pcc_loss` is the SAME
+        pooled pcc_loss, restricted to the `train_log1p_variance_top50`
+        panel's gene columns -- a single summary number for "how well are
+        we doing on the genes that actually vary," which a huge
+        low-variance gene majority can otherwise dilute in the full-panel
+        pcc_loss above."""
         self.writer.add_scalar("whole_slide/total", float(whole_slide_total), int(step))
+        self.writer.add_scalar("whole_slide/rmse", float(whole_slide_rmse), int(step))
+        self.writer.add_scalar("whole_slide/pcc_loss", float(whole_slide_pcc_loss), int(step))
+        if whole_slide_hvg50_pcc_loss is not None:
+            self.writer.add_scalar(
+                "whole_slide/hvg50_pcc_loss", float(whole_slide_hvg50_pcc_loss), int(step),
+            )
         if best_whole_slide_total is not None:
             self.writer.add_scalar(
                 "whole_slide/best_total", float(best_whole_slide_total), int(step),
@@ -483,7 +508,41 @@ class ConditionalWAETensorBoardLogger:
                 global_step=int(step), tag="embeddings/context_with_he",
             )
         self._add_spatial_figures(step, snapshot, arrays)
+        self._add_latent_scatter(step, metadata, arrays)
         self.writer.flush()
+
+    def _add_latent_scatter(self, step: int, metadata: list[list[str]], arrays: dict) -> None:
+        """A quick-glance 2D PCA scatter of the posterior latent (z), colored
+        by organ -- cheaper and more directly readable than the high-dim
+        Projector snapshot above for "is the latent space actually
+        organizing by tissue" at a glance. `organ` is METADATA_HEADER[2]."""
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        coords_2d = _pca_2d(arrays["posterior_z"])
+        organs = np.asarray([row[2] for row in metadata], dtype=str)
+        unique_organs = sorted(set(organs.tolist()))
+        organ_index = {organ: index for index, organ in enumerate(unique_organs)}
+        colors = np.asarray([organ_index[organ] for organ in organs])
+
+        fig, ax = plt.subplots(figsize=(6, 5), constrained_layout=True)
+        scatter = ax.scatter(
+            coords_2d[:, 0], coords_2d[:, 1], c=colors, cmap="tab20",
+            vmin=0, vmax=max(19, len(unique_organs) - 1), s=10,
+        )
+        handles = [
+            plt.Line2D(
+                [0], [0], marker="o", linestyle="", color=scatter.cmap(scatter.norm(index)),
+                label=organ,
+            )
+            for organ, index in organ_index.items()
+        ]
+        ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize=8)
+        ax.set_title("posterior z: 2D PCA, colored by organ")
+        ax.set_xlabel("PC1")
+        ax.set_ylabel("PC2")
+        self.writer.add_figure("embeddings/posterior_z_pca_2d", fig, step, close=True)
 
     def _add_spatial_figures(self, step: int, snapshot, arrays: dict) -> None:
         import matplotlib

@@ -84,6 +84,31 @@ def whole_slide_validation_block(root: Path, dataset_manifest: dict, *, every_n_
     }
 
 
+def tensorboard_block(root: Path, arm: str) -> dict:
+    """Shared `evaluation.tensorboard` config block for every WAE-GAN
+    ablation suite-prep script, trimmed to a minimal-but-followable set:
+    train/* scalars are OFF (too noisy to be useful step-to-step; the
+    validation trio below is what actually answers "is this arm working"),
+    validation/whole_slide scalars stay to just total/rmse/pcc_loss (no
+    conditional_mean_rmse or the old per-panel/AUC breakdown), and the
+    embedding/Projector snapshot -- the single biggest disk contributor
+    per snapshot -- is capped far below its old 5000-point default while
+    still logging often enough (every 5th validation, matching whole-slide
+    cadence) to see a real trend."""
+    return {
+        "enabled": True,
+        "log_dir": str(root / "tensorboard" / arm),
+        "log_train_scalars": False,
+        "snapshot_every_n_evals": 5,
+        "embedding_max_points": 800,
+        "embedding_max_points_per_item": 64,
+        "thumbnail_max_points": 100,
+        "thumbnail_size": 32,
+        "max_spatial_samples": 4,
+        "spatial_gene_count": 2,
+    }
+
+
 def prepare_conditional_wae_suite(
     *, comparison_config: str, manifest: str, train_gene_panels: str,
     output_root: str, hours: float = 8.0,

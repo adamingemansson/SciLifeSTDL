@@ -201,6 +201,21 @@ def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = N
         gene_coexpression_basis, _basis_metadata = load_conditional_wae_gene_coexpression_basis(
             basis_path, gene_names,
         )
+    gene_encoder_table = None
+    if str(params.get("gene_encoder_source", "linear")) == "frozen_table":
+        if gene_names is None:
+            raise ValueError(
+                "model.params.gene_encoder_source='frozen_table' requires _build_model's gene_names argument"
+            )
+        table_path = config["data"].get("gene_encoder_table_path")
+        if not table_path:
+            raise ValueError(
+                "model.params.gene_encoder_source='frozen_table' requires data.gene_encoder_table_path"
+            )
+        table_basis, _table_metadata = load_conditional_wae_gene_coexpression_basis(
+            table_path, gene_names,
+        )
+        gene_encoder_table = table_basis.basis
     return ConditionalWAE(
         n_genes,
         conditioner,
@@ -216,6 +231,7 @@ def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = N
         film_layers=tuple(params.get("film_layers", ("first", "second"))),
         film_shared_generator=bool(params.get("film_shared_generator", False)),
         gene_coexpression_basis=gene_coexpression_basis,
+        gene_encoder_table=gene_encoder_table,
     )
 
 
@@ -399,15 +415,25 @@ def _aggregate_whole_slide_metrics(per_slide_metrics: list[dict]) -> dict:
 def _run_whole_slide_validation(
     model: ConditionalWAE, samples: dict, sample_ids: list[str], gene_names: list[str],
     panels: dict, *, chunk_size: int, n_samples: int | None, seed: int, device: torch.device,
-) -> tuple[dict, float, list[dict]]:
-    """Returns (aggregated_metrics, whole_slide_total, per_slide_predictions).
-    `whole_slide_total` uses the SAME rmse_pcc_reconstruction_loss shape as
-    masked validation's `total`, pooled over every predicted spot across
-    `sample_ids`, purely so it is directly comparable in scale -- it is
-    diagnostic-only and never read by checkpoint selection beyond the
-    separate best_whole_slide/. `per_slide_predictions` is the raw
-    predict_whole_slide() output per sample, reused for spatial-map logging
-    so the model is never re-run just to plot what was already computed."""
+) -> tuple[dict, float, float, float, float, list[dict]]:
+    """Returns (aggregated_metrics, whole_slide_total, whole_slide_rmse,
+    whole_slide_pcc_loss, whole_slide_hvg50_pcc_loss, per_slide_predictions).
+    The total/rmse/pcc_loss use the SAME rmse_pcc_reconstruction_loss shape
+    as masked validation's own total/rmse/pcc_loss, pooled over every
+    predicted spot across `sample_ids`, purely so they are directly
+    comparable in scale -- they are diagnostic-only and never read by
+    checkpoint selection beyond the separate best_whole_slide/.
+    `hvg50_pcc_loss` is the SAME pooled pcc_loss computation restricted to
+    just the `train_log1p_variance_top50` panel's gene columns -- a single
+    summary number for "how well are we doing on the genes that actually
+    vary," complementing the full-panel pcc_loss above (which a huge
+    low-variance gene majority can otherwise dominate/dilute).
+    `aggregated_metrics` (per-panel PCC/RMSE/AUC) is computed for
+    completeness but not logged to TensorBoard by default -- too many arm/
+    panel/metric combinations to browse usefully there. `per_slide_
+    predictions` is the raw predict_whole_slide() output per sample, reused
+    for spatial-map logging so the model is never re-run just to plot what
+    was already computed."""
     per_slide_metrics = []
     per_slide_predictions = []
     pooled_predictions, pooled_targets = [], []
@@ -423,11 +449,31 @@ def _run_whole_slide_validation(
             torch.as_tensor(prediction["target"], dtype=torch.float32, device=device)
         )
     aggregated = _aggregate_whole_slide_metrics(per_slide_metrics)
-    total, _rmse, _pcc = rmse_pcc_reconstruction_loss(
-        torch.cat(pooled_predictions, dim=0), torch.cat(pooled_targets, dim=0),
-        pcc_weight=model.pcc_weight,
+    all_predictions = torch.cat(pooled_predictions, dim=0)
+    all_targets = torch.cat(pooled_targets, dim=0)
+    total, rmse, pcc_loss = rmse_pcc_reconstruction_loss(
+        all_predictions, all_targets, pcc_weight=model.pcc_weight,
     )
-    return aggregated, float(total), per_slide_predictions
+    hvg50_indices = _panel_gene_indices(panels, "train_log1p_variance_top50", gene_names)
+    if hvg50_indices:
+        index_tensor = torch.as_tensor(hvg50_indices, dtype=torch.long, device=all_predictions.device)
+        _hvg50_total, _hvg50_rmse, hvg50_pcc_loss = rmse_pcc_reconstruction_loss(
+            all_predictions.index_select(1, index_tensor),
+            all_targets.index_select(1, index_tensor),
+            pcc_weight=model.pcc_weight,
+        )
+    else:
+        hvg50_pcc_loss = pcc_loss
+    return (
+        aggregated, float(total), float(rmse), float(pcc_loss), float(hvg50_pcc_loss),
+        per_slide_predictions,
+    )
+
+
+def _panel_gene_indices(panels: dict, panel_name: str, gene_names: list[str]) -> list[int]:
+    panel = panels.get(panel_name) or []
+    positions = {gene: index for index, gene in enumerate(gene_names)}
+    return [positions[gene] for gene in panel if gene in positions]
 
 
 def _tensorboard_gene_indices(config: dict, dataset_manifest: dict,
@@ -750,7 +796,7 @@ def run_conditional_wae_training(
             if discriminator_loss_value is not None:
                 pieces.append(f"discriminator={discriminator_loss_value:.6f}")
             print(f"[step {step}] train: " + ", ".join(pieces), flush=True)
-            if tensorboard_logger is not None:
+            if tensorboard_logger is not None and bool(tensorboard_cfg.get("log_train_scalars", True)):
                 tensorboard_logger.add_train_scalars(
                     step, accumulated_losses, grad_norm=generator_grad_norm,
                     discriminator_loss=discriminator_loss_value,
@@ -829,7 +875,10 @@ def run_conditional_wae_training(
             if whole_slide_enabled:
                 evaluation_number = max(1, step // eval_every)
                 if smoke or (evaluation_number - 1) % whole_slide_every_n_evals == 0:
-                    aggregated_whole_slide, whole_slide_total, whole_slide_predictions = (
+                    (
+                        _aggregated_whole_slide, whole_slide_total, whole_slide_rmse, whole_slide_pcc_loss,
+                        whole_slide_hvg50_pcc_loss, whole_slide_predictions,
+                    ) = (
                         _run_whole_slide_validation(
                             model, validation_samples, whole_slide_sample_ids, gene_names,
                             whole_slide_panels, chunk_size=whole_slide_chunk_size,
@@ -843,7 +892,9 @@ def run_conditional_wae_training(
                     )
                     if tensorboard_logger is not None:
                         tensorboard_logger.add_whole_slide_scalars(
-                            step, aggregated_whole_slide, whole_slide_total=whole_slide_total,
+                            step, whole_slide_total=whole_slide_total, whole_slide_rmse=whole_slide_rmse,
+                            whole_slide_pcc_loss=whole_slide_pcc_loss,
+                            whole_slide_hvg50_pcc_loss=whole_slide_hvg50_pcc_loss,
                             best_whole_slide_total=min(best_whole_slide_total, whole_slide_total),
                             best_whole_slide_step=(
                                 step if whole_slide_total <= best_whole_slide_total else best_whole_slide_step

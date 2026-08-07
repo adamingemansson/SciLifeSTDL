@@ -30,6 +30,7 @@ from gen3_multiscale.evaluation.train_gene_panels import load_train_derived_gene
 from gen3_multiscale.scripts.prepare_conditional_wae_suite import (
     _absolutize_existing_source_paths,
     _source_repository_root,
+    tensorboard_block,
     whole_slide_validation_block,
 )
 
@@ -127,17 +128,7 @@ def prepare_wae_gan_uni2_ablation_suite(
             ]
         config.setdefault("evaluation", {})
         config["evaluation"]["train_gene_panel_artifact"] = str(panel_path)
-        config["evaluation"]["tensorboard"] = {
-            "enabled": True,
-            "log_dir": str(root / "tensorboard" / arm),
-            "snapshot_every_n_evals": 5,
-            "embedding_max_points": 5000,
-            "embedding_max_points_per_item": 64,
-            "thumbnail_max_points": 512,
-            "thumbnail_size": 48,
-            "max_spatial_samples": 4,
-            "spatial_gene_count": 2,
-        }
+        config["evaluation"]["tensorboard"] = tensorboard_block(root, arm)
         config["evaluation"]["whole_slide_validation"] = whole_slide_validation_block(root, dataset_manifest)
         config["loss"] = {
             "pcc_weight": 0.1,

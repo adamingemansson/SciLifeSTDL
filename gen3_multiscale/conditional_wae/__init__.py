@@ -10,6 +10,7 @@ from gen3_multiscale.conditional_wae.model import (
     Architecture1ImageConditioner,
     ConditionalWAE,
     FiLMConditionedExpressionEncoder,
+    FrozenGeneEmbeddingExpressionEncoder,
     imq_mmd,
 )
 
@@ -18,6 +19,7 @@ __all__ = [
     "ConditionalWAE",
     "ConditionalWAEMaskedGEXDataset",
     "FiLMConditionedExpressionEncoder",
+    "FrozenGeneEmbeddingExpressionEncoder",
     "FullImageExpressionInputs",
     "build_conditional_wae_example",
     "conditional_wae_identity_collate",

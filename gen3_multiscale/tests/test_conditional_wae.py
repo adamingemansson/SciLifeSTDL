@@ -9,6 +9,7 @@ from gen3_multiscale.conditional_wae import (
     ConditionalWAEMaskedGEXDataset,
     ConditionalWAE,
     FiLMConditionedExpressionEncoder,
+    FrozenGeneEmbeddingExpressionEncoder,
     FullImageExpressionInputs,
     build_conditional_wae_example,
     imq_mmd,
@@ -64,6 +65,99 @@ def _film_model(*, film_layers=("first", "second"), shared=False, regularizer="g
         discriminator_hidden_dim=12, n_inference_samples=3,
         encoder_conditioning="film", film_layers=film_layers, film_shared_generator=shared,
     )
+
+
+def _frozen_table_model(*, use_film, embedding_dim=9, regularizer="mmd"):
+    torch.manual_seed(0)
+    table = torch.randn(embedding_dim, 7)
+    return ConditionalWAE(
+        7,
+        Architecture1ImageConditioner(
+            7, image_feature_dim=16, gex_feature_dim=6,
+            hidden_dim=24, n_heads=4, n_blocks=1,
+            dense_threshold=20, sparse_k=3, dropout=0.0,
+        ),
+        regularizer=regularizer, latent_dim=5, autoencoder_hidden_dim=20,
+        discriminator_hidden_dim=12, n_inference_samples=3,
+        encoder_conditioning=("film" if use_film else "none"),
+        gene_encoder_table=table,
+    )
+
+
+def test_frozen_gene_embedding_encoder_forward_shape_without_film():
+    table = torch.randn(9, 7)
+    encoder = FrozenGeneEmbeddingExpressionEncoder(table, context_dim=24, latent_dim=5, hidden_dim=20)
+    output = encoder(torch.randn(6, 7))
+    assert output.shape == (6, 5)
+
+
+def test_frozen_gene_embedding_encoder_table_is_a_buffer_not_a_trainable_parameter():
+    table = torch.randn(9, 7)
+    encoder = FrozenGeneEmbeddingExpressionEncoder(table, context_dim=24, latent_dim=5, hidden_dim=20)
+    parameter_names = {name for name, _ in encoder.named_parameters()}
+    buffer_names = {name for name, _ in encoder.named_buffers()}
+    assert "frozen_table" not in parameter_names
+    assert "frozen_table" in buffer_names
+    torch.testing.assert_close(encoder.frozen_table, table)
+
+
+def test_frozen_gene_embedding_encoder_empty_film_layers_is_valid_and_ignores_context():
+    table = torch.randn(9, 7)
+    encoder = FrozenGeneEmbeddingExpressionEncoder(table, context_dim=24, latent_dim=5, hidden_dim=20, film_layers=())
+    assert encoder.film_first is None and encoder.film_second is None
+    output_no_context = encoder(torch.randn(6, 7))
+    assert output_no_context.shape == (6, 5)
+
+
+def test_frozen_gene_embedding_encoder_requires_context_when_film_layers_set():
+    table = torch.randn(9, 7)
+    encoder = FrozenGeneEmbeddingExpressionEncoder(
+        table, context_dim=24, latent_dim=5, hidden_dim=20, film_layers=("first",),
+    )
+    with pytest.raises(ValueError, match="requires 'context'"):
+        encoder(torch.randn(6, 7))
+
+
+def test_frozen_gene_embedding_encoder_rejects_gene_dim_mismatch():
+    table = torch.randn(9, 7)
+    encoder = FrozenGeneEmbeddingExpressionEncoder(table, context_dim=24, latent_dim=5, hidden_dim=20)
+    with pytest.raises(ValueError, match="genes"):
+        encoder(torch.randn(6, 5))
+
+
+def test_conditional_wae_uses_frozen_gene_embedding_encoder_when_table_provided():
+    model = _frozen_table_model(use_film=False)
+    assert isinstance(model.expression_encoder, FrozenGeneEmbeddingExpressionEncoder)
+    inputs = _inputs()
+    target = torch.rand(12, 7)
+    losses = model.compute_generator_losses(inputs, target)
+    assert torch.isfinite(losses["total"])
+
+
+def test_conditional_wae_frozen_gene_embedding_encoder_composes_with_film():
+    model = _frozen_table_model(use_film=True)
+    assert isinstance(model.expression_encoder, FrozenGeneEmbeddingExpressionEncoder)
+    assert model.expression_encoder.film_first is not None
+    assert model.expression_encoder.film_second is not None
+    inputs = _inputs()
+    target = torch.rand(12, 7)
+    losses = model.compute_generator_losses(inputs, target)
+    assert torch.isfinite(losses["total"])
+
+
+def test_conditional_wae_gene_encoder_table_rejects_wrong_gene_count():
+    with pytest.raises(ValueError, match="n_genes"):
+        ConditionalWAE(
+            7,
+            Architecture1ImageConditioner(
+                7, image_feature_dim=16, gex_feature_dim=6,
+                hidden_dim=24, n_heads=4, n_blocks=1,
+                dense_threshold=20, sparse_k=3, dropout=0.0,
+            ),
+            regularizer="mmd", latent_dim=5, autoencoder_hidden_dim=20,
+            discriminator_hidden_dim=12, n_inference_samples=3,
+            gene_encoder_table=torch.randn(9, 6),  # 6 != n_genes=7
+        )
 
 
 def test_film_encoder_output_is_identical_across_contexts_at_init():
@@ -413,6 +507,68 @@ def test_static_contract_distinguishes_full_he_tasks():
         static_audit_conditional_wae_config(base)
 
 
+def _geneencoder_config(arm, *, encoder_conditioning, gene_encoder_source="frozen_table",
+                       gene_encoder_table_path="basis.pt"):
+    params = {
+        "image_feature_dim": 16, "latent_dim": 64, "hidden_dim": 24,
+        "gex_feature_dim": 6, "autoencoder_hidden_dim": 20, "discriminator_hidden_dim": 12,
+        "gene_encoder_source": gene_encoder_source, "encoder_conditioning": encoder_conditioning,
+    }
+    if encoder_conditioning == "film":
+        params["film_layers"] = ["first", "second"]
+    return {
+        "model": {
+            "arm": arm, "kind": "conditional_wae", "task": "he_to_st", "regularizer": "mmd",
+            "include_observed_gex": False, "image_mode": "full_visible", "params": params,
+        },
+        "data": {
+            "gen3_manifest_path": "manifest.json", "tile_encoder_revision": "abc",
+            "gene_encoder_table_path": gene_encoder_table_path,
+        },
+        "training": {"checkpoint_dir": "checkpoints"},
+        "loss": {"pcc_weight": 0.1, "regularizer_weight": 0.1, "conditional_mean_weight": 1.0},
+    }
+
+
+@pytest.mark.parametrize("arm,use_film", [
+    ("wae_he_mmd_geneencoder_scfoundation_film", True),
+    ("wae_he_mmd_geneencoder_scfoundation_nofilm", False),
+    ("wae_he_mmd_geneencoder_basis_film", True),
+    ("wae_he_mmd_geneencoder_basis_nofilm", False),
+])
+def test_static_contract_passes_for_every_geneencoder_arm(arm, use_film):
+    config = _geneencoder_config(arm, encoder_conditioning=("film" if use_film else "none"))
+    report = static_audit_conditional_wae_config(config)
+    assert report["passed"] is True
+    assert report["gene_encoder_source"] == "frozen_table"
+
+
+def test_static_contract_rejects_unknown_gene_encoder_source():
+    config = _geneencoder_config(
+        "wae_he_mmd_geneencoder_scfoundation_film", encoder_conditioning="film",
+        gene_encoder_source="bogus",
+    )
+    with pytest.raises(ValueError, match="gene_encoder_source"):
+        static_audit_conditional_wae_config(config)
+
+
+def test_static_contract_requires_table_path_for_frozen_table_source():
+    config = _geneencoder_config(
+        "wae_he_mmd_geneencoder_scfoundation_film", encoder_conditioning="film",
+        gene_encoder_table_path="",
+    )
+    with pytest.raises(ValueError, match="gene_encoder_table_path"):
+        static_audit_conditional_wae_config(config)
+
+
+def test_static_contract_gene_encoder_source_defaults_to_linear():
+    config = _geneencoder_config("wae_he_gan_control", encoder_conditioning="none")
+    del config["model"]["params"]["gene_encoder_source"]
+    config["model"]["regularizer"] = "gan"
+    report = static_audit_conditional_wae_config(config)
+    assert report["gene_encoder_source"] == "linear"
+
+
 def test_precheckpoint_root_manifest_is_not_mistaken_for_resumable_weights(tmp_path):
     payload = {"kind": "conditional_wae_supervisor_run"}
     (tmp_path / "run_manifest.json").write_text(json.dumps(payload))
@@ -524,6 +680,7 @@ def test_tensorboard_snapshot_is_bounded_aligned_and_has_he_thumbnails(monkeypat
     writer = FakeWriter()
     logger = ConditionalWAETensorBoardLogger(tmp_path, writer=writer)
     monkeypatch.setattr(logger, "_add_spatial_figures", lambda *_args: None)
+    monkeypatch.setattr(logger, "_add_latent_scatter", lambda *_args: None)
     losses = _model("mmd").compute_generator_losses(
         _inputs(), torch.randn(12, 7), generator=torch.Generator().manual_seed(7),
     )
@@ -537,6 +694,46 @@ def test_tensorboard_snapshot_is_bounded_aligned_and_has_he_thumbnails(monkeypat
     }
     assert len(writer.embeddings) == 4
     assert sum("label_img" in kwargs for _args, kwargs in writer.embeddings) == 2
+
+
+def test_pca_2d_produces_two_columns_and_is_deterministic():
+    from gen3_multiscale.conditional_wae.tensorboard import _pca_2d
+
+    rng = np.random.default_rng(0)
+    values = rng.normal(size=(20, 64)).astype(np.float32)
+    coords_a = _pca_2d(values)
+    coords_b = _pca_2d(values)
+    assert coords_a.shape == (20, 2)
+    np.testing.assert_array_equal(coords_a, coords_b)
+
+
+def test_pca_2d_rejects_non_finite_input():
+    from gen3_multiscale.conditional_wae.tensorboard import _pca_2d
+
+    values = np.zeros((3, 4), dtype=np.float32)
+    values[0, 0] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        _pca_2d(values)
+
+
+def test_add_latent_scatter_writes_one_figure_tagged_by_organ_pca(tmp_path):
+    class FakeFigureWriter:
+        def __init__(self):
+            self.figures = []
+
+        def add_figure(self, tag, fig, step, close=True):
+            self.figures.append((tag, step))
+
+    writer = FakeFigureWriter()
+    logger = ConditionalWAETensorBoardLogger(tmp_path, writer=writer)
+    metadata = [
+        ["s0", "p0", "kidney", "medium", "fp", "b0", "0", "0", "True", "query"],
+        ["s0", "p0", "kidney", "medium", "fp", "b1", "1", "0", "True", "query"],
+        ["s1", "p1", "liver", "medium", "fp", "b2", "0", "1", "True", "query"],
+    ]
+    arrays = {"posterior_z": np.random.default_rng(1).normal(size=(3, 5)).astype(np.float32)}
+    logger._add_latent_scatter(10, metadata, arrays)
+    assert writer.figures == [("embeddings/posterior_z_pca_2d", 10)]
 
 
 def _accumulation_optimizer(model):
@@ -829,7 +1026,9 @@ def test_run_whole_slide_validation_computes_metrics_and_a_comparable_total():
     model = _model("mmd")
     samples = {"S0": _whole_slide_sample(n=13, seed=1, sample_id="S0"),
                "S1": _whole_slide_sample(n=9, seed=2, sample_id="S1")}
-    aggregated, total, per_slide_predictions = train_conditional_wae._run_whole_slide_validation(
+    (
+        aggregated, total, rmse, pcc_loss, hvg50_pcc_loss, per_slide_predictions,
+    ) = train_conditional_wae._run_whole_slide_validation(
         model, samples, ["S0", "S1"], genes, {"panelA": ["g0", "g1"]},
         chunk_size=4, n_samples=2, seed=0, device=torch.device("cpu"),
     )
@@ -838,5 +1037,38 @@ def test_run_whole_slide_validation_computes_metrics_and_a_comparable_total():
         for panel in aggregated[arm].values():
             assert set(panel) == {"pcc", "rmse", "auc"}
     assert np.isfinite(total)
+    assert np.isfinite(rmse)
+    assert np.isfinite(pcc_loss)
+    # No "train_log1p_variance_top50" key in this test's panels dict ->
+    # _panel_gene_indices finds nothing -> falls back to the full-panel
+    # pcc_loss verbatim (never silently 0/NaN).
+    assert hvg50_pcc_loss == pcc_loss
     assert len(per_slide_predictions) == 2
     assert per_slide_predictions[0]["sample_id"] == "S0"
+
+
+def test_run_whole_slide_validation_hvg50_pcc_loss_uses_only_the_top50_panel_columns():
+    genes = [f"g{i}" for i in range(7)]
+    model = _model("mmd")
+    samples = {"S0": _whole_slide_sample(n=13, seed=1, sample_id="S0")}
+    top50_genes = ["g1", "g3"]
+    (
+        _aggregated, _total, _rmse, pcc_loss, hvg50_pcc_loss, _per_slide_predictions,
+    ) = train_conditional_wae._run_whole_slide_validation(
+        model, samples, ["S0"], genes,
+        {"panelA": ["g0", "g1"], "train_log1p_variance_top50": top50_genes},
+        chunk_size=4, n_samples=2, seed=0, device=torch.device("cpu"),
+    )
+    assert np.isfinite(hvg50_pcc_loss)
+    # A real, distinct computation over a 2-gene subset -- not silently
+    # aliased to the full 7-gene pcc_loss (would be a near-impossible
+    # coincidence with random model weights/data).
+    assert hvg50_pcc_loss != pcc_loss
+
+
+def test_panel_gene_indices_maps_panel_gene_names_to_positions():
+    gene_names = ["g0", "g1", "g2", "g3"]
+    assert train_conditional_wae._panel_gene_indices(
+        {"train_log1p_variance_top50": ["g2", "g0", "gMISSING"]}, "train_log1p_variance_top50", gene_names,
+    ) == [2, 0]
+    assert train_conditional_wae._panel_gene_indices({}, "train_log1p_variance_top50", gene_names) == []

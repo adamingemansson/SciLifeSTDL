@@ -313,6 +313,93 @@ class FiLMConditionedExpressionEncoder(nn.Module):
         return self.projection(hidden)
 
 
+class FrozenGeneEmbeddingExpressionEncoder(nn.Module):
+    """Same two-hidden-layer + projection shape as ExpressionEncoder/
+    FiLMConditionedExpressionEncoder, but the first Linear(n_genes,
+    hidden_dim) is replaced by a FROZEN per-gene embedding table
+    (real expression @ frozen_table.T -> trainable projection into
+    hidden_dim) -- the same "frozen big representation + small trainable
+    head" pattern already used by STPathFrozenGeneEncoder
+    (src/models/stpath_gene_table.py) and GeneCoexpressionRefinement
+    (coexpression.py), applied here to the WAE's OWN posterior encoder
+    instead of a decoder-side refinement. `frozen_table` is
+    `[embedding_dim, n_genes]` -- the exact orientation
+    extract_scfoundation_gene_embedding_table and GeneResidualBasis's own
+    `basis` tensor already use, so either can be passed in directly with
+    no transpose (in practice this project reuses the SAME saved
+    gene-coexpression-basis artifacts -- from-scratch SVD-fit or
+    scFoundation-derived -- as the table source here, rather than
+    re-deriving a separate table).
+
+    Unlike FiLMConditionedExpressionEncoder (which requires at least one
+    FiLM layer), `film_layers` may be EMPTY here: a frozen-table encoder
+    with zero FiLM layers is still a real, distinct arm (the encoder
+    differs from the from-scratch linear baseline in its gene
+    representation; it just isn't ALSO image-conditioned). This lets one
+    class serve every {gene-encoder source} x {FiLM on/off} cell of a
+    factorial ablation without duplicating the film-application logic."""
+
+    _VALID_LAYERS = frozenset({"first", "second"})
+
+    def __init__(self, frozen_table: torch.Tensor, context_dim: int, *,
+                 latent_dim: int = 256, hidden_dim: int = 1024,
+                 film_layers: tuple[str, ...] = (), shared_film_generator: bool = False):
+        super().__init__()
+        table = torch.as_tensor(frozen_table, dtype=torch.float32)
+        if table.dim() != 2:
+            raise ValueError(f"frozen_table must be [embedding_dim, n_genes], got shape {tuple(table.shape)}")
+        chosen = frozenset(film_layers)
+        if not chosen.issubset(self._VALID_LAYERS):
+            raise ValueError(f"film_layers must be a subset of {self._VALID_LAYERS}, got {film_layers}")
+        if shared_film_generator and chosen != self._VALID_LAYERS:
+            raise ValueError("shared_film_generator requires film_layers to include both layers")
+        self.film_layers = chosen
+        self.register_buffer("frozen_table", table)  # [embedding_dim, n_genes], never trained
+        self.input_proj = nn.Linear(table.shape[0], hidden_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.projection = nn.Linear(hidden_dim, latent_dim)
+        self.activation = nn.GELU()
+
+        if shared_film_generator:
+            shared = _FiLMGenerator(context_dim, hidden_dim)
+            self.film_first, self.film_second = shared, shared
+        else:
+            self.film_first = _FiLMGenerator(context_dim, hidden_dim) if "first" in chosen else None
+            self.film_second = _FiLMGenerator(context_dim, hidden_dim) if "second" in chosen else None
+
+    def forward(self, expression: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
+        if expression.ndim != 2:
+            raise ValueError(f"expression must be [N, n_genes], got shape {tuple(expression.shape)}")
+        if expression.shape[-1] != self.frozen_table.shape[1]:
+            raise ValueError(
+                f"expression has {expression.shape[-1]} genes, frozen_table was built for "
+                f"{self.frozen_table.shape[1]}"
+            )
+        needs_context = self.film_first is not None or self.film_second is not None
+        if needs_context:
+            if context is None:
+                raise ValueError("this encoder has FiLM layers configured and requires 'context'")
+            if context.shape[0] != expression.shape[0]:
+                raise ValueError("context must have one row per expression row")
+
+        pretrained = expression @ self.frozen_table.T  # [B, embedding_dim], frozen
+        hidden = self.norm1(self.input_proj(pretrained))
+        if self.film_first is not None:
+            gamma, beta = self.film_first(context)
+            hidden = gamma * hidden + beta
+        hidden = self.activation(hidden)
+
+        hidden = self.norm2(self.linear2(hidden))
+        if self.film_second is not None:
+            gamma, beta = self.film_second(context)
+            hidden = gamma * hidden + beta
+        hidden = self.activation(hidden)
+
+        return self.projection(hidden)
+
+
 class ConditionalWAE(nn.Module):
     """Conditional full-expression WAE with either MMD or GAN prior matching.
 
@@ -332,7 +419,8 @@ class ConditionalWAE(nn.Module):
                  encoder_conditioning: str = "none",
                  film_layers: tuple[str, ...] = ("first", "second"),
                  film_shared_generator: bool = False,
-                 gene_coexpression_basis: GeneResidualBasis | None = None):
+                 gene_coexpression_basis: GeneResidualBasis | None = None,
+                 gene_encoder_table: torch.Tensor | None = None):
         super().__init__()
         if regularizer not in {"mmd", "gan"}:
             raise ValueError("regularizer must be 'mmd' or 'gan'")
@@ -354,7 +442,19 @@ class ConditionalWAE(nn.Module):
         if image_conditioner.n_genes != n_genes:
             raise ValueError("image_conditioner and ConditionalWAE must use the same n_genes")
         context_dim = image_conditioner.hidden_dim
-        if encoder_conditioning == "film":
+        if gene_encoder_table is not None:
+            table = torch.as_tensor(gene_encoder_table, dtype=torch.float32)
+            if table.shape[1] != n_genes:
+                raise ValueError(
+                    f"gene_encoder_table must be [embedding_dim, n_genes={n_genes}], "
+                    f"got {tuple(table.shape)}"
+                )
+            self.expression_encoder = FrozenGeneEmbeddingExpressionEncoder(
+                table, context_dim, latent_dim=latent_dim, hidden_dim=autoencoder_hidden_dim,
+                film_layers=(film_layers if encoder_conditioning == "film" else ()),
+                shared_film_generator=film_shared_generator,
+            )
+        elif encoder_conditioning == "film":
             self.expression_encoder = FiLMConditionedExpressionEncoder(
                 n_genes, context_dim, latent_dim=latent_dim, hidden_dim=autoencoder_hidden_dim,
                 film_layers=film_layers, shared_film_generator=film_shared_generator,
