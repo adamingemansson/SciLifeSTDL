@@ -13,7 +13,13 @@ before, and independently of, any conditional-WAE training run.
     python -m gen3_multiscale.scripts.fit_conditional_wae_gene_coexpression_basis \\
         --manifest /path/to/dataset_manifest.json \\
         --output-basis-path /path/to/gene_coexpression_basis.pt \\
-        --rank 64
+        --rank 64 --svd-device cuda:0
+
+At real production scale (tens of thousands of pooled training spots x
+a ~17k-gene panel), the CPU-only randomized SVD path is prohibitively
+slow -- pass --svd-device cuda:N to use the GPU path this codebase
+already relies on for the equivalent Architecture 4 residual-basis fit
+at this exact matrix scale.
 """
 from __future__ import annotations
 
@@ -33,6 +39,13 @@ def main() -> None:
     parser.add_argument("--output-basis-path", required=True)
     parser.add_argument("--rank", type=int, default=64)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--svd-device", default="cpu",
+        help="'cpu' (default) or a CUDA device ('cuda' / 'cuda:N'). At real production scale "
+             "(tens of thousands of pooled training spots x a ~17k-gene panel), the CPU path is "
+             "prohibitively slow -- pass a CUDA device to use models.gene_basis.fit_gene_residual_"
+             "basis's GPU path instead.",
+    )
     args = parser.parse_args()
 
     manifest = load_dataset_manifest(args.manifest)
@@ -49,6 +62,7 @@ def main() -> None:
 
     basis, metadata = fit_conditional_wae_gene_coexpression_basis(
         expression_by_sample, train_sample_ids, gene_names, rank=args.rank, seed=args.seed,
+        svd_device=args.svd_device,
     )
     path = save_conditional_wae_gene_coexpression_basis(basis, metadata, args.output_basis_path)
     print(f"gene coexpression basis fit and saved to {path}: {json.dumps(metadata, indent=2)}")

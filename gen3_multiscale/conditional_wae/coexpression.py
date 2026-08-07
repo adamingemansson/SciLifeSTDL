@@ -46,6 +46,7 @@ def fit_conditional_wae_gene_coexpression_basis(
     *,
     rank: int = 64,
     seed: int = 0,
+    svd_device: str = "cpu",
 ) -> tuple[GeneResidualBasis, dict]:
     """Fit a low-rank gene-coexpression basis from real, normalized
     full-gene expression pooled ONLY across `train_sample_ids` -- the
@@ -61,7 +62,14 @@ def fit_conditional_wae_gene_coexpression_basis(
     pipeline-standard transform, `data/loaders.py::basic_qc_and_
     normalize`). Deliberately a plain array mapping, not `Gen3SampleData`
     -- fitting this basis is pure gene-expression structure and has no
-    dependency on any image tile-encoder cache existing."""
+    dependency on any image tile-encoder cache existing.
+
+    `svd_device`: at real production scale (tens of thousands of pooled
+    training spots x a ~17k-gene panel), `fit_gene_residual_basis`'s
+    CPU-only randomized SVD path is prohibitively slow -- pass
+    `svd_device="cuda"` (or `"cuda:N"`) to use its GPU path instead,
+    which this same codebase already relies on for the equivalent
+    Architecture 4 residual-basis fit at this exact matrix scale."""
     if not train_sample_ids:
         raise ValueError("train_sample_ids must be non-empty")
     sorted_ids = sorted(str(sample_id) for sample_id in train_sample_ids)
@@ -85,7 +93,7 @@ def fit_conditional_wae_gene_coexpression_basis(
     if not np.all(np.isfinite(pooled)):
         raise ValueError("pooled training expression contains non-finite values")
 
-    basis = fit_gene_residual_basis(pooled, gene_names, rank=rank, random_state=seed)
+    basis = fit_gene_residual_basis(pooled, gene_names, rank=rank, random_state=seed, svd_device=svd_device)
     content_hash = hashlib.sha256(np.ascontiguousarray(pooled).tobytes()).hexdigest()
     metadata = {
         "kind": "conditional_wae_gene_coexpression_basis",

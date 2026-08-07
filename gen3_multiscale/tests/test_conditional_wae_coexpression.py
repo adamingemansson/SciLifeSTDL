@@ -90,6 +90,28 @@ def test_fit_rejects_non_finite_expression():
         fit_conditional_wae_gene_coexpression_basis({"S0": bad}, ["S0"], gene_names, rank=1)
 
 
+def test_fit_forwards_svd_device_to_fit_gene_residual_basis(monkeypatch):
+    """Regression test for the real production-scale slowness: the CLI's
+    --svd-device flag must actually reach models.gene_basis.fit_gene_
+    residual_basis's GPU path, not be silently dropped."""
+    import gen3_multiscale.conditional_wae.coexpression as coexpression_module
+
+    captured = {}
+    real_fit = fit_gene_residual_basis
+
+    def _spy(residuals, gene_names, rank, **kwargs):
+        captured.update(kwargs)
+        return real_fit(residuals, gene_names, rank, **kwargs)
+
+    monkeypatch.setattr(coexpression_module, "fit_gene_residual_basis", _spy)
+    gene_names = [f"G{i}" for i in range(6)]
+    expression_by_sample = {"S0": _synthetic_expression(gene_names, seed=0)}
+    fit_conditional_wae_gene_coexpression_basis(
+        expression_by_sample, ["S0"], gene_names, rank=3, seed=0, svd_device="cpu",
+    )
+    assert captured["svd_device"] == "cpu"
+
+
 def test_fit_accepts_real_scipy_sparse_expression_like_hest1k_adata_x():
     """Regression test: real HEST-1k adata.X is a scipy.sparse matrix, not
     a dense numpy array (see data/loaders.py's own densify-only-a-slice
