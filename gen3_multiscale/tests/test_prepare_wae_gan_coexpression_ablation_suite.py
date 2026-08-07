@@ -27,7 +27,9 @@ def _write_comparison_config(tmp_path):
 
 def _write_manifest(tmp_path):
     manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(json.dumps({"gene_panel": ["G0", "G1"], "train_sample_ids": ["S0"]}))
+    manifest_path.write_text(json.dumps({
+        "gene_panel": ["G0", "G1"], "train_sample_ids": ["S0"], "validation_sample_ids": ["V0", "V1"],
+    }))
     return manifest_path
 
 
@@ -74,6 +76,12 @@ def test_prepare_writes_a_control_and_a_coexpression_arm_with_the_right_override
     assert treatment["data"]["gene_coexpression_basis_path"] == str(basis_path)
     assert treatment["training"]["lr"] == 1e-4  # training hyperparams held fixed
     assert treatment["training"]["device"] == "cuda:2"
+
+    for arm_config in (control, treatment):
+        whole_slide = arm_config["evaluation"]["whole_slide_validation"]
+        assert whole_slide["enabled"] is True
+        assert whole_slide["max_slides"] == 2  # covers every validation_sample_ids entry
+    assert control["evaluation"]["whole_slide_validation"] == treatment["evaluation"]["whole_slide_validation"]
 
     checkpoint_dirs = {config["training"]["checkpoint_dir"] for config in configs.values()}
     log_dirs = {config["evaluation"]["tensorboard"]["log_dir"] for config in configs.values()}

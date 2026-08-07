@@ -32,6 +32,7 @@ from gen3_multiscale.evaluation.train_gene_panels import load_train_derived_gene
 from gen3_multiscale.scripts.prepare_conditional_wae_suite import (
     _absolutize_existing_source_paths,
     _source_repository_root,
+    whole_slide_validation_block,
 )
 
 ARM_ORDER = ("wae_he_gan_histology_control", "wae_he_gan_histology")
@@ -132,6 +133,7 @@ def prepare_wae_gan_histology_ablation_suite(
             "max_spatial_samples": 4,
             "spatial_gene_count": 2,
         }
+        config["evaluation"]["whole_slide_validation"] = whole_slide_validation_block(root, dataset_manifest)
         config["loss"] = {
             "pcc_weight": 0.1,
             "regularizer_weight": 0.1,

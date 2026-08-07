@@ -312,6 +312,7 @@ class ConditionalWAETensorBoardLogger:
     def add_whole_slide_spatial_maps(
         self, step: int, sample_id: str, coords: np.ndarray, true_gex: np.ndarray,
         predicted_gex: np.ndarray, gene_names: list[str], reference_projection: dict,
+        *, gene_indices: list[int] | None = None,
     ) -> None:
         """Whole-slide spatial diagnostics: PC1/PC2/PC3 as three SEPARATE
         maps with a fixed diverging scale + explained variance in the
@@ -322,7 +323,13 @@ class ConditionalWAETensorBoardLogger:
         there is no query-only subset to distinguish from a background
         lattice). `reference_projection` MUST be the same frozen basis
         (reference_projection.ensure_reference_gex_projection) across every
-        step/architecture/WAE dimensionality being compared."""
+        step/architecture/WAE dimensionality being compared.
+
+        `gene_indices` (optional) additionally plots the RAW target/
+        predicted/absolute-error value for each given gene column over
+        every spot on the slide -- the whole-slide analogue of
+        `_add_spatial_figures`'s per-gene panel, which only ever covers
+        the masked validation query subset."""
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
@@ -379,6 +386,35 @@ class ConditionalWAETensorBoardLogger:
             self.writer.add_figure(
                 f"whole_slide/{sample_id}/{label}/clusters", fig, step, close=True,
             )
+
+        if gene_indices:
+            true_gex = np.asarray(true_gex, dtype=np.float32)
+            predicted_gex = np.asarray(predicted_gex, dtype=np.float32)
+            for gene_index in gene_indices:
+                gene = gene_names[gene_index]
+                true_values = true_gex[:, gene_index]
+                predicted_values = predicted_gex[:, gene_index]
+                low = float(min(true_values.min(), predicted_values.min()))
+                high = float(max(true_values.max(), predicted_values.max()))
+                fig, axes = plt.subplots(1, 3, figsize=(12, 4), constrained_layout=True)
+                for ax, values, title, cmap, limits in (
+                    (axes[0], true_values, "target", "viridis", (low, high)),
+                    (axes[1], predicted_values, "prediction", "viridis", (low, high)),
+                    (axes[2], np.abs(predicted_values - true_values), "absolute error", "magma", (None, None)),
+                ):
+                    kwargs = {"cmap": cmap, "s": 8}
+                    if limits[0] is not None and limits[1] > limits[0]:
+                        kwargs.update(vmin=limits[0], vmax=limits[1])
+                    scatter = ax.scatter(coords[:, 0], coords[:, 1], c=values, **kwargs)
+                    fig.colorbar(scatter, ax=ax)
+                    ax.invert_yaxis()
+                    ax.set_aspect("equal", adjustable="datalim")
+                    ax.set_title(title)
+                    ax.set_axis_off()
+                fig.suptitle(f"{sample_id}: whole-slide {gene}")
+                self.writer.add_figure(
+                    f"whole_slide/{sample_id}/genes/{gene}", fig, step, close=True,
+                )
         self.writer.flush()
 
     def add_film_diagnostics(self, step: int, diagnostics: dict) -> None:

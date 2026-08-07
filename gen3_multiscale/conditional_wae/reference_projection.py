@@ -46,14 +46,20 @@ def build_reference_gex_projection(
     cohort_ids: list[str] = []
     for sample_id in ordered_ids:
         sample = samples[sample_id]
-        expression = np.asarray(sample.adata.X, dtype=np.float32)
+        raw_expression = sample.adata.X
         if list(map(str, sample.adata.var_names)) != gene_names:
             raise ValueError(f"{sample_id}: gene order does not match the frozen gene panel")
         remaining = max_points - sum(len(r) for r in rows)
         if remaining <= 0:
             break
-        positions = _even_positions(expression.shape[0], min(per_sample_limit, remaining))
-        rows.append(expression[positions])
+        positions = _even_positions(raw_expression.shape[0], min(per_sample_limit, remaining))
+        # Real HEST-1k adata.X is scipy.sparse -- slice the (small, bounded)
+        # cohort rows FIRST (cheap on a sparse matrix), densify only that
+        # slice, matching data/loaders.py's own "densify only the slice you
+        # need" convention rather than materializing a whole slide's matrix.
+        chunk = raw_expression[positions]
+        chunk = chunk.toarray() if hasattr(chunk, "toarray") else chunk
+        rows.append(np.asarray(chunk, dtype=np.float32))
         cohort_ids.extend(f"{sample_id}:{int(position)}" for position in positions)
     if not rows:
         raise ValueError("reference cohort produced zero rows")

@@ -90,6 +90,27 @@ def test_fit_rejects_non_finite_expression():
         fit_conditional_wae_gene_coexpression_basis({"S0": bad}, ["S0"], gene_names, rank=1)
 
 
+def test_fit_accepts_real_scipy_sparse_expression_like_hest1k_adata_x():
+    """Regression test: real HEST-1k adata.X is a scipy.sparse matrix, not
+    a dense numpy array (see data/loaders.py's own densify-only-a-slice
+    convention). np.asarray on a sparse matrix silently wraps it instead
+    of densifying it, which used to fail opaquely deep inside
+    np.concatenate/SVD the first time this ran against real data."""
+    import scipy.sparse as sp
+
+    gene_names = [f"G{i}" for i in range(6)]
+    dense = _synthetic_expression(gene_names, n_spots=10, seed=0)
+    sparse_expression = {"S0": sp.csr_matrix(dense)}
+    basis, metadata = fit_conditional_wae_gene_coexpression_basis(
+        sparse_expression, ["S0"], gene_names, rank=3, seed=0,
+    )
+    dense_basis, dense_metadata = fit_conditional_wae_gene_coexpression_basis(
+        {"S0": dense}, ["S0"], gene_names, rank=3, seed=0,
+    )
+    assert torch.equal(basis.basis, dense_basis.basis)
+    assert metadata["residual_content_sha256"] == dense_metadata["residual_content_sha256"]
+
+
 # -- save/load -----------------------------------------------------------------
 
 def _fit(gene_names=("G0", "G1", "G2", "G3"), rank=2):

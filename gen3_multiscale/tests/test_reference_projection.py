@@ -29,6 +29,32 @@ def test_projection_is_deterministic_for_the_same_cohort():
     assert first["provenance_hash"] == second["provenance_hash"]
 
 
+def test_build_accepts_real_scipy_sparse_adata_x_like_hest1k():
+    """Regression test: real HEST-1k adata.X is scipy.sparse (see data/
+    loaders.py's own densify-only-a-slice convention). np.asarray on a
+    sparse matrix silently wraps it rather than densifying it, which
+    used to fail the first time whole-slide validation ran against real
+    (not synthetic-dense) data."""
+    import scipy.sparse as sp
+
+    dense_samples = _samples()
+    sparse_samples = {
+        sample_id: SimpleNamespace(
+            adata=SimpleNamespace(X=sp.csr_matrix(sample.adata.X), var_names=sample.adata.var_names),
+        )
+        for sample_id, sample in dense_samples.items()
+    }
+    dense_projection = rp.build_reference_gex_projection(
+        dense_samples, ["S0", "S1"], GENES, n_components=2, n_clusters=2, seed=0,
+    )
+    sparse_projection = rp.build_reference_gex_projection(
+        sparse_samples, ["S0", "S1"], GENES, n_components=2, n_clusters=2, seed=0,
+    )
+    np.testing.assert_allclose(dense_projection["components"], sparse_projection["components"])
+    np.testing.assert_allclose(dense_projection["mean"], sparse_projection["mean"])
+    assert dense_projection["provenance_hash"] == sparse_projection["provenance_hash"]
+
+
 def test_true_and_predicted_gex_share_the_same_projection():
     samples = _samples()
     projection = rp.build_reference_gex_projection(samples, ["S0", "S1"], GENES, n_components=2, seed=0)

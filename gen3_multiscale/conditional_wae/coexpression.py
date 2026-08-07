@@ -69,7 +69,13 @@ def fit_conditional_wae_gene_coexpression_basis(
     for sample_id in sorted_ids:
         if sample_id not in expression_by_sample:
             raise KeyError(f"{sample_id}: not present in the given expression_by_sample mapping")
-        matrix = np.asarray(expression_by_sample[sample_id], dtype=np.float32)
+        raw = expression_by_sample[sample_id]
+        # Real HEST-1k adata.X is a scipy.sparse matrix (see data/loaders.py's
+        # own "densify only the slice you need" convention) -- np.asarray on
+        # a sparse matrix does NOT densify it, it wraps it in a 0-d object
+        # array, which later fails opaquely inside np.concatenate/SVD.
+        dense = raw.toarray() if hasattr(raw, "toarray") else raw
+        matrix = np.asarray(dense, dtype=np.float32)
         if matrix.ndim != 2 or matrix.shape[1] != len(gene_names):
             raise ValueError(
                 f"{sample_id}: expression has shape {matrix.shape}, expected [*, {len(gene_names)}]"

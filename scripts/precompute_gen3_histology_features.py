@@ -7,13 +7,19 @@ Deterministic, CPU-only, no model or checkpoint dependency -- purely
 color statistics, GLCM texture, multiscale spatial pooling) over each
 sample's real H&E patches and coordinates.
 
-    python -m scripts.precompute_gen3_histology_features \\
+    python scripts/precompute_gen3_histology_features.py \\
         --config <any resolved config with data.hest_data_dir/hest_cache_dir set> \\
         --manifest /path/to/dataset_manifest.json
 """
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 from omegaconf import OmegaConf

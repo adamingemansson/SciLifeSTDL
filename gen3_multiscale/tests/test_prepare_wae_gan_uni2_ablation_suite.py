@@ -29,7 +29,9 @@ def _write_comparison_config(tmp_path):
 
 def _write_manifest(tmp_path):
     manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(json.dumps({"gene_panel": ["G0", "G1"], "train_sample_ids": ["S0"]}))
+    manifest_path.write_text(json.dumps({
+        "gene_panel": ["G0", "G1"], "train_sample_ids": ["S0"], "validation_sample_ids": ["V0", "V1"],
+    }))
     return manifest_path
 
 
@@ -75,6 +77,12 @@ def test_prepare_writes_a_gigapath_control_and_a_uni2_arm_with_the_right_overrid
     assert uni2["data"]["image_encoder"] == "uni2"
     assert uni2["data"]["uni2_pinned_revision"] == _VALID_REVISION
     assert uni2["model"]["params"]["image_feature_dim"] == 1536  # same dim, no dimension change needed
+
+    for arm_config in (control, uni2):
+        whole_slide = arm_config["evaluation"]["whole_slide_validation"]
+        assert whole_slide["enabled"] is True
+        assert whole_slide["max_slides"] == 2  # covers every validation_sample_ids entry
+    assert control["evaluation"]["whole_slide_validation"] == uni2["evaluation"]["whole_slide_validation"]
     assert uni2["training"]["lr"] == 1e-4  # training hyperparams held fixed
     assert uni2["training"]["device"] == "cuda:2"
 

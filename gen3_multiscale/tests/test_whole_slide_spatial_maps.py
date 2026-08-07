@@ -75,6 +75,36 @@ def test_add_whole_slide_spatial_maps_logs_pc_composite_and_cluster_figures_for_
     assert all(step == 10 for _tag, step in writer.figures)
 
 
+def test_add_whole_slide_spatial_maps_logs_per_gene_figures_when_gene_indices_given(tmp_path):
+    projection = _projection()
+    writer = FakeWriter()
+    logger = ConditionalWAETensorBoardLogger(tmp_path, writer=writer)
+    coords = np.stack([np.arange(6), np.arange(6)], axis=1).astype(np.float32)
+    true_gex = np.random.default_rng(2).normal(size=(6, 4)).astype(np.float32)
+    predicted_gex = true_gex + 0.1
+
+    logger.add_whole_slide_spatial_maps(
+        10, "slideA", coords, true_gex, predicted_gex, GENES, projection, gene_indices=[0, 2],
+    )
+    tags = {tag for tag, _step in writer.figures}
+    assert "whole_slide/slideA/genes/G0" in tags
+    assert "whole_slide/slideA/genes/G2" in tags
+    assert "whole_slide/slideA/genes/G1" not in tags
+
+
+def test_add_whole_slide_spatial_maps_omits_gene_figures_by_default(tmp_path):
+    projection = _projection()
+    writer = FakeWriter()
+    logger = ConditionalWAETensorBoardLogger(tmp_path, writer=writer)
+    coords = np.stack([np.arange(6), np.arange(6)], axis=1).astype(np.float32)
+    true_gex = np.random.default_rng(2).normal(size=(6, 4)).astype(np.float32)
+    predicted_gex = true_gex + 0.1
+
+    logger.add_whole_slide_spatial_maps(10, "slideA", coords, true_gex, predicted_gex, GENES, projection)
+    tags = {tag for tag, _step in writer.figures}
+    assert not any("/genes/" in tag for tag in tags)
+
+
 def test_add_whole_slide_spatial_maps_never_mutates_the_frozen_projection(tmp_path):
     projection = _projection()
     original = copy.deepcopy({

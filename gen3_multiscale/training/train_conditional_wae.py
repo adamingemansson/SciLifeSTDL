@@ -619,6 +619,12 @@ def run_conditional_wae_training(
             seed=int(whole_slide_cfg.get("reference_seed", seed)),
             max_points=int(whole_slide_cfg.get("reference_max_points", 20_000)),
         )
+    whole_slide_gene_indices = (
+        _tensorboard_gene_indices(
+            config, dataset_manifest, gene_names, int(tensorboard_cfg.get("spatial_gene_count", 2)),
+        )
+        if whole_slide_reference_projection is not None else []
+    )
 
     started = time.time()
     step = resume_step
@@ -791,6 +797,7 @@ def run_conditional_wae_training(
                                     prediction["target"],
                                     prediction["predictive_mean"].detach().cpu().numpy(),
                                     gene_names, whole_slide_reference_projection,
+                                    gene_indices=whole_slide_gene_indices,
                                 )
                     if not smoke and whole_slide_total < best_whole_slide_total:
                         best_whole_slide_total = whole_slide_total
