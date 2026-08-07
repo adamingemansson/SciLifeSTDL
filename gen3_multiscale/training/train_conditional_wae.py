@@ -341,13 +341,37 @@ def _validate(model: ConditionalWAE, dataset, *, device: torch.device, seed: int
     return result
 
 
-def _select_whole_slide_sample_ids(validation_ids: list[str], max_slides: int) -> list[str]:
+def _select_whole_slide_sample_ids(
+    validation_ids: list[str], max_slides: int, *, organ_by_sample: dict[str, str] | None = None,
+) -> list[str]:
     """Deterministic, memory-bounded slide selection for whole-slide
     validation/spatial-map logging -- never more than `max_slides`
-    regardless of how many validation slides exist."""
+    regardless of how many validation slides exist.
+
+    When `organ_by_sample` is given, selection round-robins across organs
+    (alphabetically within each) so every organ gets representation before
+    any organ gets a second slide -- a small `max_slides` still covers
+    every organ present in validation, rather than picking whichever
+    slides happen to sort first alphabetically overall."""
     if max_slides < 1:
         raise ValueError("max_slides must be positive")
-    return sorted(str(sample_id) for sample_id in validation_ids)[:max_slides]
+    ordered = sorted(str(sample_id) for sample_id in validation_ids)
+    if not organ_by_sample:
+        return ordered[:max_slides]
+    by_organ: dict[str, list[str]] = {}
+    for sample_id in ordered:
+        by_organ.setdefault(str(organ_by_sample[sample_id]), []).append(sample_id)
+    selected: list[str] = []
+    round_index = 0
+    while len(selected) < max_slides and any(round_index < len(ids) for ids in by_organ.values()):
+        for organ in sorted(by_organ):
+            if len(selected) >= max_slides:
+                break
+            ids = by_organ[organ]
+            if round_index < len(ids):
+                selected.append(ids[round_index])
+        round_index += 1
+    return selected
 
 
 def _aggregate_whole_slide_metrics(per_slide_metrics: list[dict]) -> dict:
@@ -416,7 +440,38 @@ def _tensorboard_gene_indices(config: dict, dataset_manifest: dict,
     artifact = load_train_derived_gene_panels(artifact_path, dataset_manifest)
     panel = artifact["panels"].get("train_log1p_variance_top50") or []
     positions = {gene: index for index, gene in enumerate(gene_names)}
-    return [positions[gene] for gene in panel[:count]]
+    return [positions[gene] for gene in panel[:count] if gene in positions]
+
+
+def _organ_gene_indices(
+    artifact: dict | None, organ: str, gene_names: list[str], count: int,
+) -> list[int]:
+    """Per-slide gene selection for whole-slide spatial maps: uses the
+    smallest organ-specific dispersion-ranked panel for `organ` when the
+    loaded panel artifact has one (schema version 2+), falling back to
+    the pooled cross-organ panel for older artifacts.
+
+    A gene like ALB (a liver marker) can rank in the top-variance PANEL
+    purely because of liver samples elsewhere in a multi-organ training
+    cohort, while being near-zero background noise on every other
+    organ's slides -- organ-specific ranking avoids plotting genes with
+    no real signal on the slide actually being shown."""
+    if count < 1:
+        return []
+    if artifact is None:
+        return list(range(min(count, len(gene_names))))
+    organ_panels = (artifact.get("panels_by_organ") or {}).get(organ) or {}
+    panel = None
+    # Use the LARGEST available organ panel so slicing to `count` never
+    # truncates to fewer genes than requested just because the smallest
+    # named panel (e.g. top1) happened to be picked.
+    for _name, genes in sorted(organ_panels.items(), key=lambda item: -len(item[1])):
+        panel = genes
+        break
+    if panel is None:
+        panel = artifact["panels"].get("train_log1p_variance_top50") or []
+    positions = {gene: index for index, gene in enumerate(gene_names)}
+    return [positions[gene] for gene in panel[:count] if gene in positions]
 
 
 def run_conditional_wae_training(
@@ -592,8 +647,13 @@ def run_conditional_wae_training(
     whole_slide_chunk_size = max(1, int(whole_slide_cfg.get("chunk_size", 2048)))
     whole_slide_n_samples = whole_slide_cfg.get("n_samples")
     whole_slide_panels = load_configured_gene_panels(config, dataset_manifest) if whole_slide_enabled else {}
+    organ_by_validation_sample = {
+        sample_id: str(dataset_manifest["samples"][sample_id]["organ"]) for sample_id in validation_ids
+    }
     whole_slide_sample_ids = (
-        _select_whole_slide_sample_ids(validation_ids, whole_slide_max_slides)
+        _select_whole_slide_sample_ids(
+            validation_ids, whole_slide_max_slides, organ_by_sample=organ_by_validation_sample,
+        )
         if whole_slide_enabled else []
     )
     best_whole_slide_total = float("inf")
@@ -619,12 +679,11 @@ def run_conditional_wae_training(
             seed=int(whole_slide_cfg.get("reference_seed", seed)),
             max_points=int(whole_slide_cfg.get("reference_max_points", 20_000)),
         )
-    whole_slide_gene_indices = (
-        _tensorboard_gene_indices(
-            config, dataset_manifest, gene_names, int(tensorboard_cfg.get("spatial_gene_count", 2)),
-        )
-        if whole_slide_reference_projection is not None else []
-    )
+    whole_slide_gene_panel_artifact = None
+    if whole_slide_reference_projection is not None:
+        artifact_path = (config.get("evaluation") or {}).get("train_gene_panel_artifact")
+        if artifact_path:
+            whole_slide_gene_panel_artifact = load_train_derived_gene_panels(artifact_path, dataset_manifest)
 
     started = time.time()
     step = resume_step
@@ -792,12 +851,16 @@ def run_conditional_wae_training(
                         )
                         if whole_slide_reference_projection is not None:
                             for prediction in whole_slide_predictions:
+                                sample_organ = organ_by_validation_sample[prediction["sample_id"]]
                                 tensorboard_logger.add_whole_slide_spatial_maps(
                                     step, prediction["sample_id"], prediction["coords"],
                                     prediction["target"],
                                     prediction["predictive_mean"].detach().cpu().numpy(),
                                     gene_names, whole_slide_reference_projection,
-                                    gene_indices=whole_slide_gene_indices,
+                                    gene_indices=_organ_gene_indices(
+                                        whole_slide_gene_panel_artifact, sample_organ, gene_names,
+                                        int(tensorboard_cfg.get("spatial_gene_count", 2)),
+                                    ),
                                 )
                     if not smoke and whole_slide_total < best_whole_slide_total:
                         best_whole_slide_total = whole_slide_total

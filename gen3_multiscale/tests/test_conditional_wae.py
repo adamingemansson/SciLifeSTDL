@@ -748,6 +748,63 @@ def test_select_whole_slide_sample_ids_rejects_non_positive_max_slides():
         train_conditional_wae._select_whole_slide_sample_ids(["S0"], 0)
 
 
+def test_select_whole_slide_sample_ids_round_robins_across_organs():
+    validation_ids = ["K0", "K1", "L0", "B0", "B1", "B2"]
+    organ_by_sample = {
+        "K0": "Kidney", "K1": "Kidney", "L0": "Liver",
+        "B0": "Bowel", "B1": "Bowel", "B2": "Bowel",
+    }
+    # A small max_slides still covers every organ present, not whichever
+    # organ happens to sort first alphabetically overall.
+    selected = train_conditional_wae._select_whole_slide_sample_ids(
+        validation_ids, 3, organ_by_sample=organ_by_sample,
+    )
+    assert {organ_by_sample[sid] for sid in selected} == {"Kidney", "Liver", "Bowel"}
+    assert selected == ["B0", "K0", "L0"]  # one per organ, alphabetical within/across
+
+
+def test_select_whole_slide_sample_ids_fills_a_second_round_after_every_organ_has_one():
+    validation_ids = ["K0", "K1", "L0"]
+    organ_by_sample = {"K0": "Kidney", "K1": "Kidney", "L0": "Liver"}
+    selected = train_conditional_wae._select_whole_slide_sample_ids(
+        validation_ids, 3, organ_by_sample=organ_by_sample,
+    )
+    assert selected == ["K0", "L0", "K1"]  # round 1: one per organ; round 2: Kidney's second
+
+
+def test_select_whole_slide_sample_ids_without_organ_info_keeps_old_alphabetical_behavior():
+    validation_ids = ["S9", "S1", "S5"]
+    assert train_conditional_wae._select_whole_slide_sample_ids(validation_ids, 2) == ["S1", "S5"]
+
+
+def test_organ_gene_indices_uses_the_organs_own_dispersion_panel():
+    gene_names = ["ALB", "G1", "G2"]
+    artifact = {
+        "panels": {"train_log1p_variance_top50": ["ALB", "G1", "G2"]},
+        "panels_by_organ": {
+            "Kidney": {"train_dispersion_top1": ["G1"], "train_dispersion_top5": ["G1", "G2", "ALB"]},
+            "Liver": {"train_dispersion_top1": ["ALB"], "train_dispersion_top5": ["ALB", "G1", "G2"]},
+        },
+    }
+    kidney_indices = train_conditional_wae._organ_gene_indices(artifact, "Kidney", gene_names, 2)
+    assert kidney_indices == [1, 2]  # G1, G2 -- not ALB
+    liver_indices = train_conditional_wae._organ_gene_indices(artifact, "Liver", gene_names, 1)
+    assert liver_indices == [0]  # ALB
+
+
+def test_organ_gene_indices_falls_back_to_pooled_panel_for_an_unlisted_organ():
+    gene_names = ["ALB", "G1"]
+    artifact = {
+        "panels": {"train_log1p_variance_top50": ["ALB", "G1"]},
+        "panels_by_organ": {"Kidney": {"train_dispersion_top1": ["G1"]}},
+    }
+    assert train_conditional_wae._organ_gene_indices(artifact, "Lung", gene_names, 2) == [0, 1]
+
+
+def test_organ_gene_indices_falls_back_to_identity_when_artifact_is_none():
+    assert train_conditional_wae._organ_gene_indices(None, "Kidney", ["G0", "G1", "G2"], 2) == [0, 1]
+
+
 def test_film_gamma_beta_genuinely_affect_the_encoder_after_training_moves_the_weights():
     """Distinguishes real FiLM conditioning from a no-op: at init (gamma=1,
     beta=0) two different contexts must give IDENTICAL output (see

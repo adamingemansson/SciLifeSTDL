@@ -54,22 +54,31 @@ def _absolutize_existing_source_paths(value, source_root: Path):
 def whole_slide_validation_block(root: Path, dataset_manifest: dict, *, every_n_evals: int = 5) -> dict:
     """Shared `evaluation.whole_slide_validation` config block for every
     WAE-GAN ablation suite-prep script: full-slide (every spot, not just
-    masked query rows) diagnostic validation, `max_slides` covering EVERY
-    validation sample the manifest declares (never a bounded subset), and
-    ONE reference GEX-PCA/cluster basis path shared across every arm/suite
-    written under `root.parent` -- so PC1/PC2/PC3 and cluster colors mean
-    the same thing when comparing arms across different suites too, not
-    just within one suite. `reference_projection_path` is load-or-build
-    (see conditional_wae.reference_projection.ensure_reference_gex_projection):
-    the first arm to start training builds it, every later arm/suite just
-    verifies its identity and reuses it."""
+    masked query rows) diagnostic validation, `max_slides` capped to one
+    representative slide per organ present in validation (the trainer's
+    `_select_whole_slide_sample_ids` round-robins across organs so every
+    organ still gets covered even at this smaller count -- logging every
+    single validation slide was needlessly expensive: same organ's slides
+    are largely redundant for diagnostic purposes, and it multiplies
+    TensorBoard image/embedding disk usage for no real added coverage),
+    and ONE reference GEX-PCA/cluster basis path shared across every
+    arm/suite written under `root.parent` -- so PC1/PC2/PC3 and cluster
+    colors mean the same thing when comparing arms across different
+    suites too, not just within one suite. `reference_projection_path` is
+    load-or-build (see conditional_wae.reference_projection.
+    ensure_reference_gex_projection): the first arm to start training
+    builds it, every later arm/suite just verifies its identity and
+    reuses it."""
     validation_ids = dataset_manifest["validation_sample_ids"]
     if not validation_ids:
         raise ValueError("dataset manifest has zero validation_sample_ids")
+    samples = dataset_manifest.get("samples") or {}
+    n_organs = len({str(samples[sid]["organ"]) for sid in validation_ids if sid in samples and "organ" in samples[sid]})
+    max_slides = min(len(validation_ids), n_organs) if n_organs else len(validation_ids)
     return {
         "enabled": True,
         "every_n_evals": int(every_n_evals),
-        "max_slides": len(validation_ids),
+        "max_slides": max_slides,
         "chunk_size": 2048,
         "reference_projection_path": str(root.parent / "mk_wae_shared_reference_gex_projection"),
     }

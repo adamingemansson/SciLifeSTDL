@@ -35,3 +35,29 @@ def test_block_respects_a_custom_every_n_evals():
     manifest = {"validation_sample_ids": ["V0"]}
     block = whole_slide_validation_block(Path("/tmp/suite_root"), manifest, every_n_evals=3)
     assert block["every_n_evals"] == 3
+
+
+def test_block_caps_max_slides_to_one_per_organ_when_organ_info_is_present():
+    """Logging every single validation slide is redundant within an organ
+    and needlessly multiplies TensorBoard disk usage -- max_slides should
+    cap to the number of distinct organs, not the raw slide count, once
+    the manifest carries real organ labels (the trainer's slide-selection
+    round-robins across organs so coverage is still complete)."""
+    manifest = {
+        "validation_sample_ids": ["V0", "V1", "V2", "V3", "V4"],
+        "samples": {
+            "V0": {"organ": "Kidney"}, "V1": {"organ": "Kidney"},
+            "V2": {"organ": "Lung"}, "V3": {"organ": "Bowel"}, "V4": {"organ": "Bowel"},
+        },
+    }
+    block = whole_slide_validation_block(Path("/tmp/suite_root"), manifest)
+    assert block["max_slides"] == 3  # Kidney, Lung, Bowel
+
+
+def test_block_never_caps_below_the_raw_slide_count_when_organs_exceed_slides():
+    manifest = {
+        "validation_sample_ids": ["V0"],
+        "samples": {"V0": {"organ": "Kidney"}},
+    }
+    block = whole_slide_validation_block(Path("/tmp/suite_root"), manifest)
+    assert block["max_slides"] == 1

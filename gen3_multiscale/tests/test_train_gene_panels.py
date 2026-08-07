@@ -14,7 +14,10 @@ def _manifest():
         "validation_sample_ids": ["val"],
         "test_sample_ids": ["test"],
         "build_args": {"expression_transform": "log1p", "expression_target_sum": 10000},
-        "samples": {},
+        "samples": {
+            "train_a": {"organ": "Kidney"}, "train_b": {"organ": "Kidney"},
+            "val": {"organ": "Kidney"}, "test": {"organ": "Kidney"},
+        },
     }
 
 
