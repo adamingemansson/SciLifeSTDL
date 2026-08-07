@@ -58,21 +58,23 @@ ARM_SPECS = {
     # differ.
     "wae_he_gan_histology_control": ConditionalWAEArmSpec("he_to_st", "gan", False),
     "wae_he_gan_histology": ConditionalWAEArmSpec("he_to_st", "gan", False),
-    # Frozen-gene-embedding encoder x FiLM factorial: replaces the WAE's
-    # from-scratch Linear(n_genes, hidden_dim) posterior encoder with a
-    # FROZEN per-gene embedding table (real expression @ frozen_table.T ->
-    # trainable projection), sourced from an already-fit gene-coexpression
-    # basis artifact -- either scFoundation-derived or fit from-scratch on
-    # this project's own training expression (same two sources as the
-    # decoder-side coexpression-refinement ablation above, reused here for
-    # the encoder instead). Crossed with encoder_conditioning (FiLM on/off)
-    # to isolate whether FiLM is doing anything independent of the encoder
-    # swap. Regularizer is "mmd" (WAE-Wasserstein) for all four -- no GAN
-    # arm in this ablation.
+    # Gene-encoder x FiLM factorial: scFoundation's frozen per-gene
+    # embedding table (real expression @ frozen_table.T -> trainable
+    # projection, sourced from the already-fit scFoundation-derived
+    # gene-coexpression basis artifact reused as the table here) versus
+    # the plain from-scratch Linear(n_genes, hidden_dim) MLP encoder every
+    # OTHER WAE arm already uses ("mlp" -- gene_encoder_source="linear",
+    # no table/basis file needed at all). Crossed with encoder_conditioning
+    # (FiLM on/off) to isolate whether FiLM is doing anything independent
+    # of the encoder swap. "wae_he_mmd_geneencoder_mlp_nofilm" is therefore
+    # a genuine no-intervention control (plain encoder, no FiLM, just
+    # regularizer=mmd/latent_dim=64) -- the other three each add exactly
+    # one real change on top of it. Regularizer is "mmd" (WAE-Wasserstein)
+    # for all four -- no GAN arm in this ablation.
     "wae_he_mmd_geneencoder_scfoundation_film": ConditionalWAEArmSpec("he_to_st", "mmd", False),
     "wae_he_mmd_geneencoder_scfoundation_nofilm": ConditionalWAEArmSpec("he_to_st", "mmd", False),
-    "wae_he_mmd_geneencoder_basis_film": ConditionalWAEArmSpec("he_to_st", "mmd", False),
-    "wae_he_mmd_geneencoder_basis_nofilm": ConditionalWAEArmSpec("he_to_st", "mmd", False),
+    "wae_he_mmd_geneencoder_mlp_film": ConditionalWAEArmSpec("he_to_st", "mmd", False),
+    "wae_he_mmd_geneencoder_mlp_nofilm": ConditionalWAEArmSpec("he_to_st", "mmd", False),
 }
 
 _VALID_FILM_LAYERS = frozenset({"first", "second"})

@@ -530,17 +530,22 @@ def _geneencoder_config(arm, *, encoder_conditioning, gene_encoder_source="froze
     }
 
 
-@pytest.mark.parametrize("arm,use_film", [
-    ("wae_he_mmd_geneencoder_scfoundation_film", True),
-    ("wae_he_mmd_geneencoder_scfoundation_nofilm", False),
-    ("wae_he_mmd_geneencoder_basis_film", True),
-    ("wae_he_mmd_geneencoder_basis_nofilm", False),
+@pytest.mark.parametrize("arm,use_film,gene_encoder_source", [
+    ("wae_he_mmd_geneencoder_scfoundation_film", True, "frozen_table"),
+    ("wae_he_mmd_geneencoder_scfoundation_nofilm", False, "frozen_table"),
+    ("wae_he_mmd_geneencoder_mlp_film", True, "linear"),
+    ("wae_he_mmd_geneencoder_mlp_nofilm", False, "linear"),
 ])
-def test_static_contract_passes_for_every_geneencoder_arm(arm, use_film):
-    config = _geneencoder_config(arm, encoder_conditioning=("film" if use_film else "none"))
+def test_static_contract_passes_for_every_geneencoder_arm(arm, use_film, gene_encoder_source):
+    config = _geneencoder_config(
+        arm, encoder_conditioning=("film" if use_film else "none"),
+        gene_encoder_source=gene_encoder_source,
+    )
+    if gene_encoder_source == "linear":
+        del config["data"]["gene_encoder_table_path"]
     report = static_audit_conditional_wae_config(config)
     assert report["passed"] is True
-    assert report["gene_encoder_source"] == "frozen_table"
+    assert report["gene_encoder_source"] == gene_encoder_source
 
 
 def test_static_contract_rejects_unknown_gene_encoder_source():

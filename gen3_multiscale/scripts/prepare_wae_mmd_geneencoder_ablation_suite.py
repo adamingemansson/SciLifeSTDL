@@ -1,36 +1,44 @@
 #!/usr/bin/env python3
-"""Write four matched configs for a frozen-gene-embedding-encoder x FiLM
-factorial ablation, all on the WAE-MMD (Wasserstein) regularizer -- no GAN
-arm in this suite.
+"""Write four matched configs for a gene-encoder x FiLM factorial ablation,
+all on the WAE-MMD (Wasserstein) regularizer -- no GAN arm in this suite.
 
-Replaces the WAE's from-scratch Linear(n_genes, hidden_dim) posterior
-encoder with a FROZEN per-gene embedding table (real expression @
-frozen_table.T -> trainable projection into hidden_dim), sourced from an
-already-fit gene-coexpression basis artifact -- either scFoundation-derived
-or fit from-scratch on this project's own training expression (the SAME two
-basis artifacts the decoder-side coexpression-refinement ablation uses,
-reused here for the encoder instead of re-deriving a separate table).
-Crossed with `model.params.encoder_conditioning` (FiLM on/off) so the
-encoder-source effect and the FiLM effect are each independently visible,
-not confounded:
+Compares scFoundation's frozen per-gene embedding table (real expression @
+frozen_table.T -> trainable projection into hidden_dim, sourced from the
+already-fit scFoundation-derived gene-coexpression basis artifact reused
+here as the table) against the plain from-scratch Linear(n_genes,
+hidden_dim) MLP encoder every OTHER WAE arm already uses ("mlp" --
+gene_encoder_source="linear", no table/basis file at all). Crossed with
+`model.params.encoder_conditioning` (FiLM on/off) so the encoder-source
+effect and the FiLM effect are each independently visible, not confounded:
 
     arm                                     gene encoder     FiLM
     wae_he_mmd_geneencoder_scfoundation_film   scFoundation    yes
     wae_he_mmd_geneencoder_scfoundation_nofilm scFoundation    no
-    wae_he_mmd_geneencoder_basis_film          from-scratch    yes
-    wae_he_mmd_geneencoder_basis_nofilm        from-scratch    no
+    wae_he_mmd_geneencoder_mlp_film            plain MLP       yes
+    wae_he_mmd_geneencoder_mlp_nofilm          plain MLP       no
+
+"wae_he_mmd_geneencoder_mlp_nofilm" is therefore a genuine no-intervention
+control (plain encoder, no FiLM, just regularizer=mmd/latent_dim=64) --
+the other three each add exactly one real change on top of it.
 
 All four share IDENTICAL latent_dim=64, autoencoder dims, task/
 include_observed_gex/dataset/masking/losses/seed/image-encoder. Only
 model.params.gene_encoder_source/encoder_conditioning/film_layers and
-data.gene_encoder_table_path differ between arms, each declared explicitly
--- this is a gene-representation x conditioning-design ablation, not a
-training-hyperparameter or backbone ablation. Never starts training.
+data.gene_encoder_table_path (scFoundation arms only) differ between arms,
+each declared explicitly -- this is a gene-representation x conditioning-
+design ablation, not a training-hyperparameter or backbone ablation. Never
+starts training.
 
-Requires BOTH gene-coexpression basis artifacts to already exist (see
-scripts/fit_conditional_wae_gene_coexpression_basis.py and
+Requires the scFoundation-derived gene-coexpression basis artifact to
+already exist (see
 scripts/fit_conditional_wae_gene_coexpression_basis_from_scfoundation.py)
--- neither this script nor training itself ever fits one.
+-- neither this script nor training itself ever fits one. The plain-MLP
+arms need no basis file at all.
+
+All four arms default to UNI2 as the image encoder (not GigaPath) --
+this project's standing preference for new suites going forward. Requires
+the UNI2 spot-feature cache to already exist for every sample in the
+manifest (see scripts/precompute_gen3_uni2_spot_features.py).
 """
 from __future__ import annotations
 
@@ -55,20 +63,16 @@ from gen3_multiscale.scripts.prepare_conditional_wae_suite import (
 ARM_ORDER = (
     "wae_he_mmd_geneencoder_scfoundation_film",
     "wae_he_mmd_geneencoder_scfoundation_nofilm",
-    "wae_he_mmd_geneencoder_basis_film",
-    "wae_he_mmd_geneencoder_basis_nofilm",
+    "wae_he_mmd_geneencoder_mlp_film",
+    "wae_he_mmd_geneencoder_mlp_nofilm",
 )
-_TABLE_PATH_BY_SOURCE_KEY = {
-    "scfoundation": "scfoundation_basis_path",
-    "basis": "own_basis_path",
-}
 
 
 def prepare_wae_mmd_geneencoder_ablation_suite(
     *, comparison_config: str, manifest: str, train_gene_panels: str,
-    output_root: str, scfoundation_basis_path: str, own_basis_path: str,
+    output_root: str, scfoundation_basis_path: str, uni2_pinned_revision: str,
     latent_dim: int = 64, hours: float = 8.0, gpus: tuple[int, ...] = (0, 1, 2, 3),
-    cpu_threads: int = 12,
+    cpu_threads: int = 12, uni2_spot_feature_cache_dir: str | None = None,
 ) -> dict:
     if hours <= 0:
         raise ValueError("hours must be positive")
@@ -80,9 +84,8 @@ def prepare_wae_mmd_geneencoder_ablation_suite(
         raise ValueError("latent_dim must be positive")
     if not scfoundation_basis_path:
         raise ValueError("scfoundation_basis_path must be set to an already-fit basis artifact")
-    if not own_basis_path:
-        raise ValueError("own_basis_path must be set to an already-fit basis artifact")
-    basis_path_by_source = {"scfoundation": str(scfoundation_basis_path), "basis": str(own_basis_path)}
+    if not uni2_pinned_revision:
+        raise ValueError("uni2_pinned_revision must be set to the pinned MahmoodLab/UNI2-h commit SHA")
     root = Path(output_root)
     if root.exists():
         raise FileExistsError(f"{root} already exists; suite roots are immutable")
@@ -119,7 +122,6 @@ def prepare_wae_mmd_geneencoder_ablation_suite(
         "discriminator_hidden_dim": 256,  # unused for regularizer="mmd" (no discriminator), kept for schema
         "n_inference_samples": 8,
         "dropout": 0.1,
-        "gene_encoder_source": "frozen_table",
         "encoder_conditioning": "film",
         "film_layers": ["first", "second"],
         "film_shared_generator": False,
@@ -128,9 +130,10 @@ def prepare_wae_mmd_geneencoder_ablation_suite(
 
     written = {}
     for arm, gpu in zip(ARM_ORDER, gpus):
-        source_key = "scfoundation" if "scfoundation" in arm else "basis"
+        use_scfoundation = "scfoundation" in arm
         use_film = arm.endswith("_film")
         params = copy.deepcopy(shared_params)
+        params["gene_encoder_source"] = "frozen_table" if use_scfoundation else "linear"
         if not use_film:
             params["encoder_conditioning"] = "none"
             del params["film_layers"]
@@ -148,11 +151,17 @@ def prepare_wae_mmd_geneencoder_ablation_suite(
             "params": params,
         }
         config["data"]["gen3_manifest_path"] = str(manifest_path)
-        config["data"]["gene_encoder_table_path"] = basis_path_by_source[source_key]
+        config["data"]["image_encoder"] = "uni2"
+        config["data"]["uni2_pinned_revision"] = str(uni2_pinned_revision)
+        if uni2_spot_feature_cache_dir:
+            config["data"]["gen3_uni2_spot_feature_cache_dir"] = str(uni2_spot_feature_cache_dir)
         divergences = [
-            "model.arm", "model.params.gene_encoder_source", "data.gene_encoder_table_path",
+            "model.arm", "model.params.gene_encoder_source",
             "training.checkpoint_dir", "training.device", "evaluation.tensorboard.log_dir",
         ]
+        if use_scfoundation:
+            config["data"]["gene_encoder_table_path"] = str(scfoundation_basis_path)
+            divergences.append("data.gene_encoder_table_path")
         if use_film:
             divergences += [
                 "model.params.encoder_conditioning", "model.params.film_layers",
@@ -188,7 +197,7 @@ def prepare_wae_mmd_geneencoder_ablation_suite(
             "config": str(path),
             "audit": report,
             "gpu": gpu,
-            "gene_encoder_source_key": source_key,
+            "gene_encoder_source": params["gene_encoder_source"],
             "encoder_conditioning": params.get("encoder_conditioning", "none"),
             "tensorboard_log_dir": config["evaluation"]["tensorboard"]["log_dir"],
             "checkpoint_dir": config["training"]["checkpoint_dir"],
@@ -217,7 +226,7 @@ def prepare_wae_mmd_geneencoder_ablation_suite(
         "latent_dim": int(latent_dim),
         "gpus": list(gpus),
         "scfoundation_basis_path": str(scfoundation_basis_path),
-        "own_basis_path": str(own_basis_path),
+        "uni2_pinned_revision": str(uni2_pinned_revision),
         "arms": written,
     }
     (root / "run_plan.json").write_text(json.dumps(plan, indent=2, sort_keys=True))
@@ -251,15 +260,6 @@ def _allowed_divergent_keys_between(reference_arm: str, other_arm: str) -> set[t
     allowed = set(_BASE_ALLOWED_DIVERGENT_KEYS)
     if reference_film != other_film:
         allowed |= _FILM_ALLOWED_DIVERGENT_KEYS
-    else:
-        # Both FiLM or both non-FiLM: encoder_conditioning must match
-        # exactly (not declared divergent), but film_layers/
-        # film_shared_generator are only even PRESENT in the params dict
-        # for FiLM arms -- when both arms are non-FiLM neither has them at
-        # all, so there's nothing to compare; when both are FiLM they were
-        # built from the identical `shared_params` FiLM defaults, so they
-        # must match exactly too.
-        pass
     return allowed
 
 
@@ -295,10 +295,16 @@ def main() -> None:
              "-- reused here as the frozen table for the scFoundation-encoder arms.",
     )
     parser.add_argument(
-        "--own-basis-path", required=True,
-        help="MANDATORY: path to an already-fit from-scratch gene coexpression basis artifact "
-             "(scripts/fit_conditional_wae_gene_coexpression_basis.py) -- reused here as the "
-             "frozen table for the own-basis-encoder arms.",
+        "--uni2-pinned-revision", required=True,
+        help="MANDATORY: the pinned, immutable MahmoodLab/UNI2-h Hugging Face commit SHA the "
+             "UNI2 spot-feature cache was built from (scripts/precompute_gen3_uni2_spot_features.py). "
+             "Every arm in this suite uses UNI2, not GigaPath.",
+    )
+    parser.add_argument(
+        "--uni2-spot-feature-cache-dir", default=None,
+        help="Optional override for where every arm looks up its UNI2 spot-feature cache. "
+             "Defaults to the same hest_cache_dir/hest_data_dir convention every other Gen3 "
+             "spot-feature cache uses.",
     )
     parser.add_argument("--latent-dim", type=int, default=64)
     parser.add_argument("--hours", type=float, default=8.0)
@@ -312,7 +318,8 @@ def main() -> None:
         train_gene_panels=args.train_gene_panels,
         output_root=args.output_root,
         scfoundation_basis_path=args.scfoundation_basis_path,
-        own_basis_path=args.own_basis_path,
+        uni2_pinned_revision=args.uni2_pinned_revision,
+        uni2_spot_feature_cache_dir=args.uni2_spot_feature_cache_dir,
         latent_dim=args.latent_dim,
         hours=args.hours,
         gpus=gpus,
