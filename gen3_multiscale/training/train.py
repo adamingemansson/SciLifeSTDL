@@ -91,7 +91,17 @@ def expected_tile_encoder_provenance(config: dict) -> dict:
                 "MahmoodLab/UNI2-h Hugging Face commit SHA"
             )
         return {"pinned_revision": str(revision), "schema_version": 1}
-    raise ValueError(f"data.image_encoder must be 'gigapath' or 'uni2', got {image_encoder!r}")
+    if image_encoder == "omiclip":
+        revision = data_cfg.get("omiclip_pinned_revision")
+        if not revision:
+            raise ValueError(
+                "data.omiclip_pinned_revision must be set to the experiment's pinned, immutable "
+                "WangGuangyuLab/Loki Hugging Face commit SHA"
+            )
+        return {"pinned_revision": str(revision), "schema_version": 1}
+    raise ValueError(
+        f"data.image_encoder must be 'gigapath', 'uni2', or 'omiclip', got {image_encoder!r}"
+    )
 
 
 def maybe_build_slide_encoder(config: dict):

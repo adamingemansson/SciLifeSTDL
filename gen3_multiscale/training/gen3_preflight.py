@@ -25,6 +25,7 @@ import numpy as np
 from gen3_multiscale.data.dataset_manifest import verify_metadata_csv_provenance
 from gen3_multiscale.data.tile_encoder_preflight import require_consistent_tile_encoder_provenance
 from gen3_multiscale.gen4.uni2_spot_cache import require_consistent_uni2_tile_encoder_provenance
+from gen3_multiscale.gen4.omiclip_spot_cache import require_consistent_omiclip_tile_encoder_provenance
 from gen3_multiscale.training.gen3_dataset import Gen3SampleData, load_gen3_sample_data
 
 
@@ -165,12 +166,14 @@ def load_and_preflight_samples(
         model_params.get("use_global_slide", False)
     )
     image_encoder = str(cfg.data.get("image_encoder", "gigapath"))
-    if image_encoder not in {"gigapath", "uni2"}:
-        raise ValueError(f"data.image_encoder must be 'gigapath' or 'uni2', got {image_encoder!r}")
-    if image_encoder == "uni2" and require_dense_wsi:
+    if image_encoder not in {"gigapath", "uni2", "omiclip"}:
         raise ValueError(
-            "data.image_encoder='uni2' combined with use_regional_he/use_global_slide is not "
-            "supported -- dense-WSI regional/global context only has a GigaPath tile-encoder "
+            f"data.image_encoder must be 'gigapath', 'uni2', or 'omiclip', got {image_encoder!r}"
+        )
+    if image_encoder in {"uni2", "omiclip"} and require_dense_wsi:
+        raise ValueError(
+            f"data.image_encoder={image_encoder!r} combined with use_regional_he/use_global_slide is "
+            "not supported -- dense-WSI regional/global context only has a GigaPath tile-encoder "
             "path in this codebase"
         )
 
@@ -190,8 +193,10 @@ def load_and_preflight_samples(
     )
     if image_encoder == "gigapath":
         require_consistent_tile_encoder_provenance(provenance_by_source, expected_tile_encoder_provenance)
-    else:
+    elif image_encoder == "uni2":
         require_consistent_uni2_tile_encoder_provenance(provenance_by_source, expected_tile_encoder_provenance)
+    else:
+        require_consistent_omiclip_tile_encoder_provenance(provenance_by_source, expected_tile_encoder_provenance)
 
     report = {
         "version": 2,

@@ -22,7 +22,7 @@ class EncoderIdentity:
     package version, preprocessing spec), generalized across encoder
     families so cache files can be validated the same way regardless of
     which encoder produced them."""
-    encoder_name: str  # "uni2" | "scfoundation" | "stpath"
+    encoder_name: str  # "uni2" | "scfoundation" | "stpath" | "omiclip"
     checkpoint_sha256: str
     pinned_revision: str
     package_version: str

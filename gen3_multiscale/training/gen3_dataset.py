@@ -68,6 +68,7 @@ from gen3_multiscale.data import example_builder, novae_graph, slide_context, sp
 from gen3_multiscale.data import mask_fingerprint
 from gen3_multiscale.conditional_wae import histology_cache
 from gen3_multiscale.gen4 import uni2_spot_cache
+from gen3_multiscale.gen4 import omiclip_spot_cache
 from gen3_multiscale.data.boundary_graph import (
     EmptyBoundaryError,
     build_knn_adjacency,
@@ -190,8 +191,14 @@ def load_gen3_sample_data(
         spot_record = uni2_spot_cache.load_gen3_uni2_spot_features(
             cfg, sample_id, obs_names, patches, image_source_available,
         )
+    elif image_encoder == "omiclip":
+        spot_record = omiclip_spot_cache.load_gen3_omiclip_spot_features(
+            cfg, sample_id, obs_names, patches, image_source_available,
+        )
     else:
-        raise ValueError(f"data.image_encoder must be 'gigapath' or 'uni2', got {image_encoder!r}")
+        raise ValueError(
+            f"data.image_encoder must be 'gigapath', 'uni2', or 'omiclip', got {image_encoder!r}"
+        )
 
     dense_wsi_provenance = None
     slide_context_record = None

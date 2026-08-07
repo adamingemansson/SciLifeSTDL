@@ -75,10 +75,22 @@ ARM_SPECS = {
     "wae_he_mmd_geneencoder_scfoundation_nofilm": ConditionalWAEArmSpec("he_to_st", "mmd", False),
     "wae_he_mmd_geneencoder_mlp_film": ConditionalWAEArmSpec("he_to_st", "mmd", False),
     "wae_he_mmd_geneencoder_mlp_nofilm": ConditionalWAEArmSpec("he_to_st", "mmd", False),
+    # Same gene-encoder x FiLM factorial as above, but with data.image_encoder
+    # fixed to "omiclip" instead of "uni2" -- OmiCLIP's own pretraining was
+    # supervised by real, paired H&E+expression contrastive alignment
+    # (unlike GigaPath/UNI2's image-only pretraining), so this suite isolates
+    # whether an image tower that already "knows about" expression changes
+    # which gene-encoder/FiLM choice matters most. Still generative
+    # (ConditionalWAE, regularizer="mmd") -- only the frozen image encoder
+    # backbone differs from the four arms immediately above.
+    "wae_he_mmd_geneencoder_omiclip_scfoundation_film": ConditionalWAEArmSpec("he_to_st", "mmd", False),
+    "wae_he_mmd_geneencoder_omiclip_scfoundation_nofilm": ConditionalWAEArmSpec("he_to_st", "mmd", False),
+    "wae_he_mmd_geneencoder_omiclip_mlp_film": ConditionalWAEArmSpec("he_to_st", "mmd", False),
+    "wae_he_mmd_geneencoder_omiclip_mlp_nofilm": ConditionalWAEArmSpec("he_to_st", "mmd", False),
 }
 
 _VALID_FILM_LAYERS = frozenset({"first", "second"})
-_VALID_IMAGE_ENCODERS = frozenset({"gigapath", "uni2"})
+_VALID_IMAGE_ENCODERS = frozenset({"gigapath", "uni2", "omiclip"})
 
 
 def static_audit_conditional_wae_config(config: dict) -> dict:
@@ -137,9 +149,12 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
     if image_encoder == "gigapath":
         if not data.get("tile_encoder_revision"):
             raise ValueError("data.tile_encoder_revision must be pinned")
-    else:
+    elif image_encoder == "uni2":
         if not data.get("uni2_pinned_revision"):
             raise ValueError("data.uni2_pinned_revision must be pinned")
+    else:
+        if not data.get("omiclip_pinned_revision"):
+            raise ValueError("data.omiclip_pinned_revision must be pinned")
     training = config.get("training") or {}
     if not training.get("checkpoint_dir"):
         raise ValueError("training.checkpoint_dir is required")

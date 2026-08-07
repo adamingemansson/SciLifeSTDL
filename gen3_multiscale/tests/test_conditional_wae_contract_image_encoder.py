@@ -76,3 +76,48 @@ def test_wae_he_gan_uni2_arm_is_recognized():
     config = _base_config(arm="wae_he_gan_uni2", image_encoder="uni2")
     config["data"]["uni2_pinned_revision"] = _VALID_REVISION
     static_audit_conditional_wae_config(config)  # must not raise
+
+
+def test_image_encoder_omiclip_requires_omiclip_pinned_revision():
+    config = _base_config(image_encoder="omiclip")
+    with pytest.raises(ValueError, match="omiclip_pinned_revision"):
+        static_audit_conditional_wae_config(config)
+
+
+def test_image_encoder_omiclip_passes_with_omiclip_pinned_revision():
+    config = _base_config(image_encoder="omiclip")
+    config["data"]["omiclip_pinned_revision"] = _VALID_REVISION
+    report = static_audit_conditional_wae_config(config)
+    assert report["image_encoder"] == "omiclip"
+
+
+def test_image_encoder_omiclip_does_not_require_tile_encoder_revision():
+    """An omiclip arm's config never needs GigaPath's/UNI2's own pinning fields."""
+    config = _base_config(image_encoder="omiclip")
+    del config["data"]["tile_encoder_revision"]
+    config["data"]["omiclip_pinned_revision"] = _VALID_REVISION
+    static_audit_conditional_wae_config(config)  # must not raise
+
+
+def test_wae_he_mmd_geneencoder_omiclip_mlp_nofilm_arm_is_recognized():
+    config = {
+        "model": {
+            "arm": "wae_he_mmd_geneencoder_omiclip_mlp_nofilm", "kind": "conditional_wae",
+            "task": "he_to_st", "regularizer": "mmd",
+            "include_observed_gex": False, "image_mode": "full_visible",
+            "params": {
+                "image_feature_dim": 16, "latent_dim": 5, "hidden_dim": 24,
+                "gex_feature_dim": 6, "autoencoder_hidden_dim": 20,
+                "gene_encoder_source": "linear",
+            },
+        },
+        "data": {
+            "gen3_manifest_path": "manifest.json", "image_encoder": "omiclip",
+            "omiclip_pinned_revision": _VALID_REVISION,
+        },
+        "training": {"checkpoint_dir": "checkpoints"},
+        "loss": {"pcc_weight": 0.1, "regularizer_weight": 0.1, "conditional_mean_weight": 1.0},
+    }
+    report = static_audit_conditional_wae_config(config)
+    assert report["image_encoder"] == "omiclip"
+    assert report["gene_encoder_source"] == "linear"
