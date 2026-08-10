@@ -420,7 +420,8 @@ class ConditionalWAE(nn.Module):
                  film_layers: tuple[str, ...] = ("first", "second"),
                  film_shared_generator: bool = False,
                  gene_coexpression_basis: GeneResidualBasis | None = None,
-                 gene_encoder_table: torch.Tensor | None = None):
+                 gene_encoder_table: torch.Tensor | None = None,
+                 z_noise_std: float = 0.0):
         super().__init__()
         if regularizer not in {"mmd", "gan"}:
             raise ValueError("regularizer must be 'mmd' or 'gan'")
@@ -428,6 +429,8 @@ class ConditionalWAE(nn.Module):
             raise ValueError("n_genes, latent_dim and n_inference_samples must be positive")
         if regularizer_weight < 0 or conditional_mean_weight < 0 or pcc_weight < 0:
             raise ValueError("loss weights must be non-negative")
+        if z_noise_std < 0:
+            raise ValueError("z_noise_std must be non-negative")
         if encoder_conditioning not in {"none", "film"}:
             raise ValueError("encoder_conditioning must be 'none' or 'film'")
         self.n_genes = int(n_genes)
@@ -437,6 +440,7 @@ class ConditionalWAE(nn.Module):
         self.conditional_mean_weight = float(conditional_mean_weight)
         self.pcc_weight = float(pcc_weight)
         self.n_inference_samples = int(n_inference_samples)
+        self.z_noise_std = float(z_noise_std)
         self.encoder_conditioning = encoder_conditioning
         self.image_conditioner = image_conditioner
         if image_conditioner.n_genes != n_genes:
@@ -545,7 +549,26 @@ class ConditionalWAE(nn.Module):
         prior = torch.randn(
             encoded.shape, dtype=encoded.dtype, device=encoded.device, generator=generator,
         )
-        reconstruction, conditional_mean = self.decode(encoded, context)
+        # Real fix (user report, Aug 2026): at inference, z is drawn fresh
+        # from N(0,I), never from this encoder -- but the decoder here only
+        # ever sees the real ENCODED z during training. If the encoder
+        # collapses to a narrower-than-prior region (WAE-MMD only
+        # regularizes the AGGREGATE posterior, not each sample, so this is
+        # not automatically prevented), the decoder is never forced to be
+        # sensitive to genuinely prior-scale z variation, producing severely
+        # under-dispersed predictive_std at inference (observed z_std of
+        # 9-19 against an ideal of 1.0). Perturbing the decoder's z input
+        # with independent noise closes this train/inference mismatch
+        # directly. The MMD/GAN regularizer below is still computed on the
+        # CLEAN `encoded` -- only the decoder's input is perturbed, so the
+        # aggregate-posterior-matching objective itself is unchanged.
+        decoder_z = encoded
+        if self.z_noise_std > 0:
+            z_noise = torch.randn(
+                encoded.shape, dtype=encoded.dtype, device=encoded.device, generator=generator,
+            )
+            decoder_z = encoded + z_noise * self.z_noise_std
+        reconstruction, conditional_mean = self.decode(decoder_z, context)
         reconstruction_loss, reconstruction_rmse, reconstruction_pcc = (
             rmse_pcc_reconstruction_loss(
                 reconstruction, target, pcc_weight=self.pcc_weight,
@@ -620,17 +643,42 @@ class ConditionalWAE(nn.Module):
     @torch.no_grad()
     def sample_predictive_distribution(self, inputs: FullImageExpressionInputs,
                                        n_samples: int | None = None,
-                                       generator=None) -> dict:
+                                       generator=None,
+                                       z_mean: torch.Tensor | None = None,
+                                       z_std: torch.Tensor | None = None) -> dict:
         context = self.image_conditioner(inputs)
         count = int(n_samples or self.n_inference_samples)
         if count < 1:
             raise ValueError("n_samples must be positive")
+        # Ex-post density estimation (Ghosh et al., "From Variational to
+        # Deterministic Autoencoders", ICLR 2020): the standard, no-retrain
+        # fix for a WAE's aggregate-posterior/prior mismatch is to sample z
+        # at inference from a density fit to the encoder's REAL training-set
+        # output, rather than the raw prior. z_mean/z_std (per-latent-dim,
+        # fit offline by scripts/fit_conditional_wae_ex_post_prior.py) let a
+        # caller opt into that without touching training. Both None (the
+        # default) reproduces the exact pre-existing N(0,I) behavior.
+        if z_mean is None:
+            z_mean = torch.zeros(self.latent_dim, dtype=context.dtype, device=context.device)
+        else:
+            z_mean = z_mean.to(dtype=context.dtype, device=context.device)
+            if z_mean.shape != (self.latent_dim,):
+                raise ValueError(f"z_mean must be [{self.latent_dim}], got {tuple(z_mean.shape)}")
+        if z_std is None:
+            z_std = torch.ones(self.latent_dim, dtype=context.dtype, device=context.device)
+        else:
+            z_std = z_std.to(dtype=context.dtype, device=context.device)
+            if z_std.shape != (self.latent_dim,):
+                raise ValueError(f"z_std must be [{self.latent_dim}], got {tuple(z_std.shape)}")
+            if bool((z_std < 0).any()):
+                raise ValueError("z_std must be non-negative")
         samples = []
         for _ in range(count):
-            z = torch.randn(
+            noise = torch.randn(
                 context.shape[0], self.latent_dim,
                 dtype=context.dtype, device=context.device, generator=generator,
             )
+            z = z_mean.unsqueeze(0) + noise * z_std.unsqueeze(0)
             prediction, _ = self.decode(z, context)
             samples.append(prediction)
         stacked = torch.stack(samples)

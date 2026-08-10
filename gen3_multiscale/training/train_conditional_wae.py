@@ -232,6 +232,7 @@ def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = N
         film_shared_generator=bool(params.get("film_shared_generator", False)),
         gene_coexpression_basis=gene_coexpression_basis,
         gene_encoder_table=gene_encoder_table,
+        z_noise_std=float(params.get("z_noise_std", 0.0)),
     )
 
 

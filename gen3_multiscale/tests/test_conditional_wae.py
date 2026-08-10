@@ -125,6 +125,66 @@ def test_frozen_gene_embedding_encoder_rejects_gene_dim_mismatch():
         encoder(torch.randn(6, 5))
 
 
+def test_conditional_wae_rejects_a_negative_z_noise_std():
+    with pytest.raises(ValueError, match="z_noise_std"):
+        ConditionalWAE(
+            7,
+            Architecture1ImageConditioner(
+                7, image_feature_dim=16, gex_feature_dim=6,
+                hidden_dim=24, n_heads=4, n_blocks=1,
+                dense_threshold=20, sparse_k=3, dropout=0.0,
+            ),
+            regularizer="mmd", latent_dim=5, autoencoder_hidden_dim=20,
+            discriminator_hidden_dim=12, n_inference_samples=3, z_noise_std=-0.1,
+        )
+
+
+def test_z_noise_std_zero_reproduces_the_pre_fix_deterministic_reconstruction():
+    """Default z_noise_std=0.0 must be a strict no-op: the decoder always
+    sees the clean encoded z regardless of which generator is passed, so
+    reconstruction is identical across generator seeds (only prior_loss,
+    which samples an independent prior draw, would differ)."""
+    model = _model("mmd")
+    inputs, target = _inputs(), torch.rand(12, 7)
+    first = model.compute_generator_losses(inputs, target, generator=torch.Generator().manual_seed(1))
+    second = model.compute_generator_losses(inputs, target, generator=torch.Generator().manual_seed(2))
+    torch.testing.assert_close(first["expression"], second["expression"])
+    torch.testing.assert_close(first["latent"], second["latent"])
+
+
+def test_z_noise_std_positive_perturbs_the_decoder_input_but_not_the_regularized_latent():
+    """The whole point of this fix: decode from a noised z (so the decoder
+    is forced to be robust to prior-scale z variation at inference), while
+    the MMD/GAN regularizer still sees the CLEAN encoded z (so the
+    aggregate-posterior-matching objective itself is unaffected)."""
+    model = ConditionalWAE(
+        7,
+        Architecture1ImageConditioner(
+            7, image_feature_dim=16, gex_feature_dim=6,
+            hidden_dim=24, n_heads=4, n_blocks=1,
+            dense_threshold=20, sparse_k=3, dropout=0.0,
+        ),
+        regularizer="mmd", latent_dim=5, autoencoder_hidden_dim=20,
+        discriminator_hidden_dim=12, n_inference_samples=3, z_noise_std=0.5,
+    )
+    inputs, target = _inputs(), torch.rand(12, 7)
+    first = model.compute_generator_losses(inputs, target, generator=torch.Generator().manual_seed(1))
+    second = model.compute_generator_losses(inputs, target, generator=torch.Generator().manual_seed(2))
+    # Different generator seeds -> different noise draws -> different
+    # reconstruction, even though the target/context are identical.
+    assert not torch.allclose(first["expression"], second["expression"])
+    # The clean encoded latent (what the regularizer sees) never depends
+    # on z_noise_std or the generator's noise draw.
+    torch.testing.assert_close(first["latent"], second["latent"])
+    # conditional_mean_head only ever takes image context, never z -- must
+    # stay completely unaffected by z_noise_std.
+    torch.testing.assert_close(
+        first["conditional_mean_expression"], second["conditional_mean_expression"],
+    )
+    for losses in (first, second):
+        assert torch.isfinite(losses["total"])
+
+
 def test_conditional_wae_uses_frozen_gene_embedding_encoder_when_table_provided():
     model = _frozen_table_model(use_film=False)
     assert isinstance(model.expression_encoder, FrozenGeneEmbeddingExpressionEncoder)
@@ -449,6 +509,62 @@ def test_mmd_variant_routes_gradients_and_inference_never_needs_gex():
     assert model(inputs)["expression"].shape == target.shape
 
 
+def test_sample_predictive_distribution_defaults_reproduce_the_pre_ex_post_prior_behavior():
+    model = _model("mmd")
+    inputs = _inputs()
+    baseline = model.sample_predictive_distribution(
+        inputs, generator=torch.Generator().manual_seed(7),
+    )
+    explicit_standard_normal = model.sample_predictive_distribution(
+        inputs, generator=torch.Generator().manual_seed(7),
+        z_mean=torch.zeros(model.latent_dim), z_std=torch.ones(model.latent_dim),
+    )
+    torch.testing.assert_close(
+        baseline["predictive_samples"], explicit_standard_normal["predictive_samples"],
+    )
+
+
+def test_sample_predictive_distribution_ex_post_prior_with_zero_std_is_deterministic_at_the_mean():
+    model = _model("mmd")
+    inputs = _inputs()
+    z_mean = torch.randn(model.latent_dim)
+    prediction = model.sample_predictive_distribution(
+        inputs, n_samples=5, generator=torch.Generator().manual_seed(3),
+        z_mean=z_mean, z_std=torch.zeros(model.latent_dim),
+    )
+    samples = prediction["predictive_samples"]
+    for index in range(1, samples.shape[0]):
+        torch.testing.assert_close(samples[0], samples[index])
+    context = model.image_conditioner(inputs)
+    expected, _ = model.decode(z_mean.unsqueeze(0).expand(context.shape[0], -1), context)
+    torch.testing.assert_close(samples[0], expected)
+
+
+def test_sample_predictive_distribution_ex_post_prior_shifts_and_scales_z_relative_to_default():
+    model = _model("mmd")
+    inputs = _inputs()
+    narrow = model.sample_predictive_distribution(
+        inputs, n_samples=32, generator=torch.Generator().manual_seed(11),
+        z_mean=torch.zeros(model.latent_dim), z_std=torch.full((model.latent_dim,), 0.01),
+    )
+    wide = model.sample_predictive_distribution(
+        inputs, n_samples=32, generator=torch.Generator().manual_seed(11),
+        z_mean=torch.zeros(model.latent_dim), z_std=torch.ones(model.latent_dim),
+    )
+    assert float(narrow["predictive_std"].mean()) < float(wide["predictive_std"].mean())
+
+
+def test_sample_predictive_distribution_rejects_malformed_ex_post_prior():
+    model = _model("mmd")
+    inputs = _inputs()
+    with pytest.raises(ValueError, match="z_mean"):
+        model.sample_predictive_distribution(inputs, z_mean=torch.zeros(model.latent_dim + 1))
+    with pytest.raises(ValueError, match="z_std"):
+        model.sample_predictive_distribution(inputs, z_std=torch.zeros(model.latent_dim + 1))
+    with pytest.raises(ValueError, match="non-negative"):
+        model.sample_predictive_distribution(inputs, z_std=-torch.ones(model.latent_dim))
+
+
 def test_configured_dense_sparse_attention_switch_is_real():
     model = _model("mmd")  # dense_threshold=20 in the shared test model
     model(_inputs(n=12))
@@ -572,6 +688,45 @@ def test_static_contract_gene_encoder_source_defaults_to_linear():
     config["model"]["regularizer"] = "gan"
     report = static_audit_conditional_wae_config(config)
     assert report["gene_encoder_source"] == "linear"
+
+
+def test_static_contract_z_noise_std_defaults_to_zero_and_is_reported():
+    config = _geneencoder_config("wae_he_gan_control", encoder_conditioning="none")
+    config["model"]["regularizer"] = "gan"
+    report = static_audit_conditional_wae_config(config)
+    assert report["z_noise_std"] == 0.0
+
+
+def test_static_contract_rejects_a_negative_z_noise_std():
+    config = _geneencoder_config("wae_he_gan_control", encoder_conditioning="none")
+    config["model"]["regularizer"] = "gan"
+    config["model"]["params"]["z_noise_std"] = -0.1
+    with pytest.raises(ValueError, match="z_noise_std"):
+        static_audit_conditional_wae_config(config)
+
+
+def test_static_contract_accepts_a_positive_z_noise_std():
+    config = _geneencoder_config("wae_he_gan_control", encoder_conditioning="none")
+    config["model"]["regularizer"] = "gan"
+    config["model"]["params"]["z_noise_std"] = 0.5
+    report = static_audit_conditional_wae_config(config)
+    assert report["z_noise_std"] == 0.5
+
+
+def test_build_model_wires_z_noise_std_from_config():
+    config = _geneencoder_config(
+        "wae_he_gan_control", encoder_conditioning="none", gene_encoder_source="linear",
+    )
+    config["model"]["regularizer"] = "gan"
+    config["model"]["params"]["n_heads"] = 4
+    config["model"]["params"]["n_blocks"] = 1
+    config["model"]["params"]["dense_threshold"] = 20
+    config["model"]["params"]["sparse_k"] = 3
+    config["model"]["params"]["discriminator_hidden_dim"] = 12
+    config["model"]["params"]["n_inference_samples"] = 3
+    config["model"]["params"]["z_noise_std"] = 0.5
+    model = train_conditional_wae._build_model(config, n_genes=7)
+    assert model.z_noise_std == 0.5
 
 
 def test_precheckpoint_root_manifest_is_not_mistaken_for_resumable_weights(tmp_path):

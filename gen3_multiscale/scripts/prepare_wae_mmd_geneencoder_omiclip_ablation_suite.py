@@ -77,6 +77,7 @@ def prepare_wae_mmd_geneencoder_omiclip_ablation_suite(
     output_root: str, scfoundation_basis_path: str, omiclip_pinned_revision: str,
     latent_dim: int = 64, hours: float = 8.0, gpus: tuple[int, ...] = (0, 1, 2, 3),
     cpu_threads: int = 12, omiclip_spot_feature_cache_dir: str | None = None,
+    z_noise_std: float = 0.0,
 ) -> dict:
     if hours <= 0:
         raise ValueError("hours must be positive")
@@ -86,6 +87,8 @@ def prepare_wae_mmd_geneencoder_omiclip_ablation_suite(
         raise ValueError("cpu_threads must be at least 1")
     if latent_dim < 1:
         raise ValueError("latent_dim must be positive")
+    if z_noise_std < 0:
+        raise ValueError("z_noise_std must be non-negative")
     if not scfoundation_basis_path:
         raise ValueError("scfoundation_basis_path must be set to an already-fit basis artifact")
     if not omiclip_pinned_revision:
@@ -130,6 +133,7 @@ def prepare_wae_mmd_geneencoder_omiclip_ablation_suite(
         "encoder_conditioning": "film",
         "film_layers": ["first", "second"],
         "film_shared_generator": False,
+        "z_noise_std": float(z_noise_std),
     })
     base_seed = int((base.get("training") or {}).get("seed", 0))
 
@@ -232,6 +236,7 @@ def prepare_wae_mmd_geneencoder_omiclip_ablation_suite(
         "gpus": list(gpus),
         "scfoundation_basis_path": str(scfoundation_basis_path),
         "omiclip_pinned_revision": str(omiclip_pinned_revision),
+        "z_noise_std": float(z_noise_std),
         "arms": written,
     }
     (root / "run_plan.json").write_text(json.dumps(plan, indent=2, sort_keys=True))
@@ -316,6 +321,15 @@ def main() -> None:
     parser.add_argument("--hours", type=float, default=8.0)
     parser.add_argument("--gpus", default="0,1,2,3", help="comma-separated GPU ids, one per arm")
     parser.add_argument("--cpu-threads", type=int, default=12)
+    parser.add_argument(
+        "--z-noise-std", type=float, default=0.0,
+        help="Std of independent Gaussian noise added to the decoder's z input during training "
+             "(the real encoded target passes through unperturbed for the MMD/GAN regularizer -- "
+             "only the decoder's own input is noised). Closes the train/inference mismatch that "
+             "causes severe predictive_std under-dispersion at inference (z is drawn fresh from "
+             "N(0,I) there, never from this encoder). 0.0 (default) is a strict no-op, identical "
+             "to every config prepared before this option existed.",
+    )
     args = parser.parse_args()
     gpus = tuple(int(value) for value in args.gpus.split(","))
     plan = prepare_wae_mmd_geneencoder_omiclip_ablation_suite(
@@ -330,6 +344,7 @@ def main() -> None:
         hours=args.hours,
         gpus=gpus,
         cpu_threads=args.cpu_threads,
+        z_noise_std=args.z_noise_std,
     )
     print(json.dumps(plan, indent=2, sort_keys=True))
 

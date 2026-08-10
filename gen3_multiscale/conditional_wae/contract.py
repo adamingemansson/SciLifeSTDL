@@ -113,6 +113,8 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
     for field in ("latent_dim", "hidden_dim", "gex_feature_dim", "autoencoder_hidden_dim"):
         if int(params.get(field, 0)) < 1:
             raise ValueError(f"model.params.{field} must be positive")
+    if float(params.get("z_noise_std", 0.0)) < 0:
+        raise ValueError("model.params.z_noise_std must be non-negative")
     encoder_conditioning = params.get("encoder_conditioning", "none")
     if encoder_conditioning not in {"none", "film"}:
         raise ValueError("model.params.encoder_conditioning must be 'none' or 'film'")
@@ -174,4 +176,5 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
         "use_gene_coexpression_refinement": use_gene_coexpression_refinement,
         "use_histology_context": use_histology_context,
         "gene_encoder_source": gene_encoder_source,
+        "z_noise_std": float(params.get("z_noise_std", 0.0)),
     }

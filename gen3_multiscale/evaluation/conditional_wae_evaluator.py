@@ -48,11 +48,15 @@ def evaluate_conditional_wae(
     use_best: bool = True,
     allow_code_drift: bool = False,
     n_samples: int | None = None,
+    ex_post_prior_path: str | None = None,
 ) -> dict:
     if split not in {"validation", "test"}:
         raise ValueError("split must be validation or test")
     if n_masks_per_sample < 1:
         raise ValueError("n_masks_per_sample must be positive")
+    ex_post_prior = None
+    if ex_post_prior_path is not None:
+        ex_post_prior = json.loads(Path(ex_post_prior_path).read_text())
     config = resolved_config(config_path)
     static_audit_conditional_wae_config(config)
     dataset_manifest = load_dataset_manifest(config["data"]["gen3_manifest_path"])
@@ -104,6 +108,14 @@ def evaluate_conditional_wae(
     model = _build_model(config, len(gene_names), gene_names=gene_names).to(device)
     checkpoint_module.load_trainable_state(model, requested_checkpoint)
     model.eval()
+    ex_post_z_mean = ex_post_z_std = None
+    if ex_post_prior is not None:
+        if int(ex_post_prior["latent_dim"]) != model.latent_dim:
+            raise ValueError(
+                f"ex-post prior latent_dim={ex_post_prior['latent_dim']} != model latent_dim={model.latent_dim}"
+            )
+        ex_post_z_mean = torch.tensor(ex_post_prior["z_mean"], dtype=torch.float32, device=device)
+        ex_post_z_std = torch.tensor(ex_post_prior["z_std"], dtype=torch.float32, device=device)
 
     panels = load_configured_gene_panels(config, dataset_manifest)
     _indices, panel_metadata = resolve_gene_panels(gene_names, panels) if panels else ({}, {})
@@ -125,6 +137,7 @@ def evaluate_conditional_wae(
             )
             prediction = model.sample_predictive_distribution(
                 inputs, n_samples=inference_samples, generator=generator,
+                z_mean=ex_post_z_mean, z_std=ex_post_z_std,
             )
             true = np.asarray(target, dtype=np.float32)
             model_pred = prediction["predictive_mean"].detach().cpu().numpy().astype(np.float32)
@@ -179,6 +192,7 @@ def evaluate_conditional_wae(
         "n_samples": len(split_ids),
         "n_items": len(dataset),
         "n_latent_samples_per_item": inference_samples,
+        "ex_post_prior_path": str(ex_post_prior_path) if ex_post_prior_path else None,
         "task": config["model"]["task"],
         "regularizer": config["model"]["regularizer"],
         "query_he_visible": True,
@@ -217,6 +231,13 @@ def main() -> None:
     parser.add_argument("--no-use-best", action="store_true")
     parser.add_argument("--allow-code-drift", action="store_true")
     parser.add_argument("--n-samples", type=int)
+    parser.add_argument(
+        "--ex-post-prior",
+        help="Path to a JSON fit by scripts/fit_conditional_wae_ex_post_prior.py. When given, "
+             "inference-time z is drawn from this fitted per-latent-dim Gaussian instead of the "
+             "raw N(0,I) prior -- the standard no-retrain fix for WAE aggregate-posterior/prior "
+             "mismatch. Omit to reproduce the exact pre-existing N(0,I) sampling behavior.",
+    )
     args = parser.parse_args()
     evaluate_conditional_wae(
         args.config,
@@ -228,6 +249,7 @@ def main() -> None:
         use_best=not args.no_use_best,
         allow_code_drift=args.allow_code_drift,
         n_samples=args.n_samples,
+        ex_post_prior_path=args.ex_post_prior,
     )
 
 
