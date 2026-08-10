@@ -430,8 +430,15 @@ class ConditionalWAETensorBoardLogger:
                 )
                 if np.isfinite(gene_pcc):
                     self.writer.add_scalar(f"whole_slide/{sample_id}/genes/{gene}/pcc", gene_pcc, step)
-                low = float(min(true_values.min(), predicted_values.min()))
-                high = float(max(true_values.max(), predicted_values.max()))
+                # Real bug (user report, Aug 2026): raw min/max let a single
+                # outlier spot (real biology -- a sharp local expression
+                # spike is normal, not an artifact) stretch vmax and crush
+                # every other spot toward the dark end of viridis, making
+                # genuinely present signal look like near-total sparsity.
+                # 2nd-98th percentile, matching the same percentile-clip
+                # convention `_pca_rgb` already uses above in this file.
+                combined = np.concatenate([true_values, predicted_values])
+                low, high = (float(v) for v in np.percentile(combined, [2.0, 98.0]))
                 fig, axes = plt.subplots(1, 3, figsize=(12, 4), constrained_layout=True)
                 for ax, values, title, cmap, limits in (
                     (axes[0], true_values, "target", "viridis", (low, high)),
