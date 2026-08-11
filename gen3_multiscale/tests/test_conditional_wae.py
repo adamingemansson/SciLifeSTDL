@@ -513,6 +513,114 @@ def test_mmd_variant_routes_gradients_and_inference_never_needs_gex():
     assert model(inputs)["expression"].shape == target.shape
 
 
+def _distributional_model(**kwargs):
+    return ConditionalWAE(
+        7,
+        Architecture1ImageConditioner(
+            7, image_feature_dim=16, gex_feature_dim=6,
+            hidden_dim=24, n_heads=4, n_blocks=1,
+            dense_threshold=20, sparse_k=3, dropout=0.0,
+        ),
+        regularizer="mmd", latent_dim=5, autoencoder_hidden_dim=20,
+        discriminator_hidden_dim=12, n_inference_samples=3,
+        likelihood="zero_inflated_gaussian", distributional_hidden_dim=16, **kwargs,
+    )
+
+
+def _sparse_target(n=12, genes=7, seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    target = torch.rand(n, genes, generator=generator)
+    target[target < 0.6] = 0.0  # a real log1p target has a large point mass at 0
+    return target
+
+
+def test_default_likelihood_builds_no_distributional_head_and_adds_no_loss_key():
+    """The trainer's accumulator calls .detach() on every scalar loss entry,
+    so a None placeholder would break every existing gaussian_mse run."""
+    model = _model("mmd")
+    assert model.distributional_head is None
+    losses = model.compute_generator_losses(
+        _inputs(), _sparse_target(), generator=torch.Generator().manual_seed(0),
+    )
+    assert "distributional_loss" not in losses
+    for key, value in losses.items():
+        if key not in ("expression", "conditional_mean_expression", "latent"):
+            float(value.detach())  # must not raise
+
+
+def test_zero_inflated_head_contributes_a_real_loss_and_receives_gradient():
+    model = _distributional_model()
+    losses = model.compute_generator_losses(
+        _inputs(), _sparse_target(), generator=torch.Generator().manual_seed(0),
+    )
+    assert "distributional_loss" in losses
+    assert torch.isfinite(losses["distributional_loss"])
+    losses["total"].backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0
+               for p in model.distributional_head.parameters())
+
+
+def test_distributional_predictive_std_is_analytic_not_monte_carlo():
+    """The measured failure was Monte-Carlo scatter over a latent producing
+    z_std of 9-19. With a likelihood head the spread is a trained output, so
+    it must not change with the number of drawn samples."""
+    model = _distributional_model()
+    inputs = _inputs()
+    few = model.sample_predictive_distribution(
+        inputs, n_samples=2, generator=torch.Generator().manual_seed(0),
+    )
+    many = model.sample_predictive_distribution(
+        inputs, n_samples=64, generator=torch.Generator().manual_seed(1),
+    )
+    torch.testing.assert_close(few["predictive_std"], many["predictive_std"])
+    torch.testing.assert_close(few["predictive_mean"], many["predictive_mean"])
+    assert few["predictive_samples"].shape[0] == 2
+    assert many["predictive_samples"].shape[0] == 64
+    assert bool((few["predictive_std"] >= 0).all())
+
+
+def test_zero_inflated_head_can_commit_to_an_exact_zero():
+    """The flat-UMOD failure was an inability to say 'this spot is zero'.
+    A confident zero prediction must beat a confident nonzero one on a
+    genuinely all-zero target."""
+    from gen3_multiscale.conditional_wae.distributional import zero_inflated_gaussian_nll
+    target = torch.zeros(4, 3)
+    shape = target.shape
+    confident_zero = zero_inflated_gaussian_nll(
+        torch.full(shape, 8.0), torch.zeros(shape), torch.full(shape, -2.0), target,
+    )
+    confident_nonzero = zero_inflated_gaussian_nll(
+        torch.full(shape, -8.0), torch.full(shape, 2.0), torch.full(shape, -2.0), target,
+    )
+    assert float(confident_zero) < float(confident_nonzero)
+
+
+def test_static_contract_validates_and_reports_the_likelihood():
+    config = _geneencoder_config(
+        "wae_he_mmd_geneencoder_mlp_nofilm",
+        encoder_conditioning="none", gene_encoder_source="linear",
+    )
+    assert static_audit_conditional_wae_config(config)["likelihood"] == "gaussian_mse"
+    config["model"]["params"]["likelihood"] = "zero_inflated_gaussian"
+    assert static_audit_conditional_wae_config(config)["likelihood"] == "zero_inflated_gaussian"
+    config["model"]["params"]["likelihood"] = "poisson"
+    with pytest.raises(ValueError, match="likelihood"):
+        static_audit_conditional_wae_config(config)
+
+
+def test_model_rejects_an_unknown_likelihood():
+    with pytest.raises(ValueError, match="likelihood"):
+        _distributional_model.__wrapped__ if False else ConditionalWAE(
+            7,
+            Architecture1ImageConditioner(
+                7, image_feature_dim=16, gex_feature_dim=6, hidden_dim=24,
+                n_heads=4, n_blocks=1, dense_threshold=20, sparse_k=3, dropout=0.0,
+            ),
+            regularizer="mmd", latent_dim=5, autoencoder_hidden_dim=20,
+            discriminator_hidden_dim=12, n_inference_samples=3, likelihood="poisson",
+        )
+
+
 def _refining_model(n_steps, regularizer="mmd"):
     return ConditionalWAE(
         7,

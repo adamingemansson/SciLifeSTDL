@@ -237,6 +237,9 @@ def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = N
         refinement_k_neighbors=int(params.get("refinement_k_neighbors", 6)),
         refinement_hidden_dim=int(params.get("refinement_hidden_dim", 256)),
         refinement_gex_feature_dim=int(params.get("refinement_gex_feature_dim", 256)),
+        likelihood=str(params.get("likelihood", "gaussian_mse")),
+        distributional_weight=float(params.get("distributional_weight", 1.0)),
+        distributional_hidden_dim=int(params.get("distributional_hidden_dim", 1024)),
     )
 
 

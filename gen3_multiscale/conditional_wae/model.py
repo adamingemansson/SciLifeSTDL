@@ -29,6 +29,13 @@ from gen3_multiscale.conditional_wae.spatial_refinement import (
     SpatialExpressionRefiner,
     refine_expression,
 )
+from gen3_multiscale.conditional_wae.distributional import (
+    ZeroInflatedGaussianHead,
+    zero_inflated_gaussian_moments,
+    zero_inflated_gaussian_nll,
+)
+
+VALID_LIKELIHOODS = ("gaussian_mse", "zero_inflated_gaussian")
 
 
 class _ImageSpatialBlock(nn.Module):
@@ -429,8 +436,15 @@ class ConditionalWAE(nn.Module):
                  n_refinement_steps: int = 0,
                  refinement_k_neighbors: int = 6,
                  refinement_hidden_dim: int = 256,
-                 refinement_gex_feature_dim: int = 256):
+                 refinement_gex_feature_dim: int = 256,
+                 likelihood: str = "gaussian_mse",
+                 distributional_weight: float = 1.0,
+                 distributional_hidden_dim: int = 1024):
         super().__init__()
+        if likelihood not in VALID_LIKELIHOODS:
+            raise ValueError(f"likelihood must be one of {VALID_LIKELIHOODS}")
+        if distributional_weight < 0:
+            raise ValueError("distributional_weight must be non-negative")
         if regularizer not in {"mmd", "gan"}:
             raise ValueError("regularizer must be 'mmd' or 'gan'")
         if n_genes < 1 or latent_dim < 1 or n_inference_samples < 1:
@@ -501,6 +515,18 @@ class ConditionalWAE(nn.Module):
         # Iterative spatial refinement (STFlow Eq. 7 analogue): neighbouring
         # PREDICTED expression steers attention. Never reads target GEX, so the
         # query-GEX-invisible contract is unchanged. 0 steps is a strict no-op.
+        # Predictive-distribution head. When enabled it supplies an ANALYTIC
+        # per-spot/per-gene mean and std, so predictive uncertainty no longer
+        # depends on Monte-Carlo scatter over a latent that was measured to
+        # contribute noise orthogonal to the error (corr 0.002-0.025).
+        self.likelihood = likelihood
+        self.distributional_weight = float(distributional_weight)
+        self.distributional_head = (
+            ZeroInflatedGaussianHead(
+                n_genes, context_dim, hidden_dim=int(distributional_hidden_dim),
+            )
+            if likelihood == "zero_inflated_gaussian" else None
+        )
         if n_refinement_steps < 0:
             raise ValueError("n_refinement_steps must be non-negative")
         self.n_refinement_steps = int(n_refinement_steps)
@@ -640,7 +666,14 @@ class ConditionalWAE(nn.Module):
             reconstruction_loss + self.conditional_mean_weight * conditional_mean_loss
             + self.regularizer_weight * prior_loss
         )
-        return {
+        distributional_loss = None
+        if self.distributional_head is not None:
+            zero_logit, head_mean, log_sigma = self.distributional_head(context)
+            distributional_loss = zero_inflated_gaussian_nll(
+                zero_logit, head_mean, log_sigma, target,
+            )
+            total = total + self.distributional_weight * distributional_loss
+        losses = {
             "total": total,
             "expression": reconstruction,
             "conditional_mean_expression": conditional_mean,
@@ -653,6 +686,12 @@ class ConditionalWAE(nn.Module):
             "conditional_mean_pcc_loss": conditional_mean_pcc,
             "prior_loss": prior_loss,
         }
+        # Only present when the likelihood head is enabled. The trainer's
+        # accumulator calls .detach() on every scalar entry it finds, so a
+        # None placeholder here would break every gaussian_mse run.
+        if distributional_loss is not None:
+            losses["distributional_loss"] = distributional_loss
+        return losses
 
     def compute_discriminator_loss(self, target_expression, *, generator=None,
                                    inputs: FullImageExpressionInputs | None = None) -> torch.Tensor:
@@ -698,6 +737,40 @@ class ConditionalWAE(nn.Module):
         count = int(n_samples or self.n_inference_samples)
         if count < 1:
             raise ValueError("n_samples must be positive")
+        if self.distributional_head is not None:
+            # The likelihood head already defines the predictive distribution,
+            # so the mean and std are exact rather than estimated from a
+            # handful of latent draws. `predictive_samples` keeps its
+            # [n_samples, N, n_genes] contract by drawing from that fitted
+            # distribution, so every downstream consumer is unchanged.
+            zero_logit, head_mean, log_sigma = self.distributional_head(context)
+            predictive_mean, predictive_std = zero_inflated_gaussian_moments(
+                zero_logit, head_mean, log_sigma,
+            )
+            positive = torch.sigmoid(-zero_logit)
+            draws = []
+            for _ in range(count):
+                keep = (
+                    torch.rand(
+                        positive.shape, dtype=positive.dtype, device=positive.device,
+                        generator=generator,
+                    ) < positive
+                ).to(positive.dtype)
+                noise = torch.randn(
+                    head_mean.shape, dtype=head_mean.dtype, device=head_mean.device,
+                    generator=generator,
+                )
+                draws.append(keep * (head_mean + torch.exp(log_sigma) * noise))
+            return {
+                "expression": predictive_mean,
+                "predictive_mean": predictive_mean,
+                "predictive_std": predictive_std,
+                "predictive_samples": torch.stack(draws),
+                "conditional_mean_expression": self._refine(
+                    self.conditional_mean_head(context), context, inputs,
+                ),
+                "image_context": context,
+            }
         # Ex-post density estimation (Ghosh et al., "From Variational to
         # Deterministic Autoencoders", ICLR 2020): the standard, no-retrain
         # fix for a WAE's aggregate-posterior/prior mismatch is to sample z

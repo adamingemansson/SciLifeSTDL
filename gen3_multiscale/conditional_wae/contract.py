@@ -123,6 +123,13 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
                       "refinement_gex_feature_dim"):
             if int(params.get(field, 1)) < 1:
                 raise ValueError(f"model.params.{field} must be positive")
+    likelihood = str(params.get("likelihood", "gaussian_mse"))
+    if likelihood not in {"gaussian_mse", "zero_inflated_gaussian"}:
+        raise ValueError(
+            "model.params.likelihood must be 'gaussian_mse' or 'zero_inflated_gaussian'"
+        )
+    if float(params.get("distributional_weight", 1.0)) < 0:
+        raise ValueError("model.params.distributional_weight must be non-negative")
     encoder_conditioning = params.get("encoder_conditioning", "none")
     if encoder_conditioning not in {"none", "film"}:
         raise ValueError("model.params.encoder_conditioning must be 'none' or 'film'")
@@ -186,4 +193,5 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
         "gene_encoder_source": gene_encoder_source,
         "z_noise_std": float(params.get("z_noise_std", 0.0)),
         "n_refinement_steps": n_refinement_steps,
+        "likelihood": likelihood,
     }
