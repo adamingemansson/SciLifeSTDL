@@ -233,6 +233,10 @@ def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = N
         gene_coexpression_basis=gene_coexpression_basis,
         gene_encoder_table=gene_encoder_table,
         z_noise_std=float(params.get("z_noise_std", 0.0)),
+        n_refinement_steps=int(params.get("n_refinement_steps", 0)),
+        refinement_k_neighbors=int(params.get("refinement_k_neighbors", 6)),
+        refinement_hidden_dim=int(params.get("refinement_hidden_dim", 256)),
+        refinement_gex_feature_dim=int(params.get("refinement_gex_feature_dim", 256)),
     )
 
 

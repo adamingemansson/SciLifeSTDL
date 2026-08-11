@@ -187,7 +187,13 @@ class ConditionalWAESnapshotAccumulator:
             self.target_genes.append(
                 selected_target.index_select(1, gene_index).cpu().float().numpy()
             )
-        if self.n_points < self.thumbnail_max_points:
+        # H&E thumbnails are the only consumer of raw pixels after the
+        # spot-feature cache has verified them, so they are skipped when a run
+        # released the patch array (data.retain_patches_in_memory=false).
+        # Every scalar, panel and spatial-map diagnostic is unaffected; only
+        # the thumbnail strip is absent, which is the intended trade for
+        # ~75 GB of resident pixels per process.
+        if self.n_points < self.thumbnail_max_points and sample.patches is not None:
             thumbnail_take = min(count, self.thumbnail_max_points - self.n_points)
             patches = np.asarray(sample.patches)[full[:thumbnail_take]]
             if patches.ndim != 4 or patches.shape[-1] != 3:

@@ -78,6 +78,8 @@ def prepare_wae_mmd_geneencoder_omiclip_ablation_suite(
     latent_dim: int = 64, hours: float = 8.0, gpus: tuple[int, ...] = (0, 1, 2, 3),
     cpu_threads: int = 12, omiclip_spot_feature_cache_dir: str | None = None,
     z_noise_std: float = 0.0,
+    n_refinement_steps: int = 0,
+    retain_patches_in_memory: bool = True,
 ) -> dict:
     if hours <= 0:
         raise ValueError("hours must be positive")
@@ -89,6 +91,8 @@ def prepare_wae_mmd_geneencoder_omiclip_ablation_suite(
         raise ValueError("latent_dim must be positive")
     if z_noise_std < 0:
         raise ValueError("z_noise_std must be non-negative")
+    if n_refinement_steps < 0:
+        raise ValueError("n_refinement_steps must be non-negative")
     if not scfoundation_basis_path:
         raise ValueError("scfoundation_basis_path must be set to an already-fit basis artifact")
     if not omiclip_pinned_revision:
@@ -134,6 +138,7 @@ def prepare_wae_mmd_geneencoder_omiclip_ablation_suite(
         "film_layers": ["first", "second"],
         "film_shared_generator": False,
         "z_noise_std": float(z_noise_std),
+        "n_refinement_steps": int(n_refinement_steps),
     })
     base_seed = int((base.get("training") or {}).get("seed", 0))
 
@@ -161,6 +166,7 @@ def prepare_wae_mmd_geneencoder_omiclip_ablation_suite(
         }
         config["data"]["gen3_manifest_path"] = str(manifest_path)
         config["data"]["image_encoder"] = "omiclip"
+        config["data"]["retain_patches_in_memory"] = bool(retain_patches_in_memory)
         config["data"]["omiclip_pinned_revision"] = str(omiclip_pinned_revision)
         if omiclip_spot_feature_cache_dir:
             config["data"]["gen3_omiclip_spot_feature_cache_dir"] = str(omiclip_spot_feature_cache_dir)
@@ -237,6 +243,7 @@ def prepare_wae_mmd_geneencoder_omiclip_ablation_suite(
         "scfoundation_basis_path": str(scfoundation_basis_path),
         "omiclip_pinned_revision": str(omiclip_pinned_revision),
         "z_noise_std": float(z_noise_std),
+        "n_refinement_steps": int(n_refinement_steps),
         "arms": written,
     }
     (root / "run_plan.json").write_text(json.dumps(plan, indent=2, sort_keys=True))
@@ -330,6 +337,23 @@ def main() -> None:
              "N(0,I) there, never from this encoder). 0.0 (default) is a strict no-op, identical "
              "to every config prepared before this option existed.",
     )
+    parser.add_argument(
+        "--n-refinement-steps", type=int, default=0,
+        help="Iterative spatial-refinement passes. Each pass runs attention over each "
+             "spot's k-NN neighbours whose logits include the neighbour's predicted "
+             "expression (STFlow Eq. 7 analogue), applied to the model's OWN prediction "
+             "-- target GEX is never read. STFlow reports S=1->5 improving and plateauing "
+             "past 5. 0 (default) is a strict no-op identical to every config prepared "
+             "before this option existed.",
+    )
+    parser.add_argument(
+        "--release-patches-after-verification", action="store_true",
+        help="Free each slide's raw H&E patch array once the spot-feature cache has "
+             "re-hashed it against its stored patch_content_sha256. Training reads only "
+             "the verified cached features afterwards, so this drops ~376 MB per "
+             "2,500-spot slide (~75 GB per process across a full split) with no effect "
+             "on any metric. Only TensorBoard H&E thumbnails are lost.",
+    )
     args = parser.parse_args()
     gpus = tuple(int(value) for value in args.gpus.split(","))
     plan = prepare_wae_mmd_geneencoder_omiclip_ablation_suite(
@@ -340,6 +364,8 @@ def main() -> None:
         scfoundation_basis_path=args.scfoundation_basis_path,
         omiclip_pinned_revision=args.omiclip_pinned_revision,
         omiclip_spot_feature_cache_dir=args.omiclip_spot_feature_cache_dir,
+        n_refinement_steps=args.n_refinement_steps,
+        retain_patches_in_memory=not args.release_patches_after_verification,
         latent_dim=args.latent_dim,
         hours=args.hours,
         gpus=gpus,

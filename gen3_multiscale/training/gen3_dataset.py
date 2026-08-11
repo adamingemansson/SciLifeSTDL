@@ -90,7 +90,15 @@ class Gen3SampleData:
     patient_id: str
     split: str  # "train" / "validation" / "test", read from the manifest
     adata: "object"  # ad.AnnData, QC'd/gene-panel-aligned (example_builder.load_sample_for_examples's contract)
-    patches: np.ndarray
+    # `patches` is the raw [n_spots, 224, 224, 3] uint8 pixel array -- by far
+    # the largest per-sample object (~376 MB for a 2,500-spot slide, ~75 GB
+    # across a full training split, per process). It is REQUIRED during
+    # loading, where every spot-feature cache loader re-hashes it against the
+    # stored `patch_content_sha256`, but nothing in training reads pixels
+    # afterwards when features come from that verified cache. It is therefore
+    # released after verification unless `data.retain_patches_in_memory` is
+    # true (the default, which preserves the historical behaviour exactly).
+    patches: np.ndarray | None
     image_source_available: np.ndarray
     precomputed_spot_features: np.ndarray  # VERIFIED via spot_feature_cache.load_gen3_spot_features
     precomputed_spot_features_barcodes: np.ndarray  # the cache record's OWN verified barcodes -- kept alongside the features, not discarded after the fact
@@ -102,8 +110,19 @@ class Gen3SampleData:
     tile_encoder_provenance: dict  # {"dense_wsi": {...} | None, "spot_features": {...}}
     spatial_adjacency: tuple[np.ndarray, ...] | None = None  # canonical graph, built once per sample
     precomputed_histology_features: np.ndarray | None = None  # VERIFIED via histology_cache.load_gen3_histology_features; None unless data.use_histology_features
+    # The REAL verified patch row count, retained even when `patches` is
+    # released. Derived from `patches` when not given, so every existing
+    # constructor keeps working unchanged.
+    n_patch_rows: int | None = None
 
     def __post_init__(self):
+        if self.n_patch_rows is None:
+            if self.patches is None:
+                raise ValueError(
+                    f"{self.sample_id}: n_patch_rows is required when patches is None -- "
+                    "the patch/adata alignment check must never be silently skipped"
+                )
+            object.__setattr__(self, "n_patch_rows", int(np.asarray(self.patches).shape[0]))
         if self.spatial_adjacency is None:
             object.__setattr__(
                 self,
@@ -243,12 +262,22 @@ def load_gen3_sample_data(
             cfg, sample_id, obs_names, full_sample_coords, patches, image_source_available,
         )
 
+    # Every spot-feature cache loader above has already re-hashed these exact
+    # pixels against the cache's stored `patch_content_sha256`, so the
+    # provenance guarantee is fully discharged by this point. Holding the
+    # array for the rest of the run costs ~376 MB per 2,500-spot slide with
+    # no reader: `build_spatial_field_example` only needs the row count once
+    # features come from the verified cache.
+    n_patch_rows = int(np.asarray(patches).shape[0])
+    if not bool(cfg.data.get("retain_patches_in_memory", True)):
+        patches = None
     return Gen3SampleData(
         sample_id=sample_id,
         patient_id=str(record["patient_id"]),
         split=split,
         adata=adata,
         patches=patches,
+        n_patch_rows=n_patch_rows,
         image_source_available=image_source_available,
         precomputed_spot_features=spot_record["features"],
         precomputed_spot_features_barcodes=spot_record["barcodes"],
@@ -532,6 +561,7 @@ class Gen3SpatialFieldDataset(torch.utils.data.Dataset):
                 sample.adata, sample.patches, context_barcodes, query_barcodes,
                 None,
                 sample_id=sample_id, patient_id=sample.patient_id,
+                n_patch_rows=sample.n_patch_rows,
                 full_sample_coords=sample.full_sample_coords, require_full_sample_coords=True,
                 patch_size_fullres=self.patch_size_fullres, k_neighbors=self.k_neighbors,
                 local_k=self.local_k, max_rings=self.max_rings, max_boundary_size=self.max_boundary_size,

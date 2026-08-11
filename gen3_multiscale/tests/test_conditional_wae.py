@@ -15,6 +15,10 @@ from gen3_multiscale.conditional_wae import (
     imq_mmd,
 )
 from gen3_multiscale.conditional_wae.contract import static_audit_conditional_wae_config
+from gen3_multiscale.conditional_wae.spatial_refinement import (
+    SpatialExpressionRefiner,
+    padded_neighbor_graph,
+)
 from gen3_multiscale.conditional_wae.film_diagnostics import compute_film_diagnostics
 from gen3_multiscale.conditional_wae.tensorboard import (
     ConditionalWAESnapshotAccumulator,
@@ -507,6 +511,136 @@ def test_mmd_variant_routes_gradients_and_inference_never_needs_gex():
     assert prediction["predictive_mean"].shape == target.shape
     assert prediction["predictive_samples"].shape == (3, 12, 7)
     assert model(inputs)["expression"].shape == target.shape
+
+
+def _refining_model(n_steps, regularizer="mmd"):
+    return ConditionalWAE(
+        7,
+        Architecture1ImageConditioner(
+            7, image_feature_dim=16, gex_feature_dim=6,
+            hidden_dim=24, n_heads=4, n_blocks=1,
+            dense_threshold=20, sparse_k=3, dropout=0.0,
+        ),
+        regularizer=regularizer, latent_dim=5, autoencoder_hidden_dim=20,
+        discriminator_hidden_dim=12, n_inference_samples=3,
+        n_refinement_steps=n_steps, refinement_k_neighbors=3,
+        refinement_hidden_dim=16, refinement_gex_feature_dim=8,
+    )
+
+
+def test_zero_refinement_steps_builds_no_refiner_and_changes_nothing():
+    model = _refining_model(0)
+    assert model.spatial_refiner is None
+    baseline = _model("mmd")
+    assert model(_inputs())["expression"].shape == baseline(_inputs())["expression"].shape
+
+
+def test_refiner_starts_at_the_identity_so_enabling_it_cannot_break_a_checkpoint():
+    model = _refining_model(3)
+    inputs = _inputs()
+    context = model.image_conditioner(inputs)
+    base = model.conditional_mean_head(context)
+    # The update head is zero-initialised, so before any training the
+    # refinement is exactly a no-op regardless of step count.
+    torch.testing.assert_close(model._refine(base, context, inputs), base)
+
+
+def test_refinement_changes_the_prediction_once_the_update_head_is_nonzero():
+    model = _refining_model(2)
+    inputs = _inputs()
+    with torch.no_grad():
+        for parameter in model.spatial_refiner.update_head[-1].parameters():
+            parameter.add_(torch.randn_like(parameter) * 0.05)
+    context = model.image_conditioner(inputs)
+    base = model.conditional_mean_head(context)
+    refined = model._refine(base, context, inputs)
+    assert not torch.allclose(refined, base)
+    assert refined.shape == base.shape
+
+
+def test_refinement_never_reads_target_expression():
+    """The refiner must depend only on the model's OWN prediction, image
+    context and coordinates -- never on the held-out target."""
+    model = _refining_model(2)
+    inputs = _inputs()
+    with torch.no_grad():
+        for parameter in model.spatial_refiner.update_head[-1].parameters():
+            parameter.add_(torch.randn_like(parameter) * 0.05)
+    generator_kwargs = {"generator": torch.Generator().manual_seed(0)}
+    first = model.compute_generator_losses(inputs, torch.zeros(12, 7), **generator_kwargs)
+    second = model.compute_generator_losses(
+        inputs, torch.zeros(12, 7), generator=torch.Generator().manual_seed(0),
+    )
+    torch.testing.assert_close(first["expression"], second["expression"])
+    # A completely different target must not change what the refiner does to
+    # the image-only conditional mean.
+    third = model.compute_generator_losses(
+        inputs, torch.randn(12, 7) * 5.0, generator=torch.Generator().manual_seed(0),
+    )
+    torch.testing.assert_close(
+        first["conditional_mean_expression"], third["conditional_mean_expression"],
+    )
+
+
+def test_refinement_gradients_reach_the_refiner_and_the_conditioner():
+    model = _refining_model(2)
+    inputs, target = _inputs(), torch.randn(12, 7)
+    losses = model.compute_generator_losses(
+        inputs, target, generator=torch.Generator().manual_seed(1),
+    )
+    losses["total"].backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0
+               for p in model.spatial_refiner.parameters())
+    assert any(p.grad is not None for p in model.image_conditioner.parameters())
+
+
+def test_refiner_rejects_malformed_construction():
+    with pytest.raises(ValueError, match="n_refinement_steps"):
+        _refining_model(-1)
+    with pytest.raises(ValueError, match="positive"):
+        SpatialExpressionRefiner(7, 24, hidden_dim=0)
+    with pytest.raises(ValueError, match="positive"):
+        SpatialExpressionRefiner(0, 24)
+
+
+def test_padded_neighbor_graph_masks_padding_and_excludes_self_loops():
+    rng = np.random.default_rng(0)
+    coords = rng.normal(size=(9, 2)).astype(np.float32)
+    indices, mask = padded_neighbor_graph(coords, k_neighbors=3)
+    assert indices.shape == mask.shape
+    assert indices.shape[0] == 9
+    assert bool(mask.any(dim=1).all())  # no isolated spot
+    for row in range(9):
+        neighbors = indices[row][mask[row]].tolist()
+        assert row not in neighbors, "self-loop leaked into the refinement graph"
+
+
+def test_static_contract_reports_and_validates_refinement_steps():
+    config = _geneencoder_config(
+        "wae_he_mmd_geneencoder_mlp_nofilm",
+        encoder_conditioning="none", gene_encoder_source="linear",
+    )
+    config["model"]["params"].update({"n_refinement_steps": 4})
+    assert static_audit_conditional_wae_config(config)["n_refinement_steps"] == 4
+    config["model"]["params"]["n_refinement_steps"] = -1
+    with pytest.raises(ValueError, match="n_refinement_steps"):
+        static_audit_conditional_wae_config(config)
+
+
+def test_build_model_wires_refinement_from_config():
+    config = _geneencoder_config(
+        "wae_he_gan_control", encoder_conditioning="none", gene_encoder_source="linear",
+    )
+    config["model"]["params"].update({
+        "n_heads": 4, "n_blocks": 1, "dense_threshold": 20, "sparse_k": 3,
+        "discriminator_hidden_dim": 12, "n_inference_samples": 3,
+        "n_refinement_steps": 3, "refinement_k_neighbors": 5,
+        "refinement_hidden_dim": 16, "refinement_gex_feature_dim": 8,
+    })
+    model = train_conditional_wae._build_model(config, n_genes=7)
+    assert model.n_refinement_steps == 3
+    assert model.spatial_refiner is not None
+    assert model.spatial_refiner.k_neighbors == 5
 
 
 def test_sample_predictive_distribution_defaults_reproduce_the_pre_ex_post_prior_behavior():

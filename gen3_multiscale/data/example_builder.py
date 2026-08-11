@@ -184,13 +184,14 @@ def _median_nearest_neighbor_spacing(coords: np.ndarray) -> float:
 
 def build_spatial_field_example(
     adata: "ad.AnnData",  # noqa: F821
-    patches: np.ndarray,
+    patches: np.ndarray | None,
     context_barcodes: list[str],
     query_barcodes: list[str],
     image_feature_fn: Callable[[np.ndarray], np.ndarray] | None = None,
     *,
     sample_id: str,
     patient_id: str,
+    n_patch_rows: int | None = None,
     full_sample_coords: np.ndarray | None = None,
     require_full_sample_coords: bool = True,
     patch_size_fullres: float = 224.0,
@@ -363,9 +364,29 @@ def build_spatial_field_example(
         raise ValueError(f"{sample_id}: context_barcodes is empty -- no context to condition on")
     if not query_barcodes:
         raise ValueError(f"{sample_id}: query_barcodes is empty -- nothing to predict")
-    if patches.shape[0] != adata.n_obs:
+    # `patches` may be None ONLY when features come from a verified
+    # precomputed cache. That cache's loader re-hashes the real pixel content
+    # against the stored `patch_content_sha256` at load time, so the pixels
+    # have already served their provenance purpose and need not stay resident
+    # for the rest of training. The caller must then pass `n_patch_rows`, so
+    # the patch/adata alignment check below is still enforced, never skipped.
+    if patches is None:
+        if precomputed_spot_features is None:
+            raise ValueError(
+                f"{sample_id}: patches=None requires precomputed_spot_features -- raw "
+                "pixels are mandatory whenever image features are computed here"
+            )
+        if n_patch_rows is None:
+            raise ValueError(
+                f"{sample_id}: patches=None requires an explicit n_patch_rows so the "
+                "patch/adata alignment check is still enforced"
+            )
+        n_patch_rows_checked = int(n_patch_rows)
+    else:
+        n_patch_rows_checked = int(patches.shape[0])
+    if n_patch_rows_checked != adata.n_obs:
         raise ValueError(
-            f"{sample_id}: patches has {patches.shape[0]} rows but adata has {adata.n_obs} spots -- "
+            f"{sample_id}: patches has {n_patch_rows_checked} rows but adata has {adata.n_obs} spots -- "
             "patches must already be aligned to adata (load_sample_for_examples's contract)"
         )
     if image_source_available is None:

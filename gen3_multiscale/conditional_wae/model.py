@@ -25,6 +25,10 @@ from gen3_multiscale.models.attention import RelativeGeometryBias
 from gen3_multiscale.models.losses import rmse_pcc_reconstruction_loss
 from gen3_multiscale.models.gene_encoder import WeightedGeneExpressionEncoder
 from gen3_multiscale.models.tokens import SpotTokenProjection
+from gen3_multiscale.conditional_wae.spatial_refinement import (
+    SpatialExpressionRefiner,
+    refine_expression,
+)
 
 
 class _ImageSpatialBlock(nn.Module):
@@ -421,7 +425,11 @@ class ConditionalWAE(nn.Module):
                  film_shared_generator: bool = False,
                  gene_coexpression_basis: GeneResidualBasis | None = None,
                  gene_encoder_table: torch.Tensor | None = None,
-                 z_noise_std: float = 0.0):
+                 z_noise_std: float = 0.0,
+                 n_refinement_steps: int = 0,
+                 refinement_k_neighbors: int = 6,
+                 refinement_hidden_dim: int = 256,
+                 refinement_gex_feature_dim: int = 256):
         super().__init__()
         if regularizer not in {"mmd", "gan"}:
             raise ValueError("regularizer must be 'mmd' or 'gan'")
@@ -490,6 +498,42 @@ class ConditionalWAE(nn.Module):
             if gene_coexpression_basis.n_genes != n_genes:
                 raise ValueError("gene_coexpression_basis and ConditionalWAE must use the same n_genes")
             self.coexpression_refinement = GeneCoexpressionRefinement(gene_coexpression_basis)
+        # Iterative spatial refinement (STFlow Eq. 7 analogue): neighbouring
+        # PREDICTED expression steers attention. Never reads target GEX, so the
+        # query-GEX-invisible contract is unchanged. 0 steps is a strict no-op.
+        if n_refinement_steps < 0:
+            raise ValueError("n_refinement_steps must be non-negative")
+        self.n_refinement_steps = int(n_refinement_steps)
+        self.spatial_refiner = (
+            SpatialExpressionRefiner(
+                n_genes, context_dim,
+                gex_feature_dim=refinement_gex_feature_dim,
+                hidden_dim=refinement_hidden_dim,
+                k_neighbors=refinement_k_neighbors,
+            )
+            if n_refinement_steps > 0 else None
+        )
+
+    def _refine(self, expression: torch.Tensor, context: torch.Tensor,
+                inputs: FullImageExpressionInputs) -> torch.Tensor:
+        """Apply iterative spatial refinement to an expression prediction."""
+        if self.spatial_refiner is None or self.n_refinement_steps == 0:
+            return expression
+        coords = torch.as_tensor(
+            inputs.coords, dtype=expression.dtype, device=expression.device,
+        )
+        query_mask = torch.as_tensor(
+            inputs.query_mask, dtype=torch.bool, device=expression.device,
+        )
+        if coords.shape[0] != expression.shape[0]:
+            # The conditioner emits one row per QUERY spot while `coords`
+            # spans every spot in the field; select the query rows so the
+            # refinement graph is built over exactly the predicted spots.
+            coords = coords[query_mask]
+        return refine_expression(
+            self.spatial_refiner, expression, context, coords,
+            n_steps=self.n_refinement_steps,
+        )
 
     def _target(self, inputs: FullImageExpressionInputs, target_expression, *,
                 device: torch.device, dtype: torch.dtype, n_rows: int) -> torch.Tensor:
@@ -569,6 +613,8 @@ class ConditionalWAE(nn.Module):
             )
             decoder_z = encoded + z_noise * self.z_noise_std
         reconstruction, conditional_mean = self.decode(decoder_z, context)
+        reconstruction = self._refine(reconstruction, context, inputs)
+        conditional_mean = self._refine(conditional_mean, context, inputs)
         reconstruction_loss, reconstruction_rmse, reconstruction_pcc = (
             rmse_pcc_reconstruction_loss(
                 reconstruction, target, pcc_weight=self.pcc_weight,
@@ -637,7 +683,9 @@ class ConditionalWAE(nn.Module):
 
     def forward(self, inputs: FullImageExpressionInputs) -> dict:
         context = self.image_conditioner(inputs)
-        conditional_mean = self.conditional_mean_head(context)
+        conditional_mean = self._refine(
+            self.conditional_mean_head(context), context, inputs,
+        )
         return {"expression": conditional_mean, "image_context": context}
 
     @torch.no_grad()
@@ -680,9 +728,11 @@ class ConditionalWAE(nn.Module):
             )
             z = z_mean.unsqueeze(0) + noise * z_std.unsqueeze(0)
             prediction, _ = self.decode(z, context)
-            samples.append(prediction)
+            samples.append(self._refine(prediction, context, inputs))
         stacked = torch.stack(samples)
-        conditional_mean = self.conditional_mean_head(context)
+        conditional_mean = self._refine(
+            self.conditional_mean_head(context), context, inputs,
+        )
         return {
             "expression": stacked.mean(0),
             "predictive_mean": stacked.mean(0),

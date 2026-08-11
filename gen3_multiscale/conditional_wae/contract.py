@@ -115,6 +115,14 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
             raise ValueError(f"model.params.{field} must be positive")
     if float(params.get("z_noise_std", 0.0)) < 0:
         raise ValueError("model.params.z_noise_std must be non-negative")
+    n_refinement_steps = int(params.get("n_refinement_steps", 0))
+    if n_refinement_steps < 0:
+        raise ValueError("model.params.n_refinement_steps must be non-negative")
+    if n_refinement_steps > 0:
+        for field in ("refinement_k_neighbors", "refinement_hidden_dim",
+                      "refinement_gex_feature_dim"):
+            if int(params.get(field, 1)) < 1:
+                raise ValueError(f"model.params.{field} must be positive")
     encoder_conditioning = params.get("encoder_conditioning", "none")
     if encoder_conditioning not in {"none", "film"}:
         raise ValueError("model.params.encoder_conditioning must be 'none' or 'film'")
@@ -177,4 +185,5 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
         "use_histology_context": use_histology_context,
         "gene_encoder_source": gene_encoder_source,
         "z_noise_std": float(params.get("z_noise_std", 0.0)),
+        "n_refinement_steps": n_refinement_steps,
     }

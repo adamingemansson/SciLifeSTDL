@@ -141,6 +141,49 @@ def test_gen3_sample_data_rejects_mismatched_precomputed_spot_features_barcodes(
         )
 
 
+def _sample_kwargs(n=4, **overrides):
+    import hashlib
+    import anndata as ad
+    adata = ad.AnnData(np.zeros((n, 3), dtype=np.float32))
+    adata.obs_names = [f"S0-SPOT{i}-1" for i in range(n)]
+    adata.obsm["spatial"] = np.arange(2 * n, dtype=np.float64).reshape(n, 2)
+    features = np.zeros((n, 1536), dtype=np.float32)
+    kwargs = dict(
+        sample_id="S0", patient_id="P0", split="train", adata=adata,
+        patches=np.zeros((n, 4, 4, 3), dtype=np.uint8),
+        image_source_available=np.ones(n, dtype=bool),
+        precomputed_spot_features=features,
+        precomputed_spot_features_barcodes=np.asarray(adata.obs_names, dtype=str),
+        precomputed_spot_features_digest=hashlib.sha256(
+            np.ascontiguousarray(features).tobytes()
+        ).hexdigest(),
+        full_sample_coords=adata.obsm["spatial"],
+        coords3d=np.zeros((n, 3), dtype=np.float64),
+        slice_ids=np.full(n, "S0", dtype=object), slide_context_record=None,
+        tile_encoder_provenance={"dense_wsi": None, "spot_features": None},
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_n_patch_rows_is_derived_from_patches_when_not_supplied():
+    assert Gen3SampleData(**_sample_kwargs(n=5)).n_patch_rows == 5
+
+
+def test_released_patches_keep_the_real_row_count_for_the_alignment_check():
+    """data.retain_patches_in_memory=false drops ~376 MB/slide of pixels
+    AFTER the spot-feature cache has re-hashed them, but the row count that
+    guards patch/adata alignment must survive the release."""
+    sample = Gen3SampleData(**_sample_kwargs(n=6, patches=None, n_patch_rows=6))
+    assert sample.patches is None
+    assert sample.n_patch_rows == 6
+
+
+def test_releasing_patches_without_a_row_count_is_refused():
+    with pytest.raises(ValueError, match="n_patch_rows is required"):
+        Gen3SampleData(**_sample_kwargs(patches=None))
+
+
 def test_build_gen3_mask_schedule_for_train_samples_passes_its_own_report(tmp_path, monkeypatch):
     cfg, manifest = build_synthetic_gen3_experiment(tmp_path, monkeypatch)
     samples = _load_split_samples(cfg, manifest, "train")
