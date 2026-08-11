@@ -84,6 +84,14 @@ def main() -> None:
     )
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
+        "--validation-slides", type=int, default=4,
+        help="How many VALIDATION-split slides to score after every round. These are "
+             "never trained on, which is what makes the number meaningful: the "
+             "per-slide metric printed during training is measured on the slides just "
+             "optimised, so memorisation and genuine spatial learning look identical "
+             "there. 0 disables the held-out pass.",
+    )
+    parser.add_argument(
         "--max-slides", type=int,
         help="Optional cap on how many TRAIN slides to use, applied after sorting "
              "for determinism. For quick sanity runs only.",
@@ -109,6 +117,12 @@ def main() -> None:
         if args.max_slides < 1:
             raise ValueError("--max-slides must be positive")
         train_sample_ids = train_sample_ids[: args.max_slides]
+    if args.validation_slides < 0:
+        raise ValueError("--validation-slides must be non-negative")
+    validation_ids = sorted(dataset_manifest.get("validation_sample_ids") or [])[: args.validation_slides]
+    overlap = set(validation_ids) & set(train_sample_ids)
+    if overlap:
+        raise ValueError(f"validation slides {sorted(overlap)} also appear in the training split")
 
     device = torch.device(args.device)
     model = _build_model(config, len(gene_names), gene_names=gene_names)
@@ -129,7 +143,8 @@ def main() -> None:
         refiner, train_sample_ids, _slide_loader(dataset_manifest),
         rounds=args.rounds, steps_per_slide=args.steps_per_slide,
         mask_fraction=args.mask_fraction, learning_rate=args.learning_rate,
-        seed=args.seed, n_top_genes=args.n_top_genes, device=device,
+        seed=args.seed, n_top_genes=args.n_top_genes,
+        validation_ids=validation_ids, device=device,
     )
 
     provenance = {
@@ -137,6 +152,7 @@ def main() -> None:
         "gen3_manifest_path": str(config["data"]["gen3_manifest_path"]),
         "n_train_samples": len(train_sample_ids),
         "train_sample_ids": train_sample_ids,
+        "validation_sample_ids": validation_ids,
         "rounds": int(args.rounds),
         "steps_per_slide": int(args.steps_per_slide),
         "mask_fraction": float(args.mask_fraction),
@@ -149,14 +165,34 @@ def main() -> None:
         refiner.to("cpu"), args.output, gene_names=gene_names, provenance=provenance,
     )
     print(f"\nspatial prior saved to {path}", flush=True)
-    print("round  pcc_all   pcc_top%d" % args.n_top_genes, flush=True)
+    top = args.n_top_genes
+    print(
+        f"{'round':>5}  {'train_all':>9} {'train_top' + str(top):>12}  "
+        f"{'held_all':>9} {'held_top' + str(top):>12}",
+        flush=True,
+    )
+
+    def _mean(records, key):
+        values = [r[key] for r in records]
+        return np.nanmean(values) if values else float("nan")
+
     for round_index in range(1, args.rounds + 1):
-        records = [r for r in history if r["round"] == round_index]
-        if not records:
+        rows = [r for r in history if r["round"] == round_index]
+        train_rows = [r for r in rows if r["split"] == "train"]
+        held_rows = [r for r in rows if r["split"] == "validation"]
+        if not rows:
             continue
         print(
-            f"{round_index:5d}  {np.nanmean([r['masked_spot_pearson'] for r in records]):+.4f}   "
-            f"{np.nanmean([r['masked_spot_pearson_top_genes'] for r in records]):+.4f}",
+            f"{round_index:5d}  {_mean(train_rows, 'masked_spot_pearson'):+9.4f} "
+            f"{_mean(train_rows, 'masked_spot_pearson_top_genes'):+12.4f}  "
+            f"{_mean(held_rows, 'masked_spot_pearson'):+9.4f} "
+            f"{_mean(held_rows, 'masked_spot_pearson_top_genes'):+12.4f}",
+            flush=True,
+        )
+    if not validation_ids:
+        print(
+            "\nNOTE: --validation-slides 0, so every number above is measured on slides "
+            "this run trained on. It cannot distinguish learning from memorisation.",
             flush=True,
         )
     Path(str(path) + ".provenance.json").write_text(

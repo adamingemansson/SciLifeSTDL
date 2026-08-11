@@ -169,10 +169,66 @@ def test_streaming_pretraining_holds_one_slide_and_visits_every_sample():
         learning_rate=3e-3, seed=0,
     )
     assert len(history) == 8
+    assert all(record["split"] == "train" for record in history)
     assert sorted(record["sample_id"] for record in history if record["round"] == 1) == sorted(slides)
     assert len(resident) == 8  # loaded once per visit, never held across visits
     assert all(np.isfinite(record["last_loss"]) for record in history)
     assert all("masked_spot_pearson_top_genes" in record for record in history)
+
+
+def test_held_out_slides_are_scored_but_never_trained_on():
+    """The gate that makes the reported number mean something: a validation
+    slide must be evaluated every round and must never take a gradient step."""
+    refiner = _refiner()
+    slides = {f"S{i}": _slide(seed=i) for i in range(3)}
+    slides["V0"] = _slide(seed=99)
+    stepped = []
+
+    original_step = train_conditional_wae  # placeholder to keep import used
+    from gen3_multiscale.conditional_wae import spatial_prior as module
+
+    real_step = module._spatial_prior_step
+
+    def spy(refiner_, optimizer, expression, coords, **kwargs):
+        stepped.append(int(expression.shape[0]))
+        return real_step(refiner_, optimizer, expression, coords, **kwargs)
+
+    module._spatial_prior_step = spy
+    try:
+        history = pretrain_spatial_prior_streaming(
+            refiner, ["S0", "S1", "S2"], lambda sid: slides[sid],
+            rounds=2, steps_per_slide=2, learning_rate=3e-3, seed=0,
+            validation_ids=["V0"],
+        )
+    finally:
+        module._spatial_prior_step = real_step
+
+    held = [r for r in history if r["split"] == "validation"]
+    assert len(held) == 2, "the held-out slide must be scored once per round"
+    assert {r["sample_id"] for r in held} == {"V0"}
+    # V0 has a distinct spot count only if it differs; assert by identity instead:
+    assert all(r["split"] == "train" for r in history if r["sample_id"] != "V0")
+    assert len(stepped) == 3 * 2 * 2, "only training slides may take optimiser steps"
+
+
+def test_held_out_mask_is_fixed_across_rounds():
+    """A re-randomised held-out mask would make the round-to-round trajectory
+    reflect the mask changing rather than the model improving."""
+    refiner = _refiner()
+    slides = {"S0": _slide(seed=0), "V0": _slide(seed=5)}
+    history = pretrain_spatial_prior_streaming(
+        refiner, ["S0"], lambda sid: slides[sid],
+        rounds=3, steps_per_slide=1, learning_rate=0.0, seed=0,
+        validation_ids=["V0"],
+    )
+    held = [r["masked_spot_pearson"] for r in history if r["split"] == "validation"]
+    assert len(held) == 3
+    # learning_rate=0 means the module never changes, so a fixed mask must give
+    # an identical score every round.
+    assert all(
+        (np.isnan(value) and np.isnan(held[0])) or value == pytest.approx(held[0])
+        for value in held
+    )
 
 
 def test_save_and_load_round_trips_the_weights(tmp_path):
@@ -349,6 +405,7 @@ def test_pretraining_cli_runs_end_to_end_and_writes_a_loadable_prior(tmp_path, m
         "validation_sample_ids": ["V0"],
         "test_sample_ids": ["T0"],
     }))
+    held_out_ids = ["V0"]
     config = _prior_config()
     config["data"]["gen3_manifest_path"] = str(manifest_path)
     config_path = tmp_path / "arm.yaml"
@@ -357,9 +414,13 @@ def test_pretraining_cli_runs_end_to_end_and_writes_a_loadable_prior(tmp_path, m
     opened = []
 
     def fake_load(manifest, sample_id, hest_data_dir=None):
-        assert sample_id in sample_ids, "a non-TRAIN slide was opened during pretraining"
+        assert sample_id in sample_ids + held_out_ids, (
+            f"{sample_id} is in neither the train nor the validation split"
+        )
+        assert sample_id != "T0", "the TEST split must never be opened"
         opened.append(sample_id)
-        expression, coords = _slide(n_spots=25, seed=sample_ids.index(sample_id))
+        index = (sample_ids + held_out_ids).index(sample_id)
+        expression, coords = _slide(n_spots=25, seed=index)
         return types.SimpleNamespace(X=expression, obsm={"spatial": coords})
 
     monkeypatch.setattr(example_builder, "load_expression_for_model_target_space", fake_load)
@@ -368,10 +429,11 @@ def test_pretraining_cli_runs_end_to_end_and_writes_a_loadable_prior(tmp_path, m
         "pretrain_conditional_wae_spatial_prior",
         "--config", str(config_path), "--output", str(output),
         "--rounds", "2", "--steps-per-slide", "2", "--learning-rate", "3e-3",
+        "--validation-slides", "1",
     ])
     cli.main()
 
-    assert sorted(set(opened)) == sample_ids
+    assert sorted(set(opened)) == sorted(sample_ids + held_out_ids)
     assert output.exists()
     identity = load_spatial_prior_into(
         train_conditional_wae._build_model(
@@ -381,8 +443,13 @@ def test_pretraining_cli_runs_end_to_end_and_writes_a_loadable_prior(tmp_path, m
     )
     assert identity["provenance"]["n_train_samples"] == 3
     assert identity["provenance"]["train_sample_ids"] == sample_ids
-    assert json.loads((tmp_path / "prior.pt.provenance.json").read_text())["rounds"] == 2
-    assert "spatial prior saved to" in capsys.readouterr().out
+    provenance = json.loads((tmp_path / "prior.pt.provenance.json").read_text())
+    assert provenance["rounds"] == 2
+    assert provenance["validation_sample_ids"] == held_out_ids
+    output_text = capsys.readouterr().out
+    assert "spatial prior saved to" in output_text
+    # The held-out columns are the point of the summary table.
+    assert "held_all" in output_text and "HELD-OUT" in output_text
 
 
 def test_pretraining_cli_refuses_a_config_with_no_refiner(tmp_path, monkeypatch):

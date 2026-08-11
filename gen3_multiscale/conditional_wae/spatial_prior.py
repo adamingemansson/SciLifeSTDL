@@ -277,6 +277,7 @@ def pretrain_spatial_prior_streaming(refiner: SpatialExpressionRefiner,
                                      mask_fraction: float = 0.25,
                                      learning_rate: float = 1e-4, seed: int = 0,
                                      n_top_genes: int = 200,
+                                     validation_ids: list[str] | None = None,
                                      device: torch.device | None = None) -> list[dict]:
     """Pretrain over slides loaded ONE AT A TIME, holding at most one in memory.
 
@@ -292,6 +293,15 @@ def pretrain_spatial_prior_streaming(refiner: SpatialExpressionRefiner,
     kept small and the slide list is re-shuffled each round: the corpus is
     revisited ``rounds`` times in a different order rather than trained to
     convergence slide by slide. Returns one record per slide visit.
+
+    ``validation_ids`` names slides that are NEVER trained on and are scored
+    once at the end of every round. This is the number that means something:
+    the per-slide metric recorded during training is measured on the very
+    slides just optimised, so a module that memorised slide-specific structure
+    would look identical to one that learned transferable spatial structure.
+    The held-out column separates them. Its evaluation mask is drawn from a
+    fixed seed so the same spots are scored every round and the trajectory is
+    comparable across rounds rather than re-randomised each time.
     """
     if rounds < 1:
         raise ValueError("rounds must be positive")
@@ -325,6 +335,7 @@ def pretrain_spatial_prior_streaming(refiner: SpatialExpressionRefiner,
             )
             record = {
                 "round": round_index + 1,
+                "split": "train",
                 "sample_id": sample_id,
                 "n_spots": int(expression.shape[0]),
                 "first_loss": losses[0],
@@ -337,6 +348,35 @@ def pretrain_spatial_prior_streaming(refiner: SpatialExpressionRefiner,
                 f"spatial-prior round {round_index + 1}/{rounds} "
                 f"slide {position}/{len(order)} {sample_id} "
                 f"loss {losses[0]:.6f}->{losses[-1]:.6f} "
+                f"pcc_all={pearson['all_genes']:+.4f} "
+                f"pcc_top{n_top_genes}={pearson['top_variance_genes']:+.4f}",
+                flush=True,
+            )
+            del expression, coords, expression_np, coords_np
+        for sample_id in (validation_ids or []):
+            expression_np, coords_np = load_slide(sample_id)
+            expression = torch.as_tensor(np.asarray(expression_np), dtype=torch.float32, device=device)
+            coords = torch.as_tensor(np.asarray(coords_np), dtype=torch.float32, device=device)
+            # Fixed seed per slide: the same spots are hidden every round, so
+            # the round-to-round trajectory reflects the model changing rather
+            # than the mask changing.
+            held_out_mask = mask_spots(
+                expression.shape[0], mask_fraction,
+                torch.Generator().manual_seed(int(seed) + 1_000_003),
+            ).to(device)
+            pearson = masked_spot_pearson(
+                refiner, expression, coords, held_out_mask, n_top_genes=n_top_genes,
+            )
+            history.append({
+                "round": round_index + 1,
+                "split": "validation",
+                "sample_id": sample_id,
+                "n_spots": int(expression.shape[0]),
+                "masked_spot_pearson": pearson["all_genes"],
+                "masked_spot_pearson_top_genes": pearson["top_variance_genes"],
+            })
+            print(
+                f"spatial-prior round {round_index + 1}/{rounds} HELD-OUT {sample_id} "
                 f"pcc_all={pearson['all_genes']:+.4f} "
                 f"pcc_top{n_top_genes}={pearson['top_variance_genes']:+.4f}",
                 flush=True,
