@@ -22,11 +22,40 @@ gradient term.
 | gen6j | MoME + full local/boundary/regional/global spatial field |
 | gen6k | frozen Gen6-C + shared expression autoencoder + minibatch-OT latent flow |
 | gen6l | the same frozen Gen6-C + conditional WAE-GAN |
+| gen6m | Gen6-C + 2 rounds of spatial refinement over predicted expression (k=6) |
+| gen6n | Gen6-C + 4 rounds of spatial refinement over a wider neighbourhood (k=12) |
+| gen6o | Gen6-L + a supervised conditional-mean head, latent correlatable at sampling |
+| gen6p | Gen6-K with hard OT assignment instead of barycentric averaging |
 
 G6-B:E form the 2x2 encoder comparison.  G6-F:J hold scFoundation+UNI2
 fixed so fusion/geometry changes are attributable. G6-K:L deliberately use
 the exact same frozen Gen6-C checkpoint, making Gen6-C the deterministic
 control for both generative additions.
+
+G6-M:P are a second screen, each changing exactly one thing relative to an
+arm that has already been trained (M/N vs C, O vs L, P vs K), so no control
+needs re-running:
+
+- **M, N.** Nothing in G6-B:J propagates PREDICTED expression between query
+  spots -- each is decoded independently from its own conditioning. Yet on
+  this manifest's validation slides, simply averaging a spot's OBSERVED
+  neighbours scores 0.392 on the top-200 panel against a measured count-split
+  noise ceiling of 0.767. Two settings rather than one so "refinement helps"
+  can be separated from "that one depth happened to help". The refiner's
+  update head is zero-initialised and it is built under a forked RNG, so at
+  step 0 a refinement arm is bit-identical to gen6c.
+- **O.** Adds a conditioning-only prediction supervised against the same
+  target, which is what makes `prediction = conditional_mean + residual`
+  measurable; without that decomposition an uncertainty number can be
+  reported but not diagnosed. Sampling can then couple the query spots of one
+  draw (rho), so a sample expresses a region-level alternative rather than
+  spatially white noise. rho is inference-only, so the same checkpoint scores
+  at rho=0 too.
+- **P.** Barycentric OT pairing averages plan rows and contracts the flow's
+  source (measured std ratio 0.78-0.86 at target latent scale 0.1) while
+  sampling always integrates from a full N(0, I). Hard assignment returns
+  actual noise draws, so train and inference share one source. G6-K stays
+  pinned to barycentric so it remains a valid control.
 
 ## Package smoke
 
@@ -34,8 +63,12 @@ control for both generative additions.
 python -m gen3_multiscale.scripts.gen6_smoke_launcher
 ```
 
-This runs one CPU optimizer step for G6-B:J.  G6-A additionally needs the
-real STPath package/checkpoint.  G6-K:L need staged artifacts.
+This runs one CPU optimizer step for G6-B:J and G6-M:N.  G6-A additionally
+needs the real STPath package/checkpoint.  G6-K:L and G6-O:P need staged
+artifacts.  The smoke also prints G6-C, G6-M and G6-N losses, which must be
+identical: that is the refiner's zero-initialised identity plus its forked
+RNG, and a divergence there means a refinement arm is no longer comparable to
+its control.
 
 ## Prepare deterministic configs (no training)
 
@@ -111,7 +144,21 @@ python -m gen3_multiscale.scripts.prepare_gen6_generators \
   --output-root /path/gen6_generators --hours 8
 ```
 
-Launch those two configs with `run_gen6_queues --arms gen6k,gen6l`.
+Launch those configs with `run_gen6_queues --arms gen6k,gen6l`.
+
+By default this writes all four staged arms.  When G6-K and G6-L have already
+been trained, narrow it so only the new ones are prepared:
+
+```bash
+python -m gen3_multiscale.scripts.prepare_gen6_generators \
+  --conditioner-checkpoint /path/checkpoints/gen6c/best \
+  --autoencoder-checkpoint /path/shared_autoencoder.pt \
+  --output-root /path/gen6_generators_v2 --hours 8 \
+  --arms gen6o gen6p
+```
+
+The autoencoder is still required for the argument check even when only
+G6-O is prepared; only G6-K/G6-P bind it as a fingerprint.
 
 ## Evaluation
 

@@ -843,6 +843,43 @@ def test_refinement_starts_at_the_identity_then_changes_the_prediction():
     assert refined.shape == baseline(inputs)["expression"].shape
 
 
+def test_refinement_consumes_no_draws_from_the_global_rng():
+    """Building the refiner must not shift the global random stream.
+
+    Ordering alone does not achieve this: subclasses build further modules
+    after ``_SharedFieldArchitecture.__init__`` returns (Gen6Conditioner
+    installs query geometry, for one), and those would then be initialised
+    from a different point in the stream than the control arm's -- so a
+    refinement-versus-control comparison would confound the refiner with a
+    different random initialisation everywhere else.
+    """
+    _inputs, _targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    _refining(3, n_genes, gex_dim, image_dim)
+    after_refining = torch.randn(16)
+    torch.manual_seed(0)
+    Architecture1(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim, **_MODEL_KWARGS,
+    )
+    after_baseline = torch.randn(16)
+    torch.testing.assert_close(after_refining, after_baseline)
+
+
+def test_refiner_weights_are_reproducible_and_independent_of_the_run_seed():
+    """The refiner draws from its own fixed stream, so two builds under
+    different global seeds still produce the same refiner."""
+    _inputs, _targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    first = _refining(2, n_genes, gex_dim, image_dim)
+    torch.manual_seed(12345)
+    second = Architecture1(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        n_refinement_steps=2, refinement_k_neighbors=4,
+        refinement_hidden_dim=16, refinement_gex_feature_dim=8, **_MODEL_KWARGS,
+    )
+    reference = dict(second.expression_refiner.named_parameters())
+    for name, parameter in first.expression_refiner.named_parameters():
+        torch.testing.assert_close(parameter, reference[name])
+
+
 def test_refinement_gradients_reach_the_refiner():
     inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
     model = _refining(2, n_genes, gex_dim, image_dim)

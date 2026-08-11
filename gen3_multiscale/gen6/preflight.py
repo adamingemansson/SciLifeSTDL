@@ -69,7 +69,10 @@ def static_audit_gen6_config(config: dict) -> dict:
         if selected_spec.staged_conditioner:
             raise ValueError("conditioner_arm must name one of gen6a-gen6j")
         if selected_spec.arm != "gen6c":
-            raise ValueError("Gen6-K/L require model.params.conditioner_arm='gen6c'")
+            raise ValueError(
+                f"{arm} requires model.params.conditioner_arm='gen6c'; every staged "
+                "generator is compared against the same frozen control conditioner"
+            )
         for name in ("latent_dim", "n_flow_samples"):
             if int(params.get(name, 0)) <= 0:
                 raise ValueError(f"{arm} requires positive model.params.{name}")
@@ -80,10 +83,32 @@ def static_audit_gen6_config(config: dict) -> dict:
                 raise ValueError(f"{arm} requires positive model.params.ot_epsilon")
             if int(params.get("ot_sinkhorn_iters", 0)) <= 0:
                 raise ValueError(f"{arm} requires positive model.params.ot_sinkhorn_iters")
+            if str(params.get("ot_assignment", "hard")) not in {"hard", "barycentric"}:
+                raise ValueError(f"{arm} model.params.ot_assignment must be 'hard' or 'barycentric'")
         if spec.generator == "wae_gan":
             for name in ("adversarial_weight", "discriminator_weight"):
                 if float(params.get(name, -1.0)) < 0:
                     raise ValueError(f"{arm} requires non-negative model.params.{name}")
+            if float(params.get("conditional_mean_weight", 0.0)) < 0:
+                raise ValueError(f"{arm} requires non-negative model.params.conditional_mean_weight")
+            rho = float(params.get("latent_spatial_correlation", 0.0))
+            if not 0.0 <= rho <= 1.0:
+                raise ValueError(f"{arm} model.params.latent_spatial_correlation must be in [0, 1]")
+    else:
+        # Refinement is declared by the arm table, so the config must agree
+        # with it in both directions -- see build_gen6_model for why silently
+        # accepting an undeclared n_refinement_steps would void the screen.
+        steps = int(params.get("n_refinement_steps") or 0)
+        if spec.spatial_model == "refined_spatial_field":
+            if steps < 1:
+                raise ValueError(f"{arm} requires positive model.params.n_refinement_steps")
+            if int(params.get("refinement_k_neighbors", 0)) <= 0:
+                raise ValueError(f"{arm} requires positive model.params.refinement_k_neighbors")
+        elif steps:
+            raise ValueError(
+                f"{arm} declares spatial_model={spec.spatial_model!r} and must not set "
+                "model.params.n_refinement_steps"
+            )
     if selected_spec.uses_scfoundation and int(params.get("gex_context_embedding_dim") or 0) <= 0:
         raise ValueError(f"{arm} requires positive model.params.gex_context_embedding_dim")
     required = required_gen6_fingerprints(config)

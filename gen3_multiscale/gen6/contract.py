@@ -131,7 +131,55 @@ GEN6_ARM_SPECS: dict[str, Gen6ArmSpec] = {
         "staged_conditioner", "wae_gan",
         staged_conditioner=True,
     ),
+    # --- second component screen -------------------------------------------
+    # Each arm below changes exactly ONE thing relative to an arm that has
+    # already been trained, so the comparison stays readable:
+    #
+    #   gen6m, gen6n  vs gen6c  -- refine the prediction over the spot graph
+    #   gen6o         vs gen6l  -- add the supervised conditional-mean head
+    #   gen6p         vs gen6k  -- hard OT assignment instead of barycentric
+    #
+    # gen6m/gen6n follow from a measurement rather than a hunch.  On this
+    # manifest's validation slides, simply averaging a spot's OBSERVED
+    # neighbours scores 0.392 on the top-200 panel against a measured
+    # count-split noise ceiling of 0.767.  Neighbour expression is the
+    # strongest cheap signal in the data, and nothing in gen6b-gen6j
+    # propagates PREDICTED expression between query spots: every query spot is
+    # decoded independently from its own conditioning.  Refinement is the one
+    # component that closes that gap.
+    "gen6m": _spec(
+        "gen6m", "Gen6-C plus two rounds of spatial refinement over predicted expression",
+        "scfoundation", "uni2", "simple", "fourier_absolute",
+        "refined_spatial_field", "gene_transport",
+        uses_uni2_spot=True, uses_scfoundation=True,
+    ),
+    "gen6n": _spec(
+        "gen6n", "Gen6-C plus four rounds of spatial refinement over a wider neighbourhood",
+        "scfoundation", "uni2", "simple", "fourier_absolute",
+        "refined_spatial_field", "gene_transport",
+        uses_uni2_spot=True, uses_scfoundation=True,
+    ),
+    "gen6o": _spec(
+        "gen6o", "Gen6-L plus a supervised conditional-mean head and correlatable latent",
+        "selected_conditioner", "selected_conditioner", "staged", "staged",
+        "staged_conditioner", "wae_gan",
+        staged_conditioner=True,
+    ),
+    "gen6p": _spec(
+        "gen6p", "Gen6-K with hard OT assignment instead of barycentric averaging",
+        "selected_conditioner", "selected_conditioner", "staged", "staged",
+        "staged_conditioner", "latent_ot_flow",
+        staged_conditioner=True, staged_autoencoder=True,
+    ),
 }
+
+# Arms whose conditioner must refine its own predicted expression over the
+# spot graph. Derived from the table rather than hard-coded in the factory, so
+# the table stays the single source of truth for what an arm IS.
+REFINED_SPATIAL_FIELD_ARMS = frozenset(
+    arm for arm, spec in GEN6_ARM_SPECS.items()
+    if spec.spatial_model == "refined_spatial_field"
+)
 
 
 def get_gen6_arm_spec(arm: str) -> Gen6ArmSpec:
@@ -153,7 +201,10 @@ def gen6_cache_requirements(config: dict) -> dict[str, bool]:
     if spec.staged_conditioner:
         selected = str(((config.get("model") or {}).get("params") or {}).get("conditioner_arm", ""))
         if selected != "gen6c":
-            raise ValueError("Gen6-K/L must use the shared deterministic control conditioner gen6c")
+            raise ValueError(
+                f"{arm} must use the shared deterministic control conditioner gen6c, "
+                f"got {selected!r}"
+            )
         selected_spec = get_gen6_arm_spec(selected)
         if selected_spec.staged_conditioner:
             raise ValueError("a staged Gen6 generator must select a deterministic Gen6 conditioner")

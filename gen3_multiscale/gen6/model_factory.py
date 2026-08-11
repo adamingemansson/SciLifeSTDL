@@ -47,11 +47,24 @@ def build_gen6_model(
         return FineTunedSTPathBenchmark(
             gene_names=gene_names, gene_vocab_path=str(vocab), checkpoint_path=str(checkpoint),
         )
-    if arm in {"gen6k", "gen6l"}:
+    if spec.staged_conditioner:
         raise ValueError(f"{arm} must be built through its staged generative builder")
 
     params = dict(model_cfg.get("params") or {})
     kwargs = _constructor_kwargs(params)
+    # Refinement is part of an arm's identity, so it is required where the
+    # contract declares it and refused everywhere else. Without the second
+    # branch a stray model.params entry would silently turn a control arm into
+    # a refinement arm, and the screen would then be comparing nothing.
+    refinement_steps = int(params.get("n_refinement_steps") or 0)
+    if spec.spatial_model == "refined_spatial_field":
+        if refinement_steps < 1:
+            raise ValueError(f"{arm} requires positive model.params.n_refinement_steps")
+    elif refinement_steps:
+        raise ValueError(
+            f"{arm} declares spatial_model={spec.spatial_model!r} and must not set "
+            "model.params.n_refinement_steps"
+        )
     kwargs.update({
         "n_genes": len(gene_names), "gex_feature_dim": int(gex_feature_dim),
         "image_feature_dim": int(image_feature_dim),

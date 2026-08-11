@@ -72,6 +72,14 @@ from gen3_multiscale.models.slide_encoder import FrozenGigaPathSlideEncoder, poo
 from gen3_multiscale.models.tokens import QueryTokenProjection, SpotTokenProjection
 from gen3_multiscale.models.transport_head import GeneValueTransportHead
 
+# Fixed seed for the spatial refiner's own weights. Deliberately a constant
+# and not the run seed: the refiner is initialised inside a forked RNG so it
+# draws nothing from the global stream, which is what keeps a refinement arm's
+# shared weights identical to its control's. A run-dependent value here would
+# still be reproducible but would buy nothing, since the refiner's final layer
+# is zero-initialised and the arm starts at the identity regardless.
+_REFINER_INIT_SEED = 20260811
+
 
 class _SharedFieldArchitecture(nn.Module):
     """Common assembly for Architectures 1/2/3: token projections, the
@@ -217,12 +225,18 @@ class _SharedFieldArchitecture(nn.Module):
         # path is unchanged, which matters because every architecture in this
         # project inherits this class.
         #
-        # Constructed LAST, after every other submodule. Building it earlier
-        # consumes draws from the global RNG, which changes the initialisation
-        # of everything constructed after it -- so a refinement arm and its
-        # control would silently differ in weights they are supposed to share.
-        # This project synchronises initialisations across arms on purpose;
-        # ordering is what keeps that true here.
+        # Constructed LAST, after every other submodule here, and under a
+        # FORKED RNG so it consumes no draws from the global stream.
+        #
+        # Both halves are needed. Ordering alone is not enough: subclasses
+        # (Gen6Conditioner installs query geometry, for instance) build further
+        # modules after this __init__ returns, and those would then be
+        # initialised from a shifted stream. The fork makes refinement cost
+        # exactly zero global draws, so a refinement arm and its control share
+        # bit-identical weights everywhere except the refiner itself -- which
+        # is the whole point of a one-component screen. Verified by
+        # gen6_smoke_launcher: gen6m and gen6c agree to the last digit before
+        # any refinement gradient is taken.
         if n_refinement_steps < 0:
             raise ValueError("n_refinement_steps must be non-negative")
         self.n_refinement_steps = int(n_refinement_steps)
@@ -236,12 +250,14 @@ class _SharedFieldArchitecture(nn.Module):
                 SpatialExpressionRefiner,
             )
 
-            self.expression_refiner = SpatialExpressionRefiner(
-                n_genes, hidden_dim,
-                gex_feature_dim=refinement_gex_feature_dim,
-                hidden_dim=refinement_hidden_dim,
-                k_neighbors=refinement_k_neighbors,
-            )
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(_REFINER_INIT_SEED)
+                self.expression_refiner = SpatialExpressionRefiner(
+                    n_genes, hidden_dim,
+                    gex_feature_dim=refinement_gex_feature_dim,
+                    hidden_dim=refinement_hidden_dim,
+                    k_neighbors=refinement_k_neighbors,
+                )
 
     def _observed_tokens(self, inputs: SpatialFieldInputs, device: torch.device) -> torch.Tensor:
         n_observed = inputs.observed_coords.shape[0]

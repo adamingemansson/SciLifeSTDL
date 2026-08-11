@@ -8,19 +8,30 @@ from gen3_multiscale.scripts.gen4_smoke_launcher import (
     CONTEXT_DIM, GEX_DIM, IMAGE_DIM, N_GENES, _StubSlideEncoder,
     _synthetic_example, _with_wsi_context,
 )
+from gen3_multiscale.gen6.contract import GEN6_ARM_SPECS
 from gen3_multiscale.gen6.model_factory import build_gen6_model
 from gen3_multiscale.models.losses import combined_reconstruction_loss
 
 
+_SMOKE_REFINEMENT = {
+    "gen6m": {"n_refinement_steps": 2, "refinement_k_neighbors": 4},
+    "gen6n": {"n_refinement_steps": 4, "refinement_k_neighbors": 6},
+}
+
+
 def _config(arm: str) -> dict:
+    params = {
+        "image_feature_dim": IMAGE_DIM, "gex_context_embedding_dim": CONTEXT_DIM,
+        "hidden_dim": 32, "n_heads": 4, "n_blocks": 2,
+        "dense_threshold": 100, "n_gex_inducing": 4,
+        "harmonic_k_neighbors": 4, "global_slide_dim": 16,
+        "regional_grid_size": 2, "fusion_heads": 4,
+    }
+    if arm in _SMOKE_REFINEMENT:
+        params.update(_SMOKE_REFINEMENT[arm])
+        params.update({"refinement_hidden_dim": 32, "refinement_gex_feature_dim": 16})
     return {
-        "model": {"arm": arm, "kind": "conditioner", "params": {
-            "image_feature_dim": IMAGE_DIM, "gex_context_embedding_dim": CONTEXT_DIM,
-            "hidden_dim": 32, "n_heads": 4, "n_blocks": 2,
-            "dense_threshold": 100, "n_gex_inducing": 4,
-            "harmonic_k_neighbors": 4, "global_slide_dim": 16,
-            "regional_grid_size": 2, "fusion_heads": 4,
-        }},
+        "model": {"arm": arm, "kind": "conditioner", "params": params},
         "data": {"gex_feature_dim": GEX_DIM}, "training": {"seed": 0},
         "required_fingerprints": {},
     }
@@ -60,10 +71,14 @@ def smoke_arm(arm: str) -> dict:
 
 
 def main() -> None:
-    for arm in ("gen6b", "gen6c", "gen6d", "gen6e", "gen6f", "gen6g", "gen6h", "gen6i", "gen6j"):
+    for arm in ("gen6b", "gen6c", "gen6d", "gen6e", "gen6f", "gen6g", "gen6h", "gen6i",
+                "gen6j", "gen6m", "gen6n"):
         print(smoke_arm(arm))
     print({"arm": "gen6a", "status": "requires real STPath package/checkpoint smoke"})
-    print({"arms": ["gen6k", "gen6l"], "status": "require staged conditioner/generator artifacts"})
+    print({
+        "arms": sorted(arm for arm, spec in GEN6_ARM_SPECS.items() if spec.staged_conditioner),
+        "status": "require staged conditioner/generator artifacts",
+    })
 
 
 if __name__ == "__main__":

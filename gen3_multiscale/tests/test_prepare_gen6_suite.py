@@ -7,7 +7,7 @@ from gen3_multiscale.scripts.prepare_gen6_suite import prepare_gen6_suite
 from gen3_multiscale.scripts.run_gen6_queues import run_queues
 
 
-def test_prepare_gen6_suite_writes_ten_matched_configs_without_launching(tmp_path, monkeypatch):
+def test_prepare_gen6_suite_writes_twelve_matched_configs_without_launching(tmp_path, monkeypatch):
     base = {
         "experiment_name": "base",
         "model": {"arm": "gen4c", "kind": "conditioner", "params": {
@@ -57,7 +57,7 @@ def test_prepare_gen6_suite_writes_ten_matched_configs_without_launching(tmp_pat
         train_gene_panels=str(panels), output_root=str(root),
         fingerprints=fingerprints, hours=8,
     )
-    assert set(plan["arms"]) == {f"gen6{x}" for x in "abcdefghij"}
+    assert set(plan["arms"]) == {f"gen6{x}" for x in "abcdefghijmn"}
     assert not list(root.rglob("*.pid"))
     for arm in plan["arms"]:
         config = yaml.safe_load((root / "configs" / f"{arm}.yaml").read_text())
@@ -71,7 +71,7 @@ def test_prepare_gen6_suite_writes_ten_matched_configs_without_launching(tmp_pat
         "panels": ["train_log1p_variance_top200", "train_log1p_variance_top50"],
     }
     queue_plan = run_queues(str(root), ["0", "2", "3", "5"], list(plan["arms"]), dry_run=True)
-    assert sum(len(queue) for queue in queue_plan["queues"].values()) == 10
+    assert sum(len(queue) for queue in queue_plan["queues"].values()) == 12
     assert not list(root.glob("*.pid"))
 
 
@@ -122,3 +122,64 @@ def test_prepare_gen6_suite_rejects_artifact_without_required_hvg_panels(tmp_pat
             train_gene_panels=str(panels), output_root=str(tmp_path / "suite"),
             fingerprints={}, hours=8,
         )
+
+
+def test_prepared_refinement_configs_carry_their_component_and_others_do_not(
+    tmp_path, monkeypatch,
+):
+    """A config named gen6m that contains no refinement would burn eight GPU
+    hours producing a second copy of gen6c under a misleading name."""
+    from gen3_multiscale.gen6.contract import REFINED_SPATIAL_FIELD_ARMS
+
+    base = {
+        "model": {"arm": "gen6c", "kind": "conditioner", "params": {
+            "hidden_dim": 16, "gex_context_embedding_dim": 3072,
+        }},
+        "masking": {"strata": [{"name": "small"}]},
+        "data": {"tile_encoder_revision": "a" * 40}, "evaluation": {},
+        "required_fingerprints": {}, "training": {},
+    }
+    base_path = tmp_path / "base.yaml"
+    base_path.write_text(yaml.safe_dump(base))
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}")
+    panels = tmp_path / "panels.json"
+    panels.write_text("{}")
+    monkeypatch.setattr(
+        "gen3_multiscale.scripts.prepare_gen6_suite.load_dataset_manifest",
+        lambda _: {},
+    )
+    monkeypatch.setattr(
+        "gen3_multiscale.scripts.prepare_gen6_suite.load_train_derived_gene_panels",
+        lambda *_args, **_kwargs: {
+            "artifact_sha256": "panel-sha256",
+            "panels": {
+                "train_log1p_variance_top50": ["g0"],
+                "train_log1p_variance_top200": ["g1", "g2"],
+            },
+        },
+    )
+    fingerprints = {
+        "uni2_checkpoint": "uni2.bin", "uni2_revision": "b" * 40,
+        "uni2_package_version": "1", "uni2_preprocessing_spec": "spec",
+        "scfoundation_checkpoint": "scf.ckpt", "scfoundation_vocab": "vocab.tsv",
+        "scfoundation_package_version": "1", "scfoundation_preprocessing_spec": "spec",
+        "gigapath_checkpoint": "slide.pth", "stpath_checkpoint": "stpath.pth",
+        "stpath_gene_vocab": "genes.json",
+    }
+    root = tmp_path / "suite"
+    plan = prepare_gen6_suite(
+        comparison_config=str(base_path), manifest=str(manifest),
+        train_gene_panels=str(panels), output_root=str(root),
+        fingerprints=fingerprints, hours=8,
+    )
+    assert REFINED_SPATIAL_FIELD_ARMS <= set(plan["arms"])
+    for arm in plan["arms"]:
+        params = yaml.safe_load(
+            (root / "configs" / f"{arm}.yaml").read_text()
+        )["model"]["params"]
+        steps = int(params.get("n_refinement_steps") or 0)
+        if arm in REFINED_SPATIAL_FIELD_ARMS:
+            assert steps >= 1 and int(params["refinement_k_neighbors"]) >= 1
+        else:
+            assert steps == 0

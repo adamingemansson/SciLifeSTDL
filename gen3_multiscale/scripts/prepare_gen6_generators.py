@@ -14,7 +14,7 @@ from pathlib import Path
 
 import yaml
 
-from gen3_multiscale.gen6.contract import get_gen6_arm_spec
+from gen3_multiscale.gen6.contract import GEN6_ARM_SPECS, get_gen6_arm_spec
 from gen3_multiscale.gen6.preflight import static_audit_gen6_config
 from gen3_multiscale.gen5.autoencoder import (
     load_expression_autoencoder_checkpoint,
@@ -22,6 +22,50 @@ from gen3_multiscale.gen5.autoencoder import (
 )
 from gen3_multiscale.training import checkpoint as checkpoint_module
 from gen3_multiscale.training.train import dataset_manifest_fingerprint
+
+
+_MODEL_KIND = {"latent_ot_flow": "latent_flow", "wae_gan": "wae_gan"}
+
+# One generator setting per arm. gen6k/gen6l are pinned to what has already
+# been trained -- barycentric OT pairing, no conditional-mean head -- so that
+# gen6p and gen6o each differ from their control in exactly one place and the
+# older runs remain valid controls rather than needing to be redone.
+_STAGED_ARM_PARAMS = {
+    "gen6k": {
+        "n_flow_blocks": 2, "ot_epsilon": 0.1, "ot_sinkhorn_iters": 20,
+        "ot_assignment": "barycentric",
+    },
+    "gen6p": {
+        "n_flow_blocks": 2, "ot_epsilon": 0.1, "ot_sinkhorn_iters": 20,
+        # Barycentric averaging contracts the flow's source distribution
+        # (measured std ratio 0.78-0.86 when target latents have scale 0.1),
+        # while sampling always integrates from a full N(0, I). Hard
+        # assignment returns actual noise draws, so train and inference share
+        # one source.
+        "ot_assignment": "hard",
+    },
+    "gen6l": {
+        "wae_hidden_dim": 1024, "discriminator_hidden_dim": 256,
+        "adversarial_weight": 0.1, "discriminator_weight": 1.0,
+        "conditional_mean_weight": 0.0, "latent_spatial_correlation": 0.0,
+    },
+    "gen6o": {
+        "wae_hidden_dim": 1024, "discriminator_hidden_dim": 256,
+        "adversarial_weight": 0.1, "discriminator_weight": 1.0,
+        # Supervises a conditioning-only prediction alongside the sampled one,
+        # which is what makes prediction = conditional_mean + residual
+        # measurable. rho couples the query spots of a single draw so a sample
+        # can express a region-level alternative instead of white noise; it is
+        # inference-only, so this checkpoint can also be scored at rho=0.
+        "conditional_mean_weight": 1.0, "latent_spatial_correlation": 0.5,
+    },
+}
+
+_STAGED_ARMS = tuple(_STAGED_ARM_PARAMS)
+
+_unknown_staged = sorted(set(_STAGED_ARM_PARAMS) - set(GEN6_ARM_SPECS))
+if _unknown_staged:
+    raise RuntimeError(f"staged settings name arms that do not exist: {_unknown_staged}")
 
 
 def _sha256(path: Path) -> str:
@@ -33,9 +77,15 @@ def _sha256(path: Path) -> str:
 
 
 def prepare(*, conditioner_checkpoint: str, autoencoder_checkpoint: str,
-            output_root: str, hours: float = 8.0) -> dict:
+            output_root: str, hours: float = 8.0,
+            arms: tuple[str, ...] = _STAGED_ARMS) -> dict:
     if hours <= 0:
         raise ValueError("hours must be positive")
+    unknown = sorted(set(arms) - set(_STAGED_ARM_PARAMS))
+    if unknown:
+        raise ValueError(f"unknown staged Gen6 arms {unknown}; expected {sorted(_STAGED_ARM_PARAMS)}")
+    if not arms:
+        raise ValueError("no arms to prepare")
     root = Path(output_root)
     if root.exists():
         raise FileExistsError(f"{root} already exists")
@@ -47,7 +97,7 @@ def prepare(*, conditioner_checkpoint: str, autoencoder_checkpoint: str,
     conditioner_arm = str((base.get("model") or {}).get("arm", ""))
     selected = get_gen6_arm_spec(conditioner_arm)
     if selected.staged_conditioner or conditioner_arm != "gen6c":
-        raise ValueError("Gen6-K/L require the deterministic Gen6-C conditioner checkpoint")
+        raise ValueError("staged Gen6 generators require the deterministic Gen6-C conditioner checkpoint")
     manifest_path = Path(str((base.get("data") or {}).get("gen3_manifest_path") or ""))
     if not manifest_path.is_file():
         raise FileNotFoundError(f"conditioner config manifest is missing: {manifest_path}")
@@ -100,29 +150,23 @@ def prepare(*, conditioner_checkpoint: str, autoencoder_checkpoint: str,
     (root / "checkpoints").mkdir()
     (root / "logs").mkdir()
     paths = {}
-    for arm, kind in (("gen6k", "latent_flow"), ("gen6l", "wae_gan")):
+    for arm in arms:
+        spec = get_gen6_arm_spec(arm)
         config = copy.deepcopy(base)
         params = dict(config["model"].get("params") or {})
         params.update({
             "conditioner_arm": conditioner_arm, "n_flow_samples": 16,
             "n_ode_steps": 20, "latent_dim": int(ae_payload["latent_dim"]),
         })
-        if arm == "gen6k":
-            params.update({
-                "autoencoder_hidden_dim": int(ae_payload["hidden_dim"]),
-                "n_flow_blocks": 2, "ot_epsilon": 0.1, "ot_sinkhorn_iters": 20,
-            })
-        else:
-            params.update({
-                "wae_hidden_dim": 1024, "discriminator_hidden_dim": 256,
-                "adversarial_weight": 0.1, "discriminator_weight": 1.0,
-            })
+        params.update(_STAGED_ARM_PARAMS[arm])
+        if spec.staged_autoencoder:
+            params["autoencoder_hidden_dim"] = int(ae_payload["hidden_dim"])
         config["experiment_name"] = f"gen6_component_screen_{arm}_v1"
-        config["model"] = {"arm": arm, "kind": kind, "params": params}
+        config["model"] = {"arm": arm, "kind": _MODEL_KIND[spec.generator], "params": params}
         config["required_fingerprints"]["gen6_conditioner_checkpoint"] = str(
             Path(conditioner_checkpoint).resolve()
         )
-        if arm == "gen6k":
+        if spec.staged_autoencoder:
             config["required_fingerprints"]["expression_autoencoder_checkpoint"] = str(
                 autoencoder_path
             )
@@ -152,11 +196,17 @@ def main():
     parser.add_argument("--autoencoder-checkpoint", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--hours", type=float, default=8.0)
+    parser.add_argument(
+        "--arms", nargs="+", choices=sorted(_STAGED_ARM_PARAMS), default=list(_STAGED_ARMS),
+        help="Which staged generators to write configs for. Narrow this to gen6o gen6p "
+             "when gen6k and gen6l have already been trained.",
+    )
     args = parser.parse_args()
     print(json.dumps(prepare(
         conditioner_checkpoint=args.conditioner_checkpoint,
         autoencoder_checkpoint=args.autoencoder_checkpoint,
         output_root=args.output_root, hours=args.hours,
+        arms=tuple(dict.fromkeys(args.arms)),
     ), indent=2, sort_keys=True))
 
 

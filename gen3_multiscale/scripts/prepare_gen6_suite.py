@@ -18,11 +18,27 @@ import yaml
 
 from gen3_multiscale.data.dataset_manifest import load_dataset_manifest
 from gen3_multiscale.evaluation.train_gene_panels import load_train_derived_gene_panels
-from gen3_multiscale.gen6.contract import GEN6_ARM_SPECS
+from gen3_multiscale.gen6.contract import GEN6_ARM_SPECS, REFINED_SPATIAL_FIELD_ARMS
 from gen3_multiscale.gen6.preflight import static_audit_gen6_config
 
 
-_DETERMINISTIC_ARMS = tuple(f"gen6{letter}" for letter in "abcdefghij")
+_DETERMINISTIC_ARMS = tuple(f"gen6{letter}" for letter in "abcdefghijmn")
+
+# Refinement depth/neighbourhood per arm. Two points rather than one because a
+# single positive result at one setting is indistinguishable from luck, and
+# the two settings bracket the neighbour-mean baseline's own k.
+_REFINEMENT_PARAMS = {
+    "gen6m": {"n_refinement_steps": 2, "refinement_k_neighbors": 6},
+    "gen6n": {"n_refinement_steps": 4, "refinement_k_neighbors": 12},
+}
+
+if set(_REFINEMENT_PARAMS) != REFINED_SPATIAL_FIELD_ARMS:
+    raise RuntimeError(
+        "refinement settings and the arm contract disagree: "
+        f"{sorted(_REFINEMENT_PARAMS)} vs {sorted(REFINED_SPATIAL_FIELD_ARMS)}"
+    )
+if not REFINED_SPATIAL_FIELD_ARMS <= set(_DETERMINISTIC_ARMS):
+    raise RuntimeError("a refinement arm is missing from the deterministic suite")
 
 
 def _pairs(values: list[str]) -> dict[str, str]:
@@ -79,7 +95,14 @@ def prepare_gen6_suite(*, comparison_config: str, manifest: str, train_gene_pane
         ]
         params = dict((config.get("model") or {}).get("params") or {})
         params.pop("gene_basis_rank", None)
+        # Cleared unconditionally: the contract, not an inherited base config,
+        # decides which arms refine. build_gen6_model rejects the field on any
+        # arm that does not declare it.
+        for key in ("n_refinement_steps", "refinement_k_neighbors",
+                    "refinement_hidden_dim", "refinement_gex_feature_dim"):
+            params.pop(key, None)
         params.update({"init_seed": 0, "fusion_heads": 4})
+        params.update(_REFINEMENT_PARAMS.get(arm, {}))
         if spec.uses_scfoundation:
             params.setdefault("gex_context_embedding_dim", 3072)
         config["model"] = {"arm": arm, "kind": "conditioner", "params": params}
@@ -112,6 +135,8 @@ def prepare_gen6_suite(*, comparison_config: str, manifest: str, train_gene_pane
         "stage_two": {
             "gen6k": "freeze Gen6-C and apply learned-latent minibatch-OT flow",
             "gen6l": "freeze the same Gen6-C checkpoint and train its conditional WAE-GAN",
+            "gen6p": "gen6k with hard OT assignment (prepare_gen6_generators.py)",
+            "gen6o": "gen6l with a supervised conditional-mean head (prepare_gen6_generators.py)",
         },
     }
     (root / "run_plan.json").write_text(json.dumps(plan, indent=2, sort_keys=True))

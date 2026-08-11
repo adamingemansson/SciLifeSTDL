@@ -599,9 +599,10 @@ def build_gen6_model_for_inference(
             for key in (
                 "conditioner_arm", "gene_basis_rank", "n_flow_blocks", "n_flow_samples",
                 "n_ode_steps", "ot_epsilon", "ot_sinkhorn_iters", "latent_dim",
-                "autoencoder_hidden_dim",
+                "autoencoder_hidden_dim", "ot_assignment",
                 "wae_hidden_dim", "discriminator_hidden_dim", "adversarial_weight",
-                "discriminator_weight",
+                "discriminator_weight", "conditional_mean_weight",
+                "latent_spatial_correlation",
             ):
                 smoke_config["model"]["params"].pop(key, None)
             conditioner = build_gen6_model(
@@ -636,7 +637,7 @@ def build_gen6_model_for_inference(
                 configured_latent_dim = int(params.get("latent_dim", payload["latent_dim"]))
                 if configured_latent_dim != int(payload["latent_dim"]):
                     raise ValueError(
-                        "gen6k model.params.latent_dim does not match the staged "
+                        f"{arm} model.params.latent_dim does not match the staged "
                         f"autoencoder ({configured_latent_dim} != {payload['latent_dim']})"
                     )
                 autoencoder_info = {
@@ -646,7 +647,7 @@ def build_gen6_model_for_inference(
                 }
             elif needs_staged:
                 raise ValueError(
-                    "gen6k requires required_fingerprints.expression_autoencoder_checkpoint"
+                    f"{arm} requires required_fingerprints.expression_autoencoder_checkpoint"
                 )
             else:
                 latent_dim = int(params.get("latent_dim", 8))
@@ -668,6 +669,7 @@ def build_gen6_model_for_inference(
                 n_ode_steps=int(params.get("n_ode_steps", 20)),
                 ot_epsilon=float(params.get("ot_epsilon", 0.1)),
                 ot_sinkhorn_iters=int(params.get("ot_sinkhorn_iters", 20)),
+                ot_assignment=str(params.get("ot_assignment", "hard")),
             ).to(device)
         else:
             model = Gen6WAEGANModel(
@@ -678,6 +680,11 @@ def build_gen6_model_for_inference(
                 adversarial_weight=float(params.get("adversarial_weight", 0.1)),
                 discriminator_weight=float(params.get("discriminator_weight", 1.0)),
                 pcc_weight=float((config.get("loss") or {}).get("pcc_weight", 0.1)),
+                # 0.0 reproduces the original Gen6-L exactly: the head exists
+                # but receives no gradient, so its presence cannot change a
+                # historical arm's result.
+                conditional_mean_weight=float(params.get("conditional_mean_weight", 0.0)),
+                latent_spatial_correlation=float(params.get("latent_spatial_correlation", 0.0)),
                 n_samples=int(params.get("n_flow_samples", 8)),
             ).to(device)
     else:

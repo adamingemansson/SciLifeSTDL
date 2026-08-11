@@ -40,3 +40,41 @@ def test_construction_only_smoke_builds_both_staged_generator_types():
     )
     assert isinstance(flow, Gen6LatentOTFlowModel) and flow_info["kind"] == "latent_flow"
     assert isinstance(wae, Gen6WAEGANModel) and wae_info["kind"] == "wae_gan"
+
+
+def _staged_config(arm, kind, **extra_params):
+    config = _config(arm, kind, "gen6c")
+    config["model"]["params"].update(extra_params)
+    return config
+
+
+def test_staged_builder_carries_the_new_generator_settings_into_the_model():
+    """These four params are the entire difference between gen6o/gen6p and
+    their controls. If the builder drops one, the arm trains as a duplicate of
+    its control and the result reads as 'the change did nothing'."""
+    flow, _ = build_gen6_model_for_inference(
+        _staged_config("gen6p", "latent_flow", ot_assignment="hard"),
+        gene_names=[f"g{i}" for i in range(6)], device=torch.device("cpu"), smoke=True,
+    )
+    wae, _ = build_gen6_model_for_inference(
+        _staged_config(
+            "gen6o", "wae_gan",
+            conditional_mean_weight=1.0, latent_spatial_correlation=0.5,
+        ),
+        gene_names=[f"g{i}" for i in range(6)], device=torch.device("cpu"), smoke=True,
+    )
+    assert flow.ot_assignment == "hard"
+    assert wae.conditional_mean_weight == 1.0
+    assert wae.latent_spatial_correlation == 0.5
+
+
+def test_staged_defaults_reproduce_the_arms_that_already_ran():
+    """gen6k and gen6l predate these knobs. Their configs carry no value for
+    conditional_mean_weight, so the default must leave the head without
+    gradient rather than silently changing a trained arm's objective."""
+    wae, _ = build_gen6_model_for_inference(
+        _config("gen6l", "wae_gan", "gen6c"), gene_names=[f"g{i}" for i in range(6)],
+        device=torch.device("cpu"), smoke=True,
+    )
+    assert wae.conditional_mean_weight == 0.0
+    assert wae.latent_spatial_correlation == 0.0
