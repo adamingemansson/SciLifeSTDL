@@ -143,13 +143,16 @@ def test_pretraining_improves_the_projects_own_metric_not_just_mse():
     # update head), so it returns the masked spots' ZEROED input: a constant
     # prediction, whose correlation is undefined for every gene. A NaN in the
     # first log line of a real pretraining run is this, not a bug.
-    assert np.isnan(masked_spot_pearson(refiner, expression, coords, spot_mask))
+    before = masked_spot_pearson(refiner, expression, coords, spot_mask, n_top_genes=3)
+    assert np.isnan(before["all_genes"]) and np.isnan(before["top_variance_genes"])
     pretrain_spatial_prior(
         refiner, [(expression_np, coords_np)], steps=300, learning_rate=3e-3, seed=0,
         log_every=100,
     )
-    after = masked_spot_pearson(refiner, expression, coords, spot_mask)
-    assert after > 0.3, f"masked-spot PCC only reached {after:.4f}"
+    after = masked_spot_pearson(refiner, expression, coords, spot_mask, n_top_genes=3)
+    assert after["all_genes"] > 0.3, f"masked-spot PCC only reached {after['all_genes']:.4f}"
+    # The top-variance subset is the number the production log leads with.
+    assert after["top_variance_genes"] > 0.3
 
 
 def test_streaming_pretraining_holds_one_slide_and_visits_every_sample():
@@ -169,6 +172,7 @@ def test_streaming_pretraining_holds_one_slide_and_visits_every_sample():
     assert sorted(record["sample_id"] for record in history if record["round"] == 1) == sorted(slides)
     assert len(resident) == 8  # loaded once per visit, never held across visits
     assert all(np.isfinite(record["last_loss"]) for record in history)
+    assert all("masked_spot_pearson_top_genes" in record for record in history)
 
 
 def test_save_and_load_round_trips_the_weights(tmp_path):

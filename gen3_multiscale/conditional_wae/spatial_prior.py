@@ -167,14 +167,24 @@ def load_spatial_prior_into(refiner: SpatialExpressionRefiner, path: str | Path,
 
 
 def masked_spot_pearson(refiner: SpatialExpressionRefiner, expression: torch.Tensor,
-                        coords: torch.Tensor, spot_mask: torch.Tensor) -> float:
-    """Mean per-gene Pearson across the MASKED spots -- the project's metric.
+                        coords: torch.Tensor, spot_mask: torch.Tensor, *,
+                        n_top_genes: int = 200) -> dict[str, float]:
+    """Per-gene Pearson across the MASKED spots, over two gene sets.
 
     Reported alongside the MSE so the pretraining log is readable in the same
     currency as every downstream number, and so a run that merely drives MSE
     down by predicting each gene's slide mean is visible as ~0 here (genes
     with no variance across the masked spots are excluded, exactly as
     ``pearson_per_gene`` does).
+
+    Both a full-panel and a top-variance-gene average are returned. The
+    full-panel mean over ~17,000 genes is dominated by near-silent ones and
+    moves very little even when the model is genuinely learning; the headline
+    metrics in this study are HVG panels, so ``top_variance_genes`` is the
+    number to watch. They differ by roughly an order of magnitude on the same
+    data -- a parameter-free neighbour-mean predictor scores 0.056 full-panel
+    against 0.392 on the top 200 -- so quoting the wrong one badly misreads a
+    run's progress.
     """
     with torch.no_grad():
         visible = expression.clone()
@@ -193,9 +203,17 @@ def masked_spot_pearson(refiner: SpatialExpressionRefiner, expression: torch.Ten
         estimate_norm = estimate_centered.norm(dim=0)
         valid = (truth_norm > 1e-12) & (estimate_norm > 1e-12)
         if not bool(valid.any()):
-            return float("nan")
+            return {"all_genes": float("nan"), "top_variance_genes": float("nan")}
         correlation = (truth_centered * estimate_centered).sum(dim=0) / (truth_norm * estimate_norm)
-        return float(correlation[valid].mean())
+        top_count = max(1, min(int(n_top_genes), int(valid.sum())))
+        # Rank by variance in the TRUTH, so the gene set never depends on what
+        # the model happened to predict.
+        ranked = torch.argsort(torch.where(valid, truth_norm, truth_norm.new_zeros(())),
+                               descending=True)[:top_count]
+        return {
+            "all_genes": float(correlation[valid].mean()),
+            "top_variance_genes": float(correlation[ranked].mean()),
+        }
 
 
 def _spatial_prior_step(refiner: SpatialExpressionRefiner,
@@ -258,6 +276,7 @@ def pretrain_spatial_prior_streaming(refiner: SpatialExpressionRefiner,
                                      steps_per_slide: int = 4,
                                      mask_fraction: float = 0.25,
                                      learning_rate: float = 1e-4, seed: int = 0,
+                                     n_top_genes: int = 200,
                                      device: torch.device | None = None) -> list[dict]:
     """Pretrain over slides loaded ONE AT A TIME, holding at most one in memory.
 
@@ -301,20 +320,25 @@ def pretrain_spatial_prior_streaming(refiner: SpatialExpressionRefiner,
                 for _ in range(steps_per_slide)
             ]
             evaluation_mask = mask_spots(expression.shape[0], mask_fraction, generator).to(device)
-            pearson = masked_spot_pearson(refiner, expression, coords, evaluation_mask)
+            pearson = masked_spot_pearson(
+                refiner, expression, coords, evaluation_mask, n_top_genes=n_top_genes,
+            )
             record = {
                 "round": round_index + 1,
                 "sample_id": sample_id,
                 "n_spots": int(expression.shape[0]),
                 "first_loss": losses[0],
                 "last_loss": losses[-1],
-                "masked_spot_pearson": pearson,
+                "masked_spot_pearson": pearson["all_genes"],
+                "masked_spot_pearson_top_genes": pearson["top_variance_genes"],
             }
             history.append(record)
             print(
                 f"spatial-prior round {round_index + 1}/{rounds} "
                 f"slide {position}/{len(order)} {sample_id} "
-                f"loss {losses[0]:.6f}->{losses[-1]:.6f} masked_pcc={pearson:.4f}",
+                f"loss {losses[0]:.6f}->{losses[-1]:.6f} "
+                f"pcc_all={pearson['all_genes']:+.4f} "
+                f"pcc_top{n_top_genes}={pearson['top_variance_genes']:+.4f}",
                 flush=True,
             )
             del expression, coords, expression_np, coords_np

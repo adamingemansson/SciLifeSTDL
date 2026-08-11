@@ -75,6 +75,13 @@ def main() -> None:
     parser.add_argument("--mask-fraction", type=float, default=0.25)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--n-top-genes", type=int, default=200,
+        help="Size of the highest-variance gene set the reported PCC is averaged over, "
+             "alongside the full panel. The full-panel mean is dominated by near-silent "
+             "genes and moves very little; the headline metrics in this study are HVG "
+             "panels, so this is the number to watch.",
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
         "--max-slides", type=int,
@@ -122,7 +129,7 @@ def main() -> None:
         refiner, train_sample_ids, _slide_loader(dataset_manifest),
         rounds=args.rounds, steps_per_slide=args.steps_per_slide,
         mask_fraction=args.mask_fraction, learning_rate=args.learning_rate,
-        seed=args.seed, device=device,
+        seed=args.seed, n_top_genes=args.n_top_genes, device=device,
     )
 
     provenance = {
@@ -135,19 +142,23 @@ def main() -> None:
         "mask_fraction": float(args.mask_fraction),
         "learning_rate": float(args.learning_rate),
         "seed": int(args.seed),
+        "n_top_genes": int(args.n_top_genes),
         "history": history,
     }
     path = save_spatial_prior(
         refiner.to("cpu"), args.output, gene_names=gene_names, provenance=provenance,
     )
-    first_round = [r["masked_spot_pearson"] for r in history if r["round"] == 1]
-    last_round = [r["masked_spot_pearson"] for r in history if r["round"] == args.rounds]
-    print(
-        f"spatial prior saved to {path}\n"
-        f"masked-spot PCC: round 1 mean={np.nanmean(first_round):.4f} "
-        f"round {args.rounds} mean={np.nanmean(last_round):.4f}",
-        flush=True,
-    )
+    print(f"\nspatial prior saved to {path}", flush=True)
+    print("round  pcc_all   pcc_top%d" % args.n_top_genes, flush=True)
+    for round_index in range(1, args.rounds + 1):
+        records = [r for r in history if r["round"] == round_index]
+        if not records:
+            continue
+        print(
+            f"{round_index:5d}  {np.nanmean([r['masked_spot_pearson'] for r in records]):+.4f}   "
+            f"{np.nanmean([r['masked_spot_pearson_top_genes'] for r in records]):+.4f}",
+            flush=True,
+        )
     Path(str(path) + ".provenance.json").write_text(
         json.dumps({k: v for k, v in provenance.items() if k != "history"}, indent=2, sort_keys=True)
     )
