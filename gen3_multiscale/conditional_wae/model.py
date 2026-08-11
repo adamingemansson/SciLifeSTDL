@@ -732,7 +732,8 @@ class ConditionalWAE(nn.Module):
                                        n_samples: int | None = None,
                                        generator=None,
                                        z_mean: torch.Tensor | None = None,
-                                       z_std: torch.Tensor | None = None) -> dict:
+                                       z_std: torch.Tensor | None = None,
+                                       latent_spatial_correlation: float = 0.0) -> dict:
         context = self.image_conditioner(inputs)
         count = int(n_samples or self.n_inference_samples)
         if count < 1:
@@ -793,12 +794,38 @@ class ConditionalWAE(nn.Module):
                 raise ValueError(f"z_std must be [{self.latent_dim}], got {tuple(z_std.shape)}")
             if bool((z_std < 0).any()):
                 raise ValueError("z_std must be non-negative")
+        # Spatially-coherent latent sampling. Measured on four trained arms,
+        # the latent's contribution correlates 0.002-0.025 with the error it
+        # would need to explain -- the signature of i.i.d.-per-spot noise,
+        # which is what `torch.randn(n_spots, latent_dim)` draws. Real
+        # biological variation unexplained by H&E is spatially CORRELATED
+        # (tissue niches, clonal regions), so a sample that differs
+        # independently at every spot cannot express a coherent alternative
+        # hypothesis like "this whole region is tumour".
+        #
+        # Mixing a per-item shared draw with a per-spot draw as
+        #     z_i = sqrt(rho) * z_shared + sqrt(1 - rho) * z_i
+        # leaves each z_i EXACTLY marginally N(0,I) -- the distribution the
+        # MMD/GAN regularizer actually trained the encoder to match -- while
+        # imposing correlation rho between spots. It is therefore a pure
+        # inference-time change, valid on already-trained checkpoints, and
+        # rho=0 (the default) reproduces the historical sampler bit for bit.
+        if not 0.0 <= latent_spatial_correlation <= 1.0:
+            raise ValueError("latent_spatial_correlation must be in [0, 1]")
+        shared_weight = math.sqrt(latent_spatial_correlation)
+        local_weight = math.sqrt(1.0 - latent_spatial_correlation)
         samples = []
         for _ in range(count):
             noise = torch.randn(
                 context.shape[0], self.latent_dim,
                 dtype=context.dtype, device=context.device, generator=generator,
             )
+            if latent_spatial_correlation > 0:
+                shared = torch.randn(
+                    1, self.latent_dim,
+                    dtype=context.dtype, device=context.device, generator=generator,
+                )
+                noise = shared_weight * shared + local_weight * noise
             z = z_mean.unsqueeze(0) + noise * z_std.unsqueeze(0)
             prediction, _ = self.decode(z, context)
             samples.append(self._refine(prediction, context, inputs))

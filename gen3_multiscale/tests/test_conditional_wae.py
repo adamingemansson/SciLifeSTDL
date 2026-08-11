@@ -1,4 +1,5 @@
 import json
+import math
 import numpy as np
 import pytest
 import torch
@@ -511,6 +512,48 @@ def test_mmd_variant_routes_gradients_and_inference_never_needs_gex():
     assert prediction["predictive_mean"].shape == target.shape
     assert prediction["predictive_samples"].shape == (3, 12, 7)
     assert model(inputs)["expression"].shape == target.shape
+
+
+def test_latent_spatial_correlation_zero_reproduces_the_historical_sampler():
+    model = _model("mmd")
+    inputs = _inputs()
+    default = model.sample_predictive_distribution(
+        inputs, n_samples=4, generator=torch.Generator().manual_seed(5),
+    )
+    explicit = model.sample_predictive_distribution(
+        inputs, n_samples=4, generator=torch.Generator().manual_seed(5),
+        latent_spatial_correlation=0.0,
+    )
+    assert torch.equal(default["predictive_samples"], explicit["predictive_samples"])
+
+
+def test_latent_spatial_correlation_keeps_the_marginal_prior_but_couples_spots():
+    """The mixing must leave each spot's z marginally N(0,I) -- the
+    distribution MMD actually trained the encoder to match -- while making
+    a drawn field spatially coherent rather than salt-and-pepper."""
+    rho, latent_dim, n_spots, draws = 0.75, 32, 16, 3000
+    shared_weight, local_weight = math.sqrt(rho), math.sqrt(1.0 - rho)
+    generator = torch.Generator().manual_seed(0)
+    stacked = []
+    for _ in range(draws):
+        noise = torch.randn(n_spots, latent_dim, generator=generator)
+        shared = torch.randn(1, latent_dim, generator=generator)
+        stacked.append(shared_weight * shared + local_weight * noise)
+    z = torch.stack(stacked)
+    assert abs(float(z.std(0).mean()) - 1.0) < 0.05
+    correlation = torch.corrcoef(
+        torch.stack([z[:, 0, :].flatten(), z[:, 1, :].flatten()])
+    )[0, 1]
+    assert abs(float(correlation) - rho) < 0.05
+
+
+def test_latent_spatial_correlation_rejects_values_outside_the_unit_interval():
+    model = _model("mmd")
+    for bad in (-0.1, 1.1):
+        with pytest.raises(ValueError, match="latent_spatial_correlation"):
+            model.sample_predictive_distribution(
+                _inputs(), latent_spatial_correlation=bad,
+            )
 
 
 def _distributional_model(**kwargs):

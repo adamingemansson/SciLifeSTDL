@@ -49,6 +49,7 @@ def evaluate_conditional_wae(
     allow_code_drift: bool = False,
     n_samples: int | None = None,
     ex_post_prior_path: str | None = None,
+    latent_spatial_correlation: float = 0.0,
 ) -> dict:
     if split not in {"validation", "test"}:
         raise ValueError("split must be validation or test")
@@ -138,6 +139,7 @@ def evaluate_conditional_wae(
             prediction = model.sample_predictive_distribution(
                 inputs, n_samples=inference_samples, generator=generator,
                 z_mean=ex_post_z_mean, z_std=ex_post_z_std,
+                latent_spatial_correlation=latent_spatial_correlation,
             )
             true = np.asarray(target, dtype=np.float32)
             model_pred = prediction["predictive_mean"].detach().cpu().numpy().astype(np.float32)
@@ -193,6 +195,7 @@ def evaluate_conditional_wae(
         "n_items": len(dataset),
         "n_latent_samples_per_item": inference_samples,
         "ex_post_prior_path": str(ex_post_prior_path) if ex_post_prior_path else None,
+        "latent_spatial_correlation": float(latent_spatial_correlation),
         "task": config["model"]["task"],
         "regularizer": config["model"]["regularizer"],
         "query_he_visible": True,
@@ -238,6 +241,15 @@ def main() -> None:
              "raw N(0,I) prior -- the standard no-retrain fix for WAE aggregate-posterior/prior "
              "mismatch. Omit to reproduce the exact pre-existing N(0,I) sampling behavior.",
     )
+    parser.add_argument(
+        "--latent-spatial-correlation", type=float, default=0.0,
+        help="Correlation rho in [0,1] between spots' inference-time latent draws. "
+             "z_i = sqrt(rho)*z_shared + sqrt(1-rho)*z_i keeps each z_i exactly marginally "
+             "N(0,I) -- what the MMD/GAN regularizer trained for -- while making a drawn "
+             "field spatially coherent instead of i.i.d. per spot. Pure inference-time "
+             "change, valid on already-trained checkpoints; 0.0 (default) reproduces the "
+             "historical sampler exactly.",
+    )
     args = parser.parse_args()
     evaluate_conditional_wae(
         args.config,
@@ -250,6 +262,7 @@ def main() -> None:
         allow_code_drift=args.allow_code_drift,
         n_samples=args.n_samples,
         ex_post_prior_path=args.ex_post_prior,
+        latent_spatial_correlation=args.latent_spatial_correlation,
     )
 
 
