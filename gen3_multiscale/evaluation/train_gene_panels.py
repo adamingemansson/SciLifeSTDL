@@ -19,10 +19,14 @@ from scipy import sparse
 from gen3_multiscale.data.dataset_manifest import gene_panel_hash
 from gen3_multiscale.data.example_builder import load_expression_for_model_target_space
 
-_VERSION = 2
+# Bumped to 3 when within-slide-variance panels were added. An artifact built
+# by an older version lacks them entirely, so loading must fail rather than
+# silently serve only the pooled panels.
+_VERSION = 3
 _KIND = "gen3_train_derived_gene_panels"
 _METHOD = "pooled_training_spot_variance_in_model_target_space"
 _METHOD_BY_ORGAN = "organ_stratified_dispersion_in_model_target_space"
+_METHOD_WITHIN_SLIDE = "mean_within_slide_variance_in_model_target_space"
 _MIN_TRAIN_SAMPLES_PER_ORGAN = 2
 _DISPERSION_N_BINS = 20
 
@@ -122,11 +126,24 @@ def build_train_derived_gene_panels(manifest: dict, *, panel_sizes: tuple[int, .
 
     total_sum = np.zeros(len(gene_names), dtype=np.float64)
     total_squares = np.zeros(len(gene_names), dtype=np.float64)
+    # Mean WITHIN-slide variance, accumulated one slide at a time. Pooled
+    # variance decomposes as
+    #     Var_pooled = E_slide[Var_within(slide)] + Var_slide[mean(slide)]
+    # and only the FIRST term can be expressed by a within-hole correlation,
+    # which is the metric this project actually reports. The second term
+    # rewards genes that differ BETWEEN slides, so a gene silent in twelve
+    # slides and high in one ranks into the panel and is then unscoreable
+    # everywhere -- observed for real: LCN2 ranks into the pooled panel while
+    # being non-zero in 0.75% of INT14's 4,552 spots.
+    within_slide_variance = np.zeros(len(gene_names), dtype=np.float64)
+    n_slides_counted = 0
     n_spots = 0
     organ_sum: dict[str, np.ndarray] = {}
     organ_squares: dict[str, np.ndarray] = {}
     organ_n_spots: dict[str, int] = {}
     organ_train_ids: dict[str, list[str]] = {}
+    organ_within_slide: dict[str, np.ndarray] = {}
+    organ_within_slide_slides: dict[str, int] = {}
     for sample_id in train_ids:
         adata = load_expression_for_model_target_space(manifest, sample_id)
         if list(map(str, adata.var_names)) != gene_names:
@@ -138,6 +155,15 @@ def build_train_derived_gene_panels(manifest: dict, *, panel_sizes: tuple[int, .
         total_squares += squares
         n_spots += rows
         organ = organ_by_sample[sample_id]
+        if rows >= 2:
+            slide_variance = np.maximum(squares / rows - np.square(sums / rows), 0.0)
+            within_slide_variance += slide_variance
+            n_slides_counted += 1
+            organ_within_slide[organ] = (
+                organ_within_slide.get(organ, np.zeros(len(gene_names), dtype=np.float64))
+                + slide_variance
+            )
+            organ_within_slide_slides[organ] = organ_within_slide_slides.get(organ, 0) + 1
         organ_sum[organ] = organ_sum.get(organ, np.zeros(len(gene_names), dtype=np.float64)) + sums
         organ_squares[organ] = organ_squares.get(organ, np.zeros(len(gene_names), dtype=np.float64)) + squares
         organ_n_spots[organ] = organ_n_spots.get(organ, 0) + rows
@@ -154,7 +180,24 @@ def build_train_derived_gene_panels(manifest: dict, *, panel_sizes: tuple[int, .
         for size in sizes
     }
 
+    if n_slides_counted < 1:
+        raise ValueError("no training slide had at least two spots; cannot rank within-slide variance")
+    within_slide_variance /= float(n_slides_counted)
+    within_order = sorted(
+        range(len(gene_names)),
+        key=lambda idx: (-float(within_slide_variance[idx]), gene_names[idx]),
+    )
+    within_slide_ranking = [
+        {"gene": gene_names[idx], "mean_within_slide_variance": float(within_slide_variance[idx])}
+        for idx in within_order
+    ]
+    panels.update({
+        f"train_within_slide_variance_top{size}": [gene_names[idx] for idx in within_order[:size]]
+        for size in sizes
+    })
+
     ranking_by_organ: dict[str, list[dict]] = {}
+    within_slide_ranking_by_organ: dict[str, list[dict]] = {}
     panels_by_organ: dict[str, dict[str, list[str]]] = {}
     for organ in sorted(organ_train_ids):
         n_organ_train_samples = len(organ_train_ids[organ])
@@ -167,16 +210,43 @@ def build_train_derived_gene_panels(manifest: dict, *, panel_sizes: tuple[int, .
         organ_variance = np.maximum(organ_squares[organ] / organ_n_spots[organ] - np.square(organ_mean), 0.0)
         organ_ranking = _binned_dispersion_ranking(gene_names, organ_mean, organ_variance)
         ranking_by_organ[organ] = organ_ranking
-        ranked_genes = [row["gene"] for row in organ_ranking]
+        organ_ranked_genes = [row["gene"] for row in organ_ranking]
         panels_by_organ[organ] = {
-            f"train_dispersion_top{size}": ranked_genes[:size] for size in sizes
+            f"train_dispersion_top{size}": organ_ranked_genes[:size] for size in sizes
         }
+        # Both corrections applied together: the WITHIN-SLIDE statistic (so a
+        # gene must vary inside a slide, not merely between slides) restricted
+        # to slides of THIS organ (so the reference tissue is the right one).
+        # Per-organ grouping alone does not fix the pooling problem: a gene
+        # high in two kidney slides and silent in the rest still has large
+        # pooled kidney variance and no within-slide signal anywhere.
+        if organ_within_slide_slides.get(organ, 0) < 1:
+            raise ValueError(f"organ {organ!r} has no training slide with at least two spots")
+        organ_within = organ_within_slide[organ] / float(organ_within_slide_slides[organ])
+        organ_within_order = sorted(
+            range(len(gene_names)),
+            key=lambda idx: (-float(organ_within[idx]), gene_names[idx]),
+        )
+        ranking_by_organ[organ] = organ_ranking
+        within_slide_ranking_by_organ[organ] = [
+            {"gene": gene_names[idx], "mean_within_slide_variance": float(organ_within[idx])}
+            for idx in organ_within_order
+        ]
+        panels_by_organ[organ].update({
+            f"organ_within_slide_variance_top{size}": [
+                gene_names[idx] for idx in organ_within_order[:size]
+            ]
+            for size in sizes
+        })
 
     artifact = {
         "version": _VERSION,
         "kind": _KIND,
         "method": _METHOD,
         "method_by_organ": _METHOD_BY_ORGAN,
+        "method_within_slide": _METHOD_WITHIN_SLIDE,
+        "n_within_slide_ranked_samples": n_slides_counted,
+        "within_slide_ranking": within_slide_ranking,
         "dataset_manifest_fingerprint": dataset_manifest_fingerprint(manifest),
         "gene_panel_hash": gene_panel_hash(gene_names),
         "train_sample_ids": train_ids,
@@ -186,6 +256,7 @@ def build_train_derived_gene_panels(manifest: dict, *, panel_sizes: tuple[int, .
         "ranking": ranking,
         "panels": panels,
         "ranking_by_organ": ranking_by_organ,
+        "within_slide_ranking_by_organ": within_slide_ranking_by_organ,
         "panels_by_organ": panels_by_organ,
     }
     artifact["artifact_sha256"] = _canonical_hash(artifact)
@@ -196,6 +267,7 @@ def validate_train_derived_gene_panels(artifact: dict, manifest: dict) -> dict:
     if (
         artifact.get("version") != _VERSION or artifact.get("kind") != _KIND
         or artifact.get("method") != _METHOD or artifact.get("method_by_organ") != _METHOD_BY_ORGAN
+        or artifact.get("method_within_slide") != _METHOD_WITHIN_SLIDE
     ):
         raise ValueError("unsupported train-derived gene-panel artifact schema")
     if artifact.get("artifact_sha256") != _canonical_hash(artifact):
@@ -221,15 +293,39 @@ def validate_train_derived_gene_panels(artifact: dict, manifest: dict) -> dict:
         raise ValueError("train-derived gene-panel ranking contains invalid variance values")
     if not isinstance(panels, dict) or not panels:
         raise ValueError("train-derived gene-panel artifact has no panels")
-    previous: list[str] = []
-    for name, genes in sorted(panels.items(), key=lambda item: len(item[1])):
-        if not isinstance(name, str) or not isinstance(genes, list) or not genes or len(set(genes)) != len(genes):
-            raise ValueError(f"invalid train-derived panel {name!r}")
-        if genes != ranked_genes[: len(genes)]:
-            raise ValueError(f"train-derived panel {name!r} is not a prefix of the recorded ranking")
-        if previous and genes[: len(previous)] != previous:
-            raise ValueError("train-derived panels are not nested")
-        previous = genes
+    within_slide_ranking = artifact.get("within_slide_ranking")
+    if not isinstance(within_slide_ranking, list) or len(within_slide_ranking) != len(manifest["gene_panel"]):
+        raise ValueError("train-derived gene-panel within_slide_ranking is incomplete")
+    within_slide_ranked_genes = [row.get("gene") for row in within_slide_ranking if isinstance(row, dict)]
+    if set(within_slide_ranked_genes) != set(map(str, manifest["gene_panel"])):
+        raise ValueError("within-slide ranking does not cover the frozen gene panel exactly")
+
+    # Panels come from two different rankings and are only nested WITHIN a
+    # family. Checking every panel against the pooled ranking would reject the
+    # within-slide panels for the wrong reason.
+    _PANEL_FAMILIES = (
+        ("train_log1p_variance_top", ranked_genes),
+        ("train_within_slide_variance_top", within_slide_ranked_genes),
+    )
+    for prefix, source in _PANEL_FAMILIES:
+        family = {name: genes for name, genes in panels.items() if name.startswith(prefix)}
+        if not family:
+            raise ValueError(f"train-derived gene-panel artifact has no {prefix}* panels")
+        previous: list[str] = []
+        for name, genes in sorted(family.items(), key=lambda item: len(item[1])):
+            if not isinstance(genes, list) or not genes or len(set(genes)) != len(genes):
+                raise ValueError(f"invalid train-derived panel {name!r}")
+            if genes != source[: len(genes)]:
+                raise ValueError(f"train-derived panel {name!r} is not a prefix of its recorded ranking")
+            if previous and genes[: len(previous)] != previous:
+                raise ValueError(f"{prefix}* panels are not nested")
+            previous = genes
+    unclaimed = sorted(
+        name for name in panels
+        if not any(name.startswith(prefix) for prefix, _ in _PANEL_FAMILIES)
+    )
+    if unclaimed:
+        raise ValueError(f"train-derived panels {unclaimed} belong to no known ranking family")
 
     samples = manifest.get("samples") or {}
     expected_organs = {
@@ -257,15 +353,31 @@ def validate_train_derived_gene_panels(artifact: dict, manifest: dict) -> dict:
         organ_panels = panels_by_organ[organ]
         if not isinstance(organ_panels, dict) or not organ_panels:
             raise ValueError(f"train-derived gene-panel artifact has no panels for organ {organ!r}")
-        organ_previous: list[str] = []
-        for name, genes in sorted(organ_panels.items(), key=lambda item: len(item[1])):
-            if not isinstance(name, str) or not isinstance(genes, list) or not genes or len(set(genes)) != len(genes):
-                raise ValueError(f"invalid train-derived panel {name!r} for organ {organ!r}")
-            if genes != organ_ranked_genes[: len(genes)]:
-                raise ValueError(f"train-derived panel {name!r} for organ {organ!r} is not a prefix of its ranking")
-            if organ_previous and genes[: len(organ_previous)] != organ_previous:
-                raise ValueError(f"train-derived panels for organ {organ!r} are not nested")
-            organ_previous = genes
+        organ_within_ranking = (artifact.get("within_slide_ranking_by_organ") or {}).get(organ)
+        if not isinstance(organ_within_ranking, list) or len(organ_within_ranking) != len(manifest["gene_panel"]):
+            raise ValueError(f"within-slide ranking for organ {organ!r} is incomplete")
+        organ_within_genes = [row.get("gene") for row in organ_within_ranking if isinstance(row, dict)]
+        if set(organ_within_genes) != set(ranked_genes):
+            raise ValueError(f"within-slide ranking for organ {organ!r} does not cover the gene panel")
+        # Same two-family structure as the global panels above.
+        for prefix, source in (
+            ("train_dispersion_top", organ_ranked_genes),
+            ("organ_within_slide_variance_top", organ_within_genes),
+        ):
+            family = {name: genes for name, genes in organ_panels.items() if name.startswith(prefix)}
+            if not family:
+                raise ValueError(f"organ {organ!r} has no {prefix}* panels")
+            organ_previous: list[str] = []
+            for name, genes in sorted(family.items(), key=lambda item: len(item[1])):
+                if not isinstance(genes, list) or not genes or len(set(genes)) != len(genes):
+                    raise ValueError(f"invalid train-derived panel {name!r} for organ {organ!r}")
+                if genes != source[: len(genes)]:
+                    raise ValueError(
+                        f"train-derived panel {name!r} for organ {organ!r} is not a prefix of its ranking"
+                    )
+                if organ_previous and genes[: len(organ_previous)] != organ_previous:
+                    raise ValueError(f"{prefix}* panels for organ {organ!r} are not nested")
+                organ_previous = genes
     return artifact
 
 

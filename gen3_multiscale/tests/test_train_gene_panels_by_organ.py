@@ -160,3 +160,24 @@ def test_validate_rejects_an_artifact_missing_panels_by_organ(monkeypatch):
     artifact["artifact_sha256"] = panels_module._canonical_hash(artifact)
     with pytest.raises(ValueError, match="unsupported"):
         panels_module.validate_train_derived_gene_panels(artifact, manifest)
+
+
+def test_slide_target_gene_indices_picks_genes_that_vary_on_that_slide():
+    """The whole-slide figures must plot genes with signal ON THE SLIDE SHOWN.
+    A gene that is flat there produces a constant 'target' panel and the
+    comparison becomes unreadable -- the LCN2/INT14 case."""
+    import numpy as np
+
+    from gen3_multiscale.training.train_conditional_wae import _slide_target_gene_indices
+
+    gene_names = ["FLAT", "WEAK", "STRONG"]
+    rng = np.random.default_rng(0)
+    target = np.stack([
+        np.zeros(50),                     # silent on this slide
+        rng.normal(scale=0.1, size=50),   # weak
+        rng.normal(scale=3.0, size=50),   # strong
+    ], axis=1)
+    assert _slide_target_gene_indices(target, gene_names, 2) == [2, 1]
+    # A gene with zero variance is never plotted, even if more are requested.
+    assert 0 not in _slide_target_gene_indices(target, gene_names, 3)
+    assert _slide_target_gene_indices(target, gene_names, 0) == []

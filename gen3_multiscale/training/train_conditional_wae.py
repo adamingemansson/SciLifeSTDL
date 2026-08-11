@@ -514,6 +514,35 @@ def _tensorboard_gene_indices(config: dict, dataset_manifest: dict,
     return [positions[gene] for gene in panel[:count] if gene in positions]
 
 
+def _slide_target_gene_indices(target, gene_names: list[str], count: int) -> list[int]:
+    """Genes to PLOT for one slide, ranked by variance in that slide's own truth.
+
+    Purely presentational: this chooses which panels appear in the
+    target/prediction figures, never which genes any metric is computed over,
+    so using the evaluated slide's ground truth here is a display decision and
+    not a leak into a reported number.
+
+    It replaces train-panel-derived selection because that repeatedly plotted
+    genes with no signal on the slide being shown. Measured case: LCN2 entered
+    the pooled train panel and is non-zero in 0.75% of INT14's 4,552 spots, so
+    its "target" map was a flat field and the figure could not show whether the
+    model was right or wrong about anything. Ranking on the slide itself
+    guarantees the plotted genes actually vary there, which is the only way the
+    comparison is readable.
+    """
+    if count < 1:
+        return []
+    values = np.asarray(target, dtype=np.float64)
+    if values.ndim != 2 or values.shape[0] < 2 or values.shape[1] != len(gene_names):
+        return list(range(min(count, len(gene_names))))
+    variance = values.var(axis=0)
+    order = sorted(
+        range(len(gene_names)),
+        key=lambda idx: (-float(variance[idx]), gene_names[idx]),
+    )
+    return [idx for idx in order[:count] if variance[idx] > 0.0]
+
+
 def _organ_gene_indices(
     artifact: dict | None, organ: str, gene_names: list[str], count: int,
 ) -> list[int]:
@@ -933,8 +962,8 @@ def run_conditional_wae_training(
                                     prediction["target"],
                                     prediction["predictive_mean"].detach().cpu().numpy(),
                                     gene_names, whole_slide_reference_projection,
-                                    gene_indices=_organ_gene_indices(
-                                        whole_slide_gene_panel_artifact, sample_organ, gene_names,
+                                    gene_indices=_slide_target_gene_indices(
+                                        prediction["target"], gene_names,
                                         int(tensorboard_cfg.get("spatial_gene_count", 2)),
                                     ),
                                 )
