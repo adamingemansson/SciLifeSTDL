@@ -135,6 +135,64 @@ def test_prepare_honors_uni2_spot_feature_cache_dir_override(tmp_path):
     assert config["data"]["gen3_uni2_spot_feature_cache_dir"] == "/data/custom_uni2_cache"
 
 
+def test_prepare_wires_a_spatial_prior_into_every_arm(tmp_path):
+    comparison_config = _write_comparison_config(tmp_path)
+    manifest = _write_manifest(tmp_path)
+    panels = tmp_path / "panels.json"
+    panels.write_text("{}")
+    prior = tmp_path / "spatial_prior.pt"
+    prior.write_text("stub")
+
+    plan = suite_module.prepare_wae_mmd_geneencoder_ablation_suite(
+        comparison_config=str(comparison_config), manifest=str(manifest),
+        train_gene_panels=str(panels), output_root=str(tmp_path / "suite"),
+        scfoundation_basis_path=str(_scfoundation_basis_path(tmp_path)),
+        uni2_pinned_revision=UNI2_REVISION,
+        n_refinement_steps=3, spatial_prior_path=str(prior),
+    )
+    assert plan["spatial_prior_path"] == str(prior.resolve())
+    for arm in suite_module.ARM_ORDER:
+        config = yaml.safe_load((tmp_path / "suite" / "configs" / f"{arm}.yaml").read_text())
+        # Shared across arms, so it is not a declared divergence -- the
+        # matched-except-declared invariant already checked by this suite
+        # would fail if it were only wired into some of them.
+        assert config["data"]["spatial_prior_path"] == str(prior.resolve())
+
+
+def test_prepare_rejects_a_spatial_prior_with_no_refiner_to_load_it_into(tmp_path):
+    comparison_config = _write_comparison_config(tmp_path)
+    manifest = _write_manifest(tmp_path)
+    panels = tmp_path / "panels.json"
+    panels.write_text("{}")
+    prior = tmp_path / "spatial_prior.pt"
+    prior.write_text("stub")
+
+    with pytest.raises(ValueError, match="n_refinement_steps"):
+        suite_module.prepare_wae_mmd_geneencoder_ablation_suite(
+            comparison_config=str(comparison_config), manifest=str(manifest),
+            train_gene_panels=str(panels), output_root=str(tmp_path / "suite"),
+            scfoundation_basis_path=str(_scfoundation_basis_path(tmp_path)),
+            uni2_pinned_revision=UNI2_REVISION,
+            n_refinement_steps=0, spatial_prior_path=str(prior),
+        )
+
+
+def test_prepare_rejects_a_missing_spatial_prior_artifact(tmp_path):
+    comparison_config = _write_comparison_config(tmp_path)
+    manifest = _write_manifest(tmp_path)
+    panels = tmp_path / "panels.json"
+    panels.write_text("{}")
+
+    with pytest.raises(FileNotFoundError, match="pretrain it first"):
+        suite_module.prepare_wae_mmd_geneencoder_ablation_suite(
+            comparison_config=str(comparison_config), manifest=str(manifest),
+            train_gene_panels=str(panels), output_root=str(tmp_path / "suite"),
+            scfoundation_basis_path=str(_scfoundation_basis_path(tmp_path)),
+            uni2_pinned_revision=UNI2_REVISION,
+            n_refinement_steps=3, spatial_prior_path=str(tmp_path / "absent.pt"),
+        )
+
+
 def test_prepare_refuses_to_overwrite_an_existing_suite_root(tmp_path):
     comparison_config = _write_comparison_config(tmp_path)
     manifest = _write_manifest(tmp_path)

@@ -25,6 +25,7 @@ from gen3_multiscale.conditional_wae.histology_context import HistologyContextIn
 from gen3_multiscale.conditional_wae.histology_features import FEATURE_DIM as HISTOLOGY_FEATURE_DIM
 from gen3_multiscale.conditional_wae.film_diagnostics import compute_film_diagnostics
 from gen3_multiscale.conditional_wae.reference_projection import ensure_reference_gex_projection
+from gen3_multiscale.conditional_wae.spatial_prior import load_spatial_prior_into
 from gen3_multiscale.conditional_wae.tensorboard import (
     ConditionalWAESnapshotAccumulator,
     ConditionalWAETensorBoardLogger,
@@ -216,7 +217,7 @@ def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = N
             table_path, gene_names,
         )
         gene_encoder_table = table_basis.basis
-    return ConditionalWAE(
+    model = ConditionalWAE(
         n_genes,
         conditioner,
         regularizer=model_cfg["regularizer"],
@@ -241,6 +242,22 @@ def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = N
         distributional_weight=float(params.get("distributional_weight", 1.0)),
         distributional_hidden_dim=int(params.get("distributional_hidden_dim", 1024)),
     )
+    spatial_prior_path = (config.get("data") or {}).get("spatial_prior_path")
+    if spatial_prior_path:
+        # INITIALISATION ONLY. A resume or an evaluation immediately overwrites
+        # these weights with the checkpoint's, which is correct: the prior is
+        # where training starts, never what it ends at.
+        if model.spatial_refiner is None:
+            raise ValueError(
+                "data.spatial_prior_path requires model.params.n_refinement_steps > 0"
+            )
+        if gene_names is None:
+            raise ValueError(
+                "data.spatial_prior_path requires _build_model's gene_names argument so the "
+                "prior's gene panel can be checked against this run's"
+            )
+        load_spatial_prior_into(model.spatial_refiner, spatial_prior_path, gene_names=gene_names)
+    return model
 
 
 def _manifest(config: dict, dataset_manifest: dict, preflight_report: dict) -> dict:

@@ -141,6 +141,13 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
             raise ValueError("model.params.film_shared_generator requires film_layers to include both layers")
     use_gene_coexpression_refinement = bool(params.get("use_gene_coexpression_refinement", False))
     data = config.get("data") or {}
+    spatial_prior_path = data.get("spatial_prior_path")
+    if spatial_prior_path and n_refinement_steps < 1:
+        raise ValueError(
+            "data.spatial_prior_path is set but model.params.n_refinement_steps is 0, so there is "
+            "no spatial refiner to load the pretrained prior into -- the weights would be silently "
+            "discarded"
+        )
     if use_gene_coexpression_refinement and not data.get("gene_coexpression_basis_path"):
         raise ValueError(
             "model.params.use_gene_coexpression_refinement requires data.gene_coexpression_basis_path"
@@ -193,5 +200,6 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
         "gene_encoder_source": gene_encoder_source,
         "z_noise_std": float(params.get("z_noise_std", 0.0)),
         "n_refinement_steps": n_refinement_steps,
+        "spatial_prior_path": str(spatial_prior_path) if spatial_prior_path else None,
         "likelihood": likelihood,
     }

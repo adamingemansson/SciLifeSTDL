@@ -75,6 +75,7 @@ def prepare_wae_mmd_geneencoder_ablation_suite(
     cpu_threads: int = 12, uni2_spot_feature_cache_dir: str | None = None,
     z_noise_std: float = 0.0,
     n_refinement_steps: int = 0,
+    spatial_prior_path: str | None = None,
     retain_patches_in_memory: bool = True,
 ) -> dict:
     if hours <= 0:
@@ -89,6 +90,17 @@ def prepare_wae_mmd_geneencoder_ablation_suite(
         raise ValueError("z_noise_std must be non-negative")
     if n_refinement_steps < 0:
         raise ValueError("n_refinement_steps must be non-negative")
+    if spatial_prior_path:
+        if n_refinement_steps < 1:
+            raise ValueError(
+                "spatial_prior_path requires n_refinement_steps > 0 -- there would be no "
+                "refiner to load the pretrained weights into"
+            )
+        if not Path(spatial_prior_path).is_file():
+            raise FileNotFoundError(
+                f"{spatial_prior_path}: pretrain it first with "
+                "gen3_multiscale.scripts.pretrain_conditional_wae_spatial_prior"
+            )
     if not scfoundation_basis_path:
         raise ValueError("scfoundation_basis_path must be set to an already-fit basis artifact")
     if not uni2_pinned_revision:
@@ -163,6 +175,8 @@ def prepare_wae_mmd_geneencoder_ablation_suite(
         config["data"]["image_encoder"] = "uni2"
         config["data"]["retain_patches_in_memory"] = bool(retain_patches_in_memory)
         config["data"]["uni2_pinned_revision"] = str(uni2_pinned_revision)
+        if spatial_prior_path:
+            config["data"]["spatial_prior_path"] = str(Path(spatial_prior_path).resolve())
         if uni2_spot_feature_cache_dir:
             config["data"]["gen3_uni2_spot_feature_cache_dir"] = str(uni2_spot_feature_cache_dir)
         divergences = [
@@ -239,6 +253,7 @@ def prepare_wae_mmd_geneencoder_ablation_suite(
         "uni2_pinned_revision": str(uni2_pinned_revision),
         "z_noise_std": float(z_noise_std),
         "n_refinement_steps": int(n_refinement_steps),
+        "spatial_prior_path": str(Path(spatial_prior_path).resolve()) if spatial_prior_path else None,
         "arms": written,
     }
     (root / "run_plan.json").write_text(json.dumps(plan, indent=2, sort_keys=True))
@@ -341,6 +356,14 @@ def main() -> None:
              "before this option existed.",
     )
     parser.add_argument(
+        "--spatial-prior-path",
+        help="A spatial-expression prior pretrained by "
+             "gen3_multiscale.scripts.pretrain_conditional_wae_spatial_prior. Its weights "
+             "INITIALISE the refiner in every arm of this suite; training then continues "
+             "normally and the checkpoint, not the prior, is what any later resume or "
+             "evaluation loads. Requires --n-refinement-steps > 0.",
+    )
+    parser.add_argument(
         "--release-patches-after-verification", action="store_true",
         help="Free each slide's raw H&E patch array once the spot-feature cache has "
              "re-hashed it against its stored patch_content_sha256. Training reads only "
@@ -359,6 +382,7 @@ def main() -> None:
         uni2_pinned_revision=args.uni2_pinned_revision,
         uni2_spot_feature_cache_dir=args.uni2_spot_feature_cache_dir,
         n_refinement_steps=args.n_refinement_steps,
+        spatial_prior_path=args.spatial_prior_path,
         retain_patches_in_memory=not args.release_patches_after_verification,
         latent_dim=args.latent_dim,
         hours=args.hours,
