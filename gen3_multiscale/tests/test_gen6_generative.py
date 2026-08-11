@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 import torch.nn as nn
 
@@ -88,3 +89,55 @@ def test_wae_gan_one_optimizer_loss_routes_gradients_correctly():
         "wae_gan", model, inputs, generator=torch.Generator().manual_seed(7),
     )
     torch.testing.assert_close(metrics["conditioner_only_expression"], expected_conditioner)
+
+
+def test_hard_ot_assignment_preserves_the_source_distribution():
+    """The flow trains transporting FROM the paired noise but samples from a
+    full N(0,I). Barycentric pairing averages noise rows, which shrinks
+    variance and makes those two distributions different -- the same
+    train/inference mismatch class that caused severe predictive
+    under-dispersion elsewhere in this project."""
+    import torch
+
+    from gen3_multiscale.gen6.generative import sinkhorn_barycentric_ot_pairing
+
+    torch.manual_seed(0)
+    noise = torch.randn(256, 32)
+    target = torch.randn(256, 32) * 0.1
+
+    hard = sinkhorn_barycentric_ot_pairing(noise, target, assignment="hard")
+    barycentric = sinkhorn_barycentric_ot_pairing(noise, target, assignment="barycentric")
+
+    # Hard assignment returns actual noise rows, so the source is untouched.
+    assert hard.std().item() == pytest.approx(noise.std().item(), rel=0.02)
+    for row in hard:
+        assert torch.isclose(noise, row).all(dim=1).any(), "a returned row is not an original draw"
+    # Barycentric measurably contracts it at this target scale.
+    assert barycentric.std().item() < 0.95 * noise.std().item()
+
+    with pytest.raises(ValueError, match="assignment"):
+        sinkhorn_barycentric_ot_pairing(noise, target, assignment="bogus")
+
+
+def test_spatially_correlated_latent_keeps_marginals_but_couples_spots():
+    """rho must leave each spot's latent marginally N(0,I) -- what the
+    adversarial regulariser trained for -- while making one draw coherent
+    across the missing region."""
+    import torch
+
+    torch.manual_seed(0)
+    latent_dim, n_spots = 16, 400
+    for rho in (0.0, 0.5, 1.0):
+        shared_weight, local_weight = rho ** 0.5, (1.0 - rho) ** 0.5
+        draws = []
+        for _ in range(200):
+            z = torch.randn(n_spots, latent_dim)
+            if rho > 0:
+                z = shared_weight * torch.randn(1, latent_dim) + local_weight * z
+            draws.append(z)
+        stacked = torch.stack(draws)
+        # Marginal std over draws is 1 for every rho.
+        assert stacked.std(dim=0).mean().item() == pytest.approx(1.0, abs=0.05)
+        # Correlation between two spots within a draw rises with rho.
+        between = (stacked[:, 0, :] * stacked[:, 1, :]).mean().item()
+        assert between == pytest.approx(rho, abs=0.12)

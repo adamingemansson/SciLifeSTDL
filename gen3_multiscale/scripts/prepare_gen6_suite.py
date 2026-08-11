@@ -39,7 +39,8 @@ def _pairs(values: list[str]) -> dict[str, str]:
 
 def prepare_gen6_suite(*, comparison_config: str, manifest: str, train_gene_panels: str,
                        output_root: str, fingerprints: dict[str, str],
-                       hours: float = 8.0) -> dict:
+                       hours: float = 8.0,
+                       retain_patches_in_memory: bool = True) -> dict:
     if hours <= 0:
         raise ValueError("hours must be positive")
     root = Path(output_root)
@@ -85,6 +86,7 @@ def prepare_gen6_suite(*, comparison_config: str, manifest: str, train_gene_pane
         config.setdefault("loss", {})
         config["loss"].update({"primary_mode": "rmse_pcc", "pcc_weight": 0.1})
         config["data"]["gen3_manifest_path"] = str(manifest)
+        config["data"]["retain_patches_in_memory"] = bool(retain_patches_in_memory)
         config.setdefault("evaluation", {})
         config["evaluation"]["train_gene_panel_artifact"] = str(panel_path)
         config["training"]["checkpoint_dir"] = str(root / "checkpoints" / arm)
@@ -128,11 +130,21 @@ def main() -> None:
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--fingerprint", action="append", default=[])
     parser.add_argument("--hours", type=float, default=8.0)
+    parser.add_argument(
+        "--release-patches-after-verification", action="store_true",
+        help="Free each slide's raw H&E patch array once the spot-feature cache has "
+             "re-hashed it against its stored patch_content_sha256. Training reads only "
+             "the verified cached features afterwards, so this drops ~376 MB per "
+             "2,500-spot slide per process with no effect on any metric. With four "
+             "concurrent GPU queues that is the difference between comfortable and "
+             "saturating the shared box.",
+    )
     args = parser.parse_args()
     plan = prepare_gen6_suite(
         comparison_config=args.comparison_config, manifest=args.manifest,
         train_gene_panels=args.train_gene_panels,
         output_root=args.output_root, fingerprints=_pairs(args.fingerprint), hours=args.hours,
+        retain_patches_in_memory=not args.release_patches_after_verification,
     )
     print(json.dumps(plan, indent=2, sort_keys=True))
 
