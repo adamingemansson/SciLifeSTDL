@@ -797,3 +797,61 @@ def test_architecture_4_rejects_a_gene_basis_fit_on_a_different_panel():
         assert False, "expected a ValueError"
     except ValueError as exc:
         assert "gene panel" in str(exc)
+
+
+def _refining(n_refinement_steps, n_genes, gex_dim, image_dim):
+    torch.manual_seed(0)
+    return Architecture1(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim,
+        n_refinement_steps=n_refinement_steps, refinement_k_neighbors=4,
+        refinement_hidden_dim=16, refinement_gex_feature_dim=8, **_MODEL_KWARGS,
+    )
+
+
+def test_refinement_defaults_to_a_strict_no_op():
+    """Every existing architecture inherits this path, so the default must
+    construct no module and leave the forward output bit-identical."""
+    inputs, _targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    model = _refining(0, n_genes, gex_dim, image_dim)
+    assert model.expression_refiner is None
+    torch.manual_seed(0)
+    baseline = Architecture1(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim, **_MODEL_KWARGS,
+    )
+    model.eval(), baseline.eval()
+    with torch.no_grad():
+        torch.testing.assert_close(model(inputs)["expression"], baseline(inputs)["expression"])
+
+
+def test_refinement_starts_at_the_identity_then_changes_the_prediction():
+    """The refiner's update head is zero-initialised, so enabling it cannot
+    degrade a prediction before any refinement gradient has been taken."""
+    inputs, _targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    model = _refining(3, n_genes, gex_dim, image_dim)
+    assert model.expression_refiner is not None
+    torch.manual_seed(0)
+    baseline = Architecture1(
+        n_genes=n_genes, gex_feature_dim=gex_dim, image_feature_dim=image_dim, **_MODEL_KWARGS,
+    )
+    model.eval(), baseline.eval()
+    with torch.no_grad():
+        torch.testing.assert_close(model(inputs)["expression"], baseline(inputs)["expression"])
+        for parameter in model.expression_refiner.update_head[-1].parameters():
+            parameter.add_(torch.randn_like(parameter) * 0.05)
+        refined = model(inputs)["expression"]
+    assert not torch.allclose(refined, baseline(inputs)["expression"])
+    assert refined.shape == baseline(inputs)["expression"].shape
+
+
+def test_refinement_gradients_reach_the_refiner():
+    inputs, targets, n_genes, gex_dim, image_dim = _synthetic_inputs()
+    model = _refining(2, n_genes, gex_dim, image_dim)
+    out = model(inputs)
+    loss = torch.nn.functional.mse_loss(
+        out["expression"], torch.as_tensor(targets.query_expression),
+    )
+    loss.backward()
+    assert any(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for p in model.expression_refiner.parameters()
+    )

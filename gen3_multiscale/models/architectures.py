@@ -110,6 +110,10 @@ class _SharedFieldArchitecture(nn.Module):
         n_gex_inducing: int = 16,
         harmonic_k_neighbors: int = 6,
         regional_grid_size: int = 4,
+        n_refinement_steps: int = 0,
+        refinement_k_neighbors: int = 6,
+        refinement_hidden_dim: int = 256,
+        refinement_gex_feature_dim: int = 256,
         slide_encoder: FrozenGigaPathSlideEncoder | None = None,
         gigapath_checkpoint_sha256: str | None = None,
         model_architecture_version: str = "gen3-multiscale-shared-field-v1",
@@ -201,6 +205,43 @@ class _SharedFieldArchitecture(nn.Module):
             use_query_gate=use_query_gate, use_residual=use_residual, residual_rank=residual_rank,
             target_gene_scale=target_gene_scale, use_anchor_blend=use_anchor_blend,
         )
+        # Iterative refinement over the PREDICTED expression field, applied
+        # after the transport head. Query spots already exchange hidden states
+        # through the backbone, but never predicted EXPRESSION -- and the
+        # transport head's prediction is a convex combination of observed
+        # spots' values, so a spot deep inside a hole, far from any observed
+        # neighbour, receives almost nothing. Refinement propagates the
+        # boundary inward one step at a time.
+        #
+        # 0 steps is a strict no-op: no module is constructed and the forward
+        # path is unchanged, which matters because every architecture in this
+        # project inherits this class.
+        #
+        # Constructed LAST, after every other submodule. Building it earlier
+        # consumes draws from the global RNG, which changes the initialisation
+        # of everything constructed after it -- so a refinement arm and its
+        # control would silently differ in weights they are supposed to share.
+        # This project synchronises initialisations across arms on purpose;
+        # ordering is what keeps that true here.
+        if n_refinement_steps < 0:
+            raise ValueError("n_refinement_steps must be non-negative")
+        self.n_refinement_steps = int(n_refinement_steps)
+        self.expression_refiner = None
+        if n_refinement_steps > 0:
+            # Imported lazily: the module lives under conditional_wae, whose
+            # package __init__ pulls in the whole WAE stack, and importing that
+            # from models/ would risk an import cycle. Nothing is imported when
+            # refinement is off, which is every existing architecture.
+            from gen3_multiscale.conditional_wae.spatial_refinement import (
+                SpatialExpressionRefiner,
+            )
+
+            self.expression_refiner = SpatialExpressionRefiner(
+                n_genes, hidden_dim,
+                gex_feature_dim=refinement_gex_feature_dim,
+                hidden_dim=refinement_hidden_dim,
+                k_neighbors=refinement_k_neighbors,
+            )
 
     def _observed_tokens(self, inputs: SpatialFieldInputs, device: torch.device) -> torch.Tensor:
         n_observed = inputs.observed_coords.shape[0]
@@ -446,6 +487,18 @@ class _SharedFieldArchitecture(nn.Module):
             shared_candidate_relative_geometry=torch.cat(shared_geometry_parts, dim=1),
             shared_candidate_expression=torch.cat(shared_expression_parts, dim=0),
         )
+        if self.expression_refiner is not None and self.n_refinement_steps > 0:
+            from gen3_multiscale.conditional_wae.spatial_refinement import refine_expression
+
+            # Refines the model's OWN prediction over the query spots only, so
+            # no observed or target expression is read and the leakage contract
+            # is unchanged. query_coords already spans exactly the predicted
+            # spots here, unlike the conditional-WAE path where it spans the
+            # whole slide.
+            out["expression"] = refine_expression(
+                self.expression_refiner, out["expression"], final_query_hidden,
+                query_coords, n_steps=self.n_refinement_steps,
+            )
         out["query_hidden"] = final_query_hidden
         return out
 
