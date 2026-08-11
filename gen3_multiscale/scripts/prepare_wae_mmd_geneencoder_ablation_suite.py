@@ -51,11 +51,13 @@ from pathlib import Path
 import yaml
 
 from gen3_multiscale.conditional_wae.contract import static_audit_conditional_wae_config
+from gen3_multiscale.conditional_wae.model import VALID_LIKELIHOODS
 from gen3_multiscale.data.dataset_manifest import load_dataset_manifest
 from gen3_multiscale.evaluation.train_gene_panels import load_train_derived_gene_panels
 from gen3_multiscale.scripts.prepare_conditional_wae_suite import (
     _absolutize_existing_source_paths,
     _source_repository_root,
+    resolve_data_locations,
     tensorboard_block,
     whole_slide_validation_block,
 )
@@ -77,9 +79,14 @@ def prepare_wae_mmd_geneencoder_ablation_suite(
     n_refinement_steps: int = 0,
     spatial_prior_path: str | None = None,
     retain_patches_in_memory: bool = True,
+    hest_data_dir: str | None = None,
+    hest_cache_dir: str | None = None,
+    likelihood: str = "gaussian_mse",
 ) -> dict:
     if hours <= 0:
         raise ValueError("hours must be positive")
+    if likelihood not in VALID_LIKELIHOODS:
+        raise ValueError(f"likelihood must be one of {VALID_LIKELIHOODS}")
     if len(gpus) != len(ARM_ORDER) or len(set(gpus)) != len(gpus):
         raise ValueError(f"gpus must list {len(ARM_ORDER)} unique GPU ids, one per arm")
     if cpu_threads < 1:
@@ -111,6 +118,9 @@ def prepare_wae_mmd_geneencoder_ablation_suite(
     source_root = _source_repository_root(comparison_config)
     base = yaml.safe_load(Path(comparison_config).read_text())
     base = _absolutize_existing_source_paths(base, source_root)
+    base = resolve_data_locations(base, source_root, overrides={
+        "hest_data_dir": hest_data_dir, "hest_cache_dir": hest_cache_dir,
+    })
     if str((base.get("model") or {}).get("architecture", "")) != "1":
         raise ValueError("--comparison-config must be a resolved Gen3 Architecture 1 config")
     manifest_path = Path(manifest).resolve()
@@ -146,6 +156,7 @@ def prepare_wae_mmd_geneencoder_ablation_suite(
         "film_shared_generator": False,
         "z_noise_std": float(z_noise_std),
         "n_refinement_steps": int(n_refinement_steps),
+        "likelihood": str(likelihood),
     })
     base_seed = int((base.get("training") or {}).get("seed", 0))
 
@@ -253,6 +264,9 @@ def prepare_wae_mmd_geneencoder_ablation_suite(
         "uni2_pinned_revision": str(uni2_pinned_revision),
         "z_noise_std": float(z_noise_std),
         "n_refinement_steps": int(n_refinement_steps),
+        "likelihood": str(likelihood),
+        "hest_data_dir": str((base.get("data") or {})["hest_data_dir"]),
+        "hest_cache_dir": str((base.get("data") or {})["hest_cache_dir"]),
         "spatial_prior_path": str(Path(spatial_prior_path).resolve()) if spatial_prior_path else None,
         "arms": written,
     }
@@ -364,6 +378,32 @@ def main() -> None:
              "evaluation loads. Requires --n-refinement-steps > 0.",
     )
     parser.add_argument(
+        "--likelihood", choices=sorted(VALID_LIKELIHOODS), default="gaussian_mse",
+        help="Observation model for the decoder. 'gaussian_mse' (default) is the plain "
+             "squared-error objective every arm prepared so far has used. "
+             "'zero_inflated_gaussian' adds a hurdle head -- P(zero) plus a Gaussian "
+             "over the non-zero part -- which matches log1p-normalized ST data far "
+             "better: 30.9%% of this panel's genes have a measured noise ceiling below "
+             "0.1, mostly because they are zero almost everywhere. Set uniformly across "
+             "all four arms, so it is not a divergence within a suite; compare suites "
+             "to compare likelihoods.",
+    )
+    parser.add_argument(
+        "--hest-data-dir",
+        help="Absolute directory holding the HEST-1k slides. Overrides data.hest_data_dir "
+             "from the comparison config, which is the right thing to pass whenever this "
+             "suite is prepared from a different checkout than the one the comparison "
+             "config was resolved in: a relative path there is resolved against the "
+             "TRAINING process's working directory, not this one.",
+    )
+    parser.add_argument(
+        "--hest-cache-dir",
+        help="Absolute directory holding the HEST-1k feature caches. Overrides "
+             "data.hest_cache_dir. Getting this wrong is worse than getting the data "
+             "directory wrong, because a same-named but empty cache under another "
+             "checkout lets the run START and then rebuild everything.",
+    )
+    parser.add_argument(
         "--release-patches-after-verification", action="store_true",
         help="Free each slide's raw H&E patch array once the spot-feature cache has "
              "re-hashed it against its stored patch_content_sha256. Training reads only "
@@ -389,6 +429,9 @@ def main() -> None:
         gpus=gpus,
         cpu_threads=args.cpu_threads,
         z_noise_std=args.z_noise_std,
+        hest_data_dir=args.hest_data_dir,
+        hest_cache_dir=args.hest_cache_dir,
+        likelihood=args.likelihood,
     )
     print(json.dumps(plan, indent=2, sort_keys=True))
 

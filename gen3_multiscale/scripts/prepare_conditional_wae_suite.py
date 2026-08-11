@@ -51,6 +51,73 @@ def _absolutize_existing_source_paths(value, source_root: Path):
     return value
 
 
+# The two keys that decide where a run reads slides and cached features from.
+# They get their own fail-closed treatment because _absolutize_existing_source_paths
+# is deliberately permissive: it rewrites a relative string only when the
+# source-root-relative target happens to exist, and silently leaves it alone
+# otherwise. That is right for arbitrary config strings and wrong for these
+# two, where both outcomes are launch failures rather than no-ops.
+DATA_LOCATION_KEYS = ("hest_data_dir", "hest_cache_dir")
+
+
+def resolve_data_locations(config: dict, source_root: Path, *, overrides=None) -> dict:
+    """Bind ``hest_data_dir`` / ``hest_cache_dir`` to real absolute directories.
+
+    Measured failure this exists to prevent. A comparison config carried
+    ``hest_data_dir: data/raw/hest1k`` and ``hest_cache_dir: data/cache/hest1k``
+    relative to the repository they were resolved in. Prepared from a DIFFERENT
+    worktree, the data directory did not exist under that worktree's root, so
+    it was left relative and the run resolved it against its own CWD and died
+    with FileNotFoundError on the first slide -- eight hours into a queue. The
+    cache directory, meanwhile, DID exist under the new root, so it was
+    silently rebound to an empty cache belonging to the wrong checkout, which
+    would have been the worse of the two outcomes: a run that starts.
+
+    So: each key must end up absolute and pointing at a real directory. When it
+    cannot, this raises and names the override to pass instead of guessing.
+    ``overrides`` (``{key: path}``, ``None`` values ignored) wins outright, for
+    the common case where the caller simply knows where the data lives.
+    """
+    data = dict(config.get("data") or {})
+    overrides = {
+        key: value for key, value in (overrides or {}).items() if value not in (None, "")
+    }
+    unknown = sorted(set(overrides) - set(DATA_LOCATION_KEYS))
+    if unknown:
+        raise ValueError(f"unknown data-location overrides: {unknown}")
+    for key in DATA_LOCATION_KEYS:
+        if key in overrides:
+            resolved = Path(str(overrides[key])).expanduser()
+            source = "override"
+        elif data.get(key):
+            resolved = Path(str(data[key])).expanduser()
+            source = "comparison config"
+        else:
+            raise ValueError(
+                f"data.{key} is unset in the comparison config; pass --{key.replace('_', '-')}"
+            )
+        if not resolved.is_absolute():
+            candidate = (source_root / resolved)
+            if not candidate.is_dir():
+                raise FileNotFoundError(
+                    f"data.{key}={str(resolved)!r} (from the {source}) is relative and does "
+                    f"not exist under {source_root}. A relative data location is resolved "
+                    "against the training process's working directory, which is not "
+                    "knowable here. Pass an absolute "
+                    f"--{key.replace('_', '-')} instead."
+                )
+            resolved = candidate
+        resolved = resolved.resolve()
+        if not resolved.is_dir():
+            raise FileNotFoundError(
+                f"data.{key}={str(resolved)!r} (from the {source}) is not a directory"
+            )
+        data[key] = str(resolved)
+    config = dict(config)
+    config["data"] = data
+    return config
+
+
 def whole_slide_validation_block(root: Path, dataset_manifest: dict, *, every_n_evals: int = 5) -> dict:
     """Shared `evaluation.whole_slide_validation` config block for every
     WAE-GAN ablation suite-prep script: full-slide (every spot, not just

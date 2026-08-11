@@ -8,10 +8,24 @@ from gen3_multiscale.scripts import prepare_wae_mmd_geneencoder_ablation_suite a
 UNI2_REVISION = "d517a8dd47902dd7c308b3c36f63bce47e7b9a43"
 
 
-def _write_comparison_config(tmp_path):
+def _write_comparison_config(tmp_path, data_locations="relative_and_present"):
+    """Write a resolved Architecture-1 config inside a fake source repository.
+
+    ``data_locations`` selects how the two HEST directories are expressed,
+    which is the subject of the resolve_data_locations tests below:
+    ``relative_and_present`` (the ordinary case), ``relative_and_absent`` (the
+    exact shape that silently produced a CWD-relative path at launch), or
+    ``absent``.
+    """
     (tmp_path / "gen3_multiscale").mkdir()
     config_path = tmp_path / "gen3_multiscale" / "results" / "run" / "config.yaml"
     config_path.parent.mkdir(parents=True)
+    data = {"gex_feature_dim": 256, "tile_encoder_revision": "abc123"}
+    if data_locations != "absent":
+        data.update({"hest_data_dir": "data/raw/hest1k", "hest_cache_dir": "data/cache/hest1k"})
+    if data_locations == "relative_and_present":
+        (tmp_path / "data" / "raw" / "hest1k").mkdir(parents=True)
+        (tmp_path / "data" / "cache" / "hest1k").mkdir(parents=True)
     config = {
         "model": {
             "architecture": "1",
@@ -20,7 +34,7 @@ def _write_comparison_config(tmp_path):
                 "n_blocks": 3, "dense_threshold": 400, "sparse_k": 16,
             },
         },
-        "data": {"gex_feature_dim": 256, "tile_encoder_revision": "abc123"},
+        "data": data,
         "training": {"seed": 42},
     }
     config_path.write_text(yaml.safe_dump(config))
@@ -284,3 +298,105 @@ def test_matched_except_declared_rejects_an_undeclared_divergence():
     other = {"model": {"regularizer": "mmd"}, "loss": {"pcc_weight": 0.1}}
     with pytest.raises(ValueError, match="undeclared divergence"):
         suite_module._assert_matched_except_declared(control, other, "wae_he_mmd_geneencoder_mlp_film", set())
+
+
+def _prepare(tmp_path, comparison_config, **kwargs):
+    manifest = _write_manifest(tmp_path)
+    panels = tmp_path / "panels.json"
+    panels.write_text("{}")
+    return suite_module.prepare_wae_mmd_geneencoder_ablation_suite(
+        comparison_config=str(comparison_config), manifest=str(manifest),
+        train_gene_panels=str(panels), output_root=str(tmp_path / "suite"),
+        scfoundation_basis_path=str(_scfoundation_basis_path(tmp_path)),
+        uni2_pinned_revision=UNI2_REVISION, **kwargs,
+    )
+
+
+def test_data_locations_are_written_absolute(tmp_path):
+    """A relative data location in a prepared config is resolved against the
+    TRAINING process's working directory, which this script cannot know."""
+    comparison_config = _write_comparison_config(tmp_path)
+    _prepare(tmp_path, comparison_config)
+    for arm in suite_module.ARM_ORDER:
+        data = yaml.safe_load(
+            (tmp_path / "suite" / "configs" / f"{arm}.yaml").read_text()
+        )["data"]
+        assert data["hest_data_dir"] == str(tmp_path / "data" / "raw" / "hest1k")
+        assert data["hest_cache_dir"] == str(tmp_path / "data" / "cache" / "hest1k")
+
+
+def test_a_relative_data_location_that_does_not_exist_is_refused(tmp_path):
+    """Measured failure: prepared from a different checkout than the one the
+    comparison config was resolved in, hest_data_dir stayed relative and the
+    queue died with FileNotFoundError on the first slide."""
+    comparison_config = _write_comparison_config(tmp_path, data_locations="relative_and_absent")
+    with pytest.raises(FileNotFoundError, match="hest_data_dir"):
+        _prepare(tmp_path, comparison_config)
+
+
+def test_an_absolute_override_resolves_an_otherwise_unresolvable_config(tmp_path):
+    comparison_config = _write_comparison_config(tmp_path, data_locations="relative_and_absent")
+    real_data = tmp_path / "elsewhere" / "hest1k"
+    real_cache = tmp_path / "elsewhere" / "cache"
+    real_data.mkdir(parents=True)
+    real_cache.mkdir(parents=True)
+    _prepare(
+        tmp_path, comparison_config,
+        hest_data_dir=str(real_data), hest_cache_dir=str(real_cache),
+    )
+    data = yaml.safe_load(
+        (tmp_path / "suite" / "configs" / f"{suite_module.ARM_ORDER[0]}.yaml").read_text()
+    )["data"]
+    assert data["hest_data_dir"] == str(real_data)
+    assert data["hest_cache_dir"] == str(real_cache)
+
+
+def test_an_override_pointing_at_nothing_is_refused(tmp_path):
+    comparison_config = _write_comparison_config(tmp_path)
+    with pytest.raises(FileNotFoundError, match="hest_cache_dir"):
+        _prepare(tmp_path, comparison_config, hest_cache_dir=str(tmp_path / "no_such_cache"))
+
+
+def test_a_config_without_data_locations_is_refused(tmp_path):
+    comparison_config = _write_comparison_config(tmp_path, data_locations="absent")
+    with pytest.raises(ValueError, match="hest-data-dir"):
+        _prepare(tmp_path, comparison_config)
+
+
+def test_likelihood_defaults_to_gaussian_mse_and_can_be_switched(tmp_path):
+    """The zero-inflated hurdle head is implemented in the model but was not
+    reachable from this script, so the Arch-2 likelihood arm could not be
+    prepared at all."""
+    comparison_config = _write_comparison_config(tmp_path)
+    plan = _prepare(tmp_path, comparison_config)
+    assert plan["likelihood"] == "gaussian_mse"
+    for arm in suite_module.ARM_ORDER:
+        params = yaml.safe_load(
+            (tmp_path / "suite" / "configs" / f"{arm}.yaml").read_text()
+        )["model"]["params"]
+        assert params["likelihood"] == "gaussian_mse"
+
+    second = tmp_path / "second"
+    second.mkdir()
+    other = _write_comparison_config(second)
+    plan = suite_module.prepare_wae_mmd_geneencoder_ablation_suite(
+        comparison_config=str(other), manifest=str(_write_manifest(second)),
+        train_gene_panels=str(comparison_config),
+        output_root=str(tmp_path / "suite_zig"),
+        scfoundation_basis_path=str(_scfoundation_basis_path(tmp_path)),
+        uni2_pinned_revision=UNI2_REVISION, likelihood="zero_inflated_gaussian",
+    )
+    assert plan["likelihood"] == "zero_inflated_gaussian"
+    for arm in suite_module.ARM_ORDER:
+        params = yaml.safe_load(
+            (tmp_path / "suite_zig" / "configs" / f"{arm}.yaml").read_text()
+        )["model"]["params"]
+        # Uniform across arms, so it never counts as a divergence within a
+        # suite -- the matched-except-declared check would fail if it did.
+        assert params["likelihood"] == "zero_inflated_gaussian"
+
+
+def test_an_unknown_likelihood_is_refused(tmp_path):
+    comparison_config = _write_comparison_config(tmp_path)
+    with pytest.raises(ValueError, match="likelihood"):
+        _prepare(tmp_path, comparison_config, likelihood="negative_binomial")
