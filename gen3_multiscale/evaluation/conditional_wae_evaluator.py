@@ -12,6 +12,10 @@ import torch
 from omegaconf import OmegaConf
 
 from gen3_multiscale.conditional_wae import ConditionalWAEMaskedGEXDataset
+from gen3_multiscale.conditional_wae.whole_slide import (
+    predict_whole_slide,
+    whole_slide_metrics,
+)
 from gen3_multiscale.conditional_wae.contract import static_audit_conditional_wae_config
 from gen3_multiscale.data.dataset_manifest import load_dataset_manifest
 from gen3_multiscale.evaluation.gen3_evaluator import (
@@ -24,6 +28,10 @@ from gen3_multiscale.evaluation.metrics import (
     gene_panel_metrics,
     resolve_gene_panels,
 )
+from gen3_multiscale.evaluation.structured_field_metrics import (
+    noise_ceiling_adjusted_pcc,
+)
+from gen3_multiscale.evaluation.schedule_contract import fixed_mask_evaluation_metadata
 from gen3_multiscale.training import checkpoint as checkpoint_module
 from gen3_multiscale.training.gen3_dataset import Gen3SpatialFieldDataset, build_gen3_mask_schedule
 from gen3_multiscale.training.gen3_preflight import load_and_preflight_samples
@@ -35,6 +43,89 @@ from gen3_multiscale.training.train_conditional_wae import (
     _verify_resume,
 )
 from gen3_multiscale.config_identity import resolved_config
+
+
+def _load_noise_ceiling(path: str | None, *, split: str) -> dict[str, dict] | None:
+    if path is None:
+        return None
+    payload = json.loads(Path(path).read_text())
+    if payload.get("kind") != "gene_noise_ceiling_by_count_splitting":
+        raise ValueError(f"{path}: not a count-split gene-noise-ceiling artifact")
+    if payload.get("split") != split:
+        raise ValueError(
+            f"{path}: noise ceiling split {payload.get('split')!r} != evaluation split {split!r}"
+        )
+    records = {str(row["sample_id"]): row for row in payload.get("per_slide", [])}
+    if not records:
+        raise ValueError(f"{path}: noise-ceiling artifact has no per-slide records")
+    return records
+
+
+def _flatten_structured_panel(panel: dict) -> dict[str, float]:
+    """Flatten reportable values while excluding graph/sample-size counters."""
+    flat: dict[str, float] = {}
+    for section, values in panel.items():
+        if not isinstance(values, dict):
+            continue
+        for name, value in values.items():
+            if name.startswith("n_") or name.endswith("threshold_training_sd"):
+                continue
+            if isinstance(value, (int, float)):
+                flat[f"{section}.{name}"] = float(value)
+    return flat
+
+
+def _aggregate_whole_slide_structured_records(records: list[dict]) -> dict:
+    if not records:
+        raise ValueError("whole-slide structured evaluation produced no records")
+    patient_ids = [row["patient_id"] for row in records]
+    panel_names = list(records[0]["structured_field"]["panels"])
+    structured = {
+        panel: aggregate_patient_metrics(
+            [_flatten_structured_panel(row["structured_field"]["panels"][panel]) for row in records],
+            patient_ids,
+        )
+        for panel in panel_names
+    }
+    point_panels = list(records[0]["point_metrics"])
+    point = {
+        panel: aggregate_patient_metrics(
+            [row["point_metrics"][panel] for row in records], patient_ids,
+        )
+        for panel in point_panels
+    }
+    noise = None
+    if all(row.get("noise_ceiling_adjusted_pcc") is not None for row in records):
+        noise = {
+            panel: aggregate_patient_metrics(
+                [
+                    {
+                        key: value for key, value in row["noise_ceiling_adjusted_pcc"][panel].items()
+                        if isinstance(value, (int, float)) and not key.startswith("n_")
+                    }
+                    for row in records
+                ],
+                patient_ids,
+            )
+            for panel in point_panels
+        }
+    return {
+        "point_metrics_patient_aggregated": point,
+        "structured_metrics_patient_aggregated": structured,
+        "noise_ceiling_adjusted_pcc_patient_aggregated": noise,
+    }
+
+
+def _aggregate_whole_slide_structured_reports(records: list[dict]) -> dict:
+    """Patient-macro primary results, plus organ-stratified diagnostics."""
+    overall = _aggregate_whole_slide_structured_records(records)
+    overall["by_organ"] = {
+        organ: _aggregate_whole_slide_structured_records([
+            row for row in records if row["organ"] == organ
+        ])
+        for organ in sorted({row["organ"] for row in records})
+    }
+    return overall
 
 
 @torch.no_grad()
@@ -89,28 +180,11 @@ def _latent_path_predictions(
         shuffled_z = posterior_z
     shuffled_prediction = model.decode_latent_from_context(shuffled_z, context, inputs)
 
-    if z_mean is None:
-        z_mean = torch.zeros(model.latent_dim, dtype=context.dtype, device=context.device)
-    else:
-        z_mean = z_mean.to(dtype=context.dtype, device=context.device)
-    if z_std is None:
-        z_std = torch.ones(model.latent_dim, dtype=context.dtype, device=context.device)
-    else:
-        z_std = z_std.to(dtype=context.dtype, device=context.device)
-    if z_mean.shape != (model.latent_dim,) or z_std.shape != (model.latent_dim,):
-        raise ValueError("z_mean and z_std must match the model latent dimension")
-    if bool((z_std < 0).any()):
-        raise ValueError("z_std must be non-negative")
-
     prior_predictions = []
     for _ in range(n_prior_samples):
-        noise = torch.randn(
-            posterior_z.shape,
-            dtype=context.dtype,
-            device=context.device,
-            generator=generator,
+        prior_z = model.sample_inference_latent(
+            context, generator=generator, z_mean=z_mean, z_std=z_std,
         )
-        prior_z = z_mean.unsqueeze(0) + noise * z_std.unsqueeze(0)
         prior_predictions.append(model.decode_latent_from_context(prior_z, context, inputs))
     stacked = torch.stack(prior_predictions)
     conditional_mean = model.predict_point_from_context(context, inputs)
@@ -139,6 +213,7 @@ def evaluate_conditional_wae(
     ex_post_prior_path: str | None = None,
     latent_spatial_correlation: float = 0.0,
     diagnose_latent: bool = False,
+    noise_ceiling_path: str | None = None,
 ) -> dict:
     if split not in {"validation", "test"}:
         raise ValueError("split must be validation or test")
@@ -203,8 +278,15 @@ def evaluate_conditional_wae(
     model = _build_model(config, len(gene_names), gene_names=gene_names).to(device)
     checkpoint_module.load_trainable_state(model, requested_checkpoint)
     model.eval()
+    has_latent_model = bool(getattr(model, "has_latent_model", True))
+    if diagnose_latent and not has_latent_model:
+        raise ValueError("--diagnose-latent is unavailable for the deterministic arm")
+    if ex_post_prior is not None and getattr(model, "prior_mode", "standard") == "conditional":
+        raise ValueError("ex-post latent priors are incompatible with a learned conditional prior")
     ex_post_z_mean = ex_post_z_std = None
     if ex_post_prior is not None:
+        if not has_latent_model:
+            raise ValueError("ex-post latent priors are unavailable for the deterministic arm")
         if int(ex_post_prior["latent_dim"]) != model.latent_dim:
             raise ValueError(
                 f"ex-post prior latent_dim={ex_post_prior['latent_dim']} != model latent_dim={model.latent_dim}"
@@ -213,7 +295,7 @@ def evaluate_conditional_wae(
         ex_post_z_std = torch.tensor(ex_post_prior["z_std"], dtype=torch.float32, device=device)
 
     panels = load_configured_gene_panels(config, dataset_manifest)
-    _indices, panel_metadata = resolve_gene_panels(gene_names, panels) if panels else ({}, {})
+    panel_indices, panel_metadata = resolve_gene_panels(gene_names, panels) if panels else ({}, {})
     arm_names = ["model", "conditional_mean"]
     if diagnose_latent:
         arm_names += ["posterior_reconstruction", "zero_latent", "shuffled_posterior"]
@@ -298,8 +380,9 @@ def evaluate_conditional_wae(
                         panel_items[arm][panel].append(panel_metric)
             model_pred = prediction_arrays["model"]
             std = predictive_std.detach().cpu().numpy().astype(np.float64)
-            safe_std = np.where(std > 1e-8, std, np.nan)
-            calibration.add_item((true.astype(np.float64) - model_pred) / safe_std)
+            if has_latent_model:
+                safe_std = np.where(std > 1e-8, std, np.nan)
+                calibration.add_item((true.astype(np.float64) - model_pred) / safe_std)
             records.append(record)
             print(
                 f"conditional WAE evaluation progress: {index + 1}/{len(dataset)} "
@@ -317,6 +400,85 @@ def evaluate_conditional_wae(
         }
         for panel in panels
     }
+    structured_config = dict(
+        (config.get("evaluation") or {}).get("structured_field_metrics") or {}
+    )
+    whole_slide_structured = None
+    if structured_config.get("enabled", False):
+        if config["model"]["task"] != "he_to_st" or config["model"]["include_observed_gex"]:
+            raise ValueError(
+                "structured whole-slide evaluation requires H&E-only he_to_st inference"
+            )
+        if not structured_config.get("all_split_slides", False):
+            raise ValueError(
+                "structured-field evaluation must use all held-out split slides; "
+                "subsampled slides are visualization-only"
+            )
+        scale = getattr(model, "per_gene_scale", None)
+        if scale is None:
+            raise ValueError(
+                "structured-field evaluation requires the checkpoint's training-only per_gene_scale"
+            )
+        configured_ceiling = noise_ceiling_path or structured_config.get("noise_ceiling_path")
+        ceiling_by_sample = _load_noise_ceiling(configured_ceiling, split=split)
+        whole_slide_records = []
+        for slide_index, sample_id in enumerate(split_ids):
+            sample = samples[sample_id]
+            prediction = predict_whole_slide(
+                model, sample,
+                chunk_size=int(structured_config.get("chunk_size", 2048)),
+                n_samples=1,
+                seed=_stable_seed(evaluation_seed, {
+                    "sample_id": sample_id,
+                    "stratum": "whole_slide_structured_field",
+                    "query_fingerprint": "every_spot_exactly_once",
+                }),
+            )
+            slide_metrics = whole_slide_metrics(
+                prediction, gene_names, panels,
+                per_gene_scale=scale,
+                structured_field_config=structured_config,
+            )
+            point_metrics = slide_metrics["per_arm"]["conditional_mean"]
+            ceiling_metrics = None
+            if ceiling_by_sample is not None:
+                if sample_id not in ceiling_by_sample:
+                    raise ValueError(
+                        f"noise-ceiling artifact has no record for held-out slide {sample_id}"
+                    )
+                ceiling_metrics = noise_ceiling_adjusted_pcc(
+                    prediction["point_prediction"].detach().cpu().numpy(),
+                    np.asarray(prediction["target"], dtype=np.float32),
+                    gene_names,
+                    ceiling_by_sample[sample_id].get("ceiling_by_gene") or {},
+                    panel_indices=panel_indices,
+                    minimum_ceiling=float(structured_config.get("minimum_noise_ceiling", 0.05)),
+                )
+            record = {
+                "sample_id": sample_id,
+                "patient_id": str(sample.patient_id),
+                "organ": str(dataset_manifest["samples"][sample_id]["organ"]),
+                "n_spots": int(prediction["n_spots"]),
+                "point_metrics": point_metrics,
+                "structured_field": slide_metrics["structured_field"],
+                "noise_ceiling_adjusted_pcc": ceiling_metrics,
+            }
+            whole_slide_records.append(record)
+            print(
+                f"structured whole-slide evaluation progress: {slide_index + 1}/{len(split_ids)} "
+                f"sample={sample_id} spots={prediction['n_spots']}",
+                flush=True,
+            )
+            del prediction
+        whole_slide_structured = {
+            "scope": "all_held_out_slides_every_spot_exactly_once",
+            "primary_prediction": "deterministic_h_and_e_point_prediction",
+            "target_gex_visible_to_model": False,
+            "gene_panels_are_training_derived": True,
+            "noise_ceiling_path": str(configured_ceiling) if configured_ceiling else None,
+            "per_slide_records": whole_slide_records,
+            **_aggregate_whole_slide_structured_reports(whole_slide_records),
+        }
     evaluated_training_state = checkpoint_module.load_training_state(requested_checkpoint)
     latent_summary = None
     if diagnose_latent:
@@ -339,28 +501,42 @@ def evaluate_conditional_wae(
             ])),
         }
     report = {
-        "version": 2,
+        "version": 3,
         "kind": "conditional_wae_supervisor_evaluation",
         "config_path": str(config_path),
         "checkpoint_dir": str(requested_checkpoint),
         "checkpoint_step": evaluated_training_state.get("step"),
         "checkpoint_masks_seen": evaluated_training_state.get("masks_seen"),
         "checkpoint_validation_total": evaluated_training_state.get("total"),
-        "split": split,
-        "n_samples": len(split_ids),
-        "n_items": len(dataset),
+        **fixed_mask_evaluation_metadata(
+            split=split, sample_ids=split_ids, strata=strata,
+            masks_per_stratum_per_sample=n_masks_per_sample,
+            actual_n_items=len(dataset),
+        ),
         "n_latent_samples_per_item": inference_samples,
         "ex_post_prior_path": str(ex_post_prior_path) if ex_post_prior_path else None,
         "latent_spatial_correlation": float(latent_spatial_correlation),
         "diagnose_latent": bool(diagnose_latent),
         "latent_diagnostic_summary": latent_summary,
-        "prediction_roles": {
-            "primary_point_prediction": "conditional_mean",
-            "deterministic_h_and_e_prediction": "conditional_mean",
-            "wae_prior_predictive_mean": "model",
-            "calibration_prediction": "model",
-            "posterior_reconstruction_uses_target_gex": bool(diagnose_latent),
-        },
+        "prediction_roles": (
+            {
+                "primary_point_prediction": "conditional_mean",
+                "deterministic_h_and_e_prediction": "conditional_mean",
+                "wae_prior_predictive_mean": "model",
+                "calibration_prediction": "model",
+                "posterior_reconstruction_uses_target_gex": bool(diagnose_latent),
+            }
+            if has_latent_model else {
+                "primary_point_prediction": "model",
+                "deterministic_h_and_e_prediction": "model",
+                "conditional_mean": "exact_alias_of_model",
+                "calibration_prediction": None,
+                "posterior_reconstruction_uses_target_gex": False,
+            }
+        ),
+        "conditioner_mode": config["model"]["params"].get("conditioner_mode", "spatial"),
+        "prior_mode": getattr(model, "prior_mode", "standard"),
+        "has_latent_model": has_latent_model,
         "task": config["model"]["task"],
         "regularizer": config["model"]["regularizer"],
         "query_he_visible": True,
@@ -371,6 +547,7 @@ def evaluate_conditional_wae(
         "per_panel_patient_aggregated_metrics": panel_aggregated,
         "conditional_wae_calibration": calibration.summary(),
         "per_item_records": records,
+        "whole_slide_structured_field_evaluation": whole_slide_structured,
     }
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -380,10 +557,13 @@ def evaluate_conditional_wae(
     print(f"conditional WAE evaluation report saved to {output_path}", flush=True)
     for arm in arm_names:
         metrics = aggregated[arm]
-        label = {
-            "model": "wae_prior_predictive_mean",
-            "conditional_mean": "deterministic_h_and_e_point_prediction",
-        }.get(arm, arm)
+        if has_latent_model:
+            label = {
+                "model": "wae_prior_predictive_mean",
+                "conditional_mean": "deterministic_h_and_e_point_prediction",
+            }.get(arm, arm)
+        else:
+            label = "deterministic_h_and_e_point_prediction" if arm == "model" else "deterministic_alias"
         print(
             f"{label} pcc={metrics['pcc']['patient_mean']:.4f} "
             f"rmse={metrics['rmse']['patient_mean']:.4f}",
@@ -398,7 +578,12 @@ def main() -> None:
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--split", choices=("validation", "test"), default="validation")
-    parser.add_argument("--n-masks-per-sample", type=int, default=8)
+    parser.add_argument(
+        "--n-masks-per-stratum-per-sample", "--n-masks-per-sample",
+        dest="n_masks_per_sample", type=int, default=8,
+        help="Masks for each configured stratum of each sample (default: 8). "
+             "The older --n-masks-per-sample spelling is a compatibility alias.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no-use-best", action="store_true")
     parser.add_argument("--allow-code-drift", action="store_true")
@@ -424,6 +609,11 @@ def main() -> None:
              "change, valid on already-trained checkpoints; 0.0 (default) reproduces the "
              "historical sampler exactly.",
     )
+    parser.add_argument(
+        "--noise-ceiling",
+        help="Optional count-split noise-ceiling JSON for reporting PCC as a fraction of "
+             "measurable signal in the structured whole-slide section.",
+    )
     args = parser.parse_args()
     evaluate_conditional_wae(
         args.config,
@@ -438,6 +628,7 @@ def main() -> None:
         ex_post_prior_path=args.ex_post_prior,
         latent_spatial_correlation=args.latent_spatial_correlation,
         diagnose_latent=args.diagnose_latent,
+        noise_ceiling_path=args.noise_ceiling,
     )
 
 

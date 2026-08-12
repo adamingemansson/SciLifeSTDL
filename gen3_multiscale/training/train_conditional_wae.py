@@ -18,6 +18,8 @@ from gen3_multiscale.conditional_wae import (
     Architecture1ImageConditioner,
     ConditionalWAEMaskedGEXDataset,
     ConditionalWAE,
+    DeterministicSpatialPredictor,
+    LocalImageConditioner,
 )
 from gen3_multiscale.conditional_wae.coexpression import load_conditional_wae_gene_coexpression_basis
 from gen3_multiscale.conditional_wae.contract import static_audit_conditional_wae_config
@@ -26,6 +28,9 @@ from gen3_multiscale.conditional_wae.histology_features import FEATURE_DIM as HI
 from gen3_multiscale.conditional_wae.film_diagnostics import compute_film_diagnostics
 from gen3_multiscale.conditional_wae.reference_projection import ensure_reference_gex_projection
 from gen3_multiscale.conditional_wae.spatial_prior import load_spatial_prior_into
+from gen3_multiscale.conditional_wae.structured_field import (
+    load_centered_gene_structure_artifact,
+)
 from gen3_multiscale.conditional_wae.tensorboard import (
     ConditionalWAESnapshotAccumulator,
     ConditionalWAETensorBoardLogger,
@@ -171,20 +176,33 @@ def accumulate_and_step_generator(
     return accumulated_losses, float(grad_norm)
 
 
-def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = None) -> ConditionalWAE:
+def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = None) -> torch.nn.Module:
     model_cfg = config["model"]
     params = model_cfg["params"]
-    conditioner = Architecture1ImageConditioner(
-        n_genes=n_genes,
-        image_feature_dim=int(params["image_feature_dim"]),
-        gex_feature_dim=int(params["gex_feature_dim"]),
-        hidden_dim=int(params["hidden_dim"]),
-        n_heads=int(params["n_heads"]),
-        n_blocks=int(params["n_blocks"]),
-        dense_threshold=int(params["dense_threshold"]),
-        sparse_k=int(params["sparse_k"]),
-        dropout=float(params.get("dropout", 0.1)),
-    )
+    conditioner_mode = str(params.get("conditioner_mode", "spatial"))
+    if conditioner_mode == "local":
+        conditioner = LocalImageConditioner(
+            n_genes=n_genes,
+            image_feature_dim=int(params["image_feature_dim"]),
+            hidden_dim=int(params["hidden_dim"]),
+            image_proj_dim=int(params.get("image_proj_dim", 256)),
+            modality_flag_dim=int(params.get("modality_flag_dim", 16)),
+            dropout=float(params.get("dropout", 0.1)),
+        )
+    elif conditioner_mode == "spatial":
+        conditioner = Architecture1ImageConditioner(
+            n_genes=n_genes,
+            image_feature_dim=int(params["image_feature_dim"]),
+            gex_feature_dim=int(params["gex_feature_dim"]),
+            hidden_dim=int(params["hidden_dim"]),
+            n_heads=int(params["n_heads"]),
+            n_blocks=int(params["n_blocks"]),
+            dense_threshold=int(params["dense_threshold"]),
+            sparse_k=int(params["sparse_k"]),
+            dropout=float(params.get("dropout", 0.1)),
+        )
+    else:
+        raise ValueError("model.params.conditioner_mode must be 'local' or 'spatial'")
     if bool(params.get("use_histology_context", False)):
         conditioner = HistologyContextInjector(conditioner, histology_feature_dim=HISTOLOGY_FEATURE_DIM)
     loss = config["loss"]
@@ -217,6 +235,46 @@ def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = N
             table_path, gene_names,
         )
         gene_encoder_table = table_basis.basis
+    structure_artifact = None
+    structure_path = (config.get("data") or {}).get("centered_gene_structure_path")
+    if structure_path:
+        if gene_names is None:
+            raise ValueError("centered gene structure requires the current gene_names")
+        structure_artifact = load_centered_gene_structure_artifact(
+            structure_path, gene_names,
+        )
+        configured_hash = (config.get("data") or {}).get(
+            "centered_gene_structure_basis_sha256"
+        )
+        if configured_hash != structure_artifact.metadata.get("basis_sha256"):
+            raise ValueError(
+                "centered gene-structure basis hash does not match the immutable config"
+            )
+    use_structure = bool(params.get("use_centered_gene_structure", False))
+    if use_structure and structure_artifact is None:
+        raise ValueError(
+            "use_centered_gene_structure requires data.centered_gene_structure_path"
+        )
+    if bool(params.get("deterministic_only", False)):
+        return DeterministicSpatialPredictor(
+            n_genes, conditioner,
+            hidden_dim=int(params["autoencoder_hidden_dim"]),
+            pcc_weight=float(loss["pcc_weight"]),
+            n_inference_samples=int(params.get("n_inference_samples", 1)),
+            gene_structure_artifact=(structure_artifact if use_structure else None),
+            gene_structure_hidden_dim=int(params.get("gene_structure_hidden_dim", 64)),
+            n_refinement_steps=int(params.get("n_refinement_steps", 0)),
+            refinement_k_neighbors=int(params.get("refinement_k_neighbors", 6)),
+            refinement_hidden_dim=int(params.get("refinement_hidden_dim", 256)),
+            refinement_gex_feature_dim=int(params.get("refinement_gex_feature_dim", 256)),
+            per_gene_scale=(
+                structure_artifact.per_gene_scale if structure_artifact is not None else None
+            ),
+            local_gradient_weight=float(loss.get("local_gradient_weight", 0.0)),
+            wide_gradient_weight=float(loss.get("wide_gradient_weight", 0.0)),
+            local_gradient_k=int(params.get("local_gradient_k", 6)),
+            wide_gradient_k=int(params.get("wide_gradient_k", 18)),
+        )
     model = ConditionalWAE(
         n_genes,
         conditioner,
@@ -232,6 +290,8 @@ def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = N
         film_layers=tuple(params.get("film_layers", ("first", "second"))),
         film_shared_generator=bool(params.get("film_shared_generator", False)),
         gene_coexpression_basis=gene_coexpression_basis,
+        gene_structure_artifact=(structure_artifact if use_structure else None),
+        gene_structure_hidden_dim=int(params.get("gene_structure_hidden_dim", 64)),
         gene_encoder_table=gene_encoder_table,
         z_noise_std=float(params.get("z_noise_std", 0.0)),
         n_refinement_steps=int(params.get("n_refinement_steps", 0)),
@@ -241,6 +301,21 @@ def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = N
         likelihood=str(params.get("likelihood", "gaussian_mse")),
         distributional_weight=float(params.get("distributional_weight", 1.0)),
         distributional_hidden_dim=int(params.get("distributional_hidden_dim", 1024)),
+        prior_mode=str(params.get("prior_mode", "standard")),
+        conditional_prior_hidden_dim=int(params.get("conditional_prior_hidden_dim", 256)),
+        conditional_prior_context_weight=float(
+            params.get("conditional_prior_context_weight", 1.0)
+        ),
+        conditional_prior_anchor_weight=float(
+            params.get("conditional_prior_anchor_weight", 0.1)
+        ),
+        per_gene_scale=(
+            structure_artifact.per_gene_scale if structure_artifact is not None else None
+        ),
+        local_gradient_weight=float(loss.get("local_gradient_weight", 0.0)),
+        wide_gradient_weight=float(loss.get("wide_gradient_weight", 0.0)),
+        local_gradient_k=int(params.get("local_gradient_k", 6)),
+        wide_gradient_k=int(params.get("wide_gradient_k", 18)),
     )
     spatial_prior_path = (config.get("data") or {}).get("spatial_prior_path")
     if spatial_prior_path:
@@ -267,6 +342,9 @@ def _manifest(config: dict, dataset_manifest: dict, preflight_report: dict) -> d
         "arm": config["model"]["arm"],
         "task": config["model"]["task"],
         "regularizer": config["model"]["regularizer"],
+        "conditioner_mode": str(config["model"]["params"].get("conditioner_mode", "spatial")),
+        "prior_mode": str(config["model"]["params"].get("prior_mode", "standard")),
+        "deterministic_only": bool(config["model"]["params"].get("deterministic_only", False)),
         "image_mode": "full_visible",
         "query_gex_visible": False,
         "surrounding_gex_visible": bool(config["model"]["include_observed_gex"]),
@@ -322,13 +400,17 @@ def _checkpoint_resume_state(checkpoint_dir: Path) -> tuple[bool, dict | None]:
 
 
 @torch.no_grad()
-def _validate(model: ConditionalWAE, dataset, *, device: torch.device, seed: int,
+def _validate(model: torch.nn.Module, dataset, *, device: torch.device, seed: int,
               snapshot: ConditionalWAESnapshotAccumulator | None = None,
               samples: dict | None = None, collect_film_diagnostics: bool = False) -> dict:
     model.eval()
     totals, rmses, pcc_losses = [], [], []
     wae_prior_totals, wae_prior_rmses, wae_prior_pcc_losses = [], [], []
-    collect_film = collect_film_diagnostics and model.encoder_conditioning == "film"
+    has_latent_model = bool(getattr(model, "has_latent_model", True))
+    collect_film = (
+        collect_film_diagnostics and has_latent_model
+        and model.encoder_conditioning == "film"
+    )
     film_posterior_z, film_context = [], []
     film_predictive_std, film_predictive_mean, film_conditional_mean = [], [], []
     for index in range(len(dataset)):
@@ -353,12 +435,14 @@ def _validate(model: ConditionalWAE, dataset, *, device: torch.device, seed: int
         wae_prior_rmses.append(float(wae_rmse))
         wae_prior_pcc_losses.append(float(wae_pcc_loss))
         posterior_z = None
-        if (snapshot is not None and not snapshot.full) or collect_film:
+        if has_latent_model and ((snapshot is not None and not snapshot.full) or collect_film):
             # Held-out target GEX is encoded only for a diagnostic Projector/
             # collapse view. It is never fed to sample_predictive_distribution
             # or model selection.
             posterior_z = model.encode_posterior(target_tensor, inputs=inputs)
         if snapshot is not None and not snapshot.full:
+            if not has_latent_model:
+                raise ValueError("latent TensorBoard snapshots are unavailable for deterministic models")
             if samples is None or inputs.sample_id not in samples:
                 raise ValueError("TensorBoard snapshot requires the aligned validation sample")
             snapshot.add(
@@ -608,6 +692,9 @@ def run_conditional_wae_training(
     )
     strata = config["masking"]["strata"]
     n_smoke_masks = max(1, len(strata))
+    validation_masks_per_stratum_per_sample = (
+        n_smoke_masks if smoke else int(data_cfg.get("n_validation_masks", 4))
+    )
     train_samples = {sample_id: samples[sample_id] for sample_id in train_ids}
     validation_samples = {sample_id: samples[sample_id] for sample_id in validation_ids}
     train_schedule = build_gen3_mask_schedule(
@@ -625,7 +712,7 @@ def run_conditional_wae_training(
         strata,
         "validation",
         split_counts={
-            "validation": n_smoke_masks if smoke else int(data_cfg.get("n_validation_masks", 4)),
+            "validation": validation_masks_per_stratum_per_sample,
         },
         split_seeds={"validation": 700_000},
     ) if validation_samples else None
@@ -643,7 +730,10 @@ def run_conditional_wae_training(
         )
         boundary_report = base_validation.validate_boundary_schedule()
         print(
-            f"validation boundary preflight: PASS ({boundary_report['n_items_checked']} masks)",
+            "training-time validation boundary preflight: PASS "
+            f"({boundary_report['n_items_checked']} fixed items = "
+            f"{len(validation_ids)} samples x {len(strata)} strata x "
+            f"{validation_masks_per_stratum_per_sample} masks per stratum per sample)",
             flush=True,
         )
         validation_dataset = ConditionalWAEMaskedGEXDataset(
@@ -835,6 +925,7 @@ def run_conditional_wae_training(
         for _ in range(gradient_accumulation_steps):
             m_inputs, m_target, _identity, skipped = _select_train_item_with_minimum_queries(
                 train_dataset, step=masks_seen, seed=seed,
+                minimum_query_spots=(2 if getattr(model, "has_latent_model", True) else 1),
             )
             skipped_small_masks_total += skipped
             m_target_tensor = torch.as_tensor(m_target, dtype=torch.float32, device=device)
@@ -879,6 +970,12 @@ def run_conditional_wae_training(
             ]
             if discriminator_loss_value is not None:
                 pieces.append(f"discriminator={discriminator_loss_value:.6f}")
+            for key, label in (
+                ("local_gradient_loss", "gradient_local"),
+                ("wide_gradient_loss", "gradient_wide"),
+            ):
+                if key in accumulated_losses:
+                    pieces.append(f"{label}={accumulated_losses[key]:.6f}")
             print(f"[step {step}] train: " + ", ".join(pieces), flush=True)
             if tensorboard_logger is not None and bool(tensorboard_cfg.get("log_train_scalars", True)):
                 tensorboard_logger.add_train_scalars(
@@ -891,7 +988,7 @@ def run_conditional_wae_training(
                 )
         if validation_dataset is not None and (smoke or step % eval_every == 0):
             snapshot = None
-            if tensorboard_logger is not None:
+            if tensorboard_logger is not None and getattr(model, "has_latent_model", True):
                 snapshot_every = max(1, int(tensorboard_cfg.get("snapshot_every_n_evals", 5)))
                 evaluation_number = max(1, step // eval_every)
                 if (evaluation_number - 1) % snapshot_every == 0:

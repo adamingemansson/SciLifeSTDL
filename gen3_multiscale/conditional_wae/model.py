@@ -22,12 +22,19 @@ from gen3_multiscale.models.gene_basis import GeneResidualBasis
 from gen3_multiscale.gen5.autoencoder import ExpressionEncoder
 from gen3_multiscale.data.boundary_graph import build_knn_adjacency
 from gen3_multiscale.models.attention import RelativeGeometryBias
-from gen3_multiscale.models.losses import rmse_pcc_reconstruction_loss
+from gen3_multiscale.models.losses import (
+    rmse_pcc_reconstruction_loss,
+    spatial_gradient_loss,
+)
 from gen3_multiscale.models.gene_encoder import WeightedGeneExpressionEncoder
 from gen3_multiscale.models.tokens import SpotTokenProjection
 from gen3_multiscale.conditional_wae.spatial_refinement import (
     SpatialExpressionRefiner,
     refine_expression,
+)
+from gen3_multiscale.conditional_wae.structured_field import (
+    CenteredGeneStructureArtifact,
+    CenteredGeneStructureRefinement,
 )
 from gen3_multiscale.conditional_wae.distributional import (
     ZeroInflatedGaussianHead,
@@ -36,6 +43,59 @@ from gen3_multiscale.conditional_wae.distributional import (
 )
 
 VALID_LIKELIHOODS = ("gaussian_mse", "zero_inflated_gaussian")
+VALID_CONDITIONER_MODES = ("local", "spatial")
+VALID_PRIOR_MODES = ("standard", "conditional")
+
+
+class LocalImageConditioner(nn.Module):
+    """Strict per-spot UNI2 conditioner with no spatial information.
+
+    This control deliberately has no coordinate input, neighbour graph,
+    attention block, observed-GEX branch, or spatial refiner.  Each query row
+    is therefore a function only of its own frozen image embedding and the
+    image-availability flag.  Keeping this as a separate module (instead of
+    zeroing coordinates inside :class:`Architecture1ImageConditioner`) makes
+    the no-spatial claim structural and auditable.
+    """
+
+    def __init__(self, n_genes: int, image_feature_dim: int = 1536,
+                 hidden_dim: int = 512, image_proj_dim: int = 256,
+                 modality_flag_dim: int = 16, dropout: float = 0.1):
+        super().__init__()
+        self.n_genes = int(n_genes)
+        self.image_feature_dim = int(image_feature_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.image_branch = nn.Sequential(
+            nn.LayerNorm(image_feature_dim),
+            nn.Linear(image_feature_dim, image_proj_dim),
+            nn.GELU(),
+        )
+        self.availability_branch = nn.Sequential(
+            nn.Linear(1, modality_flag_dim), nn.GELU(),
+        )
+        self.output = nn.Sequential(
+            nn.Linear(image_proj_dim + modality_flag_dim, hidden_dim),
+            nn.GELU(), nn.Dropout(dropout), nn.LayerNorm(hidden_dim),
+        )
+
+    def forward(self, inputs: FullImageExpressionInputs) -> torch.Tensor:
+        validate_full_image_expression_inputs(inputs)
+        device = next(self.parameters()).device
+        image = torch.as_tensor(inputs.image_features, dtype=torch.float32, device=device)
+        available = torch.as_tensor(
+            inputs.image_available, dtype=torch.float32, device=device,
+        ).unsqueeze(-1)
+        query_mask = torch.as_tensor(inputs.query_mask, dtype=torch.bool, device=device)
+        if image.ndim != 2 or image.shape[1] != self.image_feature_dim:
+            raise ValueError(
+                f"image features must be [N, {self.image_feature_dim}], got {tuple(image.shape)}"
+            )
+        # A missing image is never allowed to masquerade as a real embedding.
+        image = image * available
+        context = self.output(torch.cat([
+            self.image_branch(image), self.availability_branch(available),
+        ], dim=-1))
+        return context[query_mask]
 
 
 class _ImageSpatialBlock(nn.Module):
@@ -251,6 +311,50 @@ def imq_mmd(encoded: torch.Tensor, prior: torch.Tensor,
     return value.clamp_min(0.0)
 
 
+def conditional_imq_mmd(encoded: torch.Tensor, prior: torch.Tensor,
+                        context: torch.Tensor, *, context_weight: float = 1.0) -> torch.Tensor:
+    """Joint-MMD match of ``(context, posterior-z)`` and ``(context, prior-z)``.
+
+    A global ``MMD(q(z), p(z))`` would permit a learned prior to ignore the
+    image condition completely.  Matching the two joint distributions keeps
+    the condition in the discrepancy.  Context is detached and normalized
+    per feature so the conditioner cannot reduce the penalty by collapsing or
+    rescaling its own representation.
+    """
+    if context_weight <= 0:
+        raise ValueError("context_weight must be positive")
+    if context.ndim != 2 or context.shape[0] != encoded.shape[0]:
+        raise ValueError("context must be [N, context_dim] and align with latent rows")
+    normalized = nn.functional.layer_norm(context.detach(), (context.shape[-1],))
+    # Equalize the expected context and latent squared-norm contributions.
+    scale = float(context_weight) * math.sqrt(encoded.shape[1] / context.shape[1])
+    condition = normalized * scale
+    return imq_mmd(
+        torch.cat([condition, encoded], dim=-1),
+        torch.cat([condition, prior], dim=-1),
+    )
+
+
+class ConditionalGaussianPrior(nn.Module):
+    """Image-conditioned diagonal Gaussian ``p(z | context)``."""
+
+    def __init__(self, context_dim: int, latent_dim: int, hidden_dim: int = 256):
+        super().__init__()
+        self.latent_dim = int(latent_dim)
+        self.network = nn.Sequential(
+            nn.LayerNorm(context_dim), nn.Linear(context_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, 2 * latent_dim),
+        )
+        # Start at the historical N(0,I) prior; conditioning must earn its use.
+        nn.init.zeros_(self.network[-1].weight)
+        nn.init.zeros_(self.network[-1].bias)
+
+    def forward(self, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        parameters = self.network(context)
+        mean, log_std = parameters.split(self.latent_dim, dim=-1)
+        return mean, log_std.clamp(min=-5.0, max=2.0).exp()
+
+
 class _FiLMGenerator(nn.Module):
     """Maps image context to a per-feature (gamma, beta) pair, zero-initialized
     so `gamma=1, beta=0` regardless of context -- FiLM(h) = h at construction,
@@ -411,6 +515,184 @@ class FrozenGeneEmbeddingExpressionEncoder(nn.Module):
         return self.projection(hidden)
 
 
+class DeterministicSpatialPredictor(nn.Module):
+    """UNI2 + spatial conditioner + supervised full-GEX prediction head.
+
+    No expression encoder, latent, prior, MMD term, or residual decoder is
+    constructed. Its prediction dictionary matches ``ConditionalWAE`` so
+    data, checkpointing and metric code stay identical across the ablation.
+    """
+
+    def __init__(self, n_genes: int, image_conditioner: nn.Module, *,
+                 hidden_dim: int = 1024, pcc_weight: float = 0.1,
+                 n_inference_samples: int = 1,
+                 gene_structure_artifact: CenteredGeneStructureArtifact | None = None,
+                 gene_structure_hidden_dim: int = 64,
+                 n_refinement_steps: int = 0,
+                 refinement_k_neighbors: int = 6,
+                 refinement_hidden_dim: int = 256,
+                 refinement_gex_feature_dim: int = 256,
+                 per_gene_scale: torch.Tensor | None = None,
+                 local_gradient_weight: float = 0.0,
+                 wide_gradient_weight: float = 0.0,
+                 local_gradient_k: int = 6,
+                 wide_gradient_k: int = 18):
+        super().__init__()
+        if n_genes < 1 or hidden_dim < 1 or n_inference_samples < 1:
+            raise ValueError("n_genes, hidden_dim and n_inference_samples must be positive")
+        if pcc_weight < 0 or local_gradient_weight < 0 or wide_gradient_weight < 0:
+            raise ValueError("loss weights must be non-negative")
+        if n_refinement_steps < 0:
+            raise ValueError("n_refinement_steps must be non-negative")
+        if local_gradient_k < 1 or wide_gradient_k < 1:
+            raise ValueError("gradient neighbourhood sizes must be positive")
+        self.n_genes = int(n_genes)
+        self.pcc_weight = float(pcc_weight)
+        self.n_inference_samples = int(n_inference_samples)
+        self.image_conditioner = image_conditioner
+        self.conditional_mean_head = nn.Sequential(
+            nn.LayerNorm(image_conditioner.hidden_dim),
+            nn.Linear(image_conditioner.hidden_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, n_genes),
+        )
+        self.coexpression_refinement = (
+            CenteredGeneStructureRefinement(
+                gene_structure_artifact, hidden_dim=int(gene_structure_hidden_dim),
+            )
+            if gene_structure_artifact is not None else None
+        )
+        self.discriminator = None
+        self.distributional_head = None
+        self.n_refinement_steps = int(n_refinement_steps)
+        self.spatial_refiner = (
+            SpatialExpressionRefiner(
+                n_genes, image_conditioner.hidden_dim,
+                gex_feature_dim=int(refinement_gex_feature_dim),
+                hidden_dim=int(refinement_hidden_dim),
+                k_neighbors=int(refinement_k_neighbors),
+            )
+            if self.n_refinement_steps > 0 else None
+        )
+        if per_gene_scale is None:
+            if local_gradient_weight > 0 or wide_gradient_weight > 0:
+                raise ValueError("gradient supervision requires a training-only per_gene_scale")
+            scale = torch.ones(n_genes, dtype=torch.float32)
+        else:
+            scale = torch.as_tensor(per_gene_scale, dtype=torch.float32)
+            if scale.shape != (n_genes,) or not torch.isfinite(scale).all() or not torch.all(scale > 0):
+                raise ValueError("per_gene_scale must be finite, positive, and [n_genes]")
+        self.register_buffer("per_gene_scale", scale, persistent=True)
+        self.local_gradient_weight = float(local_gradient_weight)
+        self.wide_gradient_weight = float(wide_gradient_weight)
+        self.local_gradient_k = int(local_gradient_k)
+        self.wide_gradient_k = int(wide_gradient_k)
+        self.encoder_conditioning = "none"
+        self.prior_mode = "none"
+        self.has_latent_model = False
+        self.latent_dim = 0
+
+    def decode_base_from_context(self, context: torch.Tensor) -> torch.Tensor:
+        """Decode rows independently, then apply within-spot gene programs."""
+        prediction = self.conditional_mean_head(context)
+        if self.coexpression_refinement is not None:
+            prediction = self.coexpression_refinement(prediction)
+        return prediction
+
+    def refine_prediction(self, expression: torch.Tensor, context: torch.Tensor,
+                          inputs: FullImageExpressionInputs) -> torch.Tensor:
+        """Apply the same between-spot field update in every inference path."""
+        if self.spatial_refiner is None or self.n_refinement_steps == 0:
+            return expression
+        coords = torch.as_tensor(inputs.coords, dtype=expression.dtype, device=expression.device)
+        query_mask = torch.as_tensor(inputs.query_mask, dtype=torch.bool, device=expression.device)
+        query_coords = coords[query_mask]
+        if query_coords.shape[0] != expression.shape[0]:
+            raise ValueError("query coordinates do not align with deterministic predictions")
+        return refine_expression(
+            self.spatial_refiner, expression, context, query_coords,
+            n_steps=self.n_refinement_steps,
+        )
+
+    def predict_point_from_context(self, context: torch.Tensor,
+                                   inputs: FullImageExpressionInputs) -> torch.Tensor:
+        return self.refine_prediction(self.decode_base_from_context(context), context, inputs)
+
+    def forward(self, inputs: FullImageExpressionInputs) -> dict:
+        context = self.image_conditioner(inputs)
+        point = self.predict_point_from_context(context, inputs)
+        return {
+            "expression": point, "point_prediction": point,
+            "conditional_mean_expression": point, "image_context": context,
+        }
+
+    def compute_generator_losses(self, inputs: FullImageExpressionInputs,
+                                 target_expression, *, generator=None) -> dict:
+        del generator
+        context = self.image_conditioner(inputs)
+        target = torch.as_tensor(target_expression, dtype=context.dtype, device=context.device)
+        query_mask = torch.as_tensor(inputs.query_mask, dtype=torch.bool, device=context.device)
+        if target.shape == (len(query_mask), self.n_genes):
+            target = target[query_mask]
+        if target.shape != (context.shape[0], self.n_genes):
+            raise ValueError("target expression does not align with deterministic query rows")
+        point = self.predict_point_from_context(context, inputs)
+        total, rmse, pcc = rmse_pcc_reconstruction_loss(
+            point, target, pcc_weight=self.pcc_weight,
+        )
+        query_coords = torch.as_tensor(
+            inputs.coords, dtype=point.dtype, device=point.device,
+        )[query_mask]
+        zero = total.new_zeros(())
+        local_gradient = (
+            spatial_gradient_loss(
+                point, target, query_coords, k_neighbors=self.local_gradient_k,
+                per_gene_scale=self.per_gene_scale,
+            )
+            if self.local_gradient_weight > 0 else zero
+        )
+        wide_gradient = (
+            spatial_gradient_loss(
+                point, target, query_coords, k_neighbors=self.wide_gradient_k,
+                per_gene_scale=self.per_gene_scale,
+            )
+            if self.wide_gradient_weight > 0 else zero
+        )
+        primary = total
+        total = (
+            primary
+            + self.local_gradient_weight * local_gradient
+            + self.wide_gradient_weight * wide_gradient
+        )
+        return {
+            "total": total, "expression": point,
+            "conditional_mean_expression": point,
+            "latent": point.new_empty((point.shape[0], 0)),
+            "reconstruction_loss": primary, "reconstruction_rmse": rmse,
+            "reconstruction_pcc_loss": pcc, "conditional_mean_loss": total,
+            "conditional_mean_rmse": rmse, "conditional_mean_pcc_loss": pcc,
+            "prior_loss": zero,
+            "local_gradient_loss": local_gradient,
+            "wide_gradient_loss": wide_gradient,
+        }
+
+    @torch.no_grad()
+    def sample_predictive_distribution(self, inputs: FullImageExpressionInputs,
+                                       n_samples: int | None = None, **_kwargs) -> dict:
+        context = self.image_conditioner(inputs)
+        point = self.predict_point_from_context(context, inputs)
+        count = int(n_samples or self.n_inference_samples)
+        if count < 1:
+            raise ValueError("n_samples must be positive")
+        samples = point.unsqueeze(0).expand(count, -1, -1)
+        return {
+            "expression": point, "point_prediction": point,
+            "wae_predictive_mean": point, "predictive_mean": point,
+            "predictive_std": torch.zeros_like(point),
+            "predictive_samples": samples,
+            "conditional_mean_expression": point, "image_context": context,
+        }
+
+
 class ConditionalWAE(nn.Module):
     """Conditional full-expression WAE with either MMD or GAN prior matching.
 
@@ -419,7 +701,7 @@ class ConditionalWAE(nn.Module):
     differs, making the comparison interpretable.
     """
 
-    def __init__(self, n_genes: int, image_conditioner: Architecture1ImageConditioner,
+    def __init__(self, n_genes: int, image_conditioner: nn.Module,
                  *, regularizer: str, latent_dim: int = 256,
                  autoencoder_hidden_dim: int = 1024,
                  discriminator_hidden_dim: int = 256,
@@ -431,6 +713,8 @@ class ConditionalWAE(nn.Module):
                  film_layers: tuple[str, ...] = ("first", "second"),
                  film_shared_generator: bool = False,
                  gene_coexpression_basis: GeneResidualBasis | None = None,
+                 gene_structure_artifact: CenteredGeneStructureArtifact | None = None,
+                 gene_structure_hidden_dim: int = 64,
                  gene_encoder_table: torch.Tensor | None = None,
                  z_noise_std: float = 0.0,
                  n_refinement_steps: int = 0,
@@ -439,7 +723,16 @@ class ConditionalWAE(nn.Module):
                  refinement_gex_feature_dim: int = 256,
                  likelihood: str = "gaussian_mse",
                  distributional_weight: float = 1.0,
-                 distributional_hidden_dim: int = 1024):
+                 distributional_hidden_dim: int = 1024,
+                 prior_mode: str = "standard",
+                 conditional_prior_hidden_dim: int = 256,
+                 conditional_prior_context_weight: float = 1.0,
+                 conditional_prior_anchor_weight: float = 0.1,
+                 per_gene_scale: torch.Tensor | None = None,
+                 local_gradient_weight: float = 0.0,
+                 wide_gradient_weight: float = 0.0,
+                 local_gradient_k: int = 6,
+                 wide_gradient_k: int = 18):
         super().__init__()
         if likelihood not in VALID_LIKELIHOODS:
             raise ValueError(f"likelihood must be one of {VALID_LIKELIHOODS}")
@@ -449,12 +742,21 @@ class ConditionalWAE(nn.Module):
             raise ValueError("regularizer must be 'mmd' or 'gan'")
         if n_genes < 1 or latent_dim < 1 or n_inference_samples < 1:
             raise ValueError("n_genes, latent_dim and n_inference_samples must be positive")
-        if regularizer_weight < 0 or conditional_mean_weight < 0 or pcc_weight < 0:
+        if (regularizer_weight < 0 or conditional_mean_weight < 0 or pcc_weight < 0
+                or local_gradient_weight < 0 or wide_gradient_weight < 0):
             raise ValueError("loss weights must be non-negative")
+        if local_gradient_k < 1 or wide_gradient_k < 1:
+            raise ValueError("gradient neighbourhood sizes must be positive")
         if z_noise_std < 0:
             raise ValueError("z_noise_std must be non-negative")
         if encoder_conditioning not in {"none", "film"}:
             raise ValueError("encoder_conditioning must be 'none' or 'film'")
+        if prior_mode not in VALID_PRIOR_MODES:
+            raise ValueError(f"prior_mode must be one of {VALID_PRIOR_MODES}")
+        if prior_mode == "conditional" and regularizer != "mmd":
+            raise ValueError("conditional prior is currently defined only for WAE-MMD")
+        if conditional_prior_context_weight <= 0 or conditional_prior_anchor_weight < 0:
+            raise ValueError("conditional-prior context weight must be positive and anchor weight non-negative")
         self.n_genes = int(n_genes)
         self.latent_dim = int(latent_dim)
         self.regularizer = regularizer
@@ -464,10 +766,20 @@ class ConditionalWAE(nn.Module):
         self.n_inference_samples = int(n_inference_samples)
         self.z_noise_std = float(z_noise_std)
         self.encoder_conditioning = encoder_conditioning
+        self.prior_mode = str(prior_mode)
+        self.has_latent_model = True
         self.image_conditioner = image_conditioner
         if image_conditioner.n_genes != n_genes:
             raise ValueError("image_conditioner and ConditionalWAE must use the same n_genes")
         context_dim = image_conditioner.hidden_dim
+        self.conditional_prior = (
+            ConditionalGaussianPrior(
+                context_dim, latent_dim, hidden_dim=int(conditional_prior_hidden_dim),
+            )
+            if self.prior_mode == "conditional" else None
+        )
+        self.conditional_prior_context_weight = float(conditional_prior_context_weight)
+        self.conditional_prior_anchor_weight = float(conditional_prior_anchor_weight)
         if gene_encoder_table is not None:
             table = torch.as_tensor(gene_encoder_table, dtype=torch.float32)
             if table.shape[1] != n_genes:
@@ -512,6 +824,16 @@ class ConditionalWAE(nn.Module):
             if gene_coexpression_basis.n_genes != n_genes:
                 raise ValueError("gene_coexpression_basis and ConditionalWAE must use the same n_genes")
             self.coexpression_refinement = GeneCoexpressionRefinement(gene_coexpression_basis)
+        # New structured-field path. Unlike the legacy reconstruction-only
+        # coexpression refiner above, this exact module is applied by
+        # ``refine_prediction`` to posterior reconstruction, deterministic
+        # point prediction, and every sampled inference path.
+        self.centered_gene_structure_refinement = (
+            CenteredGeneStructureRefinement(
+                gene_structure_artifact, hidden_dim=int(gene_structure_hidden_dim),
+            )
+            if gene_structure_artifact is not None else None
+        )
         # Iterative spatial refinement (STFlow Eq. 7 analogue): neighbouring
         # PREDICTED expression steers attention. Never reads target GEX, so the
         # query-GEX-invisible contract is unchanged. 0 steps is a strict no-op.
@@ -539,10 +861,26 @@ class ConditionalWAE(nn.Module):
             )
             if n_refinement_steps > 0 else None
         )
+        if per_gene_scale is None:
+            if local_gradient_weight > 0 or wide_gradient_weight > 0:
+                raise ValueError("gradient supervision requires a training-only per_gene_scale")
+            scale = torch.ones(n_genes, dtype=torch.float32)
+        else:
+            scale = torch.as_tensor(per_gene_scale, dtype=torch.float32)
+            if (scale.shape != (n_genes,) or not torch.isfinite(scale).all()
+                    or not torch.all(scale > 0)):
+                raise ValueError("per_gene_scale must be finite, positive, and [n_genes]")
+        self.register_buffer("per_gene_scale", scale, persistent=True)
+        self.local_gradient_weight = float(local_gradient_weight)
+        self.wide_gradient_weight = float(wide_gradient_weight)
+        self.local_gradient_k = int(local_gradient_k)
+        self.wide_gradient_k = int(wide_gradient_k)
 
     def _refine(self, expression: torch.Tensor, context: torch.Tensor,
                 inputs: FullImageExpressionInputs) -> torch.Tensor:
-        """Apply iterative spatial refinement to an expression prediction."""
+        """Apply the identical structured path to every prediction role."""
+        if self.centered_gene_structure_refinement is not None:
+            expression = self.centered_gene_structure_refinement(expression)
         if self.spatial_refiner is None or self.n_refinement_steps == 0:
             return expression
         coords = torch.as_tensor(
@@ -616,9 +954,14 @@ class ConditionalWAE(nn.Module):
             n_rows=context.shape[0],
         )
         encoded = self._encode_target(target, context)
-        prior = torch.randn(
+        standard_prior = torch.randn(
             encoded.shape, dtype=encoded.dtype, device=encoded.device, generator=generator,
         )
+        if self.conditional_prior is None:
+            prior = standard_prior
+        else:
+            prior_mean, prior_std = self.conditional_prior(context)
+            prior = prior_mean + prior_std * standard_prior
         # Real fix (user report, Aug 2026): at inference, z is drawn fresh
         # from N(0,I), never from this encoder -- but the decoder here only
         # ever sees the real ENCODED z during training. If the encoder
@@ -649,8 +992,59 @@ class ConditionalWAE(nn.Module):
         conditional_mean_loss, conditional_mean_rmse, conditional_mean_pcc = rmse_pcc_reconstruction_loss(
             conditional_mean, target, pcc_weight=self.pcc_weight,
         )
+        query_mask = torch.as_tensor(
+            inputs.query_mask, dtype=torch.bool, device=context.device,
+        )
+        query_coords = torch.as_tensor(
+            inputs.coords, dtype=context.dtype, device=context.device,
+        )[query_mask]
+        zero = reconstruction_loss.new_zeros(())
+        if self.local_gradient_weight > 0:
+            local_gradient_reconstruction = spatial_gradient_loss(
+                reconstruction, target, query_coords,
+                k_neighbors=self.local_gradient_k,
+                per_gene_scale=self.per_gene_scale,
+            )
+            local_gradient_conditional_mean = spatial_gradient_loss(
+                conditional_mean, target, query_coords,
+                k_neighbors=self.local_gradient_k,
+                per_gene_scale=self.per_gene_scale,
+            )
+            local_gradient = 0.5 * (
+                local_gradient_reconstruction + local_gradient_conditional_mean
+            )
+        else:
+            local_gradient_reconstruction = local_gradient_conditional_mean = local_gradient = zero
+        if self.wide_gradient_weight > 0:
+            wide_gradient_reconstruction = spatial_gradient_loss(
+                reconstruction, target, query_coords,
+                k_neighbors=self.wide_gradient_k,
+                per_gene_scale=self.per_gene_scale,
+            )
+            wide_gradient_conditional_mean = spatial_gradient_loss(
+                conditional_mean, target, query_coords,
+                k_neighbors=self.wide_gradient_k,
+                per_gene_scale=self.per_gene_scale,
+            )
+            wide_gradient = 0.5 * (
+                wide_gradient_reconstruction + wide_gradient_conditional_mean
+            )
+        else:
+            wide_gradient_reconstruction = wide_gradient_conditional_mean = wide_gradient = zero
+        conditional_alignment_loss = prior_anchor_loss = None
         if self.regularizer == "mmd":
-            prior_loss = imq_mmd(encoded, prior)
+            if self.conditional_prior is None:
+                prior_loss = imq_mmd(encoded, prior)
+            else:
+                conditional_alignment_loss = conditional_imq_mmd(
+                    encoded, prior, context,
+                    context_weight=self.conditional_prior_context_weight,
+                )
+                prior_anchor_loss = imq_mmd(prior, standard_prior)
+                prior_loss = (
+                    conditional_alignment_loss
+                    + self.conditional_prior_anchor_weight * prior_anchor_loss
+                )
         else:
             detached_state = {
                 name: value.detach() for name, value in self.discriminator.named_parameters()
@@ -665,6 +1059,8 @@ class ConditionalWAE(nn.Module):
         total = (
             reconstruction_loss + self.conditional_mean_weight * conditional_mean_loss
             + self.regularizer_weight * prior_loss
+            + self.local_gradient_weight * local_gradient
+            + self.wide_gradient_weight * wide_gradient
         )
         distributional_loss = None
         if self.distributional_head is not None:
@@ -685,12 +1081,21 @@ class ConditionalWAE(nn.Module):
             "conditional_mean_rmse": conditional_mean_rmse,
             "conditional_mean_pcc_loss": conditional_mean_pcc,
             "prior_loss": prior_loss,
+            "local_gradient_loss": local_gradient,
+            "wide_gradient_loss": wide_gradient,
+            "local_gradient_reconstruction_loss": local_gradient_reconstruction,
+            "local_gradient_conditional_mean_loss": local_gradient_conditional_mean,
+            "wide_gradient_reconstruction_loss": wide_gradient_reconstruction,
+            "wide_gradient_conditional_mean_loss": wide_gradient_conditional_mean,
         }
         # Only present when the likelihood head is enabled. The trainer's
         # accumulator calls .detach() on every scalar entry it finds, so a
         # None placeholder here would break every gaussian_mse run.
         if distributional_loss is not None:
             losses["distributional_loss"] = distributional_loss
+        if conditional_alignment_loss is not None:
+            losses["conditional_alignment_loss"] = conditional_alignment_loss
+            losses["prior_anchor_loss"] = prior_anchor_loss
         return losses
 
     def compute_discriminator_loss(self, target_expression, *, generator=None,
@@ -729,6 +1134,7 @@ class ConditionalWAE(nn.Module):
             "conditional_mean_expression": point_prediction,
             "image_context": context,
         }
+
 
     def predict_point_from_context(
         self, context: torch.Tensor, inputs: FullImageExpressionInputs,
@@ -785,7 +1191,12 @@ class ConditionalWAE(nn.Module):
         """Draw one latent field using the canonical inference sampler."""
         if not 0.0 <= latent_spatial_correlation <= 1.0:
             raise ValueError("latent_spatial_correlation must be in [0, 1]")
-        z_mean, z_std = self.resolve_inference_prior(context, z_mean, z_std)
+        if self.conditional_prior is not None:
+            if z_mean is not None or z_std is not None:
+                raise ValueError("ex-post z_mean/z_std overrides are incompatible with a conditional prior")
+            z_mean, z_std = self.conditional_prior(context)
+        else:
+            z_mean, z_std = self.resolve_inference_prior(context, z_mean, z_std)
         noise = torch.randn(
             context.shape[0], self.latent_dim,
             dtype=context.dtype, device=context.device, generator=generator,
@@ -799,7 +1210,10 @@ class ConditionalWAE(nn.Module):
                 math.sqrt(latent_spatial_correlation) * shared
                 + math.sqrt(1.0 - latent_spatial_correlation) * noise
             )
-        return z_mean.unsqueeze(0) + noise * z_std.unsqueeze(0)
+        if z_mean.ndim == 1:
+            z_mean = z_mean.unsqueeze(0)
+            z_std = z_std.unsqueeze(0)
+        return z_mean + noise * z_std
 
     @torch.no_grad()
     def sample_predictive_distribution(self, inputs: FullImageExpressionInputs,

@@ -280,6 +280,9 @@ class ConditionalWAETensorBoardLogger:
             values["train/discriminator"] = discriminator_loss
         if discriminator_grad_norm is not None:
             values["train/discriminator_grad_norm"] = discriminator_grad_norm
+        for key in ("local_gradient_loss", "wide_gradient_loss"):
+            if key in losses:
+                values[f"train/{key}"] = losses[key]
         if learning_rate is not None:
             values["train/learning_rate"] = learning_rate
         for tag, value in values.items():

@@ -109,3 +109,35 @@ def test_whole_slide_metrics_without_panels_only_reports_all_genes():
     metrics = whole_slide_metrics(prediction, gene_names)
     assert list(metrics["per_arm"]["model"]) == ["all_genes"]
     assert metrics["gene_panel_metadata"] == {}
+
+
+def test_whole_slide_metrics_can_add_structured_field_diagnostics():
+    model = _model()
+    sample = _sample(n=17)
+    gene_names = [f"g{i}" for i in range(7)]
+    prediction = predict_whole_slide(model, sample, chunk_size=6, n_samples=2, seed=0)
+    metrics = whole_slide_metrics(
+        prediction, gene_names,
+        gene_panels={"small_panel": ["g0", "g1", "g2"]},
+        per_gene_scale=np.ones(7),
+        structured_field_config={
+            "enabled": True, "local_k": 3, "wide_k": 5,
+            "nontrivial_gradient_threshold_training_sd": 0.25,
+        },
+    )
+    structured = metrics["structured_field"]
+    assert structured["scope"] == "one held_out_whole_slide_every_spot_exactly_once"
+    assert set(structured["panels"]) == {"all_genes", "small_panel"}
+    assert "coexpression" not in structured["panels"]["all_genes"]
+    assert "coexpression" in structured["panels"]["small_panel"]
+
+
+def test_structured_whole_slide_metrics_require_training_scale():
+    model = _model()
+    sample = _sample(n=9)
+    prediction = predict_whole_slide(model, sample, chunk_size=9, n_samples=2, seed=0)
+    with pytest.raises(ValueError, match="training-only per_gene_scale"):
+        whole_slide_metrics(
+            prediction, [f"g{i}" for i in range(7)],
+            structured_field_config={"enabled": True},
+        )
