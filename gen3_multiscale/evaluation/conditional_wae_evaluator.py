@@ -74,12 +74,10 @@ def _latent_path_predictions(
     )
     posterior_z = model._encode_target(target, context)
 
-    posterior, _ = model.decode(posterior_z, context)
-    posterior = model._refine(posterior, context, inputs)
+    posterior = model.decode_latent_from_context(posterior_z, context, inputs)
 
     zero_z = torch.zeros_like(posterior_z)
-    zero_prediction, _ = model.decode(zero_z, context)
-    zero_prediction = model._refine(zero_prediction, context, inputs)
+    zero_prediction = model.decode_latent_from_context(zero_z, context, inputs)
 
     if posterior_z.shape[0] > 1:
         # A deterministic cyclic permutation breaks spot-to-latent alignment
@@ -89,8 +87,7 @@ def _latent_path_predictions(
         shuffled_z = torch.roll(posterior_z, shifts=1, dims=0)
     else:
         shuffled_z = posterior_z
-    shuffled_prediction, _ = model.decode(shuffled_z, context)
-    shuffled_prediction = model._refine(shuffled_prediction, context, inputs)
+    shuffled_prediction = model.decode_latent_from_context(shuffled_z, context, inputs)
 
     if z_mean is None:
         z_mean = torch.zeros(model.latent_dim, dtype=context.dtype, device=context.device)
@@ -114,12 +111,9 @@ def _latent_path_predictions(
             generator=generator,
         )
         prior_z = z_mean.unsqueeze(0) + noise * z_std.unsqueeze(0)
-        draw, _ = model.decode(prior_z, context)
-        prior_predictions.append(model._refine(draw, context, inputs))
+        prior_predictions.append(model.decode_latent_from_context(prior_z, context, inputs))
     stacked = torch.stack(prior_predictions)
-    conditional_mean = model._refine(
-        model.conditional_mean_head(context), context, inputs,
-    )
+    conditional_mean = model.predict_point_from_context(context, inputs)
     return {
         "model": stacked.mean(0),
         "predictive_std": stacked.std(0, unbiased=False),
@@ -345,7 +339,7 @@ def evaluate_conditional_wae(
             ])),
         }
     report = {
-        "version": 1,
+        "version": 2,
         "kind": "conditional_wae_supervisor_evaluation",
         "config_path": str(config_path),
         "checkpoint_dir": str(requested_checkpoint),
@@ -360,6 +354,13 @@ def evaluate_conditional_wae(
         "latent_spatial_correlation": float(latent_spatial_correlation),
         "diagnose_latent": bool(diagnose_latent),
         "latent_diagnostic_summary": latent_summary,
+        "prediction_roles": {
+            "primary_point_prediction": "conditional_mean",
+            "deterministic_h_and_e_prediction": "conditional_mean",
+            "wae_prior_predictive_mean": "model",
+            "calibration_prediction": "model",
+            "posterior_reconstruction_uses_target_gex": bool(diagnose_latent),
+        },
         "task": config["model"]["task"],
         "regularizer": config["model"]["regularizer"],
         "query_he_visible": True,
@@ -379,8 +380,12 @@ def evaluate_conditional_wae(
     print(f"conditional WAE evaluation report saved to {output_path}", flush=True)
     for arm in arm_names:
         metrics = aggregated[arm]
+        label = {
+            "model": "wae_prior_predictive_mean",
+            "conditional_mean": "deterministic_h_and_e_point_prediction",
+        }.get(arm, arm)
         print(
-            f"{arm} pcc={metrics['pcc']['patient_mean']:.4f} "
+            f"{label} pcc={metrics['pcc']['patient_mean']:.4f} "
             f"rmse={metrics['rmse']['patient_mean']:.4f}",
             flush=True,
         )
