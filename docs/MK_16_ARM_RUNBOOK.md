@@ -15,6 +15,11 @@ the same expanded manifest, full gene panel, frozen/pinned UNI2 cache, masks,
 optimizer, seed, budget, TensorBoard/evaluation schema and train-only centered
 gene-structure artifact.
 
+Raw H&E patch tensors are retained only while their UNI2-cache provenance is
+verified and are then released (`data.retain_patches_in_memory: false`). The
+compact UNI2 features remain resident. This is the expanded-cohort RAM fix and
+is set explicitly in every generated arm.
+
 ## Scheduling
 
 - Wave 1 runs Batch A + B: eight processes concurrently, two on each of GPUs
@@ -29,21 +34,52 @@ gene-structure artifact.
 
 ## Prepare only
 
-Run this after the centered gene-structure artifact is complete. Use the exact
-expanded-cohort manifest and training-derived panels intended for the screen.
+The expanded cohort currently has 242 training slides, 14 validation slides and
+17,068 genes. Fit its missing shared structure once before suite preparation.
+The fitter deterministically samples at most 512 spots per training slide,
+records the source/selected row counts and selection hash, and releases every
+slide's raw H&E patches immediately. This bounds the randomized-SVD matrix at
+at most 123,904 rows instead of pooling every spot from all 242 slides.
 
 ```bash
-cd /data/adam.ingemansson/SciLifeSTDL-MK
+cd /data/adam.ingemansson/SciLifeSTDL-MK16
+conda activate st3d
 
 PYTHON=/data/adam.ingemansson/miniforge3/envs/st3d/bin/python3
-COMPARISON=/absolute/path/to/resolved_gen3_arch1_config.yaml
-MANIFEST=/absolute/path/to/expanded_dataset_manifest.json
-PANELS=/absolute/path/to/expanded_train_gene_panels.json
-STRUCTURE=/absolute/path/to/centered_gene_structure_rank64.pt
+MANIFEST=/data/adam.ingemansson/SciLifeSTDL/data/cache/hest1k/gen3_multiorgan7_expanded_manifest_seed1.json
+STRUCTURE_ROOT=/data/adam.ingemansson/SciLifeSTDL-MK16/gen3_multiscale/results/mk_centered_structure_expanded_rank64
+STRUCTURE="$STRUCTURE_ROOT/centered_gene_structure_rank64.pt"
+mkdir -p "$STRUCTURE_ROOT"
+set -o pipefail
+
+CUDA_VISIBLE_DEVICES=0 "$PYTHON" -u \
+  -m gen3_multiscale.scripts.fit_mk_centered_gene_structure \
+  --manifest "$MANIFEST" \
+  --output "$STRUCTURE" \
+  --rank 64 \
+  --seed 0 \
+  --max-spots-per-slide 512 \
+  --svd-device cuda:0 \
+  2>&1 | tee "$STRUCTURE_ROOT/fit.log"
+
+"$PYTHON" -m gen3_multiscale.scripts.discover_mk_16_inputs
+```
+
+Run the preparation command below only after that command saves and validates
+the structure artifact. It does not start model training.
+
+```bash
+cd /data/adam.ingemansson/SciLifeSTDL-MK16
+
+PYTHON=/data/adam.ingemansson/miniforge3/envs/st3d/bin/python3
+COMPARISON=/data/adam.ingemansson/SciLifeSTDL/gen3_multiscale/results/gen3_full_harmonicfix_20260730T150307Z/config_arch1/config.yaml
+MANIFEST=/data/adam.ingemansson/SciLifeSTDL/data/cache/hest1k/gen3_multiorgan7_expanded_manifest_seed1.json
+PANELS=/data/adam.ingemansson/SciLifeSTDL-MK/gen3_multiscale/results/train_gene_panels_v3.json
+STRUCTURE=/data/adam.ingemansson/SciLifeSTDL-MK16/gen3_multiscale/results/mk_centered_structure_expanded_rank64/centered_gene_structure_rank64.pt
 UNI2_CACHE=/data/adam.ingemansson/SciLifeSTDL/data/cache/hest1k/uni2_gen3_spot_cache
 UNI2_REV=d517a8dd47902dd7c308b3c36f63bce47e7b9a43
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
-ROOT=/data/adam.ingemansson/SciLifeSTDL-MK/gen3_multiscale/results/mk_16_arm_${STAMP}
+ROOT=/data/adam.ingemansson/SciLifeSTDL-MK16/gen3_multiscale/results/mk_16_arm_${STAMP}
 
 for path in "$PYTHON" "$COMPARISON" "$MANIFEST" "$PANELS" "$STRUCTURE" "$UNI2_CACHE"; do
   [[ -e "$path" ]] || { echo "MISSING: $path"; exit 1; }
@@ -76,7 +112,7 @@ and `gpu_process_counts` equal to two for every listed GPU.
 Do not run these until the currently active experiment is finished.
 
 ```bash
-cd /data/adam.ingemansson/SciLifeSTDL-MK
+cd /data/adam.ingemansson/SciLifeSTDL-MK16
 PYTHON=/data/adam.ingemansson/miniforge3/envs/st3d/bin/python3
 ROOT=$(cat gen3_multiscale/results/LATEST_MK_16_ARM_SUITE_ROOT.txt)
 

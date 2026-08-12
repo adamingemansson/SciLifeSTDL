@@ -21,6 +21,7 @@ from gen3_multiscale.conditional_wae.structured_field import (
 )
 from gen3_multiscale.training.train_conditional_wae import _build_model
 from gen3_multiscale.scripts import prepare_mk_structured_field_suite as suite_module
+from gen3_multiscale.scripts.fit_mk_centered_gene_structure import _select_spot_rows
 from gen3_multiscale.conditional_wae.whole_slide import predict_whole_slide
 
 
@@ -36,6 +37,32 @@ def _fit_artifact():
         {"a": "kidney", "b": "kidney", "c": "lung"},
         [f"g{i}" for i in range(6)], rank=3, seed=2,
     )
+
+
+def test_centered_structure_spot_selection_is_bounded_and_deterministic():
+    expression = np.arange(100 * 4, dtype=np.float32).reshape(100, 4)
+    first, first_indices = _select_spot_rows(
+        expression, "slide-a", max_spots_per_slide=12, seed=7,
+    )
+    second, second_indices = _select_spot_rows(
+        expression, "slide-a", max_spots_per_slide=12, seed=7,
+    )
+    assert first.shape == (12, 4)
+    assert np.array_equal(first_indices, second_indices)
+    assert np.array_equal(first, second)
+    assert np.array_equal(first, expression[first_indices])
+    assert np.all(np.diff(first_indices) > 0)
+
+
+def test_centered_structure_spot_selection_copies_small_slides():
+    expression = np.arange(5 * 3, dtype=np.float32).reshape(5, 3)
+    selected, indices = _select_spot_rows(
+        expression, "slide-a", max_spots_per_slide=12, seed=7,
+    )
+    assert np.array_equal(indices, np.arange(5))
+    assert np.array_equal(selected, expression)
+    selected[0, 0] = -1
+    assert expression[0, 0] == 0
 
 
 def _inputs(n=8):
