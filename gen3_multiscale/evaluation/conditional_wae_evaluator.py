@@ -37,6 +37,100 @@ from gen3_multiscale.training.train_conditional_wae import (
 from gen3_multiscale.config_identity import resolved_config
 
 
+@torch.no_grad()
+def _latent_path_predictions(
+    model,
+    inputs,
+    target_expression,
+    *,
+    n_prior_samples: int,
+    generator: torch.Generator,
+    z_mean: torch.Tensor | None = None,
+    z_std: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    """Evaluate the distinct deterministic, posterior and prior WAE paths.
+
+    This is diagnostic-only: ``posterior_reconstruction`` is allowed to encode
+    the real target GEX and must never be presented as an inference result.  It
+    answers whether the trained decoder can use target-aligned latent
+    information at all.  The zero and shuffled paths then separate "decoder
+    ignores z" from "decoder uses z, but prior samples are misaligned".
+    """
+    if n_prior_samples < 1:
+        raise ValueError("n_prior_samples must be positive")
+    if model.distributional_head is not None:
+        raise ValueError(
+            "latent-path diagnostics require likelihood='gaussian_mse'; the "
+            "distributional head bypasses the WAE latent decoder at inference"
+        )
+
+    context = model.image_conditioner(inputs)
+    target = model._target(
+        inputs,
+        target_expression,
+        device=context.device,
+        dtype=context.dtype,
+        n_rows=context.shape[0],
+    )
+    posterior_z = model._encode_target(target, context)
+
+    posterior, _ = model.decode(posterior_z, context)
+    posterior = model._refine(posterior, context, inputs)
+
+    zero_z = torch.zeros_like(posterior_z)
+    zero_prediction, _ = model.decode(zero_z, context)
+    zero_prediction = model._refine(zero_prediction, context, inputs)
+
+    if posterior_z.shape[0] > 1:
+        # A deterministic cyclic permutation breaks spot-to-latent alignment
+        # without consuming the prior-sampling RNG stream.  Consequently the
+        # diagnostic's ``model`` arm remains bit-identical to ordinary rho=0
+        # prior sampling for the same seed and number of draws.
+        shuffled_z = torch.roll(posterior_z, shifts=1, dims=0)
+    else:
+        shuffled_z = posterior_z
+    shuffled_prediction, _ = model.decode(shuffled_z, context)
+    shuffled_prediction = model._refine(shuffled_prediction, context, inputs)
+
+    if z_mean is None:
+        z_mean = torch.zeros(model.latent_dim, dtype=context.dtype, device=context.device)
+    else:
+        z_mean = z_mean.to(dtype=context.dtype, device=context.device)
+    if z_std is None:
+        z_std = torch.ones(model.latent_dim, dtype=context.dtype, device=context.device)
+    else:
+        z_std = z_std.to(dtype=context.dtype, device=context.device)
+    if z_mean.shape != (model.latent_dim,) or z_std.shape != (model.latent_dim,):
+        raise ValueError("z_mean and z_std must match the model latent dimension")
+    if bool((z_std < 0).any()):
+        raise ValueError("z_std must be non-negative")
+
+    prior_predictions = []
+    for _ in range(n_prior_samples):
+        noise = torch.randn(
+            posterior_z.shape,
+            dtype=context.dtype,
+            device=context.device,
+            generator=generator,
+        )
+        prior_z = z_mean.unsqueeze(0) + noise * z_std.unsqueeze(0)
+        draw, _ = model.decode(prior_z, context)
+        prior_predictions.append(model._refine(draw, context, inputs))
+    stacked = torch.stack(prior_predictions)
+    conditional_mean = model._refine(
+        model.conditional_mean_head(context), context, inputs,
+    )
+    return {
+        "model": stacked.mean(0),
+        "predictive_std": stacked.std(0, unbiased=False),
+        "conditional_mean": conditional_mean,
+        "posterior_reconstruction": posterior,
+        "zero_latent": zero_prediction,
+        "shuffled_posterior": shuffled_prediction,
+        "posterior_z": posterior_z,
+    }
+
+
 def evaluate_conditional_wae(
     config_path: str,
     checkpoint_dir: str,
@@ -50,11 +144,17 @@ def evaluate_conditional_wae(
     n_samples: int | None = None,
     ex_post_prior_path: str | None = None,
     latent_spatial_correlation: float = 0.0,
+    diagnose_latent: bool = False,
 ) -> dict:
     if split not in {"validation", "test"}:
         raise ValueError("split must be validation or test")
     if n_masks_per_sample < 1:
         raise ValueError("n_masks_per_sample must be positive")
+    if diagnose_latent and latent_spatial_correlation != 0.0:
+        raise ValueError(
+            "--diagnose-latent currently requires --latent-spatial-correlation 0; "
+            "the diagnostic isolates marginal prior/posterior alignment, not joint-field correlation"
+        )
     ex_post_prior = None
     if ex_post_prior_path is not None:
         ex_post_prior = json.loads(Path(ex_post_prior_path).read_text())
@@ -120,7 +220,9 @@ def evaluate_conditional_wae(
 
     panels = load_configured_gene_panels(config, dataset_manifest)
     _indices, panel_metadata = resolve_gene_panels(gene_names, panels) if panels else ({}, {})
-    arm_names = ("model", "conditional_mean")
+    arm_names = ["model", "conditional_mean"]
+    if diagnose_latent:
+        arm_names += ["posterior_reconstruction", "zero_latent", "shuffled_posterior"]
     items = {arm: [] for arm in arm_names}
     panel_items = {arm: {panel: [] for panel in panels} for arm in arm_names}
     patient_ids = []
@@ -128,6 +230,10 @@ def evaluate_conditional_wae(
     calibration = _GaussianCalibrationAccumulator()
     inference_samples = int(n_samples or config["model"]["params"]["n_inference_samples"])
     evaluation_seed = int(config["training"].get("seed", 0))
+    latent_sum = torch.zeros(model.latent_dim, dtype=torch.float64, device=device)
+    latent_sum_squared = torch.zeros_like(latent_sum)
+    latent_rows = 0
+    latent_output_sensitivity = []
     with torch.no_grad():
         for index in range(len(dataset)):
             inputs, target, identity = dataset[index]
@@ -136,32 +242,68 @@ def evaluate_conditional_wae(
             generator = torch.Generator(device=device).manual_seed(
                 _stable_seed(evaluation_seed, identity),
             )
-            prediction = model.sample_predictive_distribution(
-                inputs, n_samples=inference_samples, generator=generator,
-                z_mean=ex_post_z_mean, z_std=ex_post_z_std,
-                latent_spatial_correlation=latent_spatial_correlation,
-            )
             true = np.asarray(target, dtype=np.float32)
-            model_pred = prediction["predictive_mean"].detach().cpu().numpy().astype(np.float32)
-            mean_pred = prediction["conditional_mean_expression"].detach().cpu().numpy().astype(np.float32)
-            model_metrics = per_item_reconstruction_metrics(model_pred, true)
-            mean_metrics = per_item_reconstruction_metrics(mean_pred, true)
-            items["model"].append(model_metrics)
-            items["conditional_mean"].append(mean_metrics)
+            if diagnose_latent:
+                prediction = _latent_path_predictions(
+                    model,
+                    inputs,
+                    target,
+                    n_prior_samples=inference_samples,
+                    generator=generator,
+                    z_mean=ex_post_z_mean,
+                    z_std=ex_post_z_std,
+                )
+                prediction_tensors = {arm: prediction[arm] for arm in arm_names}
+                posterior_z = prediction["posterior_z"].to(torch.float64)
+                latent_sum += posterior_z.sum(dim=0)
+                latent_sum_squared += posterior_z.square().sum(dim=0)
+                latent_rows += int(posterior_z.shape[0])
+                latent_output_sensitivity.append({
+                    "posterior_vs_zero_rmse": float(torch.sqrt(torch.mean(
+                        (prediction["posterior_reconstruction"] - prediction["zero_latent"]).square()
+                    ))),
+                    "posterior_vs_shuffled_rmse": float(torch.sqrt(torch.mean(
+                        (prediction["posterior_reconstruction"] - prediction["shuffled_posterior"]).square()
+                    ))),
+                })
+                predictive_std = prediction["predictive_std"]
+            else:
+                prediction = model.sample_predictive_distribution(
+                    inputs, n_samples=inference_samples, generator=generator,
+                    z_mean=ex_post_z_mean, z_std=ex_post_z_std,
+                    latent_spatial_correlation=latent_spatial_correlation,
+                )
+                prediction_tensors = {
+                    "model": prediction["predictive_mean"],
+                    "conditional_mean": prediction["conditional_mean_expression"],
+                }
+                predictive_std = prediction["predictive_std"]
+            prediction_arrays = {
+                arm: tensor.detach().cpu().numpy().astype(np.float32)
+                for arm, tensor in prediction_tensors.items()
+            }
+            arm_metrics = {
+                arm: per_item_reconstruction_metrics(prediction_arrays[arm], true)
+                for arm in arm_names
+            }
+            for arm in arm_names:
+                items[arm].append(arm_metrics[arm])
             record = {
                 **identity,
                 "patient_id": patient_id,
-                "model": model_metrics,
-                "conditional_mean": mean_metrics,
+                **arm_metrics,
             }
+            if diagnose_latent:
+                record["latent_output_sensitivity"] = latent_output_sensitivity[-1]
             if panels:
                 record["gene_panels"] = {}
-                for arm, prediction_array in (("model", model_pred), ("conditional_mean", mean_pred)):
+                for arm, prediction_array in prediction_arrays.items():
                     metrics = gene_panel_metrics(prediction_array, true, gene_names, panels)
                     record["gene_panels"][arm] = metrics
                     for panel, panel_metric in metrics.items():
                         panel_items[arm][panel].append(panel_metric)
-            std = prediction["predictive_std"].detach().cpu().numpy().astype(np.float64)
+            model_pred = prediction_arrays["model"]
+            std = predictive_std.detach().cpu().numpy().astype(np.float64)
             safe_std = np.where(std > 1e-8, std, np.nan)
             calibration.add_item((true.astype(np.float64) - model_pred) / safe_std)
             records.append(record)
@@ -182,6 +324,26 @@ def evaluate_conditional_wae(
         for panel in panels
     }
     evaluated_training_state = checkpoint_module.load_training_state(requested_checkpoint)
+    latent_summary = None
+    if diagnose_latent:
+        if latent_rows < 1:
+            raise ValueError("latent diagnostic encoded no posterior rows")
+        z_mean_observed = latent_sum / latent_rows
+        z_variance_observed = latent_sum_squared / latent_rows - z_mean_observed.square()
+        z_std_observed = torch.sqrt(torch.clamp(z_variance_observed, min=0.0))
+        latent_summary = {
+            "n_rows": int(latent_rows),
+            "posterior_mean_l2": float(torch.linalg.vector_norm(z_mean_observed)),
+            "posterior_std_min": float(z_std_observed.min()),
+            "posterior_std_mean": float(z_std_observed.mean()),
+            "posterior_std_max": float(z_std_observed.max()),
+            "mean_posterior_vs_zero_output_rmse": float(np.mean([
+                row["posterior_vs_zero_rmse"] for row in latent_output_sensitivity
+            ])),
+            "mean_posterior_vs_shuffled_output_rmse": float(np.mean([
+                row["posterior_vs_shuffled_rmse"] for row in latent_output_sensitivity
+            ])),
+        }
     report = {
         "version": 1,
         "kind": "conditional_wae_supervisor_evaluation",
@@ -196,6 +358,8 @@ def evaluate_conditional_wae(
         "n_latent_samples_per_item": inference_samples,
         "ex_post_prior_path": str(ex_post_prior_path) if ex_post_prior_path else None,
         "latent_spatial_correlation": float(latent_spatial_correlation),
+        "diagnose_latent": bool(diagnose_latent),
+        "latent_diagnostic_summary": latent_summary,
         "task": config["model"]["task"],
         "regularizer": config["model"]["regularizer"],
         "query_he_visible": True,
@@ -235,6 +399,11 @@ def main() -> None:
     parser.add_argument("--allow-code-drift", action="store_true")
     parser.add_argument("--n-samples", type=int)
     parser.add_argument(
+        "--diagnose-latent", action="store_true",
+        help="Add target-posterior, zero-latent and within-mask shuffled-posterior arms. "
+             "The posterior arm reads held-out target GEX and is diagnostic only, never inference.",
+    )
+    parser.add_argument(
         "--ex-post-prior",
         help="Path to a JSON fit by scripts/fit_conditional_wae_ex_post_prior.py. When given, "
              "inference-time z is drawn from this fitted per-latent-dim Gaussian instead of the "
@@ -263,6 +432,7 @@ def main() -> None:
         n_samples=args.n_samples,
         ex_post_prior_path=args.ex_post_prior,
         latent_spatial_correlation=args.latent_spatial_correlation,
+        diagnose_latent=args.diagnose_latent,
     )
 
 
