@@ -27,6 +27,7 @@ from gen3_multiscale.conditional_wae.tensorboard import (
     METADATA_HEADER,
 )
 from gen3_multiscale.data.boundary_graph import build_knn_adjacency
+from gen3_multiscale.evaluation.conditional_wae_evaluator import _latent_path_predictions
 from gen3_multiscale.training import train_conditional_wae
 from gen3_multiscale.scripts.prepare_conditional_wae_suite import (
     _absolutize_existing_source_paths,
@@ -56,6 +57,56 @@ def _model(regularizer):
         regularizer=regularizer, latent_dim=5, autoencoder_hidden_dim=20,
         discriminator_hidden_dim=12, n_inference_samples=3,
     )
+
+
+def test_latent_path_diagnostic_preserves_the_standard_prior_mean_and_supports_film():
+    inputs = _inputs()
+    target = torch.randn(12, 7)
+    for model in (_model("mmd"), _film_model(regularizer="mmd")):
+        model.eval()
+        diagnostic = _latent_path_predictions(
+            model,
+            inputs,
+            target,
+            n_prior_samples=4,
+            generator=torch.Generator().manual_seed(17),
+        )
+        ordinary = model.sample_predictive_distribution(
+            inputs,
+            n_samples=4,
+            generator=torch.Generator().manual_seed(17),
+        )
+        torch.testing.assert_close(diagnostic["model"], ordinary["predictive_mean"])
+        torch.testing.assert_close(diagnostic["predictive_std"], ordinary["predictive_std"])
+        torch.testing.assert_close(
+            diagnostic["conditional_mean"], ordinary["conditional_mean_expression"],
+        )
+        assert diagnostic["posterior_reconstruction"].shape == target.shape
+        assert diagnostic["zero_latent"].shape == target.shape
+        assert diagnostic["shuffled_posterior"].shape == target.shape
+        assert diagnostic["posterior_z"].shape == (12, model.latent_dim)
+
+
+def test_latent_path_diagnostic_refuses_distributional_head_that_bypasses_z():
+    model = ConditionalWAE(
+        7,
+        Architecture1ImageConditioner(
+            7, image_feature_dim=16, gex_feature_dim=6,
+            hidden_dim=24, n_heads=4, n_blocks=1,
+            dense_threshold=20, sparse_k=3, dropout=0.0,
+        ),
+        regularizer="mmd", latent_dim=5, autoencoder_hidden_dim=20,
+        discriminator_hidden_dim=12, n_inference_samples=3,
+        likelihood="zero_inflated_gaussian", distributional_hidden_dim=16,
+    )
+    with pytest.raises(ValueError, match="bypasses the WAE latent decoder"):
+        _latent_path_predictions(
+            model,
+            _inputs(),
+            torch.randn(12, 7),
+            n_prior_samples=4,
+            generator=torch.Generator().manual_seed(0),
+        )
 
 
 def _film_model(*, film_layers=("first", "second"), shared=False, regularizer="gan"):
