@@ -722,10 +722,84 @@ class ConditionalWAE(nn.Module):
 
     def forward(self, inputs: FullImageExpressionInputs) -> dict:
         context = self.image_conditioner(inputs)
-        conditional_mean = self._refine(
-            self.conditional_mean_head(context), context, inputs,
+        point_prediction = self.predict_point_from_context(context, inputs)
+        return {
+            "expression": point_prediction,
+            "point_prediction": point_prediction,
+            "conditional_mean_expression": point_prediction,
+            "image_context": context,
+        }
+
+    def predict_point_from_context(
+        self, context: torch.Tensor, inputs: FullImageExpressionInputs,
+    ) -> torch.Tensor:
+        """Deterministic H&E-conditioned point prediction.
+
+        ``expression`` has this meaning in :meth:`forward`.  Keeping the
+        operation in one public method prevents masked and whole-slide
+        inference from silently applying different post-processing.
+        """
+        return self.refine_prediction(self.conditional_mean_head(context), context, inputs)
+
+    def refine_prediction(
+        self, expression: torch.Tensor, context: torch.Tensor,
+        inputs: FullImageExpressionInputs,
+    ) -> torch.Tensor:
+        """Public inference post-processing shared by every entry point."""
+        return self._refine(expression, context, inputs)
+
+    def decode_latent_from_context(
+        self, z: torch.Tensor, context: torch.Tensor,
+        inputs: FullImageExpressionInputs,
+    ) -> torch.Tensor:
+        """Decode one latent field and apply the configured refinement."""
+        prediction, _ = self.decode(z, context)
+        return self.refine_prediction(prediction, context, inputs)
+
+    def resolve_inference_prior(
+        self, context: torch.Tensor, z_mean: torch.Tensor | None = None,
+        z_std: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Validate and place optional ex-post prior parameters."""
+        if z_mean is None:
+            z_mean = torch.zeros(self.latent_dim, dtype=context.dtype, device=context.device)
+        else:
+            z_mean = z_mean.to(dtype=context.dtype, device=context.device)
+            if z_mean.shape != (self.latent_dim,):
+                raise ValueError(f"z_mean must be [{self.latent_dim}], got {tuple(z_mean.shape)}")
+        if z_std is None:
+            z_std = torch.ones(self.latent_dim, dtype=context.dtype, device=context.device)
+        else:
+            z_std = z_std.to(dtype=context.dtype, device=context.device)
+            if z_std.shape != (self.latent_dim,):
+                raise ValueError(f"z_std must be [{self.latent_dim}], got {tuple(z_std.shape)}")
+            if bool((z_std < 0).any()):
+                raise ValueError("z_std must be non-negative")
+        return z_mean, z_std
+
+    def sample_inference_latent(
+        self, context: torch.Tensor, *, generator=None,
+        z_mean: torch.Tensor | None = None, z_std: torch.Tensor | None = None,
+        latent_spatial_correlation: float = 0.0,
+    ) -> torch.Tensor:
+        """Draw one latent field using the canonical inference sampler."""
+        if not 0.0 <= latent_spatial_correlation <= 1.0:
+            raise ValueError("latent_spatial_correlation must be in [0, 1]")
+        z_mean, z_std = self.resolve_inference_prior(context, z_mean, z_std)
+        noise = torch.randn(
+            context.shape[0], self.latent_dim,
+            dtype=context.dtype, device=context.device, generator=generator,
         )
-        return {"expression": conditional_mean, "image_context": context}
+        if latent_spatial_correlation > 0:
+            shared = torch.randn(
+                1, self.latent_dim,
+                dtype=context.dtype, device=context.device, generator=generator,
+            )
+            noise = (
+                math.sqrt(latent_spatial_correlation) * shared
+                + math.sqrt(1.0 - latent_spatial_correlation) * noise
+            )
+        return z_mean.unsqueeze(0) + noise * z_std.unsqueeze(0)
 
     @torch.no_grad()
     def sample_predictive_distribution(self, inputs: FullImageExpressionInputs,
@@ -762,14 +836,15 @@ class ConditionalWAE(nn.Module):
                     generator=generator,
                 )
                 draws.append(keep * (head_mean + torch.exp(log_sigma) * noise))
+            point_prediction = self.predict_point_from_context(context, inputs)
             return {
-                "expression": predictive_mean,
+                "expression": point_prediction,
+                "point_prediction": point_prediction,
+                "wae_predictive_mean": predictive_mean,
                 "predictive_mean": predictive_mean,
                 "predictive_std": predictive_std,
                 "predictive_samples": torch.stack(draws),
-                "conditional_mean_expression": self._refine(
-                    self.conditional_mean_head(context), context, inputs,
-                ),
+                "conditional_mean_expression": point_prediction,
                 "image_context": context,
             }
         # Ex-post density estimation (Ghosh et al., "From Variational to
@@ -780,20 +855,6 @@ class ConditionalWAE(nn.Module):
         # fit offline by scripts/fit_conditional_wae_ex_post_prior.py) let a
         # caller opt into that without touching training. Both None (the
         # default) reproduces the exact pre-existing N(0,I) behavior.
-        if z_mean is None:
-            z_mean = torch.zeros(self.latent_dim, dtype=context.dtype, device=context.device)
-        else:
-            z_mean = z_mean.to(dtype=context.dtype, device=context.device)
-            if z_mean.shape != (self.latent_dim,):
-                raise ValueError(f"z_mean must be [{self.latent_dim}], got {tuple(z_mean.shape)}")
-        if z_std is None:
-            z_std = torch.ones(self.latent_dim, dtype=context.dtype, device=context.device)
-        else:
-            z_std = z_std.to(dtype=context.dtype, device=context.device)
-            if z_std.shape != (self.latent_dim,):
-                raise ValueError(f"z_std must be [{self.latent_dim}], got {tuple(z_std.shape)}")
-            if bool((z_std < 0).any()):
-                raise ValueError("z_std must be non-negative")
         # Spatially-coherent latent sampling. Measured on four trained arms,
         # the latent's contribution correlates 0.002-0.025 with the error it
         # would need to explain -- the signature of i.i.d.-per-spot noise,
@@ -810,32 +871,24 @@ class ConditionalWAE(nn.Module):
         # imposing correlation rho between spots. It is therefore a pure
         # inference-time change, valid on already-trained checkpoints, and
         # rho=0 (the default) reproduces the historical sampler bit for bit.
-        if not 0.0 <= latent_spatial_correlation <= 1.0:
-            raise ValueError("latent_spatial_correlation must be in [0, 1]")
-        shared_weight = math.sqrt(latent_spatial_correlation)
-        local_weight = math.sqrt(1.0 - latent_spatial_correlation)
         samples = []
         for _ in range(count):
-            noise = torch.randn(
-                context.shape[0], self.latent_dim,
-                dtype=context.dtype, device=context.device, generator=generator,
+            z = self.sample_inference_latent(
+                context, generator=generator, z_mean=z_mean, z_std=z_std,
+                latent_spatial_correlation=latent_spatial_correlation,
             )
-            if latent_spatial_correlation > 0:
-                shared = torch.randn(
-                    1, self.latent_dim,
-                    dtype=context.dtype, device=context.device, generator=generator,
-                )
-                noise = shared_weight * shared + local_weight * noise
-            z = z_mean.unsqueeze(0) + noise * z_std.unsqueeze(0)
-            prediction, _ = self.decode(z, context)
-            samples.append(self._refine(prediction, context, inputs))
+            samples.append(self.decode_latent_from_context(z, context, inputs))
         stacked = torch.stack(samples)
-        conditional_mean = self._refine(
-            self.conditional_mean_head(context), context, inputs,
-        )
+        conditional_mean = self.predict_point_from_context(context, inputs)
+        predictive_mean = stacked.mean(0)
         return {
-            "expression": stacked.mean(0),
-            "predictive_mean": stacked.mean(0),
+            # ``expression`` now agrees with forward(): it is the
+            # deterministic H&E point prediction.  ``predictive_mean`` is
+            # retained as the backward-compatible Monte-Carlo WAE prior mean.
+            "expression": conditional_mean,
+            "point_prediction": conditional_mean,
+            "wae_predictive_mean": predictive_mean,
+            "predictive_mean": predictive_mean,
             "predictive_std": stacked.std(0, unbiased=False),
             "predictive_samples": stacked,
             "conditional_mean_expression": conditional_mean,

@@ -6,10 +6,10 @@ meaningful for Task I / he_to_st arms). Every tissue spot is predicted
 exactly once. The image conditioner's context is computed ONCE for the
 whole slide (correctness requires the full slide's attention neighborhood
 together, and the existing dense/sparse-attention switch already bounds its
-memory); only the per-spot decode step -- which duplicates across the
-`n_samples` stochastic draws -- is split into memory-safe chunks. The
-latent noise for every spot is drawn in one canonical pass BEFORE chunking,
-so results are exactly independent of `chunk_size`.
+memory). Decoder work is chunked, but each complete slide prediction is
+reassembled BEFORE spatial refinement so whole-slide and masked inference
+use the same graph and post-processing. Draws are accumulated online, which
+avoids retaining ``n_samples * n_spots * n_genes`` values in GPU memory.
 """
 from __future__ import annotations
 
@@ -32,6 +32,8 @@ def predict_whole_slide(
     n_samples: int | None = None, seed: int = 0,
     normalized_coords: np.ndarray | None = None,
     padded_adjacency: tuple[np.ndarray, np.ndarray] | None = None,
+    z_mean: torch.Tensor | None = None, z_std: torch.Tensor | None = None,
+    latent_spatial_correlation: float = 0.0,
 ) -> dict:
     if chunk_size < 1:
         raise ValueError("chunk_size must be positive")
@@ -44,39 +46,54 @@ def predict_whole_slide(
     count = int(n_samples or model.n_inference_samples)
     if count < 1:
         raise ValueError("n_samples must be positive")
+    if model.distributional_head is not None:
+        raise ValueError(
+            "whole-slide inference currently requires likelihood='gaussian_mse'; "
+            "refinement semantics for the distributional head are not defined"
+        )
 
     generator = torch.Generator(device=context.device).manual_seed(int(seed))
-    z_all = torch.randn(
-        count, n_rows, model.latent_dim,
-        dtype=context.dtype, device=context.device, generator=generator,
+    predictive_sum = torch.zeros(
+        n_rows, model.n_genes, dtype=context.dtype, device=context.device,
     )
+    predictive_sum_squared = torch.zeros_like(predictive_sum)
+    for _ in range(count):
+        z = model.sample_inference_latent(
+            context, generator=generator, z_mean=z_mean, z_std=z_std,
+            latent_spatial_correlation=latent_spatial_correlation,
+        )
+        decoded_chunks = []
+        for start in range(0, n_rows, chunk_size):
+            end = min(start + chunk_size, n_rows)
+            decoded_chunks.append(model.decode(z[start:end], context[start:end])[0])
+        complete_draw = torch.cat(decoded_chunks, dim=0)
+        if complete_draw.shape != predictive_sum.shape:
+            raise RuntimeError("whole-slide chunking did not cover every row exactly once")
+        complete_draw = model.refine_prediction(complete_draw, context, inputs)
+        predictive_sum.add_(complete_draw)
+        predictive_sum_squared.add_(complete_draw.square())
 
-    predictive_mean_chunks: list[torch.Tensor] = []
-    predictive_std_chunks: list[torch.Tensor] = []
-    conditional_mean_chunks: list[torch.Tensor] = []
-    covered = np.zeros(n_rows, dtype=bool)
-    for start in range(0, n_rows, chunk_size):
-        end = min(start + chunk_size, n_rows)
-        context_chunk = context[start:end]
-        draws = [
-            model.decode(z_all[draw_index, start:end], context_chunk)[0]
-            for draw_index in range(count)
-        ]
-        stacked = torch.stack(draws)
-        predictive_mean_chunks.append(stacked.mean(0))
-        predictive_std_chunks.append(stacked.std(0, unbiased=False))
-        conditional_mean_chunks.append(model.conditional_mean_head(context_chunk))
-        covered[start:end] = True
-    if not covered.all():
-        raise RuntimeError("whole-slide chunking did not cover every row exactly once")
+    predictive_mean = predictive_sum / count
+    predictive_variance = (predictive_sum_squared / count - predictive_mean.square()).clamp_min(0.0)
+    conditional_mean_chunks = [
+        model.conditional_mean_head(context[start:min(start + chunk_size, n_rows)])
+        for start in range(0, n_rows, chunk_size)
+    ]
+    point_prediction = model.refine_prediction(
+        torch.cat(conditional_mean_chunks, dim=0), context, inputs,
+    )
 
     return {
         "sample_id": inputs.sample_id,
         "coords": np.asarray(sample.full_sample_coords, dtype=np.float32),
         "target": target,
-        "predictive_mean": torch.cat(predictive_mean_chunks, dim=0),
-        "predictive_std": torch.cat(predictive_std_chunks, dim=0),
-        "conditional_mean_expression": torch.cat(conditional_mean_chunks, dim=0),
+        "expression": point_prediction,
+        "point_prediction": point_prediction,
+        "conditional_mean_expression": point_prediction,
+        "wae_predictive_mean": predictive_mean,
+        "predictive_mean": predictive_mean,
+        "predictive_std": predictive_variance.sqrt(),
+        "image_context": context,
         "context": context,
         "n_spots": int(n_rows),
     }
@@ -95,7 +112,7 @@ def whole_slide_metrics(
 ) -> dict:
     """PCC/RMSE/AUC for one whole-slide prediction, restricted to all genes
     and each configured panel (e.g. CCRCC-50, HVG-50, HVG-200), for both the
-    stochastic-model arm (predictive_mean) and the conditional-mean arm --
+    WAE-prior arm (predictive_mean) and deterministic point-prediction arm --
     the same two-arm split conditional_wae_evaluator.py already reports."""
     true = np.asarray(prediction["target"], dtype=np.float32)
     arms = {
@@ -115,5 +132,9 @@ def whole_slide_metrics(
         "sample_id": prediction["sample_id"],
         "n_spots": prediction["n_spots"],
         "per_arm": per_arm,
+        "prediction_roles": {
+            "primary_point_prediction": "conditional_mean",
+            "wae_prior_predictive_mean": "model",
+        },
         "gene_panel_metadata": panel_metadata,
     }

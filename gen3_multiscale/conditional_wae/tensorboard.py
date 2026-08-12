@@ -162,7 +162,7 @@ class ConditionalWAESnapshotAccumulator:
                 str(bool(available[row])), "query",
             ])
         local_index = torch.as_tensor(local, dtype=torch.long, device=target.device)
-        predictive_mean = prediction["predictive_mean"].detach().index_select(0, local_index)
+        point_prediction = prediction["point_prediction"].detach().index_select(0, local_index)
         selected_target = target.detach().index_select(0, local_index)
         self.posterior_z.append(
             posterior_z.detach().index_select(0, local_index).cpu().float().numpy()
@@ -174,15 +174,15 @@ class ConditionalWAESnapshotAccumulator:
         self.coords.append(raw_coords)
         self.sample_ids.append(np.full(count, sample_id, dtype=object))
         self.point_rmse.append(
-            torch.sqrt(torch.mean((predictive_mean - selected_target).square(), dim=1))
+            torch.sqrt(torch.mean((point_prediction - selected_target).square(), dim=1))
             .cpu().float().numpy()
         )
         if self.logged_gene_indices:
             gene_index = torch.as_tensor(
-                self.logged_gene_indices, dtype=torch.long, device=predictive_mean.device,
+                self.logged_gene_indices, dtype=torch.long, device=point_prediction.device,
             )
             self.prediction_genes.append(
-                predictive_mean.index_select(1, gene_index).cpu().float().numpy()
+                point_prediction.index_select(1, gene_index).cpu().float().numpy()
             )
             self.target_genes.append(
                 selected_target.index_select(1, gene_index).cpu().float().numpy()
@@ -305,6 +305,10 @@ class ConditionalWAETensorBoardLogger:
                                best_total: float | None = None, best_step: int | None = None) -> None:
         for key in ("total", "rmse", "pcc_loss"):
             self.writer.add_scalar(f"validation/{key}", float(entry[key]), int(step))
+            self.writer.add_scalar(f"validation/point_{key}", float(entry[key]), int(step))
+        for key in ("wae_prior_total", "wae_prior_rmse", "wae_prior_pcc_loss"):
+            if key in entry:
+                self.writer.add_scalar(f"validation/{key}", float(entry[key]), int(step))
         if best_total is not None:
             self.writer.add_scalar("validation/best_total", float(best_total), int(step))
         if best_step is not None:
@@ -328,6 +332,9 @@ class ConditionalWAETensorBoardLogger:
         self.writer.add_scalar("whole_slide/total", float(whole_slide_total), int(step))
         self.writer.add_scalar("whole_slide/rmse", float(whole_slide_rmse), int(step))
         self.writer.add_scalar("whole_slide/pcc_loss", float(whole_slide_pcc_loss), int(step))
+        self.writer.add_scalar("whole_slide/point_total", float(whole_slide_total), int(step))
+        self.writer.add_scalar("whole_slide/point_rmse", float(whole_slide_rmse), int(step))
+        self.writer.add_scalar("whole_slide/point_pcc_loss", float(whole_slide_pcc_loss), int(step))
         if whole_slide_hvg50_pcc_loss is not None:
             self.writer.add_scalar(
                 "whole_slide/hvg50_pcc_loss", float(whole_slide_hvg50_pcc_loss), int(step),

@@ -326,7 +326,8 @@ def _validate(model: ConditionalWAE, dataset, *, device: torch.device, seed: int
               snapshot: ConditionalWAESnapshotAccumulator | None = None,
               samples: dict | None = None, collect_film_diagnostics: bool = False) -> dict:
     model.eval()
-    totals, rmses, pcc_losses, conditional_mean_rmses = [], [], [], []
+    totals, rmses, pcc_losses = [], [], []
+    wae_prior_totals, wae_prior_rmses, wae_prior_pcc_losses = [], [], []
     collect_film = collect_film_diagnostics and model.encoder_conditioning == "film"
     film_posterior_z, film_context = [], []
     film_predictive_std, film_predictive_mean, film_conditional_mean = [], [], []
@@ -335,16 +336,22 @@ def _validate(model: ConditionalWAE, dataset, *, device: torch.device, seed: int
         target_tensor = torch.as_tensor(target, dtype=torch.float32, device=device)
         generator = torch.Generator(device=device).manual_seed(_stable_seed(seed, identity))
         prediction = model.sample_predictive_distribution(inputs, generator=generator)
+        # Primary point metrics use the deterministic H&E prediction.  The
+        # WAE prior mean remains a separate generative diagnostic; mixing the
+        # two previously made early stopping and deployment report different
+        # notions of "the model output".
         total, rmse, pcc_loss = rmse_pcc_reconstruction_loss(
-            prediction["predictive_mean"], target_tensor, pcc_weight=model.pcc_weight,
+            prediction["point_prediction"], target_tensor, pcc_weight=model.pcc_weight,
         )
-        _mean_total, mean_rmse, _ = rmse_pcc_reconstruction_loss(
-            prediction["conditional_mean_expression"], target_tensor, pcc_weight=model.pcc_weight,
+        wae_total, wae_rmse, wae_pcc_loss = rmse_pcc_reconstruction_loss(
+            prediction["wae_predictive_mean"], target_tensor, pcc_weight=model.pcc_weight,
         )
         totals.append(float(total))
         rmses.append(float(rmse))
         pcc_losses.append(float(pcc_loss))
-        conditional_mean_rmses.append(float(mean_rmse))
+        wae_prior_totals.append(float(wae_total))
+        wae_prior_rmses.append(float(wae_rmse))
+        wae_prior_pcc_losses.append(float(wae_pcc_loss))
         posterior_z = None
         if (snapshot is not None and not snapshot.full) or collect_film:
             # Held-out target GEX is encoded only for a diagnostic Projector/
@@ -370,7 +377,10 @@ def _validate(model: ConditionalWAE, dataset, *, device: torch.device, seed: int
         "total": float(np.mean(totals)),
         "rmse": float(np.mean(rmses)),
         "pcc_loss": float(np.mean(pcc_losses)),
-        "conditional_mean_rmse": float(np.mean(conditional_mean_rmses)),
+        "conditional_mean_rmse": float(np.mean(rmses)),
+        "wae_prior_total": float(np.mean(wae_prior_totals)),
+        "wae_prior_rmse": float(np.mean(wae_prior_rmses)),
+        "wae_prior_pcc_loss": float(np.mean(wae_prior_pcc_losses)),
         "n_items": len(dataset),
     }
     if collect_film and film_posterior_z:
@@ -443,8 +453,9 @@ def _run_whole_slide_validation(
 ) -> tuple[dict, float, float, float, float, list[dict]]:
     """Returns (aggregated_metrics, whole_slide_total, whole_slide_rmse,
     whole_slide_pcc_loss, whole_slide_hvg50_pcc_loss, per_slide_predictions).
-    The total/rmse/pcc_loss use the SAME rmse_pcc_reconstruction_loss shape
-    as masked validation's own total/rmse/pcc_loss, pooled over every
+    The total/rmse/pcc_loss use the deterministic H&E point prediction and
+    the SAME rmse_pcc_reconstruction_loss shape as masked validation's own
+    primary metrics, pooled over every
     predicted spot across `sample_ids`, purely so they are directly
     comparable in scale -- they are diagnostic-only and never read by
     checkpoint selection beyond the separate best_whole_slide/.
@@ -469,7 +480,7 @@ def _run_whole_slide_validation(
         )
         per_slide_metrics.append(whole_slide_metrics(prediction, gene_names, panels))
         per_slide_predictions.append(prediction)
-        pooled_predictions.append(prediction["predictive_mean"])
+        pooled_predictions.append(prediction["point_prediction"])
         pooled_targets.append(
             torch.as_tensor(prediction["target"], dtype=torch.float32, device=device)
         )
@@ -710,10 +721,20 @@ def run_conditional_wae_training(
         raise ValueError("training.gradient_accumulation_steps must be a positive integer")
     history_path = checkpoint_dir / "validation_history.json"
     history = json.loads(history_path.read_text()) if history_path.is_file() and not smoke else []
-    best_total = min((entry["total"] for entry in history), default=float("inf"))
+    point_history = [
+        entry for entry in history
+        if entry.get("primary_prediction_role") == "conditional_mean"
+    ]
+    best_total = min((entry["total"] for entry in point_history), default=float("inf"))
     best_step = next(
-        (entry["step"] for entry in history if entry["total"] == best_total), None,
-    ) if history else None
+        (entry["step"] for entry in point_history if entry["total"] == best_total), None,
+    ) if point_history else None
+    if history and not point_history:
+        print(
+            "legacy validation history uses WAE-prior primary scores; the corrected "
+            "deterministic point-prediction best score starts fresh",
+            flush=True,
+        )
     if not smoke and resume_step > 0:
         prior_training_state = checkpoint_module.load_training_state(checkpoint_dir)
         # Old checkpoints (pre-accumulation) never recorded masks_seen;
@@ -760,9 +781,18 @@ def run_conditional_wae_training(
     best_whole_slide_step = None
     if whole_slide_enabled and not smoke:
         prior_whole_slide_state = checkpoint_module.load_training_state(checkpoint_dir / "best_whole_slide")
-        if "whole_slide_total" in prior_whole_slide_state:
+        if (
+            "whole_slide_total" in prior_whole_slide_state
+            and prior_whole_slide_state.get("primary_prediction_role") == "conditional_mean"
+        ):
             best_whole_slide_total = float(prior_whole_slide_state["whole_slide_total"])
             best_whole_slide_step = int(prior_whole_slide_state["step"])
+        elif "whole_slide_total" in prior_whole_slide_state:
+            print(
+                "ignoring legacy best_whole_slide score: it was measured on the WAE prior mean, "
+                "not the deterministic point prediction",
+                flush=True,
+            )
     whole_slide_reference_projection = None
     if whole_slide_enabled and tensorboard_logger is not None:
         reference_projection_path = whole_slide_cfg.get("reference_projection_path")
@@ -897,12 +927,13 @@ def run_conditional_wae_training(
             entry = {
                 "step": step,
                 "masks_seen": masks_seen,
+                "primary_prediction_role": "conditional_mean",
                 **validation_result,
             }
             print(
                 f"[step {step}] validation: total={entry['total']:.6f}, "
                 f"rmse={entry['rmse']:.6f}, "
-                f"conditional_mean_rmse={entry['conditional_mean_rmse']:.6f}, "
+                f"wae_prior_rmse={entry['wae_prior_rmse']:.6f}, "
                 f"masks_seen={masks_seen}",
                 flush=True,
             )
@@ -924,7 +955,10 @@ def run_conditional_wae_training(
                     save_best_checkpoint_bundle(
                         model, config, gene_names, checkpoint_dir / "best",
                         step=step, val_loss=entry["total"], run_manifest=run_manifest,
-                        extra_metadata={"masks_seen": masks_seen},
+                        extra_metadata={
+                            "masks_seen": masks_seen,
+                            "primary_prediction_role": "conditional_mean",
+                        },
                     )
             if whole_slide_enabled:
                 evaluation_number = max(1, step // eval_every)
@@ -960,7 +994,7 @@ def run_conditional_wae_training(
                                 tensorboard_logger.add_whole_slide_spatial_maps(
                                     step, prediction["sample_id"], prediction["coords"],
                                     prediction["target"],
-                                    prediction["predictive_mean"].detach().cpu().numpy(),
+                                    prediction["point_prediction"].detach().cpu().numpy(),
                                     gene_names, whole_slide_reference_projection,
                                     gene_indices=_slide_target_gene_indices(
                                         prediction["target"], gene_names,
@@ -975,6 +1009,7 @@ def run_conditional_wae_training(
                             step=step, val_loss=whole_slide_total, run_manifest=run_manifest,
                             extra_metadata={
                                 "masks_seen": masks_seen, "whole_slide_total": whole_slide_total,
+                                "primary_prediction_role": "conditional_mean",
                                 "kind": "whole_slide_diagnostic_only",
                             },
                         )

@@ -21,6 +21,7 @@ from gen3_multiscale.conditional_wae.spatial_refinement import (
     padded_neighbor_graph,
 )
 from gen3_multiscale.conditional_wae.film_diagnostics import compute_film_diagnostics
+from gen3_multiscale.conditional_wae.whole_slide import predict_whole_slide
 from gen3_multiscale.conditional_wae.tensorboard import (
     ConditionalWAESnapshotAccumulator,
     ConditionalWAETensorBoardLogger,
@@ -563,6 +564,44 @@ def test_mmd_variant_routes_gradients_and_inference_never_needs_gex():
     assert prediction["predictive_mean"].shape == target.shape
     assert prediction["predictive_samples"].shape == (3, 12, 7)
     assert model(inputs)["expression"].shape == target.shape
+
+
+def test_predictive_output_names_separate_point_prediction_from_wae_prior_mean():
+    model = _model("mmd")
+    inputs = _inputs()
+    prediction = model.sample_predictive_distribution(
+        inputs, n_samples=3, generator=torch.Generator().manual_seed(2),
+    )
+    torch.testing.assert_close(prediction["expression"], model(inputs)["expression"])
+    torch.testing.assert_close(prediction["point_prediction"], prediction["expression"])
+    torch.testing.assert_close(
+        prediction["conditional_mean_expression"], prediction["point_prediction"],
+    )
+    torch.testing.assert_close(
+        prediction["wae_predictive_mean"], prediction["predictive_mean"],
+    )
+
+
+def test_masked_validation_uses_the_deterministic_point_prediction_as_primary():
+    model = _model("mmd").eval()
+    inputs = _inputs()
+    target = model(inputs)["expression"].detach().cpu().numpy()
+
+    class OneItem:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, _index):
+            return inputs, target, {
+                "sample_id": "slide", "stratum": "test", "query_fingerprint": "fixed",
+            }
+
+    result = train_conditional_wae._validate(
+        model, OneItem(), device=torch.device("cpu"), seed=0,
+    )
+    assert result["rmse"] == pytest.approx(0.0, abs=1e-7)
+    assert result["conditional_mean_rmse"] == result["rmse"]
+    assert result["wae_prior_rmse"] > result["rmse"]
 
 
 def test_latent_spatial_correlation_zero_reproduces_the_historical_sampler():
@@ -1135,7 +1174,7 @@ def test_tensorboard_snapshot_is_bounded_aligned_and_has_he_thumbnails(monkeypat
         thumbnail_size=4,
     )
     prediction = {
-        "predictive_mean": target + 1,
+        "point_prediction": target + 1,
         "image_context": torch.arange(42, dtype=torch.float32).reshape(7, 6),
     }
     identity = {"stratum": "medium", "query_fingerprint": "fixed-mask"}
@@ -1187,6 +1226,7 @@ def test_tensorboard_snapshot_is_bounded_aligned_and_has_he_thumbnails(monkeypat
     logger.add_snapshot(10, accumulator)
     assert {entry[0] for entry in writer.scalars} >= {
         "train/total", "train/prior", "validation/total", "validation/rmse",
+        "validation/point_total", "validation/point_rmse",
     }
     assert len(writer.embeddings) == 4
     assert sum("label_img" in kwargs for _args, kwargs in writer.embeddings) == 2
@@ -1411,6 +1451,38 @@ def _whole_slide_sample(n=15, genes=7, image_dim=16, seed=0, sample_id="slide"):
             var_names=[f"g{i}" for i in range(genes)],
         ),
     )
+
+
+def test_whole_slide_matches_masked_inference_with_active_spatial_refinement():
+    sample = _whole_slide_sample(n=15, seed=11)
+    inputs, _target = build_conditional_wae_example(
+        sample, query_indices=None, include_observed_gex=False,
+    )
+    model = _refining_model(2)
+    # Make refinement genuinely non-identity so this catches the historical
+    # whole-slide path that silently skipped it.
+    with torch.no_grad():
+        for parameter in model.spatial_refiner.update_head[-1].parameters():
+            parameter.add_(torch.randn_like(parameter) * 0.05)
+    model.eval()
+    expected = model.sample_predictive_distribution(
+        inputs, n_samples=4, generator=torch.Generator().manual_seed(19),
+    )
+    actual = predict_whole_slide(
+        model, sample, chunk_size=4, n_samples=4, seed=19,
+    )
+    torch.testing.assert_close(actual["point_prediction"], expected["point_prediction"])
+    torch.testing.assert_close(actual["predictive_mean"], expected["predictive_mean"])
+    torch.testing.assert_close(actual["predictive_std"], expected["predictive_std"])
+
+
+def test_whole_slide_output_is_independent_of_decoder_chunk_size():
+    sample = _whole_slide_sample(n=15, seed=12)
+    model = _refining_model(2).eval()
+    small = predict_whole_slide(model, sample, chunk_size=3, n_samples=3, seed=7)
+    large = predict_whole_slide(model, sample, chunk_size=100, n_samples=3, seed=7)
+    for key in ("point_prediction", "predictive_mean", "predictive_std"):
+        torch.testing.assert_close(small[key], large[key])
 
 
 def test_aggregate_whole_slide_metrics_averages_across_slides_ignoring_nan_auc():
