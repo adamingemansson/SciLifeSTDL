@@ -45,6 +45,37 @@ _PROVENANCE_FIELDS = (
 )
 
 
+def require_uni2_spot_cache_coverage(
+    cache_root: str | Path,
+    sample_ids,
+) -> dict:
+    """Fail before launching when any manifest sample lacks a UNI2 cache file.
+
+    This is intentionally a cheap file-coverage audit. The normal loader still
+    performs the full barcode/content/provenance validation when samples are
+    loaded.
+    """
+    root = Path(cache_root).expanduser().resolve()
+    if root.name == "uni2_gen3_spot_cache":
+        root = root.parent
+    cache_dir = root / "uni2_gen3_spot_cache"
+    required = sorted({str(sample_id) for sample_id in sample_ids})
+    missing = [sample_id for sample_id in required if not (cache_dir / f"{sample_id}.npz").is_file()]
+    if missing:
+        preview = ", ".join(missing[:15])
+        suffix = " ..." if len(missing) > 15 else ""
+        raise FileNotFoundError(
+            f"UNI2 cache {cache_dir} covers {len(required) - len(missing)}/{len(required)} "
+            f"manifest samples; missing {len(missing)}: {preview}{suffix}"
+        )
+    return {
+        "cache_root": str(root),
+        "cache_dir": str(cache_dir),
+        "required_samples": len(required),
+        "missing_samples": [],
+    }
+
+
 def validate_uni2_tile_encoder_provenance(source: str, provenance: dict) -> None:
     """Fail-closed validation of a real UNI2 tile-encoder provenance dict
     (the same shape `FrozenUNI2TileEncoder.identity`/`build_uni2_spot_

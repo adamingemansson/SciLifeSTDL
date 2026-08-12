@@ -25,6 +25,7 @@ import yaml
 from gen3_multiscale.conditional_wae.contract import static_audit_conditional_wae_config
 from gen3_multiscale.data.dataset_manifest import load_dataset_manifest
 from gen3_multiscale.evaluation.train_gene_panels import load_train_derived_gene_panels
+from gen3_multiscale.gen4.uni2_spot_cache import require_uni2_spot_cache_coverage
 from gen3_multiscale.scripts.prepare_conditional_wae_suite import (
     _absolutize_existing_source_paths,
     _source_repository_root,
@@ -93,6 +94,9 @@ def prepare_mk_architecture_suite(
 
     manifest_path = Path(manifest).expanduser().resolve()
     dataset_manifest = load_dataset_manifest(manifest_path)
+    require_uni2_spot_cache_coverage(
+        uni2_cache, dataset_manifest["samples"],
+    )
     panel_path = Path(train_gene_panels).expanduser().resolve()
     panel_artifact = load_train_derived_gene_panels(panel_path, dataset_manifest)
     required = {"train_log1p_variance_top50", "train_log1p_variance_top200"}

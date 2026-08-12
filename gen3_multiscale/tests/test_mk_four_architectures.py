@@ -205,6 +205,7 @@ def test_suite_preparer_writes_four_gpu_mask_safe_configs(tmp_path, monkeypatch)
         "validation_sample_ids": ["v0"],
         "samples": {"v0": {"organ": "kidney"}},
     }
+    (uni2_cache / "v0.npz").touch()
     monkeypatch.setattr(suite_module, "load_dataset_manifest", lambda _path: manifest)
     monkeypatch.setattr(
         suite_module, "load_train_derived_gene_panels",

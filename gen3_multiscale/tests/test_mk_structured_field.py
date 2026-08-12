@@ -341,6 +341,8 @@ def test_suite_preparer_writes_four_audited_configs(tmp_path, monkeypatch):
             "c": {"organ": "lung"}, "v0": {"organ": "kidney"},
         },
     }
+    for sample_id in manifest["samples"]:
+        (uni2_cache / f"{sample_id}.npz").touch()
     artifact = _fit_artifact()
     structure_path = save_centered_gene_structure_artifact(
         artifact, tmp_path / "structure.pt",
@@ -415,6 +417,8 @@ def test_suite_preparer_writes_structured_latent_families(
         "samples": {"a": {"organ": "kidney"}, "b": {"organ": "kidney"},
                     "c": {"organ": "lung"}, "v0": {"organ": "kidney"}},
     }
+    for sample_id in manifest["samples"]:
+        (uni2_cache / f"{sample_id}.npz").touch()
     artifact = _fit_artifact()
     structure_path = save_centered_gene_structure_artifact(
         artifact, tmp_path / family / "structure.pt",
