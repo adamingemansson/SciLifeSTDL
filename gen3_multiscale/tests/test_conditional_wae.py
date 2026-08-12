@@ -599,7 +599,10 @@ def test_masked_validation_uses_the_deterministic_point_prediction_as_primary():
     result = train_conditional_wae._validate(
         model, OneItem(), device=torch.device("cpu"), seed=0,
     )
-    assert result["rmse"] == pytest.approx(0.0, abs=1e-7)
+    # rmse_pcc_reconstruction_loss deliberately evaluates sqrt(MSE + 1e-8)
+    # for finite gradients at an exact match, so its perfect-prediction floor
+    # is 1e-4 rather than zero.
+    assert result["rmse"] == pytest.approx(1.0e-4, abs=1e-8)
     assert result["conditional_mean_rmse"] == result["rmse"]
     assert result["wae_prior_rmse"] > result["rmse"]
 
