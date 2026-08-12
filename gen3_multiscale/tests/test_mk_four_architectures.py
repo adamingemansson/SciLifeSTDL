@@ -229,6 +229,7 @@ def test_suite_preparer_writes_four_gpu_mask_safe_configs(tmp_path, monkeypatch)
         # only visible logical device rather than cuda:<physical id>.
         assert config["training"]["device"] == "cuda"
         assert config["data"]["image_encoder"] == "uni2"
+        assert config["data"]["gen3_uni2_spot_feature_cache_dir"] == str(cache)
         assert config["data"]["retain_patches_in_memory"] is False
         assert config["model"]["params"]["n_refinement_steps"] == 0
     assert (root.parent / "LATEST_MK_FOUR_ARCHITECTURE_SUITE_ROOT.txt").read_text().strip() == str(root)

@@ -293,7 +293,16 @@ def cfg_cache_root(cfg) -> Path:
     needed)."""
     configured = cfg.data.get("gen3_uni2_spot_feature_cache_dir")
     if configured:
-        return Path(str(configured))
+        configured_path = Path(str(configured))
+        # Historical configs use both meanings for the unfortunately named
+        # `*_cache_dir` field: some store the parent cache root, while others
+        # store the concrete `uni2_gen3_spot_cache/` directory. `_cache_path`
+        # appends that fixed directory itself, so canonicalize the latter to
+        # its parent instead of silently producing
+        # `uni2_gen3_spot_cache/uni2_gen3_spot_cache/<sample>.npz`.
+        if configured_path.name == "uni2_gen3_spot_cache":
+            return configured_path.parent
+        return configured_path
     cache_root = cfg.data.get("hest_cache_dir", cfg.data.hest_data_dir)
     return Path(str(cache_root))
 

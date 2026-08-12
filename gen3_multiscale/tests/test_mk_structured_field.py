@@ -367,6 +367,7 @@ def test_suite_preparer_writes_four_audited_configs(tmp_path, monkeypatch):
         assert config["model"]["regularizer"] == "none"
         assert config["model"]["include_observed_gex"] is False
         assert config["data"]["image_encoder"] == "uni2"
+        assert config["data"]["gen3_uni2_spot_feature_cache_dir"] == str(cache)
         structured = config["evaluation"]["structured_field_metrics"]
         assert structured["enabled"] is True
         assert structured["all_split_slides"] is True

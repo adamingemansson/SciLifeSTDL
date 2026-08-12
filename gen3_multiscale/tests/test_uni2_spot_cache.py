@@ -168,6 +168,15 @@ def test_cfg_cache_root_respects_an_explicit_override(tmp_path):
     assert cfg_cache_root(cfg) == override
 
 
+def test_cfg_cache_root_accepts_the_concrete_uni2_cache_directory(tmp_path):
+    concrete = tmp_path / "uni2_gen3_spot_cache"
+    cfg = OmegaConf.create({"data": {
+        "gen3_uni2_spot_feature_cache_dir": str(concrete),
+        "hest_data_dir": str(tmp_path),
+    }})
+    assert cfg_cache_root(cfg) == tmp_path
+
+
 def test_cfg_cache_root_falls_back_to_hest_cache_dir(tmp_path):
     cfg = OmegaConf.create({"data": {"hest_data_dir": str(tmp_path / "hest1k")}})
     assert cfg_cache_root(cfg) == tmp_path / "hest1k"

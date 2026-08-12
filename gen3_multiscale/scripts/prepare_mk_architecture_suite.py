@@ -71,9 +71,13 @@ def prepare_mk_architecture_suite(
         raise ValueError("gpus must contain four distinct GPU ids")
     if not uni2_pinned_revision:
         raise ValueError("uni2_pinned_revision must be a pinned UNI2 commit")
-    uni2_cache = Path(uni2_spot_feature_cache_dir).expanduser().resolve()
-    if not uni2_cache.is_dir():
-        raise FileNotFoundError(f"UNI2 spot cache directory does not exist: {uni2_cache}")
+    uni2_input = Path(uni2_spot_feature_cache_dir).expanduser().resolve()
+    uni2_cache = uni2_input.parent if uni2_input.name == "uni2_gen3_spot_cache" else uni2_input
+    if not (uni2_cache / "uni2_gen3_spot_cache").is_dir():
+        raise FileNotFoundError(
+            "UNI2 cache root must contain uni2_gen3_spot_cache/: "
+            f"{uni2_cache}"
+        )
 
     root = Path(output_root).expanduser().resolve()
     if root.exists():
