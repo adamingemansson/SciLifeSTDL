@@ -168,6 +168,38 @@ def test_within_between_gradient_and_combined_have_exact_components():
             assert losses["wide_gradient_loss"] == 0
 
 
+@pytest.mark.parametrize(
+    "composition,expected",
+    [
+        ("within_then_between", 4.0),
+        ("between_then_within", 3.0),
+        ("within_between_within", 5.0),
+        ("parallel_gated", 1.2),
+    ],
+)
+def test_deterministic_structured_compositions_are_real_and_ordered(
+    monkeypatch, composition, expected,
+):
+    artifact = _fit_artifact()
+    model = DeterministicSpatialPredictor(
+        6, _spatial(), hidden_dim=20, gene_structure_artifact=artifact,
+        n_refinement_steps=1, per_gene_scale=artifact.per_gene_scale,
+        structured_composition=composition,
+    )
+    monkeypatch.setattr(model, "_apply_within", lambda expression: expression + 1.0)
+    monkeypatch.setattr(
+        model, "_apply_between",
+        lambda expression, _context, _inputs: expression * 2.0,
+    )
+    expression = torch.ones(4, 6)
+    output = model.refine_prediction(expression, torch.zeros(4, 16), _inputs())
+    torch.testing.assert_close(output, torch.full_like(output, expected))
+    if composition == "parallel_gated":
+        torch.testing.assert_close(model.composition_gates(), torch.tensor([0.1, 0.1]))
+    else:
+        assert model.composition_gates() is None
+
+
 def _contract(arm, design, family="deterministic"):
     conditioner, structure, refinement, local_gradient, wide_gradient = design
     if family == "deterministic":
@@ -264,6 +296,40 @@ def test_training_factory_builds_each_structured_field_arm(tmp_path):
         assert model.n_refinement_steps == design[2]
         assert (model.local_gradient_weight > 0) is design[3]
         assert (model.wide_gradient_weight > 0) is design[4]
+
+
+def test_composition_contract_and_factory_fail_closed(tmp_path):
+    artifact = _fit_artifact()
+    path = save_centered_gene_structure_artifact(artifact, tmp_path / "structure.pt")
+    compositions = {
+        "mk_wb_serial": "within_then_between",
+        "mk_bw_serial": "between_then_within",
+        "mk_wbw_sandwich": "within_between_within",
+        "mk_wb_parallel_gated": "parallel_gated",
+    }
+    design = ("spatial", True, 1, False, False)
+    for arm, composition in compositions.items():
+        config = _contract(arm, design)
+        config["model"]["params"]["structured_composition"] = composition
+        config["model"]["params"].update({
+            "image_feature_dim": 12, "hidden_dim": 16,
+            "gex_feature_dim": 5, "autoencoder_hidden_dim": 20,
+        })
+        config["data"]["centered_gene_structure_path"] = str(path)
+        config["data"]["centered_gene_structure_basis_sha256"] = artifact.metadata["basis_sha256"]
+        audit = static_audit_conditional_wae_config(config)
+        assert audit["structured_composition"] == composition
+        model = _build_model(config, 6, gene_names=[f"g{i}" for i in range(6)])
+        assert model.structured_composition == composition
+        assert model.coexpression_refinement is not None
+        assert model.spatial_refiner is not None
+        assert model.local_gradient_weight == model.wide_gradient_weight == 0
+
+        broken = copy.deepcopy(config)
+        broken["model"]["params"]["structured_composition"] = "within_then_between"
+        if composition != "within_then_between":
+            with pytest.raises(ValueError, match="structured composition"):
+                static_audit_conditional_wae_config(broken)
 
 
 @pytest.mark.parametrize(
@@ -374,6 +440,33 @@ def test_suite_preparer_writes_four_audited_configs(tmp_path, monkeypatch):
         assert structured["enabled"] is True
         assert structured["all_split_slides"] is True
         assert (structured["local_k"], structured["wide_k"]) == (6, 18)
+
+    composition_root = tmp_path / "composition-suite"
+    composition_plan = suite_module.prepare_mk_structured_field_suite(
+        comparison_config=str(comparison), manifest=str(manifest_path),
+        train_gene_panels=str(panels_path),
+        centered_gene_structure=str(structure_path), output_root=str(composition_root),
+        uni2_pinned_revision="pinned", uni2_spot_feature_cache_dir=str(uni2_cache),
+        family="deterministic_composition",
+    )
+    assert tuple(composition_plan["arm_order"]) == suite_module.COMPOSITION_ARM_ORDER
+    expected_compositions = {
+        "mk_wb_serial": "within_then_between",
+        "mk_bw_serial": "between_then_within",
+        "mk_wbw_sandwich": "within_between_within",
+        "mk_wb_parallel_gated": "parallel_gated",
+    }
+    for arm, expected_composition in expected_compositions.items():
+        config = yaml.safe_load(
+            (composition_root / "configs" / f"{arm}.yaml").read_text()
+        )
+        audit = static_audit_conditional_wae_config(config)
+        assert audit["passed"]
+        assert audit["structured_composition"] == expected_composition
+        assert config["model"]["params"]["use_centered_gene_structure"] is True
+        assert config["model"]["params"]["n_refinement_steps"] == 1
+        assert config["loss"]["local_gradient_weight"] == 0
+        assert config["loss"]["wide_gradient_weight"] == 0
 
 
 @pytest.mark.parametrize(

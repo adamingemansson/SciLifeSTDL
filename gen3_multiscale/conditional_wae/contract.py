@@ -23,6 +23,10 @@ ARM_SPECS = {
     "mk_field_between": ConditionalWAEArmSpec("he_to_st", "none", False),
     "mk_field_gradient": ConditionalWAEArmSpec("he_to_st", "none", False),
     "mk_field_combined": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_wb_serial": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_bw_serial": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_wbw_sandwich": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_wb_parallel_gated": ConditionalWAEArmSpec("he_to_st", "none", False),
     "wae_within": ConditionalWAEArmSpec("he_to_st", "mmd", False),
     "wae_between": ConditionalWAEArmSpec("he_to_st", "mmd", False),
     "wae_gradient": ConditionalWAEArmSpec("he_to_st", "mmd", False),
@@ -131,6 +135,12 @@ _MK_STRUCTURED_FIELD_DESIGNS = {
     "cwae_between": ("spatial", False, 1, False, False),
     "cwae_gradient": ("local", False, 0, True, True),
     "cwae_combined": ("spatial", True, 1, True, True),
+    # Clean deterministic composition screen: both structured mechanisms are
+    # present, while gradient supervision stays off in every arm.
+    "mk_wb_serial": ("spatial", True, 1, False, False),
+    "mk_bw_serial": ("spatial", True, 1, False, False),
+    "mk_wbw_sandwich": ("spatial", True, 1, False, False),
+    "mk_wb_parallel_gated": ("spatial", True, 1, False, False),
 }
 _MK_STRUCTURED_FIELD_FAMILIES = {
     "mk_field_within": ("none", True),
@@ -145,7 +155,21 @@ _MK_STRUCTURED_FIELD_FAMILIES = {
     "cwae_between": ("conditional", False),
     "cwae_gradient": ("conditional", False),
     "cwae_combined": ("conditional", False),
+    "mk_wb_serial": ("none", True),
+    "mk_bw_serial": ("none", True),
+    "mk_wbw_sandwich": ("none", True),
+    "mk_wb_parallel_gated": ("none", True),
 }
+_MK_STRUCTURED_COMPOSITIONS = {
+    "mk_wb_serial": "within_then_between",
+    "mk_bw_serial": "between_then_within",
+    "mk_wbw_sandwich": "within_between_within",
+    "mk_wb_parallel_gated": "parallel_gated",
+}
+_VALID_STRUCTURED_COMPOSITIONS = frozenset({
+    "within_then_between", "between_then_within",
+    "within_between_within", "parallel_gated",
+})
 
 
 def static_audit_conditional_wae_config(config: dict) -> dict:
@@ -182,6 +206,14 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
                       "refinement_gex_feature_dim"):
             if int(params.get(field, 1)) < 1:
                 raise ValueError(f"model.params.{field} must be positive")
+    structured_composition = str(
+        params.get("structured_composition", "within_then_between")
+    )
+    if structured_composition not in _VALID_STRUCTURED_COMPOSITIONS:
+        raise ValueError(
+            "model.params.structured_composition must be one of "
+            f"{sorted(_VALID_STRUCTURED_COMPOSITIONS)}"
+        )
     likelihood = str(params.get("likelihood", "gaussian_mse"))
     if likelihood not in {"gaussian_mse", "zero_inflated_gaussian"}:
         raise ValueError(
@@ -224,6 +256,11 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
             if n_refinement_steps != 0:
                 raise ValueError("deterministic MK arm tests the transformer only; spatial refinement must be off")
     elif is_new_mk_arm:
+        if structured_composition != "within_then_between":
+            raise ValueError(
+                "non-default structured composition is currently defined only for "
+                "deterministic predictors"
+            )
         if model.get("regularizer") != "mmd" and prior_mode == "conditional":
             raise ValueError("conditional prior is currently supported only with WAE-MMD")
         if encoder_conditioning != "film":
@@ -267,6 +304,14 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
         if actual != expected:
             raise ValueError(
                 f"{arm}: structured-field design {actual} does not match immutable contract {expected}"
+            )
+        expected_composition = _MK_STRUCTURED_COMPOSITIONS.get(
+            arm, "within_then_between"
+        )
+        if structured_composition != expected_composition:
+            raise ValueError(
+                f"{arm}: structured composition {structured_composition!r} does not "
+                f"match immutable contract {expected_composition!r}"
             )
         if int(params.get("local_gradient_k", 0)) < 1 or int(params.get("wide_gradient_k", 0)) < 1:
             raise ValueError("structured-field gradient neighbourhood sizes must be positive")
@@ -336,4 +381,5 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
         "use_centered_gene_structure": bool(params.get("use_centered_gene_structure", False)),
         "local_gradient_weight": local_gradient_weight,
         "wide_gradient_weight": wide_gradient_weight,
+        "structured_composition": structured_composition,
     }

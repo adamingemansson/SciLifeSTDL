@@ -53,6 +53,28 @@ ARM_DESIGN = {
         "wide_gradient_weight": 0.025,
     },
 }
+COMPOSITION_ARM_ORDER = (
+    "mk_wb_serial",
+    "mk_bw_serial",
+    "mk_wbw_sandwich",
+    "mk_wb_parallel_gated",
+)
+COMPOSITION_ARM_DESIGN = {
+    arm: {
+        "conditioner_mode": "spatial",
+        "use_centered_gene_structure": True,
+        "n_refinement_steps": 1,
+        "local_gradient_weight": 0.0,
+        "wide_gradient_weight": 0.0,
+        "structured_composition": composition,
+    }
+    for arm, composition in zip(COMPOSITION_ARM_ORDER, (
+        "within_then_between",
+        "between_then_within",
+        "within_between_within",
+        "parallel_gated",
+    ))
+}
 FAMILY_SPECS = {
     "deterministic": {
         "arm_order": ARM_ORDER, "regularizer": "none",
@@ -66,10 +88,16 @@ FAMILY_SPECS = {
         "arm_order": ("cwae_within", "cwae_between", "cwae_gradient", "cwae_combined"),
         "regularizer": "mmd", "prior_mode": "conditional", "deterministic_only": False,
     },
+    "deterministic_composition": {
+        "arm_order": COMPOSITION_ARM_ORDER, "regularizer": "none",
+        "prior_mode": "none", "deterministic_only": True,
+    },
 }
 
 
 def _design_for_arm(arm: str) -> dict:
+    if arm in COMPOSITION_ARM_DESIGN:
+        return COMPOSITION_ARM_DESIGN[arm]
     suffix = arm.removeprefix("mk_field_").removeprefix("cwae_").removeprefix("wae_")
     source = f"mk_field_{suffix}"
     if source not in ARM_DESIGN:
@@ -167,6 +195,7 @@ def prepare_mk_structured_field_suite(
         "conditional_prior_context_weight": 1.0,
         "conditional_prior_anchor_weight": 0.1,
         "z_noise_std": 0.0,
+        "structured_composition": "within_then_between",
     })
     seed = int((base.get("training") or {}).get("seed", 0))
     arms = {}
@@ -248,6 +277,7 @@ def prepare_mk_structured_field_suite(
             "model.params.film_shared_generator",
             "model.params.use_centered_gene_structure",
             "model.params.n_refinement_steps", "loss.local_gradient_weight",
+            "model.params.structured_composition",
             "loss.wide_gradient_weight", "training.checkpoint_dir",
             "evaluation.tensorboard.log_dir",
             "evaluation.structured_field_metrics",

@@ -45,6 +45,12 @@ from gen3_multiscale.conditional_wae.distributional import (
 VALID_LIKELIHOODS = ("gaussian_mse", "zero_inflated_gaussian")
 VALID_CONDITIONER_MODES = ("local", "spatial")
 VALID_PRIOR_MODES = ("standard", "conditional")
+VALID_STRUCTURED_COMPOSITIONS = (
+    "within_then_between",
+    "between_then_within",
+    "within_between_within",
+    "parallel_gated",
+)
 
 
 class LocalImageConditioner(nn.Module):
@@ -529,6 +535,7 @@ class DeterministicSpatialPredictor(nn.Module):
                  gene_structure_artifact: CenteredGeneStructureArtifact | None = None,
                  gene_structure_hidden_dim: int = 64,
                  n_refinement_steps: int = 0,
+                 structured_composition: str = "within_then_between",
                  refinement_k_neighbors: int = 6,
                  refinement_hidden_dim: int = 256,
                  refinement_gex_feature_dim: int = 256,
@@ -544,6 +551,11 @@ class DeterministicSpatialPredictor(nn.Module):
             raise ValueError("loss weights must be non-negative")
         if n_refinement_steps < 0:
             raise ValueError("n_refinement_steps must be non-negative")
+        if structured_composition not in VALID_STRUCTURED_COMPOSITIONS:
+            raise ValueError(
+                "structured_composition must be one of "
+                f"{VALID_STRUCTURED_COMPOSITIONS}"
+            )
         if local_gradient_k < 1 or wide_gradient_k < 1:
             raise ValueError("gradient neighbourhood sizes must be positive")
         self.n_genes = int(n_genes)
@@ -564,6 +576,7 @@ class DeterministicSpatialPredictor(nn.Module):
         self.discriminator = None
         self.distributional_head = None
         self.n_refinement_steps = int(n_refinement_steps)
+        self.structured_composition = str(structured_composition)
         self.spatial_refiner = (
             SpatialExpressionRefiner(
                 n_genes, image_conditioner.hidden_dim,
@@ -572,6 +585,16 @@ class DeterministicSpatialPredictor(nn.Module):
                 k_neighbors=int(refinement_k_neighbors),
             )
             if self.n_refinement_steps > 0 else None
+        )
+        if self.structured_composition != "within_then_between":
+            if self.coexpression_refinement is None or self.spatial_refiner is None:
+                raise ValueError(
+                    f"structured_composition={self.structured_composition!r} requires "
+                    "both centered gene-structure and between-spot refinement"
+                )
+        self.composition_gate_logits = (
+            nn.Parameter(torch.full((2,), math.log(0.1 / 0.9), dtype=torch.float32))
+            if self.structured_composition == "parallel_gated" else None
         )
         if per_gene_scale is None:
             if local_gradient_weight > 0 or wide_gradient_weight > 0:
@@ -592,15 +615,22 @@ class DeterministicSpatialPredictor(nn.Module):
         self.latent_dim = 0
 
     def decode_base_from_context(self, context: torch.Tensor) -> torch.Tensor:
-        """Decode rows independently, then apply within-spot gene programs."""
-        prediction = self.conditional_mean_head(context)
-        if self.coexpression_refinement is not None:
-            prediction = self.coexpression_refinement(prediction)
-        return prediction
+        """Decode rows independently, before either structured correction.
 
-    def refine_prediction(self, expression: torch.Tensor, context: torch.Tensor,
-                          inputs: FullImageExpressionInputs) -> torch.Tensor:
-        """Apply the same between-spot field update in every inference path."""
+        Whole-slide inference chunks this row-independent operation, then
+        reassembles the complete slide before calling ``refine_prediction``.
+        Keeping every structured operation in that second stage prevents a
+        between-spot branch from accidentally seeing only a decoder chunk.
+        """
+        return self.conditional_mean_head(context)
+
+    def _apply_within(self, expression: torch.Tensor) -> torch.Tensor:
+        if self.coexpression_refinement is None:
+            return expression
+        return self.coexpression_refinement(expression)
+
+    def _apply_between(self, expression: torch.Tensor, context: torch.Tensor,
+                       inputs: FullImageExpressionInputs) -> torch.Tensor:
         if self.spatial_refiner is None or self.n_refinement_steps == 0:
             return expression
         coords = torch.as_tensor(inputs.coords, dtype=expression.dtype, device=expression.device)
@@ -612,6 +642,34 @@ class DeterministicSpatialPredictor(nn.Module):
             self.spatial_refiner, expression, context, query_coords,
             n_steps=self.n_refinement_steps,
         )
+
+    def refine_prediction(self, expression: torch.Tensor, context: torch.Tensor,
+                          inputs: FullImageExpressionInputs) -> torch.Tensor:
+        """Apply the configured within/between composition identically everywhere."""
+        if self.structured_composition == "within_then_between":
+            return self._apply_between(self._apply_within(expression), context, inputs)
+        if self.structured_composition == "between_then_within":
+            return self._apply_within(self._apply_between(expression, context, inputs))
+        if self.structured_composition == "within_between_within":
+            prediction = self._apply_within(expression)
+            prediction = self._apply_between(prediction, context, inputs)
+            return self._apply_within(prediction)
+        if self.structured_composition == "parallel_gated":
+            within = self._apply_within(expression)
+            between = self._apply_between(expression, context, inputs)
+            gates = torch.sigmoid(self.composition_gate_logits)
+            return (
+                expression
+                + gates[0] * (within - expression)
+                + gates[1] * (between - expression)
+            )
+        raise RuntimeError(f"unhandled structured composition {self.structured_composition!r}")
+
+    def composition_gates(self) -> torch.Tensor | None:
+        """Return learned within/between branch weights for diagnostics."""
+        if self.composition_gate_logits is None:
+            return None
+        return torch.sigmoid(self.composition_gate_logits)
 
     def predict_point_from_context(self, context: torch.Tensor,
                                    inputs: FullImageExpressionInputs) -> torch.Tensor:
@@ -663,7 +721,7 @@ class DeterministicSpatialPredictor(nn.Module):
             + self.local_gradient_weight * local_gradient
             + self.wide_gradient_weight * wide_gradient
         )
-        return {
+        result = {
             "total": total, "expression": point,
             "conditional_mean_expression": point,
             "latent": point.new_empty((point.shape[0], 0)),
@@ -674,6 +732,13 @@ class DeterministicSpatialPredictor(nn.Module):
             "local_gradient_loss": local_gradient,
             "wide_gradient_loss": wide_gradient,
         }
+        gates = self.composition_gates()
+        if gates is not None:
+            result.update({
+                "composition_gate_within": gates[0],
+                "composition_gate_between": gates[1],
+            })
+        return result
 
     @torch.no_grad()
     def sample_predictive_distribution(self, inputs: FullImageExpressionInputs,

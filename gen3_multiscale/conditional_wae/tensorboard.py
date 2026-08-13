@@ -283,6 +283,9 @@ class ConditionalWAETensorBoardLogger:
         for key in ("local_gradient_loss", "wide_gradient_loss"):
             if key in losses:
                 values[f"train/{key}"] = losses[key]
+        for key in ("composition_gate_within", "composition_gate_between"):
+            if key in losses:
+                values[f"train/{key}"] = losses[key]
         if learning_rate is not None:
             values["train/learning_rate"] = learning_rate
         for tag, value in values.items():
