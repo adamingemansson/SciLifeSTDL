@@ -231,6 +231,7 @@ def evaluate_conditional_wae(
     static_audit_conditional_wae_config(config)
     dataset_manifest = load_dataset_manifest(config["data"]["gen3_manifest_path"])
     split_ids = list(dataset_manifest[f"{split}_sample_ids"])
+    strata = list(config["masking"]["strata"])
     cfg_om = OmegaConf.create(config)
     samples, preflight_report = load_and_preflight_samples(
         cfg_om,
@@ -241,13 +242,13 @@ def evaluate_conditional_wae(
     schedule = build_gen3_mask_schedule(
         dataset_manifest,
         samples,
-        config["masking"]["strata"],
+        strata,
         split,
         split_counts={split: int(n_masks_per_sample)},
         split_seeds={split: 700_000 if split == "validation" else 900_000},
     )
     base_dataset = Gen3SpatialFieldDataset(
-        dataset_manifest, samples, schedule, config["masking"]["strata"],
+        dataset_manifest, samples, schedule, strata,
         novae_enabled=False,
     )
     base_dataset.validate_boundary_schedule()
@@ -276,7 +277,17 @@ def evaluate_conditional_wae(
     checkpoint_module.verify_gene_names(requested_checkpoint, gene_names)
     device = torch.device(device_name if torch.cuda.is_available() else "cpu")
     model = _build_model(config, len(gene_names), gene_names=gene_names).to(device)
-    checkpoint_module.load_trainable_state(model, requested_checkpoint)
+    # ``per_gene_scale`` is never learned: it is reconstructed as all ones
+    # for unstructured historical arms or loaded from the hash-verified,
+    # training-only centered-gene artifact for structured arms.  Older valid
+    # checkpoints predate this registered buffer, so allow precisely this
+    # deterministic buffer to be absent while retaining strict checks for all
+    # learned weights and every other persistent checkpoint buffer.
+    checkpoint_module.load_trainable_state(
+        model,
+        requested_checkpoint,
+        reconstructed_buffer_names={"per_gene_scale"},
+    )
     model.eval()
     has_latent_model = bool(getattr(model, "has_latent_model", True))
     if diagnose_latent and not has_latent_model:

@@ -154,8 +154,10 @@ def _is_frozen_backbone_module(module: nn.Module) -> bool:
 
 def _expected_trainable_state_names(model: nn.Module) -> set[str]:
     """The exact set of state_dict keys `save_trainable_state` saves --
-    every trainable parameter plus every buffer NOT owned by a frozen
-    backbone module. Shared by `save_trainable_state` (to build the saved
+    every trainable parameter plus every persistent buffer NOT owned by a
+    frozen backbone module. Nonpersistent buffers are reconstructed and, by
+    PyTorch contract, never appear in ``state_dict``. Shared by
+    `save_trainable_state` (to build the saved
     blob) and `load_trainable_state` (to validate a loaded blob has no
     unexpected keys -- Codex re-audit of commit 2162ff4, finding #3:
     "reject unexpected model-state keys, not only optimizer blob keys")
@@ -167,9 +169,23 @@ def _expected_trainable_state_names(model: nn.Module) -> set[str]:
         parts = buf_name.split(".")
         return any(".".join(parts[:i]) in frozen_module_names for i in range(1, len(parts)))
 
+    # ``named_buffers()`` includes buffers registered with
+    # ``persistent=False``, while ``state_dict()`` deliberately excludes
+    # them.  Save filtering is performed against ``state_dict()`` below, so
+    # requiring every named buffer during load would demand keys that could
+    # never have been saved.  Limit the buffer contract to persistent state.
+    persistent_buffer_names = set()
+    for module_name, module in model.named_modules():
+        nonpersistent = module._non_persistent_buffers_set
+        for local_name, value in module._buffers.items():
+            if value is None or local_name in nonpersistent:
+                continue
+            persistent_buffer_names.add(
+                f"{module_name}.{local_name}" if module_name else local_name
+            )
     names = set(trainable_names)
     for buf_name, _ in model.named_buffers():
-        if not _under_frozen_module(buf_name):
+        if buf_name in persistent_buffer_names and not _under_frozen_module(buf_name):
             names.add(buf_name)
     return names
 
@@ -850,7 +866,12 @@ def resolve_checkpoint_identity(checkpoint_dir: str | Path) -> CheckpointIdentit
     )
 
 
-def load_trainable_state(model: nn.Module, checkpoint_dir: str | Path) -> None:
+def load_trainable_state(
+    model: nn.Module,
+    checkpoint_dir: str | Path,
+    *,
+    reconstructed_buffer_names: set[str] | None = None,
+) -> None:
     """Load a previously-saved trainable state onto a freshly-constructed,
     architecturally-identical model. No-op if the checkpoint genuinely has
     no trainable_weights.pt (a fully-frozen model — verified by checking
@@ -905,9 +926,23 @@ def load_trainable_state(model: nn.Module, checkpoint_dir: str | Path) -> None:
     weights_path = in_dir / "trainable_weights.pt"
     trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
     expected_names = _expected_trainable_state_names(model)
+    reconstructed = set(reconstructed_buffer_names or ())
+    buffer_names = {name for name, _ in model.named_buffers()}
+    invalid_reconstructed = reconstructed - buffer_names
+    if invalid_reconstructed:
+        raise ValueError(
+            "reconstructed_buffer_names contains names that are not model buffers: "
+            f"{sorted(invalid_reconstructed)}"
+        )
+    trainable_overlap = reconstructed & trainable_names
+    if trainable_overlap:
+        raise ValueError(
+            "trainable parameters can never be treated as reconstructed buffers: "
+            f"{sorted(trainable_overlap)}"
+        )
     if weights_path.is_file():
         state = torch.load(weights_path, map_location="cpu")
-        missing = expected_names - set(state.keys())
+        missing = expected_names - set(state.keys()) - reconstructed
         if missing:
             raise RuntimeError(
                 f"saved weights at {in_dir} are missing expected trainable parameter(s)/buffer(s) this "
@@ -940,10 +975,11 @@ def load_trainable_state(model: nn.Module, checkpoint_dir: str | Path) -> None:
         # `trainable_names` makes "the whole file is missing" fail
         # exactly whenever "the file exists but is missing some expected
         # keys" would have failed too.
-        if expected_names:
+        required_names = expected_names - reconstructed
+        if required_names:
             raise RuntimeError(
                 f"{weights_path} is missing but this model architecture has expected trainable "
-                f"parameter(s)/buffer(s) {sorted(expected_names)}; the checkpoint at {in_dir} looks incomplete"
+                f"parameter(s)/buffer(s) {sorted(required_names)}; the checkpoint at {in_dir} looks incomplete"
             )
 
 

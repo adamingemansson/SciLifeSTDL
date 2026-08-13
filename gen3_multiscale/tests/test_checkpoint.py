@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from gen3_multiscale.training.checkpoint import (
-    save_checkpoint, load_trainable_state, load_training_state,
+    save_checkpoint, save_trainable_state, load_trainable_state, load_training_state,
     list_checkpoint_history, list_checkpoint_bundles, rollback_checkpoint,
     load_optimizer_and_rng_state, verify_gene_names, resolve_checkpoint_identity,
 )
@@ -47,6 +47,13 @@ class _FrozenWithBuffer(nn.Module):
         self.register_buffer("some_buffer", torch.zeros(3))
 
 
+class _TrainableWithNonPersistentBuffer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lin = nn.Linear(2, 2)
+        self.register_buffer("derived", torch.tensor([7.0]), persistent=False)
+
+
 def test_checkpoint_round_trip_preserves_trainable_weights_only():
     m = _Tiny()
     with torch.no_grad():
@@ -62,6 +69,36 @@ def test_checkpoint_round_trip_preserves_trainable_weights_only():
         # frozen submodule stays at its own fresh random init
         assert not torch.allclose(m2.frozen.weight, m.frozen.weight)
         assert load_training_state(tmp)["step"] == 100
+
+
+def test_checkpoint_does_not_require_nonpersistent_reconstructed_buffers():
+    model = _TrainableWithNonPersistentBuffer()
+    with tempfile.TemporaryDirectory() as tmp:
+        save_checkpoint(model, {"name": "derived"}, ["g"], tmp, step=1)
+        identity = resolve_checkpoint_identity(tmp)
+        state = torch.load(identity.resolved_dir / "trainable_weights.pt", map_location="cpu")
+        assert "derived" not in state
+        restored = _TrainableWithNonPersistentBuffer()
+        load_trainable_state(restored, tmp)
+        torch.testing.assert_close(restored.lin.weight, model.lin.weight)
+        torch.testing.assert_close(restored.derived, torch.tensor([7.0]))
+
+
+def test_explicit_reconstructed_buffer_may_be_absent_from_legacy_checkpoint():
+    model = _FrozenWithBuffer()
+    with tempfile.TemporaryDirectory() as tmp:
+        weights_path = save_trainable_state(model, tmp)
+        state = torch.load(weights_path, map_location="cpu")
+        del state["some_buffer"]
+        torch.save(state, weights_path)
+
+        restored = _FrozenWithBuffer()
+        load_trainable_state(
+            restored,
+            tmp,
+            reconstructed_buffer_names={"some_buffer"},
+        )
+        torch.testing.assert_close(restored.some_buffer, torch.zeros(3))
 
 
 def test_checkpoint_zero_trainable_params_still_saves_metadata():
