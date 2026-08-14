@@ -15,6 +15,24 @@ H-Optimus-1, 0.4197 for GenBio-PathFM, 0.4150 for H-Optimus-0, 0.4141 for
 UNI2-h and 0.3875 for GigaPath. Those values are **not** thresholds for Track B.
 They use different samples, panels and preprocessing.
 
+The official UNI2/GigaPath reproduction is prepared, but intentionally not
+launched, in
+`configs/benchmarks/hest_official_track_a_uni2_gigapath.yaml`. It pins the
+official nine tasks, official top-50 gene lists, HEST normalization, PCA-256
+and ridge. HEST downloads its benchmark data and extracts encoder embeddings
+on the first fold; UNI2 and GigaPath model access must therefore be available
+before launch. Record the HEST source commit and environment lock alongside
+the output. The launch command, when explicitly approved, is:
+
+```bash
+cd /data/adam.ingemansson/SciLifeSTDL-MK16/HEST
+python -u -m hest.bench.benchmark \
+  --config ../configs/benchmarks/hest_official_track_a_uni2_gigapath.yaml
+```
+
+Do not run this command merely to update Track B: it is a separate external
+benchmark contract and can download data and encoder weights.
+
 ## Track B — expanded exact split
 
 Purpose: compare methods on the real project objective. Use the immutable
@@ -147,7 +165,9 @@ python -u -m gen3_multiscale.evaluation.frozen_feature_ridge_artifact_evaluator 
   --cache-dir "$UNI2_CACHE" \
   --fit-report "$BENCHMARK_ROOT/uni2_pca256_ridge_validation.json" \
   --fit-artifact "$BENCHMARK_ROOT/uni2_pca256_ridge_validation.model.npz" \
-  --output "$BENCHMARK_ROOT/uni2_pca256_ridge_validation_rescored.json"
+  --output "$BENCHMARK_ROOT/uni2_pca256_ridge_validation_rescored.json" \
+  --per-gene-diagnostics-output \
+    "$BENCHMARK_ROOT/uni2_pca256_ridge_validation_rescored.per_gene.npz"
 ```
 
 This path fails closed on manifest path, gene order, encoder, missing-image
@@ -161,6 +181,36 @@ python -m gen3_multiscale.scripts.summarize_hest_mk_benchmarks \
   "$MK_EVALUATION_ROOT" "$STPATH_EVALUATION_ROOT" "$BENCHMARK_ROOT" \
   --output "$BENCHMARK_ROOT/comparable_results.csv"
 ```
+
+For the actual Track-B decision table, use the stricter auditor. It admits
+only exact 14-slide/every-spot normalized-log1p H&E-only reports and writes all
+rejection reasons. STPath remains visible but carries an explicit HEST-1k
+pretraining-overlap caveat.
+
+```bash
+python -m gen3_multiscale.scripts.build_hest_mk_track_b_leaderboard \
+  --ridge-report "$BENCHMARK_ROOT/uni2_pca256_ridge_validation_rescored.json" \
+  --roots "$MK_EVALUATION_ROOT" "$STPATH_EVALUATION_ROOT" "$BENCHMARK_ROOT" \
+  --output "$BENCHMARK_ROOT/track_b_whole_slide_leaderboard.tsv"
+```
+
+Add `--per-gene-diagnostics-output /path/to/METHOD.per_gene.npz` when
+re-scoring each MK, ridge/MLP or H&E-only STPath report. Then explain which
+genes drive each score and whether success tracks abundance, spatial
+autocorrelation, gradient energy or the count-split ceiling:
+
+```bash
+python -m gen3_multiscale.scripts.analyze_hest_mk_per_gene \
+  "$BENCHMARK_ROOT"/*.per_gene.npz \
+  --noise-ceiling "$NOISE_CEILING" \
+  --output-dir "$BENCHMARK_ROOT/per_gene_analysis"
+```
+
+The sidecar comparison fails if gene order, slide/patient identity, or any
+target-derived attribute differs between methods. It reports breadth
+(fractions of genes above PCC 0/0.1/0.2/0.3), top/bottom genes, and rank
+associations between performance and held-out gene properties. These are
+diagnostics; they must not be used to select training features.
 
 The versioned machine-readable contract and method registry are in
 `configs/benchmarks/hest_mk_2026.yaml`.

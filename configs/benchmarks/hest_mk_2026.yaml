@@ -9,7 +9,9 @@ tracks:
     protocol_source: https://github.com/mahmoodlab/HEST
     published_table_version: "2026-04-03"
     target_smoothing: false
-    status: requires_official_hest_checkout_and_folds
+    status: prepared_not_launched
+    prepared_config: configs/benchmarks/hest_official_track_a_uni2_gigapath.yaml
+    prepared_hest_commit: 3ddb5ea
   expanded_exact_split:
     purpose: project objective on the immutable 242-train/14-validation cohort
     primary_metric: whole_slide_gene_wise_pcc_patient_macro

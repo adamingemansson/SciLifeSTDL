@@ -141,6 +141,14 @@ Keep these four scopes distinct:
 - [ ] Report per-slide, patient-macro 95% CIs and organ-stratified results.
 - [ ] Optionally report count-split noise-ceiling-adjusted PCC alongside—not
   instead of—ordinary PCC.
+- [ ] Save compressed per-gene whole-slide sidecars for every final method;
+  require identical gene/slide/target identity before comparing them.
+- [ ] Report whether model gains are broad across genes (fractions above PCC
+  0/0.1/0.2/0.3) or concentrated in a small high-performing subset.
+- [ ] Test associations between gene performance and held-out abundance,
+  variance, nonzero rate, Moran's I, gradient energy and count-split ceiling.
+- [ ] Build the final table with the fail-closed Track-B leaderboard auditor;
+  retain its accepted/rejected report audit JSON.
 - [ ] For latent arms, report deterministic conditional mean, posterior
   reconstruction and sampled inference separately.
 - [ ] Never call posterior reconstruction an inference result: it uses real GEX.

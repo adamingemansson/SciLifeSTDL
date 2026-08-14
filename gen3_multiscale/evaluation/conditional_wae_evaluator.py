@@ -28,6 +28,9 @@ from gen3_multiscale.evaluation.metrics import (
     gene_panel_metrics,
     resolve_gene_panels,
 )
+from gen3_multiscale.evaluation.per_gene_diagnostics import (
+    PerGeneDiagnosticsAccumulator,
+)
 from gen3_multiscale.evaluation.structured_field_metrics import (
     noise_ceiling_adjusted_pcc,
 )
@@ -214,6 +217,7 @@ def evaluate_conditional_wae(
     latent_spatial_correlation: float = 0.0,
     diagnose_latent: bool = False,
     noise_ceiling_path: str | None = None,
+    per_gene_diagnostics_output: str | None = None,
 ) -> dict:
     if split not in {"validation", "test"}:
         raise ValueError("split must be validation or test")
@@ -415,6 +419,10 @@ def evaluate_conditional_wae(
         (config.get("evaluation") or {}).get("structured_field_metrics") or {}
     )
     whole_slide_structured = None
+    if per_gene_diagnostics_output and not structured_config.get("enabled", False):
+        raise ValueError(
+            "--per-gene-diagnostics-output requires structured whole-slide evaluation"
+        )
     if structured_config.get("enabled", False):
         if config["model"]["task"] != "he_to_st" or config["model"]["include_observed_gex"]:
             raise ValueError(
@@ -433,6 +441,10 @@ def evaluate_conditional_wae(
         configured_ceiling = noise_ceiling_path or structured_config.get("noise_ceiling_path")
         ceiling_by_sample = _load_noise_ceiling(configured_ceiling, split=split)
         whole_slide_records = []
+        per_gene_accumulator = (
+            PerGeneDiagnosticsAccumulator(gene_names)
+            if per_gene_diagnostics_output else None
+        )
         for slide_index, sample_id in enumerate(split_ids):
             sample = samples[sample_id]
             prediction = predict_whole_slide(
@@ -475,18 +487,41 @@ def evaluate_conditional_wae(
                 "noise_ceiling_adjusted_pcc": ceiling_metrics,
             }
             whole_slide_records.append(record)
+            if per_gene_accumulator is not None:
+                per_gene_accumulator.add_slide(
+                    sample_id=sample_id,
+                    patient_id=str(sample.patient_id),
+                    organ=str(dataset_manifest["samples"][sample_id]["organ"]),
+                    predicted=prediction["point_prediction"].detach().cpu().numpy(),
+                    target=np.asarray(prediction["target"], dtype=np.float32),
+                    coords=np.asarray(prediction["coords"], dtype=np.float32),
+                    local_k=int(structured_config.get("local_k", 6)),
+                )
             print(
                 f"structured whole-slide evaluation progress: {slide_index + 1}/{len(split_ids)} "
                 f"sample={sample_id} spots={prediction['n_spots']}",
                 flush=True,
             )
             del prediction
+        per_gene_path = None
+        if per_gene_accumulator is not None:
+            per_gene_path = per_gene_accumulator.save(
+                per_gene_diagnostics_output,
+                provenance={
+                    "method": str(config["model"].get("arm") or Path(config_path).stem),
+                    "report_output": str(Path(output).expanduser().resolve()),
+                    "split": split,
+                    "target_space": "normalize_total_then_log1p",
+                    "primary_prediction": "deterministic_h_and_e_point_prediction",
+                },
+            )
         whole_slide_structured = {
             "scope": "all_held_out_slides_every_spot_exactly_once",
             "primary_prediction": "deterministic_h_and_e_point_prediction",
             "target_gex_visible_to_model": False,
             "gene_panels_are_training_derived": True,
             "noise_ceiling_path": str(configured_ceiling) if configured_ceiling else None,
+            "per_gene_diagnostics_path": str(per_gene_path) if per_gene_path else None,
             "per_slide_records": whole_slide_records,
             **_aggregate_whole_slide_structured_reports(whole_slide_records),
         }
@@ -625,6 +660,10 @@ def main() -> None:
         help="Optional count-split noise-ceiling JSON for reporting PCC as a fraction of "
              "measurable signal in the structured whole-slide section.",
     )
+    parser.add_argument(
+        "--per-gene-diagnostics-output",
+        help="Optional compressed NPZ with held-out slide-by-gene point and spatial diagnostics.",
+    )
     args = parser.parse_args()
     evaluate_conditional_wae(
         args.config,
@@ -640,6 +679,7 @@ def main() -> None:
         latent_spatial_correlation=args.latent_spatial_correlation,
         diagnose_latent=args.diagnose_latent,
         noise_ceiling_path=args.noise_ceiling,
+        per_gene_diagnostics_output=args.per_gene_diagnostics_output,
     )
 
 

@@ -37,6 +37,7 @@ from gen3_multiscale.evaluation.frozen_feature_ridge_evaluator import (
     _stable_indices,
 )
 from gen3_multiscale.evaluation.metrics import aggregate_patient_metrics, resolve_gene_panels
+from gen3_multiscale.evaluation.per_gene_diagnostics import PerGeneDiagnosticsAccumulator
 from gen3_multiscale.evaluation.structured_field_metrics import structured_field_metrics
 from gen3_multiscale.evaluation.train_gene_panels import load_train_derived_gene_panels
 from gen3_multiscale.data import spot_feature_cache
@@ -181,6 +182,7 @@ def evaluate_frozen_feature_mlp(
     seed: int = 0, local_k: int = 6, wide_k: int = 18,
     missing_image_policy: str = "zero", device_str: str = "cuda",
     linear_algebra_device: str = "cuda",
+    per_gene_diagnostics_output: str | None = None,
 ) -> dict:
     started = time.perf_counter()
     if image_encoder not in {"uni2", "gigapath"}:
@@ -326,6 +328,10 @@ def evaluate_frozen_feature_mlp(
     per_gene_scale = np.asarray(checkpoint["per_gene_scale"], dtype=np.float32)
 
     records = []
+    per_gene_accumulator = (
+        PerGeneDiagnosticsAccumulator(gene_names)
+        if per_gene_diagnostics_output else None
+    )
     with torch.no_grad():
         for position, sample_id in enumerate(split_ids):
             sample = _load_sample(cfg, manifest, sample_id)
@@ -356,6 +362,12 @@ def evaluate_frozen_feature_mlp(
                 "point_metrics": point,
                 "structured_field": structured,
             })
+            if per_gene_accumulator is not None:
+                per_gene_accumulator.add_slide(
+                    sample_id=sample_id, patient_id=str(sample.patient_id),
+                    organ=str(manifest["samples"][sample_id]["organ"]),
+                    predicted=predicted, target=target, coords=coords, local_k=local_k,
+                )
             print(
                 f"Whole-slide evaluation: {position + 1}/{len(split_ids)} "
                 f"sample={sample_id} spots={len(evaluated)}", flush=True,
@@ -382,6 +394,17 @@ def evaluate_frozen_feature_mlp(
         float(torch.cuda.max_memory_allocated(device) / (1024 ** 2))
         if device.type == "cuda" else 0.0
     )
+    per_gene_path = None
+    if per_gene_accumulator is not None:
+        per_gene_path = per_gene_accumulator.save(
+            per_gene_diagnostics_output,
+            provenance={
+                "method": f"{image_encoder}_pca_mlp",
+                "report_output": str(output_path), "split": split,
+                "target_space": "normalize_total_then_log1p",
+                "primary_prediction": "frozen_feature_mlp",
+            },
+        )
     report = {
         "version": 1,
         "kind": "frozen_feature_pca_mlp_whole_slide_benchmark",
@@ -418,6 +441,7 @@ def evaluate_frozen_feature_mlp(
         "point_metrics_by_organ": by_organ,
         "point_metrics_by_technology": by_technology,
         "per_slide_records": records,
+        "per_gene_diagnostics_path": str(per_gene_path) if per_gene_path else None,
         "model_artifact": str(checkpoint_path),
         "comparability_notes": {
             "primary": "whole-slide gene-wise PCC, patient macro average",
@@ -460,6 +484,7 @@ def main() -> None:
     parser.add_argument("--missing-image-policy", choices=("zero",), default="zero")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--linear-algebra-device", default="cuda")
+    parser.add_argument("--per-gene-diagnostics-output")
     args = parser.parse_args()
     evaluate_frozen_feature_mlp(
         config_path=args.config, output=args.output,
@@ -478,6 +503,7 @@ def main() -> None:
         local_k=args.local_k, wide_k=args.wide_k,
         missing_image_policy=args.missing_image_policy,
         device_str=args.device, linear_algebra_device=args.linear_algebra_device,
+        per_gene_diagnostics_output=args.per_gene_diagnostics_output,
     )
 
 

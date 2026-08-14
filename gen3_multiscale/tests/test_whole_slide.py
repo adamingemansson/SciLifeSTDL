@@ -96,8 +96,12 @@ def test_whole_slide_metrics_reports_all_genes_and_configured_panels():
     assert metrics["n_spots"] == 17
     assert metrics["sample_id"] == "slide"
     for arm in ("model", "conditional_mean"):
-        assert set(metrics["per_arm"][arm]["all_genes"]) == {"pcc", "rmse", "auc"}
-        assert set(metrics["per_arm"][arm]["small_panel"]) == {"pcc", "rmse", "auc"}
+        assert {"pcc", "rmse", "auc"}.issubset(
+            metrics["per_arm"][arm]["all_genes"]
+        )
+        assert {"pcc", "rmse", "auc"}.issubset(
+            metrics["per_arm"][arm]["small_panel"]
+        )
         assert np.isfinite(metrics["per_arm"][arm]["all_genes"]["rmse"])
 
 

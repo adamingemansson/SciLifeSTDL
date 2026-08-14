@@ -31,6 +31,7 @@ from gen3_multiscale.evaluation.frozen_feature_ridge_evaluator import (
     _panel_metrics,
 )
 from gen3_multiscale.evaluation.metrics import aggregate_patient_metrics, resolve_gene_panels
+from gen3_multiscale.evaluation.per_gene_diagnostics import PerGeneDiagnosticsAccumulator
 from gen3_multiscale.evaluation.structured_field_metrics import structured_field_metrics
 from gen3_multiscale.evaluation.train_gene_panels import load_train_derived_gene_panels
 from gen3_multiscale.data import spot_feature_cache
@@ -105,6 +106,7 @@ def evaluate_frozen_feature_ridge_artifact(
     image_encoder: str = "uni2", cache_dir: str | None = None,
     hest_data_dir: str | None = None, split: str = "validation",
     local_k: int = 6, wide_k: int = 18, missing_image_policy: str = "zero",
+    per_gene_diagnostics_output: str | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     if image_encoder not in {"uni2", "gigapath"}:
@@ -179,6 +181,10 @@ def evaluate_frozen_feature_ridge_artifact(
     if not isinstance(expected_provenance, dict) or not expected_provenance:
         raise ValueError("fit report lacks frozen-feature provenance")
     records: list[dict[str, Any]] = []
+    per_gene_accumulator = (
+        PerGeneDiagnosticsAccumulator(gene_names)
+        if per_gene_diagnostics_output else None
+    )
     for position, sample_id in enumerate(split_ids):
         sample = _load_sample(cfg, manifest, sample_id)
         actual_provenance = sample.tile_encoder_provenance["spot_features"]
@@ -207,6 +213,12 @@ def evaluate_frozen_feature_ridge_artifact(
                 panel_indices=panel_indices, local_k=local_k, wide_k=wide_k,
             ),
         })
+        if per_gene_accumulator is not None:
+            per_gene_accumulator.add_slide(
+                sample_id=sample_id, patient_id=str(sample.patient_id),
+                organ=str(manifest["samples"][sample_id]["organ"]),
+                predicted=predicted, target=target, coords=coords, local_k=local_k,
+            )
         print(
             f"Whole-slide re-evaluation: {position + 1}/{len(split_ids)} "
             f"sample={sample_id} spots={len(evaluated)}", flush=True,
@@ -227,6 +239,17 @@ def evaluate_frozen_feature_ridge_artifact(
         )
         for panel in records[0]["structured_field"]["panels"]
     }
+    per_gene_path = None
+    if per_gene_accumulator is not None:
+        per_gene_path = per_gene_accumulator.save(
+            per_gene_diagnostics_output,
+            provenance={
+                "method": f"{image_encoder}_pca_ridge",
+                "report_output": str(Path(output).expanduser().resolve()),
+                "split": split, "target_space": "normalize_total_then_log1p",
+                "primary_prediction": "frozen_feature_ridge",
+            },
+        )
     report = {
         **{
             key: value for key, value in fit_report.items()
@@ -249,6 +272,7 @@ def evaluate_frozen_feature_ridge_artifact(
             records, "technology",
         ),
         "per_slide_records": records,
+        "per_gene_diagnostics_path": str(per_gene_path) if per_gene_path else None,
         "reevaluation_runtime_seconds": float(time.perf_counter() - started),
         "parameter_count": int(coefficients.size),
         "comparability_notes": {
@@ -278,6 +302,7 @@ def main() -> None:
     parser.add_argument("--local-k", type=int, default=6)
     parser.add_argument("--wide-k", type=int, default=18)
     parser.add_argument("--missing-image-policy", choices=("zero", "exclude"), default="zero")
+    parser.add_argument("--per-gene-diagnostics-output")
     args = parser.parse_args()
     evaluate_frozen_feature_ridge_artifact(
         config_path=args.config, manifest_path=args.manifest,
@@ -287,6 +312,7 @@ def main() -> None:
         cache_dir=args.cache_dir, hest_data_dir=args.hest_data_dir,
         split=args.split, local_k=args.local_k, wide_k=args.wide_k,
         missing_image_policy=args.missing_image_policy,
+        per_gene_diagnostics_output=args.per_gene_diagnostics_output,
     )
 
 
