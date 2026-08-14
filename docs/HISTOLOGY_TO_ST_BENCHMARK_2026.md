@@ -78,6 +78,7 @@ python -u -m gen3_multiscale.evaluation.frozen_feature_ridge_evaluator \
   --ridge-spots-per-slide 2048 \
   --ridge-alpha 1.0 \
   --missing-image-policy zero \
+  --linear-algebra-device cuda:0 \
   --output "$BENCHMARK_ROOT/uni2_pca256_ridge_validation.json"
 ```
 

@@ -23,6 +23,7 @@ from typing import Any
 import numpy as np
 from omegaconf import OmegaConf
 from scipy import sparse
+import torch
 
 from gen3_multiscale.config_identity import resolved_config
 from gen3_multiscale.data.dataset_manifest import load_dataset_manifest
@@ -108,6 +109,69 @@ def _atomic_json(path: Path, payload: dict) -> None:
     os.replace(temporary, path)
 
 
+class _CovariancePCA:
+    """Small PCA projection fitted from bounded sufficient statistics."""
+
+    def __init__(self, mean: np.ndarray, components: np.ndarray):
+        self.mean_ = np.asarray(mean, dtype=np.float32)
+        self.components_ = np.asarray(components, dtype=np.float32)
+
+    def transform(self, features: np.ndarray) -> np.ndarray:
+        centered = np.asarray(features, dtype=np.float32) - self.mean_[None, :]
+        return centered @ self.components_.T
+
+
+def _fit_covariance_pca(
+    feature_sum: np.ndarray,
+    feature_cross_product: np.ndarray,
+    n_rows: int,
+    n_components: int,
+    device: str,
+) -> _CovariancePCA:
+    """Fit PCA without invoking NumPy/SciPy LAPACK.
+
+    The server's MKL build has repeatedly segfaulted in ``SLASWP`` during
+    randomized SVD. Computing the small feature covariance explicitly and
+    using torch's eigensolver on CUDA avoids that failure while producing the
+    same principal subspace from the exact bounded train-only sample.
+    """
+    if n_rows < 2:
+        raise ValueError("PCA requires at least two sampled training rows")
+    mean = np.asarray(feature_sum, dtype=np.float64) / float(n_rows)
+    covariance = (
+        np.asarray(feature_cross_product, dtype=np.float64)
+        - float(n_rows) * np.outer(mean, mean)
+    ) / float(n_rows - 1)
+    covariance = 0.5 * (covariance + covariance.T)
+    target_device = torch.device(device)
+    if target_device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"linear algebra device {device!r} requested but CUDA is unavailable")
+    covariance_tensor = torch.as_tensor(
+        covariance, dtype=torch.float64, device=target_device,
+    )
+    eigenvalues, eigenvectors = torch.linalg.eigh(covariance_tensor)
+    order = torch.argsort(eigenvalues, descending=True)[:n_components]
+    components = eigenvectors[:, order].T.cpu().numpy()
+    del covariance_tensor, eigenvalues, eigenvectors
+    if target_device.type == "cuda":
+        torch.cuda.empty_cache()
+    return _CovariancePCA(mean, components)
+
+
+def _solve_ridge(
+    xtx: np.ndarray, xty: np.ndarray, penalty: np.ndarray, device: str,
+) -> np.ndarray:
+    """Solve ridge normal equations without the server's unstable MKL LAPACK."""
+    target_device = torch.device(device)
+    lhs = torch.as_tensor(xtx + penalty, dtype=torch.float64, device=target_device)
+    rhs = torch.as_tensor(xty, dtype=torch.float64, device=target_device)
+    solution = torch.linalg.solve(lhs, rhs).cpu().numpy()
+    del lhs, rhs
+    if target_device.type == "cuda":
+        torch.cuda.empty_cache()
+    return solution
+
+
 def evaluate_frozen_feature_ridge(
     *, config_path: str, output: str, image_encoder: str,
     manifest_path: str | None = None, train_gene_panels_path: str | None = None,
@@ -116,6 +180,7 @@ def evaluate_frozen_feature_ridge(
     pca_spots_per_slide: int = 128, ridge_spots_per_slide: int = 2048,
     ridge_alpha: float = 1.0, seed: int = 0, local_k: int = 6,
     wide_k: int = 18, missing_image_policy: str = "zero",
+    linear_algebra_device: str = "cpu",
 ) -> dict:
     if image_encoder not in {"uni2", "gigapath"}:
         raise ValueError("image_encoder must be 'uni2' or 'gigapath'")
@@ -185,8 +250,12 @@ def evaluate_frozen_feature_ridge(
     panels = dict(panel_payload.get("panels") or {})
     panel_indices, panel_metadata = resolve_gene_panels(gene_names, panels) if panels else ({}, {})
 
-    # Pass 1: bounded, equal-per-slide train-only sample for PCA.
-    pca_rows = []
+    # Pass 1: bounded, equal-per-slide train-only covariance statistics for
+    # PCA. This avoids retaining/concatenating the sampled feature matrix and
+    # avoids the server's unstable MKL randomized-SVD path.
+    feature_sum = None
+    feature_cross_product = None
+    n_pca_rows = 0
     provenance_by_sample = {}
     for position, sample_id in enumerate(train_ids):
         sample = _load_sample(cfg, manifest, sample_id)
@@ -194,13 +263,19 @@ def evaluate_frozen_feature_ridge(
         chosen = candidates[_stable_indices(
             sample_id, len(candidates), pca_spots_per_slide, seed,
         )]
-        pca_rows.append(np.asarray(sample.precomputed_spot_features[chosen], dtype=np.float32))
+        rows = np.asarray(sample.precomputed_spot_features[chosen], dtype=np.float64)
+        if feature_sum is None:
+            feature_sum = np.zeros(rows.shape[1], dtype=np.float64)
+            feature_cross_product = np.zeros((rows.shape[1], rows.shape[1]), dtype=np.float64)
+        feature_sum += rows.sum(axis=0)
+        feature_cross_product += rows.T @ rows
+        n_pca_rows += len(rows)
         provenance_by_sample[sample_id] = sample.tile_encoder_provenance["spot_features"]
         print(
             f"PCA sampling: {position + 1}/{len(train_ids)} sample={sample_id} rows={len(chosen)}",
             flush=True,
         )
-        del sample
+        del sample, rows
     reference_provenance = provenance_by_sample[train_ids[0]]
     mismatched = [
         sample_id for sample_id, value in provenance_by_sample.items()
@@ -208,17 +283,21 @@ def evaluate_frozen_feature_ridge(
     ]
     if mismatched:
         raise ValueError(f"spot-feature provenance differs across samples: {mismatched[:10]}")
-    pca_matrix = np.concatenate(pca_rows, axis=0)
-    del pca_rows
-    maximum_components = min(pca_matrix.shape[0] - 1, pca_matrix.shape[1])
+    maximum_components = min(n_pca_rows - 1, len(feature_sum))
     if pca_components > maximum_components:
         raise ValueError(
             f"pca_components={pca_components} exceeds train-only sample rank {maximum_components}"
         )
-    from sklearn.decomposition import PCA
-    pca = PCA(n_components=pca_components, svd_solver="randomized", random_state=seed)
-    pca.fit(pca_matrix)
-    del pca_matrix
+    print(
+        f"PCA eigensolve: rows={n_pca_rows} features={len(feature_sum)} "
+        f"components={pca_components} device={linear_algebra_device}",
+        flush=True,
+    )
+    pca = _fit_covariance_pca(
+        feature_sum, feature_cross_product, n_pca_rows,
+        pca_components, linear_algebra_device,
+    )
+    del feature_sum, feature_cross_product
 
     # Pass 2: sufficient statistics for multi-output ridge and train-only
     # per-gene scales. The intercept is not regularized.
@@ -249,7 +328,8 @@ def evaluate_frozen_feature_ridge(
         del sample, x, x_augmented, y
     penalty = np.eye(augmented_dim, dtype=np.float64) * float(ridge_alpha)
     penalty[-1, -1] = 0.0
-    coefficients = np.linalg.solve(xtx + penalty, xty)
+    print(f"Ridge solve: device={linear_algebra_device}", flush=True)
+    coefficients = _solve_ridge(xtx, xty, penalty, linear_algebra_device)
     train_mean = target_sum / n_train_rows
     per_gene_scale = np.sqrt(np.maximum(
         target_sum_squared / n_train_rows - np.square(train_mean), 0.0,
@@ -357,6 +437,8 @@ def evaluate_frozen_feature_ridge(
         "target_space": manifest.get("build_args", {}).get("expression_transform"),
         "expression_target_sum": manifest.get("build_args", {}).get("expression_target_sum"),
         "pca_components": int(pca_components),
+        "pca_method": "train_only_bounded_covariance_eigh",
+        "linear_algebra_device": linear_algebra_device,
         "pca_spots_per_slide": int(pca_spots_per_slide),
         "ridge_spots_per_slide": int(ridge_spots_per_slide),
         "ridge_alpha": float(ridge_alpha),
@@ -407,6 +489,10 @@ def main() -> None:
         "--missing-image-policy", choices=("zero", "exclude"), default="zero",
         help="Use zero-placeholder cache rows (MK-comparable default) or exclude missing H&E spots.",
     )
+    parser.add_argument(
+        "--linear-algebra-device", default="cpu",
+        help="Torch device for PCA eigensolve and ridge solve; use cuda on the server to avoid MKL.",
+    )
     args = parser.parse_args()
     evaluate_frozen_feature_ridge(
         config_path=args.config,
@@ -425,6 +511,7 @@ def main() -> None:
         local_k=args.local_k,
         wide_k=args.wide_k,
         missing_image_policy=args.missing_image_policy,
+        linear_algebra_device=args.linear_algebra_device,
     )
 
 

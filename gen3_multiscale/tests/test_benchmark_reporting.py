@@ -5,6 +5,8 @@ import numpy as np
 
 from gen3_multiscale.evaluation.frozen_feature_ridge_evaluator import (
     _candidate_indices,
+    _fit_covariance_pca,
+    _solve_ridge,
     _stable_indices,
 )
 from gen3_multiscale.scripts.summarize_hest_mk_benchmarks import rows_from_report
@@ -28,6 +30,26 @@ def test_candidate_indices_match_zero_placeholder_contract():
 
     assert _candidate_indices(Sample(), "zero").tolist() == [0, 1, 2, 3]
     assert _candidate_indices(Sample(), "exclude").tolist() == [0, 2]
+
+
+def test_covariance_pca_and_torch_ridge_avoid_numpy_lapack():
+    rng = np.random.default_rng(4)
+    features = rng.normal(size=(40, 6))
+    pca = _fit_covariance_pca(
+        features.sum(axis=0), features.T @ features,
+        len(features), n_components=3, device="cpu",
+    )
+    projected = pca.transform(features)
+    assert projected.shape == (40, 3)
+    assert np.allclose(projected.mean(axis=0), 0.0, atol=1e-6)
+
+    x = np.column_stack([projected, np.ones(len(projected))])
+    truth = rng.normal(size=(40, 5))
+    penalty = np.eye(x.shape[1])
+    penalty[-1, -1] = 0.0
+    actual = _solve_ridge(x.T @ x, x.T @ truth, penalty, "cpu")
+    expected = np.linalg.solve(x.T @ x + penalty, x.T @ truth)
+    assert np.allclose(actual, expected)
 
 
 def test_summary_parser_emits_patient_macro_ridge_row(tmp_path: Path):
