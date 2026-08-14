@@ -4,8 +4,11 @@ from pathlib import Path
 import numpy as np
 
 from gen3_multiscale.evaluation.frozen_feature_ridge_evaluator import (
+    _CovariancePCA,
     _candidate_indices,
     _fit_covariance_pca,
+    _positive_gene_scale,
+    _save_fit_artifact,
     _solve_ridge,
     _stable_indices,
 )
@@ -50,6 +53,35 @@ def test_covariance_pca_and_torch_ridge_avoid_numpy_lapack():
     actual = _solve_ridge(x.T @ x, x.T @ truth, penalty, "cpu")
     expected = np.linalg.solve(x.T @ x + penalty, x.T @ truth)
     assert np.allclose(actual, expected)
+
+
+def test_gene_scale_floors_only_constant_genes_and_fit_is_saved(tmp_path: Path):
+    target = np.asarray([
+        [1.0, 2.0, 4.0],
+        [1.0, 4.0, 4.0],
+        [1.0, 6.0, 4.0],
+    ])
+    scale, n_floored = _positive_gene_scale(
+        target.sum(axis=0), np.square(target).sum(axis=0), len(target),
+    )
+    assert n_floored == 2
+    assert scale[0] == np.float32(1e-6)
+    assert scale[1] > 0
+    assert scale[2] == np.float32(1e-6)
+
+    artifact = tmp_path / "ridge.model.npz"
+    pca = _CovariancePCA(np.zeros(2), np.eye(2))
+    _save_fit_artifact(
+        artifact,
+        pca=pca,
+        coefficients=np.ones((3, 3)),
+        per_gene_scale=scale,
+        gene_names=["g0", "g1", "g2"],
+    )
+    with np.load(artifact, allow_pickle=False) as payload:
+        assert payload["coefficients"].shape == (3, 3)
+        assert np.all(payload["per_gene_scale"] > 0)
+        assert payload["gene_names"].tolist() == ["g0", "g1", "g2"]
 
 
 def test_summary_parser_emits_patient_macro_ridge_row(tmp_path: Path):

@@ -172,6 +172,61 @@ def _solve_ridge(
     return solution
 
 
+def _positive_gene_scale(
+    target_sum: np.ndarray,
+    target_sum_squared: np.ndarray,
+    n_rows: int,
+    *,
+    floor: float = 1e-6,
+) -> tuple[np.ndarray, int]:
+    """Return finite positive train-only gene scales for spatial metrics.
+
+    Some genes can be constant in the bounded ridge sample. Their empirical
+    standard deviation is exactly zero, but the structured-field metrics use
+    the scale as a divisor and therefore require a strictly positive value.
+    Flooring only those degenerate scales preserves every non-degenerate
+    training standard deviation and matches the training-side convention.
+    """
+    if n_rows < 1:
+        raise ValueError("gene-scale estimation requires at least one row")
+    if not np.isfinite(floor) or floor <= 0:
+        raise ValueError("gene-scale floor must be finite and positive")
+    mean = np.asarray(target_sum, dtype=np.float64) / float(n_rows)
+    variance = np.maximum(
+        np.asarray(target_sum_squared, dtype=np.float64) / float(n_rows)
+        - np.square(mean),
+        0.0,
+    )
+    scale = np.sqrt(variance)
+    if not np.isfinite(scale).all():
+        raise ValueError("train-only per-gene scales contain non-finite values")
+    n_floored = int(np.count_nonzero(scale < floor))
+    return np.clip(scale, floor, None).astype(np.float32), n_floored
+
+
+def _save_fit_artifact(
+    path: Path,
+    *,
+    pca: _CovariancePCA,
+    coefficients: np.ndarray,
+    per_gene_scale: np.ndarray,
+    gene_names: list[str],
+) -> None:
+    """Atomically persist the expensive fit before held-out evaluation."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    with temporary.open("wb") as handle:
+        np.savez_compressed(
+            handle,
+            pca_mean=pca.mean_.astype(np.float32),
+            pca_components=pca.components_.astype(np.float32),
+            coefficients=np.asarray(coefficients, dtype=np.float32),
+            per_gene_scale=np.asarray(per_gene_scale, dtype=np.float32),
+            gene_names=np.asarray(gene_names),
+        )
+    os.replace(temporary, path)
+
+
 def evaluate_frozen_feature_ridge(
     *, config_path: str, output: str, image_encoder: str,
     manifest_path: str | None = None, train_gene_panels_path: str | None = None,
@@ -330,10 +385,27 @@ def evaluate_frozen_feature_ridge(
     penalty[-1, -1] = 0.0
     print(f"Ridge solve: device={linear_algebra_device}", flush=True)
     coefficients = _solve_ridge(xtx, xty, penalty, linear_algebra_device)
-    train_mean = target_sum / n_train_rows
-    per_gene_scale = np.sqrt(np.maximum(
-        target_sum_squared / n_train_rows - np.square(train_mean), 0.0,
-    ))
+    per_gene_scale, n_gene_scales_floored = _positive_gene_scale(
+        target_sum, target_sum_squared, n_train_rows,
+    )
+    print(
+        f"Train-only gene scales: {n_gene_scales_floored}/{len(gene_names)} "
+        "constant genes floored to 1e-6",
+        flush=True,
+    )
+
+    # Persist the expensive train-only PCA/ridge fit before any held-out
+    # reporting. A later metric or plotting failure must not discard the fit.
+    output_path = Path(output).expanduser().resolve()
+    model_path = output_path.with_suffix(".model.npz")
+    _save_fit_artifact(
+        model_path,
+        pca=pca,
+        coefficients=coefficients,
+        per_gene_scale=per_gene_scale,
+        gene_names=gene_names,
+    )
+    print(f"Ridge fit artifact saved to {model_path}", flush=True)
 
     records = []
     for position, sample_id in enumerate(split_ids):
@@ -409,20 +481,6 @@ def evaluate_frozen_feature_ridge(
             for panel in technology_records[0]["point_metrics"]
         }
 
-    output_path = Path(output).expanduser().resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    model_path = output_path.with_suffix(".model.npz")
-    model_temporary = model_path.with_name(f"{model_path.name}.tmp.{os.getpid()}")
-    with model_temporary.open("wb") as handle:
-        np.savez_compressed(
-            handle,
-            pca_mean=pca.mean_.astype(np.float32),
-            pca_components=pca.components_.astype(np.float32),
-            coefficients=coefficients.astype(np.float32),
-            per_gene_scale=per_gene_scale.astype(np.float32),
-            gene_names=np.asarray(gene_names),
-        )
-    os.replace(model_temporary, model_path)
     report = {
         "version": 1,
         "kind": "frozen_feature_pca_ridge_whole_slide_benchmark",
@@ -444,6 +502,7 @@ def evaluate_frozen_feature_ridge(
         "ridge_alpha": float(ridge_alpha),
         "n_train_samples": len(train_ids),
         "n_train_rows_for_ridge": int(n_train_rows),
+        "n_gene_scales_floored": int(n_gene_scales_floored),
         "n_validation_samples": len(split_ids),
         "gene_panel_metadata": panel_metadata,
         "point_metrics_patient_aggregated": point_aggregated,
