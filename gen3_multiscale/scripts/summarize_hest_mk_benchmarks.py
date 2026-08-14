@@ -11,9 +11,43 @@ from pathlib import Path
 FIELDS = (
     "track", "scope", "method", "prediction", "panel", "pcc", "spearman",
     "rmse", "mse", "mae", "r2", "median_gene_r2", "median_gene_pcc",
-    "fraction_gene_pcc_gt_0_1", "fraction_gene_pcc_gt_0_2", "auc",
-    "n_patients", "source",
+    "gene_pcc_q25", "gene_pcc_q75", "fraction_gene_pcc_gt_0",
+    "fraction_gene_pcc_gt_0_1", "fraction_gene_pcc_gt_0_2",
+    "fraction_gene_pcc_gt_0_3", "auc",
+    "mean_spot_profile_pcc", "median_spot_profile_pcc",
+    "coexpression_matrix_pcc", "coexpression_matrix_mae",
+    "mean_per_gene_ssim", "median_per_gene_ssim",
+    "moran_i_pcc", "moran_i_mae",
+    "local_signed_gradient_pcc", "wide_signed_gradient_pcc",
+    "local_gradient_energy_ratio", "wide_gradient_energy_ratio",
+    "local_gradient_sign_agreement", "wide_gradient_sign_agreement",
+    "n_patients", "runtime_seconds", "peak_gpu_memory_mib", "parameter_count",
+    "mean_image_coverage_fraction", "source",
 )
+
+POINT_FIELDS = (
+    "pcc", "spearman", "rmse", "mse", "mae", "r2", "median_gene_r2",
+    "median_gene_pcc", "gene_pcc_q25", "gene_pcc_q75",
+    "fraction_gene_pcc_gt_0", "fraction_gene_pcc_gt_0_1",
+    "fraction_gene_pcc_gt_0_2", "fraction_gene_pcc_gt_0_3", "auc",
+)
+
+STRUCTURED_FIELDS = {
+    "mean_spot_profile_pcc": "spot_profile.mean_spot_profile_pcc",
+    "median_spot_profile_pcc": "spot_profile.median_spot_profile_pcc",
+    "coexpression_matrix_pcc": "coexpression.correlation_matrix_pcc",
+    "coexpression_matrix_mae": "coexpression.correlation_matrix_mae",
+    "mean_per_gene_ssim": "spatial_ssim.mean_per_gene_ssim",
+    "median_per_gene_ssim": "spatial_ssim.median_per_gene_ssim",
+    "moran_i_pcc": "moran_local.moran_i_pcc",
+    "moran_i_mae": "moran_local.moran_i_mae",
+    "local_signed_gradient_pcc": "gradient_local.signed_gradient_pcc",
+    "wide_signed_gradient_pcc": "gradient_wide.signed_gradient_pcc",
+    "local_gradient_energy_ratio": "gradient_local.gradient_energy_ratio",
+    "wide_gradient_energy_ratio": "gradient_wide.gradient_energy_ratio",
+    "local_gradient_sign_agreement": "gradient_local.sign_agreement_nontrivial",
+    "wide_gradient_sign_agreement": "gradient_wide.sign_agreement_nontrivial",
+}
 
 
 def _metric_value(metrics: dict, name: str):
@@ -23,18 +57,40 @@ def _metric_value(metrics: dict, name: str):
     return value
 
 
-def _row(*, track, scope, method, prediction, panel, metrics, source):
+def _row(
+    *, track, scope, method, prediction, panel, metrics, source,
+    structured_metrics: dict | None = None, metadata: dict | None = None,
+):
+    metadata = metadata or {}
+    coverage = metadata.get("mean_image_coverage_fraction")
+    if coverage is None:
+        slide_records = metadata.get("per_slide_records") or []
+        values = [
+            row.get("image_coverage_fraction") for row in slide_records
+            if row.get("image_coverage_fraction") is not None
+        ]
+        coverage = sum(float(value) for value in values) / len(values) if values else None
     return {
         "track": track,
         "scope": scope,
         "method": method,
         "prediction": prediction,
         "panel": panel,
-        **{name: _metric_value(metrics, name) for name in FIELDS[5:-2]},
+        **{name: _metric_value(metrics, name) for name in POINT_FIELDS},
+        **{
+            output_name: _metric_value(structured_metrics or {}, metric_name)
+            for output_name, metric_name in STRUCTURED_FIELDS.items()
+        },
         "n_patients": (
             metrics.get("pcc", {}).get("n_patients")
             if isinstance(metrics.get("pcc"), dict) else None
         ),
+        "runtime_seconds": metadata.get(
+            "runtime_seconds", metadata.get("reevaluation_runtime_seconds"),
+        ),
+        "peak_gpu_memory_mib": metadata.get("peak_gpu_memory_mib"),
+        "parameter_count": metadata.get("parameter_count"),
+        "mean_image_coverage_fraction": coverage,
         "source": str(source),
     }
 
@@ -47,12 +103,18 @@ def _method_name(report: dict, path: Path) -> str:
 def rows_from_report(path: Path, report: dict) -> list[dict]:
     kind = report.get("kind")
     rows = []
-    if kind == "frozen_feature_pca_ridge_whole_slide_benchmark":
-        method = f"{report['image_encoder']}_pca{report['pca_components']}_ridge"
+    if kind in {
+        "frozen_feature_pca_ridge_whole_slide_benchmark",
+        "frozen_feature_pca_mlp_whole_slide_benchmark",
+    }:
+        decoder = "ridge" if "ridge" in kind else "mlp"
+        method = f"{report['image_encoder']}_pca{report['pca_components']}_{decoder}"
+        structured = report.get("structured_metrics_patient_aggregated") or {}
         for panel, metrics in report["point_metrics_patient_aggregated"].items():
             rows.append(_row(
                 track="expanded_exact_split", scope="whole_slide", method=method,
                 prediction="deterministic", panel=panel, metrics=metrics, source=path,
+                structured_metrics=structured.get(panel), metadata=report,
             ))
         return rows
 
@@ -66,6 +128,7 @@ def rows_from_report(path: Path, report: dict) -> list[dict]:
             rows.append(_row(
                 track="expanded_exact_split", scope="fixed_mask", method=method,
                 prediction=prediction, panel="all_genes", metrics=fixed_all, source=path,
+                metadata=report,
             ))
         for panel, arms in report.get("per_panel_patient_aggregated_metrics", {}).items():
             metrics = arms.get(prediction)
@@ -73,12 +136,16 @@ def rows_from_report(path: Path, report: dict) -> list[dict]:
                 rows.append(_row(
                     track="expanded_exact_split", scope="fixed_mask", method=method,
                     prediction=prediction, panel=panel, metrics=metrics, source=path,
+                    metadata=report,
                 ))
         whole = report.get("whole_slide_structured_field_evaluation") or {}
+        structured = whole.get("structured_metrics_patient_aggregated") or {}
         for panel, metrics in whole.get("point_metrics_patient_aggregated", {}).items():
             rows.append(_row(
                 track="expanded_exact_split", scope="whole_slide", method=method,
                 prediction="conditional_mean", panel=panel, metrics=metrics, source=path,
+                structured_metrics=structured.get(panel),
+                metadata={**report, "per_slide_records": whole.get("per_slide_records", [])},
             ))
         return rows
 
@@ -89,12 +156,21 @@ def rows_from_report(path: Path, report: dict) -> list[dict]:
             rows.append(_row(
                 track="expanded_exact_split", scope="fixed_mask", method=method,
                 prediction="pretrained_zero_shot", panel="all_genes",
-                metrics=all_metrics, source=path,
+                metrics=all_metrics, source=path, metadata=report,
             ))
         for panel, metrics in report.get("per_panel_patient_aggregated_metrics", {}).items():
             rows.append(_row(
                 track="expanded_exact_split", scope="fixed_mask", method=method,
                 prediction="pretrained_zero_shot", panel=panel, metrics=metrics, source=path,
+                metadata=report,
+            ))
+        whole = report.get("whole_slide_point_evaluation") or {}
+        for panel, metrics in whole.get("point_metrics_patient_aggregated", {}).items():
+            rows.append(_row(
+                track="expanded_exact_split", scope="whole_slide", method=method,
+                prediction="pretrained_zero_shot", panel=panel,
+                metrics=metrics, source=path,
+                metadata={**report, "per_slide_records": whole.get("per_slide_records", [])},
             ))
     return rows
 

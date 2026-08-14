@@ -25,6 +25,7 @@ from gen3_multiscale.evaluation.metrics import (
     gene_panel_metrics,
     resolve_gene_panels,
 )
+from gen3_multiscale.evaluation.schedule_contract import fixed_mask_evaluation_metadata
 from gen3_multiscale.training import checkpoint as checkpoint_module
 from gen3_multiscale.training.gen3_dataset import Gen3SpatialFieldDataset, build_gen3_mask_schedule
 from gen3_multiscale.training.gen3_preflight import load_and_preflight_samples
@@ -164,9 +165,11 @@ def evaluate_conditional_flow(
         "kind": "conditional_flow_supervisor_evaluation",
         "config_path": str(config_path),
         "checkpoint_dir": str(requested_checkpoint),
-        "split": split,
-        "n_samples": len(split_ids),
-        "n_items": len(dataset),
+        **fixed_mask_evaluation_metadata(
+            split=split, sample_ids=split_ids, strata=config["masking"]["strata"],
+            masks_per_stratum_per_sample=n_masks_per_sample,
+            actual_n_items=len(dataset),
+        ),
         "n_latent_samples_per_item": inference_samples,
         "n_ode_steps": inference_steps,
         "task": config["model"]["task"],
@@ -201,7 +204,11 @@ def main() -> None:
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--split", choices=("validation", "test"), default="validation")
-    parser.add_argument("--n-masks-per-sample", type=int, default=8)
+    parser.add_argument(
+        "--n-masks-per-stratum-per-sample", "--n-masks-per-sample",
+        dest="n_masks_per_sample", type=int, default=8,
+        help="Masks for each configured stratum of each sample; legacy spelling retained.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no-use-best", action="store_true")
     parser.add_argument("--allow-code-drift", action="store_true")

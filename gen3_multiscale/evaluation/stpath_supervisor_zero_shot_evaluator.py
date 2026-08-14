@@ -31,7 +31,14 @@ from gen3_multiscale.evaluation.gen3_evaluator import (
     load_configured_gene_panels,
     per_item_reconstruction_metrics,
 )
-from gen3_multiscale.evaluation.metrics import aggregate_patient_metrics, gene_panel_metrics
+from gen3_multiscale.evaluation.metrics import (
+    aggregate_patient_metrics,
+    comparable_expression_metrics,
+    gene_panel_metrics,
+    nonzero_auc,
+    resolve_gene_panels,
+)
+from gen3_multiscale.evaluation.schedule_contract import fixed_mask_evaluation_metadata
 from gen3_multiscale.evaluation.stpath_zero_shot_evaluator import (
     _rows,
     _sha256_file,
@@ -48,6 +55,22 @@ from gen3_multiscale.training.train import (
 
 
 TASKS = ("he_to_st", "he_plus_st_to_st")
+
+
+def _whole_slide_panel_metrics(
+    predicted: np.ndarray, target: np.ndarray,
+    panel_indices: dict[str, np.ndarray],
+) -> dict[str, dict[str, float]]:
+    def score(left: np.ndarray, right: np.ndarray) -> dict[str, float]:
+        return {
+            **comparable_expression_metrics(left, right),
+            "auc": nonzero_auc(left, right),
+        }
+
+    result = {"all_genes": score(predicted, target)}
+    for panel, indices in panel_indices.items():
+        result[panel] = score(predicted[:, indices], target[:, indices])
+    return result
 
 
 def _stpath_task_positions(
@@ -120,6 +143,9 @@ def evaluate_stpath_supervisor_zero_shot(
 
     gene_names = list(manifest["gene_panel"])
     gene_panels = load_configured_gene_panels(config, manifest)
+    panel_indices, panel_metadata = (
+        resolve_gene_panels(gene_names, gene_panels) if gene_panels else ({}, {})
+    )
     device = torch.device(device_str)
     from src.models.stpath_encoder import STPathContextEncoder
 
@@ -243,15 +269,62 @@ def evaluate_stpath_supervisor_zero_shot(
         if (idx + 1) % 10 == 0 or idx + 1 == len(dataset):
             print(f"[STPath {task} evaluation {idx + 1}/{len(dataset)}] {sample.sample_id}", flush=True)
 
+    whole_slide_point_evaluation = None
+    if task == "he_to_st":
+        whole_slide_records = []
+        for sample_id in split_ids:
+            sample = samples[sample_id]
+            pred_supported_native = he_only_prediction_cache[sample_id]
+            pred_supported_normalized = stpath_log1p_to_normalized_log1p(
+                pred_supported_native, target_sum=target_sum,
+            )
+            predicted = scatter_supported_genes(
+                pred_supported_normalized, supported_positions, len(gene_names),
+            )
+            target = _rows(sample.adata.X, np.arange(sample.adata.n_obs, dtype=np.int64))
+            whole_slide_records.append({
+                "sample_id": sample_id,
+                "patient_id": str(sample.patient_id),
+                "organ": str(manifest["samples"][sample_id]["organ"]),
+                "technology": str(
+                    manifest["samples"][sample_id].get("tech")
+                    or manifest["samples"][sample_id].get("st_technology")
+                    or "unknown"
+                ),
+                "n_spots": int(sample.adata.n_obs),
+                "point_metrics": _whole_slide_panel_metrics(
+                    predicted, target, panel_indices,
+                ),
+            })
+        whole_slide_patients = [row["patient_id"] for row in whole_slide_records]
+        point_aggregated = {
+            panel: aggregate_patient_metrics(
+                [row["point_metrics"][panel] for row in whole_slide_records],
+                whole_slide_patients,
+            )
+            for panel in whole_slide_records[0]["point_metrics"]
+        }
+        whole_slide_point_evaluation = {
+            "scope": "all_held_out_slides_every_spot_exactly_once",
+            "primary_prediction": "pretrained_stpath_h_and_e_only",
+            "target_gex_visible_to_model": False,
+            "surrounding_gex_visible_to_model": False,
+            "target_space": "normalize_total_then_log1p",
+            "gene_panel_metadata": panel_metadata,
+            "per_slide_records": whole_slide_records,
+            "point_metrics_patient_aggregated": point_aggregated,
+        }
+
     return {
         "version": 1,
         "kind": "stpath_supervisor_zero_shot_evaluation_report",
         "task": task,
         "config_path": str(config_path),
-        "split": split,
-        "n_samples": len(split_ids),
-        "n_items": len(dataset),
-        "n_masks_per_sample": int(n_masks_per_sample),
+        **fixed_mask_evaluation_metadata(
+            split=split, sample_ids=split_ids, strata=strata,
+            masks_per_stratum_per_sample=n_masks_per_sample,
+            actual_n_items=len(dataset),
+        ),
         "dataset_manifest_fingerprint": dataset_manifest_fingerprint(manifest),
         "mask_schedule_fingerprint": hashlib.sha256(
             json.dumps(schedule.reports, sort_keys=True, default=str).encode("utf-8")
@@ -290,6 +363,7 @@ def evaluate_stpath_supervisor_zero_shot(
             for panel, items in normalized_panel_items.items()
         },
         "per_item_records": per_item_records,
+        "whole_slide_point_evaluation": whole_slide_point_evaluation,
     }
 
 
@@ -310,7 +384,11 @@ def main() -> None:
     parser.add_argument("--stpath-model-weights", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--split", choices=["validation", "test"], default="validation")
-    parser.add_argument("--n-masks-per-sample", type=int, default=8)
+    parser.add_argument(
+        "--n-masks-per-stratum-per-sample", "--n-masks-per-sample",
+        dest="n_masks_per_sample", type=int, default=8,
+        help="Masks for each configured stratum of each sample; legacy spelling retained.",
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--allow-test", action="store_true")
     args = parser.parse_args()

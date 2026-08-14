@@ -41,9 +41,12 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
+from gen3_multiscale.evaluation.schedule_contract import fixed_mask_evaluation_metadata
+
 from gen3_multiscale.data.dataset_manifest import gene_panel_hash, load_dataset_manifest
 from gen3_multiscale.evaluation.metrics import (
-    aggregate_patient_metrics, embed_pca, gene_panel_metrics, nonzero_auc, pearson_per_gene, resolve_gene_panels,
+    aggregate_patient_metrics, comparable_expression_metrics, embed_pca, gene_panel_metrics,
+    nonzero_auc, pearson_per_gene, resolve_gene_panels,
     rmse, st_fid, st_mmd,
 )
 from gen3_multiscale.evaluation.train_gene_panels import load_train_derived_gene_panels
@@ -67,13 +70,10 @@ def per_item_reconstruction_metrics(pred: np.ndarray, true: np.ndarray) -> dict:
     as a perfect or zero match)."""
     if pred.shape != true.shape:
         raise ValueError(f"pred {pred.shape} and true {true.shape} must have the same shape")
-    per_gene_pcc = pearson_per_gene(pred, true)
-    valid = np.isfinite(per_gene_pcc)
+    metrics = comparable_expression_metrics(pred, true)
     return {
-        "pcc": float(np.nanmean(per_gene_pcc)) if valid.any() else float("nan"),
-        "rmse": rmse(pred, true),
-        "n_valid_genes": int(valid.sum()),
-        "n_genes": int(per_gene_pcc.shape[0]),
+        **metrics,
+        "n_genes": int(pred.shape[1]),
         # Launch blocker #9: "nonzero AUC" -- can distinguish
         # zero/measured-absent vs. nonzero true expression from predicted
         # magnitude alone, flattened across every gene in this item.
@@ -728,7 +728,9 @@ def evaluate_gen3_checkpoint(
             json.dumps(schedule.reports, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest(),
         "use_best": bool(use_best),
+        "n_masks_per_stratum_per_sample": int(n_masks_per_sample),
         "n_masks_per_sample": int(n_masks_per_sample),
+        "n_masks_per_sample_semantics": "legacy_alias_for_per_stratum_per_sample",
         "code_drift_present": bool(code_drift_present),
         "code_drift_acknowledged": bool(code_drift_present and allow_code_drift),
     }
@@ -740,9 +742,11 @@ def evaluate_gen3_checkpoint(
         "checkpoint_dir": str(checkpoint_dir),
         "weights_dir": str(weights_dir),
         "checkpoint_identity": checkpoint_identity_record,
-        "split": split,
-        "n_samples": len(split_ids),
-        "n_items": len(dataset),
+        **fixed_mask_evaluation_metadata(
+            split=split, sample_ids=split_ids, strata=strata,
+            masks_per_stratum_per_sample=n_masks_per_sample,
+            actual_n_items=len(dataset),
+        ),
         "evaluation_seed": int(evaluation_seed),
         "cache_preflight_report": preflight_report,
         "per_arm_patient_aggregated_metrics": aggregated,
@@ -830,7 +834,11 @@ def main() -> None:
     parser.add_argument("--checkpoint-dir", required=True, help="A real, already-trained checkpoint_dir")
     parser.add_argument("--output", required=True, help="Path to atomically write the evaluation report JSON to")
     parser.add_argument("--split", default="validation", choices=["validation", "test"])
-    parser.add_argument("--n-masks-per-sample", type=int, default=8)
+    parser.add_argument(
+        "--n-masks-per-stratum-per-sample", "--n-masks-per-sample",
+        dest="n_masks_per_sample", type=int, default=8,
+        help="Masks for each configured stratum of each sample; legacy spelling retained.",
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
         "--evaluation-seed", type=int, default=0,

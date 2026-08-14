@@ -145,6 +145,9 @@ def run_conditional_flow_training(
     )
     strata = config["masking"]["strata"]
     n_smoke_masks = max(1, len(strata))
+    validation_masks_per_stratum_per_sample = (
+        n_smoke_masks if smoke else int(data_cfg.get("n_validation_masks", 4))
+    )
     train_samples = {sample_id: samples[sample_id] for sample_id in train_ids}
     validation_samples = {sample_id: samples[sample_id] for sample_id in validation_ids}
     train_schedule = build_gen3_mask_schedule(
@@ -156,7 +159,7 @@ def run_conditional_flow_training(
     validation_schedule = build_gen3_mask_schedule(
         dataset_manifest, validation_samples, strata, "validation",
         split_counts={
-            "validation": n_smoke_masks if smoke else int(data_cfg.get("n_validation_masks", 4)),
+            "validation": validation_masks_per_stratum_per_sample,
         },
         split_seeds={"validation": 700_000},
     ) if validation_samples else None
@@ -175,7 +178,10 @@ def run_conditional_flow_training(
         )
         boundary_report = base_validation.validate_boundary_schedule()
         print(
-            f"validation boundary preflight: PASS ({boundary_report['n_items_checked']} masks)",
+            "training-time validation boundary preflight: PASS "
+            f"({boundary_report['n_items_checked']} fixed items = "
+            f"{len(validation_ids)} samples x {len(strata)} strata x "
+            f"{validation_masks_per_stratum_per_sample} masks per stratum per sample)",
             flush=True,
         )
         validation_dataset = ConditionalWAEMaskedGEXDataset(

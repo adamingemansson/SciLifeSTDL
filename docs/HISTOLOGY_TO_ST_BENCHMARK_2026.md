@@ -36,13 +36,15 @@ PCC. The 448-item fixed-mask result remains a separately labelled stress test.
 
 - spot-profile PCC;
 - gene-gene coexpression-matrix PCC/MAE;
+- per-gene SSIM after the shared masked Visium rasterization;
 - Moran's-I PCC/MAE;
 - local/wide signed-gradient PCC, sign agreement and energy ratio;
 - count-splitting noise-ceiling-adjusted PCC where available.
 
-Standard image-grid SSIM is intentionally not claimed by the current graph
-metrics. Add it only with one fixed, documented Visium rasterization shared by
-every method; do not relabel graph agreement as literature SSIM.
+SSIM uses one method-independent rasterization: the median spot-neighbour
+distance defines two raster pixels, spot values are Gaussian-splatted, local
+moments are normalized by tissue support, and SSIM is averaged only at real
+spot centers. Empty background is therefore never included in the mean.
 
 ## Method tiers
 
@@ -89,6 +91,44 @@ analysis.
 
 Repeat with `--image-encoder gigapath` and its cache directory. Consolidate
 reports without comparing incompatible tracks:
+
+The nonlinear frozen-UNI2 control uses the same train-only PCA and exact
+whole-slide evaluator:
+
+```bash
+python -u -m gen3_multiscale.evaluation.frozen_feature_mlp_evaluator \
+  --config "$COMPARISON_CONFIG" \
+  --manifest "$MANIFEST" \
+  --train-gene-panels "$PANELS" \
+  --image-encoder uni2 \
+  --cache-dir "$UNI2_CACHE" \
+  --pca-components 256 \
+  --hidden-dim 512 \
+  --device cuda \
+  --linear-algebra-device cuda:0 \
+  --output "$BENCHMARK_ROOT/uni2_pca256_mlp_validation.json"
+```
+
+If the ridge fit is already complete and only the metric implementation has
+changed, reuse its immutable fit instead of reloading the 242 training slides:
+
+```bash
+python -u -m gen3_multiscale.evaluation.frozen_feature_ridge_artifact_evaluator \
+  --config "$COMPARISON_CONFIG" \
+  --manifest "$MANIFEST" \
+  --train-gene-panels "$PANELS" \
+  --image-encoder uni2 \
+  --cache-dir "$UNI2_CACHE" \
+  --fit-report "$BENCHMARK_ROOT/uni2_pca256_ridge_validation.json" \
+  --fit-artifact "$BENCHMARK_ROOT/uni2_pca256_ridge_validation.model.npz" \
+  --output "$BENCHMARK_ROOT/uni2_pca256_ridge_validation_rescored.json"
+```
+
+This path fails closed on manifest path, gene order, encoder, missing-image
+policy, artifact dimensions, and feature-cache provenance. It evaluates only
+the held-out slides.
+
+Consolidate reports without comparing incompatible tracks:
 
 ```bash
 python -m gen3_multiscale.scripts.summarize_hest_mk_benchmarks \
