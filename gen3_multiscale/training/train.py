@@ -1985,6 +1985,9 @@ def run_training(
     # optimizer step and one validation step.
     n_smoke_masks = max(1, len(strata))
     n_training_masks = n_smoke_masks if smoke else int(data_cfg.get("n_training_masks_per_sample", 500))
+    # Historical config name retained for checkpoint compatibility. This is
+    # the number of masks for each stratum of each held-out sample, not the
+    # total number of validation items.
     n_validation_masks = n_smoke_masks if smoke else int(data_cfg.get("n_validation_masks", 4))
 
     train_schedule = build_gen3_mask_schedule(
@@ -2042,8 +2045,10 @@ def run_training(
         )
         boundary_preflight = val_dataset.validate_boundary_schedule()
         print(
-            f"validation boundary preflight: PASS "
-            f"({boundary_preflight['n_items_checked']} fixed masks checked)",
+            "training-time validation boundary preflight: PASS "
+            f"({boundary_preflight['n_items_checked']} fixed items = "
+            f"{len(validation_ids)} samples x {len(strata)} strata x "
+            f"{n_validation_masks} masks per stratum per sample)",
             flush=True,
         )
         # requirement #9: deterministic FIXED-mask validation -- never shuffled.

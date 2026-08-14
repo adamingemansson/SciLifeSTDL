@@ -3,6 +3,7 @@ import pytest
 
 from gen3_multiscale.evaluation.stpath_supervisor_zero_shot_evaluator import (
     _stpath_task_positions,
+    _whole_slide_panel_metrics,
 )
 
 
@@ -38,3 +39,17 @@ def test_stpath_supervisor_task_rejects_unknown_mode():
             context_pos=np.asarray([0]),
             query_pos=np.asarray([1]),
         )
+
+
+def test_stpath_whole_slide_metrics_use_gene_wise_correlations_and_panels():
+    rng = np.random.default_rng(4)
+    target = rng.normal(size=(40, 4))
+    predicted = target.copy()
+    predicted[:, 3] = predicted[:, 3].mean()
+    report = _whole_slide_panel_metrics(
+        predicted, target, {"first_three": np.asarray([0, 1, 2])},
+    )
+    assert report["first_three"]["pcc"] == pytest.approx(1.0)
+    assert report["all_genes"]["pcc"] == pytest.approx(0.75)
+    assert "spearman" in report["all_genes"]
+    assert "mae" in report["all_genes"]

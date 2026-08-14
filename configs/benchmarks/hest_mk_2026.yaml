@@ -47,6 +47,8 @@ metrics:
     - median_gene_r2
     - fraction_gene_r2_gt_0
   spatial:
+    - mean_per_gene_ssim
+    - median_per_gene_ssim
     - moran_i_pcc
     - moran_i_mae
     - local_signed_gradient_pcc
@@ -67,8 +69,7 @@ metrics:
     - image_coverage_fraction
     - runtime_seconds
     - peak_gpu_memory_mib
-  deferred_until_one_shared_rasterizer_exists:
-    - spatial_map_ssim
+  deferred:
     - spatial_map_psnr
 
 methods:
@@ -78,6 +79,12 @@ methods:
     local_status: runnable
     runner: gen3_multiscale.evaluation.frozen_feature_ridge_evaluator
     reason: exact linear control for the frozen image backbone used by MK
+  - id: uni2_h_pca256_mlp
+    tier: mandatory
+    family: frozen_encoder_probe
+    local_status: runnable
+    runner: gen3_multiscale.evaluation.frozen_feature_mlp_evaluator
+    reason: nonlinear frozen-UNI2 control in the exact expanded-cohort target space
   - id: gigapath_pca256_ridge
     tier: mandatory
     family: frozen_encoder_probe

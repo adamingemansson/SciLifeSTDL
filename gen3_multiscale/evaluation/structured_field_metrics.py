@@ -15,6 +15,8 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+from scipy.ndimage import gaussian_filter
+from scipy.spatial import cKDTree
 
 from gen3_multiscale.data.boundary_graph import build_knn_adjacency
 from gen3_multiscale.evaluation.metrics import pearson_per_gene
@@ -127,6 +129,171 @@ def coexpression_agreement(predicted: np.ndarray, target: np.ndarray) -> dict[st
         "correlation_matrix_pcc": _correlation(pred_pairs, true_pairs),
         "correlation_matrix_mae": float(np.mean(np.abs(pred_pairs - true_pairs))),
         "n_gene_pairs": int(true_pairs.size),
+    }
+
+
+def _visium_raster_geometry(
+    coords: np.ndarray, *, pixels_per_neighbor: float = 2.0,
+    margin_pixels: int = 5, max_side_pixels: int = 768,
+) -> tuple[np.ndarray, np.ndarray, tuple[int, int], float]:
+    """Map spot centers to one deterministic, bounded regular raster.
+
+    The median nearest-neighbour distance defines the resolution. This keeps
+    the raster independent of scanner pixels-per-micron while preserving the
+    spot lattice. Extremely large coordinate spans increase the pixel size
+    rather than allocating an unbounded image. The same geometry is used for
+    target and prediction, and no expression values influence it.
+    """
+    coords = np.asarray(coords, dtype=np.float64)
+    if coords.ndim != 2 or coords.shape[1] != 2 or coords.shape[0] < 2:
+        raise ValueError("coords must have shape [n_spots >= 2, 2]")
+    if not np.isfinite(coords).all():
+        raise ValueError("coords must be finite")
+    if pixels_per_neighbor <= 0 or margin_pixels < 0 or max_side_pixels < 16:
+        raise ValueError("invalid Visium raster geometry settings")
+
+    distances, _ = cKDTree(coords).query(coords, k=2)
+    nearest = np.asarray(distances[:, 1], dtype=np.float64)
+    nearest = nearest[np.isfinite(nearest) & (nearest > 0)]
+    if nearest.size == 0:
+        raise ValueError("spot coordinates have no positive neighbour spacing")
+    pixel_size = float(np.median(nearest) / pixels_per_neighbor)
+    spans = np.ptp(coords, axis=0)
+    usable_side = max_side_pixels - 2 * margin_pixels - 1
+    if usable_side < 1:
+        raise ValueError("max_side_pixels is too small for the requested margin")
+    pixel_size = max(pixel_size, float(np.max(spans) / usable_side), 1e-12)
+
+    indices = np.rint((coords - coords.min(axis=0)) / pixel_size).astype(np.int64)
+    # Coordinates are conventionally x/y; NumPy arrays are row/column.
+    cols = indices[:, 0] + margin_pixels
+    rows = indices[:, 1] + margin_pixels
+    shape = (
+        int(rows.max()) + margin_pixels + 1,
+        int(cols.max()) + margin_pixels + 1,
+    )
+    return rows, cols, shape, pixel_size
+
+
+def spatial_ssim_agreement(
+    predicted: np.ndarray, target: np.ndarray, coords: np.ndarray, *,
+    pixels_per_neighbor: float = 2.0, interpolation_sigma_pixels: float = 1.0,
+    ssim_sigma_pixels: float = 1.5, max_side_pixels: int = 768,
+    gene_chunk_size: int = 32,
+) -> dict[str, float]:
+    """Masked per-gene SSIM after one fixed Visium spot rasterization.
+
+    Spot values are Gaussian-splatted onto a regular grid whose resolution is
+    tied to the slide's median nearest-neighbour spacing. Local SSIM moments
+    are normalized by the rasterized tissue support and the final score is
+    averaged at observed spot centers only. Consequently, empty background
+    cannot make two otherwise poor fields appear similar.
+
+    The SSIM constants use each target gene's held-out dynamic range. A
+    truth-constant gene is ineligible; a flat prediction for a variable truth
+    remains a scored model failure. Predictions are not clipped to the target
+    range.
+    """
+    predicted, target = _arrays(predicted, target)
+    if interpolation_sigma_pixels <= 0 or ssim_sigma_pixels <= 0:
+        raise ValueError("SSIM raster sigmas must be positive")
+    if gene_chunk_size < 1:
+        raise ValueError("gene_chunk_size must be positive")
+    rows, cols, shape, pixel_size = _visium_raster_geometry(
+        coords, pixels_per_neighbor=pixels_per_neighbor,
+        max_side_pixels=max_side_pixels,
+    )
+    # Each chunk keeps several raster tensors alive for local moments. Bound
+    # the requested chunk by raster area so pathological coordinate spans do
+    # not turn an evaluation metric into a multi-gigabyte allocation.
+    gene_chunk_size = min(
+        int(gene_chunk_size), max(1, 2_000_000 // int(shape[0] * shape[1])),
+    )
+
+    impulses = np.zeros(shape, dtype=np.float64)
+    np.add.at(impulses, (rows, cols), 1.0)
+    interpolation_weight = gaussian_filter(
+        impulses, interpolation_sigma_pixels, mode="constant", truncate=3.0,
+    )
+    support = interpolation_weight > max(float(interpolation_weight.max()) * 1e-3, 1e-12)
+    support_float = support.astype(np.float64)
+    local_weight = gaussian_filter(
+        support_float, ssim_sigma_pixels, mode="constant", truncate=3.5,
+    )
+    local_weight = np.maximum(local_weight, 1e-12)
+
+    scores = np.full(predicted.shape[1], np.nan, dtype=np.float64)
+    spatial_sigma = (interpolation_sigma_pixels, interpolation_sigma_pixels, 0.0)
+    local_sigma = (ssim_sigma_pixels, ssim_sigma_pixels, 0.0)
+    denominator = np.maximum(interpolation_weight[:, :, None], 1e-12)
+    support_3d = support_float[:, :, None]
+    local_denominator = local_weight[:, :, None]
+    for start in range(0, predicted.shape[1], gene_chunk_size):
+        end = min(start + gene_chunk_size, predicted.shape[1])
+        width = end - start
+        pred_impulses = np.zeros((*shape, width), dtype=np.float64)
+        true_impulses = np.zeros((*shape, width), dtype=np.float64)
+        np.add.at(pred_impulses, (rows, cols), predicted[:, start:end])
+        np.add.at(true_impulses, (rows, cols), target[:, start:end])
+        pred_field = gaussian_filter(pred_impulses, spatial_sigma, mode="constant", truncate=3.0)
+        true_field = gaussian_filter(true_impulses, spatial_sigma, mode="constant", truncate=3.0)
+        pred_field = np.where(support_3d > 0, pred_field / denominator, 0.0)
+        true_field = np.where(support_3d > 0, true_field / denominator, 0.0)
+
+        pred_mean = gaussian_filter(
+            pred_field * support_3d, local_sigma, mode="constant", truncate=3.5,
+        ) / local_denominator
+        true_mean = gaussian_filter(
+            true_field * support_3d, local_sigma, mode="constant", truncate=3.5,
+        ) / local_denominator
+        pred_second = gaussian_filter(
+            np.square(pred_field) * support_3d, local_sigma,
+            mode="constant", truncate=3.5,
+        ) / local_denominator
+        true_second = gaussian_filter(
+            np.square(true_field) * support_3d, local_sigma,
+            mode="constant", truncate=3.5,
+        ) / local_denominator
+        cross = gaussian_filter(
+            pred_field * true_field * support_3d, local_sigma,
+            mode="constant", truncate=3.5,
+        ) / local_denominator
+        pred_variance = np.maximum(pred_second - np.square(pred_mean), 0.0)
+        true_variance = np.maximum(true_second - np.square(true_mean), 0.0)
+        covariance = cross - pred_mean * true_mean
+
+        data_range = np.ptp(target[:, start:end], axis=0)
+        eligible = data_range >= 1e-8
+        c1 = np.square(0.01 * np.maximum(data_range, 1e-8))[None, None, :]
+        c2 = np.square(0.03 * np.maximum(data_range, 1e-8))[None, None, :]
+        ssim_map = (
+            (2.0 * pred_mean * true_mean + c1) * (2.0 * covariance + c2)
+            / np.maximum(
+                (np.square(pred_mean) + np.square(true_mean) + c1)
+                * (pred_variance + true_variance + c2),
+                1e-18,
+            )
+        )
+        center_scores = np.mean(ssim_map[rows, cols, :], axis=0)
+        center_scores = np.clip(center_scores, -1.0, 1.0)
+        block = scores[start:end]
+        block[eligible] = center_scores[eligible]
+        scores[start:end] = block
+
+    finite = scores[np.isfinite(scores)]
+    return {
+        "mean_per_gene_ssim": float(np.mean(finite)) if finite.size else float("nan"),
+        "median_per_gene_ssim": float(np.median(finite)) if finite.size else float("nan"),
+        "gene_ssim_q25": float(np.quantile(finite, 0.25)) if finite.size else float("nan"),
+        "gene_ssim_q75": float(np.quantile(finite, 0.75)) if finite.size else float("nan"),
+        "n_eligible_genes": int(finite.size),
+        "raster_height": int(shape[0]),
+        "raster_width": int(shape[1]),
+        "raster_pixel_size_coordinate_units": float(pixel_size),
+        "pixels_per_median_neighbor": float(pixels_per_neighbor),
+        "interpolation_sigma_pixels": float(interpolation_sigma_pixels),
+        "ssim_sigma_pixels": float(ssim_sigma_pixels),
+        "background_included_in_mean": False,
     }
 
 
@@ -275,6 +442,9 @@ def structured_field_metrics(
         panel_scale = scale[indices]
         entry: dict[str, Any] = {
             "spot_profile": spot_profile_agreement(panel_pred, panel_true),
+            "spatial_ssim": spatial_ssim_agreement(
+                panel_pred, panel_true, coords,
+            ),
             "moran_local": moran_i_agreement(
                 panel_pred, panel_true, coords, k_neighbors=local_k,
             ),
@@ -291,7 +461,7 @@ def structured_field_metrics(
             entry["coexpression"] = coexpression_agreement(panel_pred, panel_true)
         panels[name] = entry
     return {
-        "version": 1,
+        "version": 2,
         "scope": "one held_out_whole_slide_every_spot_exactly_once",
         "gradient_units": "training_only_per_gene_standard_deviation",
         "local_k": int(local_k),

@@ -34,6 +34,8 @@ import os
 import sys
 from pathlib import Path
 
+from gen3_multiscale.evaluation.schedule_contract import fixed_mask_evaluation_metadata
+
 import numpy as np
 import torch
 from omegaconf import OmegaConf
@@ -256,10 +258,11 @@ def evaluate_stpath_zero_shot(
         "version": 1,
         "kind": "gen3_zero_shot_stpath_evaluation_report",
         "config_path": str(config_path),
-        "split": split,
-        "n_samples": len(split_ids),
-        "n_items": len(dataset),
-        "n_masks_per_sample": int(n_masks_per_sample),
+        **fixed_mask_evaluation_metadata(
+            split=split, sample_ids=split_ids, strata=strata,
+            masks_per_stratum_per_sample=n_masks_per_sample,
+            actual_n_items=len(dataset),
+        ),
         "dataset_manifest_fingerprint": dataset_manifest_fingerprint(manifest),
         "mask_schedule_fingerprint": hashlib.sha256(
             json.dumps(schedule.reports, sort_keys=True, default=str).encode("utf-8")
@@ -316,7 +319,11 @@ def main() -> None:
     parser.add_argument("--stpath-model-weights", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--split", choices=["validation", "test"], default="validation")
-    parser.add_argument("--n-masks-per-sample", type=int, default=8)
+    parser.add_argument(
+        "--n-masks-per-stratum-per-sample", "--n-masks-per-sample",
+        dest="n_masks_per_sample", type=int, default=8,
+        help="Masks for each configured stratum of each sample; legacy spelling retained.",
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--allow-test", action="store_true")
     args = parser.parse_args()

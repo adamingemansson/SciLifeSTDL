@@ -6,6 +6,7 @@ from gen3_multiscale.evaluation.structured_field_metrics import (
     moran_i_agreement,
     noise_ceiling_adjusted_pcc,
     signed_gradient_agreement,
+    spatial_ssim_agreement,
     spot_profile_agreement,
     structured_field_metrics,
     undirected_knn_edges,
@@ -40,6 +41,7 @@ def test_perfect_field_scores_as_perfect_without_nan_collapse():
     for name in ("all_genes", "panel"):
         panel = report["panels"][name]
         assert panel["spot_profile"]["mean_spot_profile_pcc"] == pytest.approx(1.0)
+        assert panel["spatial_ssim"]["mean_per_gene_ssim"] == pytest.approx(1.0)
         assert panel["moran_local"]["moran_i_pcc"] == pytest.approx(1.0)
         assert panel["gradient_local"]["signed_gradient_pcc"] == pytest.approx(1.0)
         assert panel["gradient_local"]["gradient_energy_ratio"] == pytest.approx(1.0)
@@ -60,6 +62,29 @@ def test_spatial_permutation_preserves_values_but_breaks_field_metrics():
     )
     assert shuffled_moran["moran_i_mae"] > perfect_moran["moran_i_mae"] + 0.1
     assert shuffled_gradient["signed_gradient_pcc"] < perfect_gradient["signed_gradient_pcc"] - 0.5
+
+
+def test_visium_ssim_is_perfect_for_identical_fields_and_penalizes_permutation():
+    coords, target = _field(seed=22, side=9)
+    rng = np.random.default_rng(23)
+    perfect = spatial_ssim_agreement(target, target, coords, gene_chunk_size=2)
+    shuffled = spatial_ssim_agreement(
+        target[rng.permutation(len(target))], target, coords, gene_chunk_size=2,
+    )
+    assert perfect["mean_per_gene_ssim"] == pytest.approx(1.0, abs=1e-10)
+    assert perfect["n_eligible_genes"] == target.shape[1]
+    assert perfect["background_included_in_mean"] is False
+    assert shuffled["mean_per_gene_ssim"] < perfect["mean_per_gene_ssim"] - 0.2
+
+
+def test_visium_ssim_excludes_truth_constant_genes_without_dropping_flat_failures():
+    coords, target = _field(seed=24, side=8, genes=3)
+    target[:, 0] = 2.0
+    predicted = target.copy()
+    predicted[:, 1] = predicted[:, 1].mean()
+    report = spatial_ssim_agreement(predicted, target, coords, gene_chunk_size=2)
+    assert report["n_eligible_genes"] == 2
+    assert report["mean_per_gene_ssim"] < 1.0
 
 
 def test_flat_prediction_is_penalized_not_dropped():

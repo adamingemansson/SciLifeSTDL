@@ -102,6 +102,23 @@ def _flatten_structured_panel(panel: dict[str, Any]) -> dict[str, float]:
     return flat
 
 
+def _aggregate_point_metrics_by_group(
+    records: list[dict], group_key: str,
+) -> dict[str, dict[str, dict]]:
+    """Patient-macro point metrics within each reported cohort stratum."""
+    grouped: dict[str, dict[str, dict]] = {}
+    for group in sorted({str(row[group_key]) for row in records}):
+        selected = [row for row in records if str(row[group_key]) == group]
+        patient_ids = [str(row["patient_id"]) for row in selected]
+        grouped[group] = {
+            panel: aggregate_patient_metrics(
+                [row["point_metrics"][panel] for row in selected], patient_ids,
+            )
+            for panel in selected[0]["point_metrics"]
+        }
+    return grouped
+
+
 def _atomic_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
@@ -459,27 +476,8 @@ def evaluate_frozen_feature_ridge(
         )
         for panel in records[0]["structured_field"]["panels"]
     }
-    by_organ = {}
-    for organ in sorted({row["organ"] for row in records}):
-        organ_records = [row for row in records if row["organ"] == organ]
-        organ_patients = [row["patient_id"] for row in organ_records]
-        by_organ[organ] = {
-            panel: aggregate_patient_metrics(
-                [row["point_metrics"][panel] for row in organ_records], organ_patients,
-            )
-            for panel in organ_records[0]["point_metrics"]
-        }
-    by_technology = {}
-    for technology in sorted({row["technology"] for row in records}):
-        technology_records = [row for row in records if row["technology"] == technology]
-        technology_patients = [row["patient_id"] for row in technology_records]
-        by_technology[technology] = {
-            panel: aggregate_patient_metrics(
-                [row["point_metrics"][panel] for row in technology_records],
-                technology_patients,
-            )
-            for panel in technology_records[0]["point_metrics"]
-        }
+    by_organ = _aggregate_point_metrics_by_group(records, "organ")
+    by_technology = _aggregate_point_metrics_by_group(records, "technology")
 
     report = {
         "version": 1,
