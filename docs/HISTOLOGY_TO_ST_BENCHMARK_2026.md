@@ -25,12 +25,34 @@ PCC. The 448-item fixed-mask result remains a separately labelled stress test.
 
 ### Required point metrics
 
-- gene-wise PCC and Spearman across spots;
+- mean/median gene-wise PCC and Spearman across spots (spatial localization);
+- mean/median spot-profile PCC across genes (within-spot composition);
+- slide mean-expression-profile PCC/Spearman across genes (global tissue
+  composition, explicitly not raw-count pseudobulk);
+- pooled flattened PCC as a labelled diagnostic only, never a ranking metric,
+  because abundant genes and between-gene means can dominate it;
 - RMSE, MSE and MAE in normalized-log1p space;
 - mean/median per-gene R2, retaining negative values rather than clipping;
 - median/IQR gene PCC and fractions above 0, 0.1, 0.2 and 0.3;
 - patient-macro estimates, paired slide deltas and 95% confidence intervals;
 - all genes, train HVG-50/200 and within-slide-variance 50/200.
+
+The shared evaluator also emits formula-compatible versions of the six point
+diagnostics used by HEtoSGEBench: per-gene PCC, normalized mutual information,
+Jensen-Shannon divergence, range/standard-deviation-normalized RMSE, coordinate-free vector
+SSIM and zero/nonzero AUC. Their mean and median are reported. The benchmark
+paper's additional raw-count AUC thresholds (counts >1, >2, >5, and so on)
+are not claimed here because Track B evaluates normalized-log1p targets and
+predictions; zero/nonzero status is the only threshold preserved exactly by
+that transform. Track B retains its stricter patient-macro aggregation and
+fixed training-derived panels, so these fields must not be presented as a
+numerical reproduction of that paper's cohort or cross-validation protocol.
+
+Interpretation is directional: higher is better for PCC, Spearman, NMI, SSIM,
+AUC and R2; lower is better for RMSE, MAE, JS divergence and NRMSE. Gradient
+energy ratios are best near 1 rather than simply high. Pooled PCC and the
+mean-expression-profile metrics describe calibration/composition but cannot
+demonstrate that spatial gene patterns are localized correctly.
 
 ### Required structured metrics
 
@@ -45,6 +67,9 @@ SSIM uses one method-independent rasterization: the median spot-neighbour
 distance defines two raster pixels, spot values are Gaussian-splatted, local
 moments are normalized by tissue support, and SSIM is averaged only at real
 spot centers. Empty background is therefore never included in the mean.
+This coordinate-aware spatial SSIM remains distinct from the paper-compatible
+`benchmark_gene_ssim`, which treats each gene as a one-dimensional vector and
+does not use spot coordinates.
 
 ## Method tiers
 

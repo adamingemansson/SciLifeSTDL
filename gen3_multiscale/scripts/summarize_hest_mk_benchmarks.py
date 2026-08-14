@@ -10,11 +10,21 @@ from pathlib import Path
 
 FIELDS = (
     "track", "scope", "method", "prediction", "panel", "pcc", "spearman",
+    "mean_gene_pcc", "mean_gene_spearman", "median_gene_spearman",
+    "gene_spearman_q25", "gene_spearman_q75", "pooled_pcc",
+    "mean_spot_profile_pcc", "median_spot_profile_pcc",
+    "spot_profile_pcc_q25", "spot_profile_pcc_q75",
+    "mean_expression_profile_pcc", "mean_expression_profile_spearman",
     "rmse", "mse", "mae", "r2", "median_gene_r2", "median_gene_pcc",
     "gene_pcc_q25", "gene_pcc_q75", "fraction_gene_pcc_gt_0",
     "fraction_gene_pcc_gt_0_1", "fraction_gene_pcc_gt_0_2",
     "fraction_gene_pcc_gt_0_3", "auc",
-    "mean_spot_profile_pcc", "median_spot_profile_pcc",
+    "mean_gene_nonzero_auc", "median_gene_nonzero_auc",
+    "mean_gene_nmi", "median_gene_nmi",
+    "mean_gene_js_divergence", "median_gene_js_divergence",
+    "mean_gene_nrmse_range", "median_gene_nrmse_range",
+    "mean_gene_nrmse_sd", "median_gene_nrmse_sd",
+    "mean_benchmark_gene_ssim", "median_benchmark_gene_ssim",
     "coexpression_matrix_pcc", "coexpression_matrix_mae",
     "mean_per_gene_ssim", "median_per_gene_ssim",
     "moran_i_pcc", "moran_i_mae",
@@ -26,10 +36,22 @@ FIELDS = (
 )
 
 POINT_FIELDS = (
-    "pcc", "spearman", "rmse", "mse", "mae", "r2", "median_gene_r2",
+    "pcc", "spearman", "mean_gene_pcc", "mean_gene_spearman",
+    "median_gene_spearman", "gene_spearman_q25", "gene_spearman_q75",
+    "pooled_pcc",
+    "mean_spot_profile_pcc", "median_spot_profile_pcc",
+    "spot_profile_pcc_q25", "spot_profile_pcc_q75",
+    "mean_expression_profile_pcc", "mean_expression_profile_spearman",
+    "rmse", "mse", "mae", "r2", "median_gene_r2",
     "median_gene_pcc", "gene_pcc_q25", "gene_pcc_q75",
     "fraction_gene_pcc_gt_0", "fraction_gene_pcc_gt_0_1",
     "fraction_gene_pcc_gt_0_2", "fraction_gene_pcc_gt_0_3", "auc",
+    "mean_gene_nonzero_auc", "median_gene_nonzero_auc",
+    "mean_gene_nmi", "median_gene_nmi",
+    "mean_gene_js_divergence", "median_gene_js_divergence",
+    "mean_gene_nrmse_range", "median_gene_nrmse_range",
+    "mean_gene_nrmse_sd", "median_gene_nrmse_sd",
+    "mean_benchmark_gene_ssim", "median_benchmark_gene_ssim",
 )
 
 STRUCTURED_FIELDS = {
@@ -70,17 +92,24 @@ def _row(
             if row.get("image_coverage_fraction") is not None
         ]
         coverage = sum(float(value) for value in values) / len(values) if values else None
+    point_values = {name: _metric_value(metrics, name) for name in POINT_FIELDS}
+    structured_values = {}
+    for output_name, metric_name in STRUCTURED_FIELDS.items():
+        value = _metric_value(structured_metrics or {}, metric_name)
+        # Spot-profile PCC is now part of the shared point contract as well,
+        # so fixed-mask reports expose it. Prefer the whole-slide structured
+        # copy when present, otherwise retain the point value.
+        structured_values[output_name] = (
+            point_values.get(output_name) if value is None else value
+        )
     return {
         "track": track,
         "scope": scope,
         "method": method,
         "prediction": prediction,
         "panel": panel,
-        **{name: _metric_value(metrics, name) for name in POINT_FIELDS},
-        **{
-            output_name: _metric_value(structured_metrics or {}, metric_name)
-            for output_name, metric_name in STRUCTURED_FIELDS.items()
-        },
+        **point_values,
+        **structured_values,
         "n_patients": (
             metrics.get("pcc", {}).get("n_patients")
             if isinstance(metrics.get("pcc"), dict) else None

@@ -19,7 +19,7 @@ from scipy.ndimage import gaussian_filter
 from scipy.spatial import cKDTree
 
 from gen3_multiscale.data.boundary_graph import build_knn_adjacency
-from gen3_multiscale.evaluation.metrics import pearson_per_gene
+from gen3_multiscale.evaluation.metrics import pearson_per_gene, spot_profile_pcc_per_spot
 from gen3_multiscale.evaluation.noise_ceiling import normalized_score
 
 
@@ -74,15 +74,13 @@ def spot_profile_agreement(predicted: np.ndarray, target: np.ndarray) -> dict[st
     # Chunk spots so an all-gene whole slide does not allocate several extra
     # [n_spots, n_genes] float64 arrays at once.  Transposing a spot block maps
     # the shared per-gene PCC implementation onto one PCC per original spot.
-    per_spot = np.concatenate([
-        pearson_per_gene(predicted[start:end].T, target[start:end].T)
-        for start in range(0, predicted.shape[0], 256)
-        for end in [min(start + 256, predicted.shape[0])]
-    ])
+    per_spot = spot_profile_pcc_per_spot(predicted, target)
     finite = per_spot[np.isfinite(per_spot)]
     return {
         "mean_spot_profile_pcc": float(finite.mean()) if finite.size else float("nan"),
         "median_spot_profile_pcc": float(np.median(finite)) if finite.size else float("nan"),
+        "spot_profile_pcc_q25": float(np.quantile(finite, 0.25)) if finite.size else float("nan"),
+        "spot_profile_pcc_q75": float(np.quantile(finite, 0.75)) if finite.size else float("nan"),
         "n_eligible_spots": int(finite.size),
     }
 

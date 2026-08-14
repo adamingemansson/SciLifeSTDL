@@ -9,9 +9,13 @@ from scipy.stats import pearsonr
 
 from gen3_multiscale.evaluation.metrics import (
     aggregate_patient_metrics, boundary_interior_bins, comparable_expression_metrics,
+    benchmark_vector_ssim_per_gene,
     edge_gradient_agreement, gene_panel_metrics,
     graph_laplacian_agreement, hole_size_bins, nonzero_auc, pearson_per_gene,
-    r2_per_gene, resolve_gene_panels, rmse,
+    jensen_shannon_divergence_per_gene, nonzero_auc_per_gene,
+    normalized_mutual_information_per_gene, normalized_rmse_per_gene,
+    pooled_pearson, r2_per_gene, resolve_gene_panels, rmse,
+    spot_profile_pcc_per_spot,
     spatial_variogram_agreement, spearman_per_gene, st_fid, st_mmd,
 )
 
@@ -73,6 +77,63 @@ def test_comparable_metrics_expose_broad_per_gene_performance():
     assert set(("pcc", "spearman", "rmse", "mse", "mae", "r2")) <= set(out)
     assert out["median_gene_pcc"] > 0.9
     assert out["fraction_gene_pcc_gt_0_3"] == pytest.approx(0.75)
+    assert out["pcc"] == pytest.approx(out["mean_gene_pcc"])
+    assert out["spearman"] == pytest.approx(out["mean_gene_spearman"])
+    assert -1.0 <= out["mean_spot_profile_pcc"] <= 1.0
+    assert -1.0 <= out["pooled_pcc"] <= 1.0
+
+
+def test_complementary_pcc_axes_are_explicit_and_perfect_for_identical_arrays():
+    true = np.array([
+        [0.0, 1.0, 4.0, 2.0],
+        [1.0, 3.0, 2.0, 0.0],
+        [2.0, 0.0, 1.0, 5.0],
+        [4.0, 2.0, 0.0, 1.0],
+    ])
+    out = comparable_expression_metrics(true.copy(), true)
+    for key in (
+        "mean_gene_pcc", "pooled_pcc", "mean_spot_profile_pcc",
+        "mean_expression_profile_pcc", "mean_expression_profile_spearman",
+        "mean_gene_nmi", "mean_benchmark_gene_ssim", "mean_gene_nonzero_auc",
+    ):
+        assert out[key] == pytest.approx(1.0)
+    assert out["mean_gene_js_divergence"] == pytest.approx(0.0)
+    assert out["mean_gene_nrmse_range"] == pytest.approx(0.0)
+    assert out["mean_gene_nrmse_sd"] == pytest.approx(0.0)
+
+
+def test_paper_inspired_metrics_penalize_wrong_predictions_and_keep_constants_explicit():
+    true = np.array([
+        [0.0, 0.0, 2.0],
+        [0.0, 1.0, 2.0],
+        [1.0, 0.0, 2.0],
+        [2.0, 3.0, 2.0],
+        [4.0, 2.0, 2.0],
+        [3.0, 4.0, 2.0],
+    ])
+    pred = true[::-1].copy()
+    pred[:, 1] = 1.0
+    nmi = normalized_mutual_information_per_gene(pred, true)
+    js = jensen_shannon_divergence_per_gene(pred, true)
+    nrmse_range, nrmse_sd = normalized_rmse_per_gene(pred, true)
+    vector_ssim = benchmark_vector_ssim_per_gene(pred, true)
+    auc = nonzero_auc_per_gene(pred, true)
+    assert 0.0 <= nmi[0] < 1.0
+    assert nmi[1] == pytest.approx(0.0)
+    assert np.isnan(nmi[2])
+    assert js[0] > 0.0
+    assert nrmse_range[0] > 0.0 and nrmse_sd[0] > 0.0
+    assert vector_ssim[0] < 1.0 and np.isnan(vector_ssim[2])
+    assert 0.0 <= auc[0] < 1.0 and np.isnan(auc[2])
+
+
+def test_spot_and_pooled_pcc_helpers_preserve_failure_semantics():
+    true = np.array([[0.0, 1.0, 2.0], [2.0, 1.0, 0.0]])
+    pred = true.copy()
+    assert np.allclose(spot_profile_pcc_per_spot(pred, true), 1.0)
+    assert pooled_pearson(pred, true) == pytest.approx(1.0)
+    flat = np.ones_like(pred)
+    assert pooled_pearson(flat, true) == pytest.approx(0.0)
 
 
 def test_r2_per_gene_keeps_negative_failures_and_skips_constant_truth():

@@ -186,6 +186,245 @@ def gene_correlation_summary(per_gene_pcc: np.ndarray) -> dict[str, float]:
     }
 
 
+def _finite_summary(values: np.ndarray, prefix: str) -> dict[str, float]:
+    """Return a compact mean/median/IQR/count summary for a metric vector."""
+    values = np.asarray(values, dtype=np.float64)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return {
+            f"mean_{prefix}": float("nan"),
+            f"median_{prefix}": float("nan"),
+            f"{prefix}_q25": float("nan"),
+            f"{prefix}_q75": float("nan"),
+            f"n_valid_{prefix}": 0,
+        }
+    return {
+        f"mean_{prefix}": float(np.mean(finite)),
+        f"median_{prefix}": float(np.median(finite)),
+        f"{prefix}_q25": float(np.quantile(finite, 0.25)),
+        f"{prefix}_q75": float(np.quantile(finite, 0.75)),
+        f"n_valid_{prefix}": int(finite.size),
+    }
+
+
+def pooled_pearson(pred: np.ndarray, true: np.ndarray) -> float:
+    """PCC after flattening spots and genes, without a full centered copy.
+
+    This is deliberately a secondary diagnostic: it is dominated by gene
+    abundance/mean differences and must not replace mean per-gene PCC.
+    """
+    pred = np.asarray(pred)
+    true = np.asarray(true)
+    if pred.shape != true.shape or pred.size == 0:
+        raise ValueError("pred and true must be matching non-empty arrays")
+    n = float(pred.size)
+    sum_pred = float(np.sum(pred, dtype=np.float64))
+    sum_true = float(np.sum(true, dtype=np.float64))
+    pred_ss = float(np.sum(np.square(pred, dtype=np.float64), dtype=np.float64)) - sum_pred ** 2 / n
+    true_ss = float(np.sum(np.square(true, dtype=np.float64), dtype=np.float64)) - sum_true ** 2 / n
+    if true_ss <= 1e-12:
+        return float("nan")
+    if pred_ss <= 1e-12:
+        return 0.0
+    cross = float(np.sum(np.multiply(pred, true, dtype=np.float64), dtype=np.float64))
+    covariance = cross - sum_pred * sum_true / n
+    return float(np.clip(covariance / np.sqrt(pred_ss * true_ss), -1.0, 1.0))
+
+
+def spot_profile_pcc_per_spot(
+    pred: np.ndarray, true: np.ndarray, *, chunk_size: int = 256,
+) -> np.ndarray:
+    """PCC across genes inside every spot.
+
+    This complements per-gene PCC across spots: it asks whether the relative
+    expression profile within a location is correct, not whether a gene is
+    spatially localized correctly across the tissue.
+    """
+    pred = np.asarray(pred)
+    true = np.asarray(true)
+    if pred.ndim != 2 or pred.shape != true.shape or pred.shape[0] == 0:
+        raise ValueError("pred and true must be matching non-empty 2-D arrays")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+    return np.concatenate([
+        pearson_per_gene(pred[start:end].T, true[start:end].T)
+        for start in range(0, pred.shape[0], chunk_size)
+        for end in [min(start + chunk_size, pred.shape[0])]
+    ])
+
+
+def normalized_mutual_information_per_gene(
+    pred: np.ndarray, true: np.ndarray, *, chunk_size: int = 64,
+) -> np.ndarray:
+    """HEtoSGEBench-style per-gene normalized mutual information.
+
+    Prediction and truth are discretized separately into equal-frequency
+    bins. MI is normalized by the geometric mean of their entropies. A
+    truth-constant gene is ineligible; a constant prediction scores zero.
+    """
+    pred = np.asarray(pred)
+    true = np.asarray(true)
+    if pred.ndim != 2 or pred.shape != true.shape or pred.shape[0] == 0:
+        raise ValueError("pred and true must be matching non-empty 2-D arrays")
+    n_items, n_genes = pred.shape
+    n_bins = min(n_items, max(10, int(n_items ** (1.0 / 3.0))))
+    out = np.full(n_genes, np.nan, dtype=np.float64)
+    for start in range(0, n_genes, chunk_size):
+        end = min(start + chunk_size, n_genes)
+        pred_rank = rankdata(pred[:, start:end], axis=0, method="average")
+        true_rank = rankdata(true[:, start:end], axis=0, method="average")
+        pred_bin = np.minimum(
+            ((pred_rank - 1.0) * n_bins / n_items).astype(np.int64), n_bins - 1,
+        )
+        true_bin = np.minimum(
+            ((true_rank - 1.0) * n_bins / n_items).astype(np.int64), n_bins - 1,
+        )
+        pred_hot = np.eye(n_bins, dtype=np.float64)[pred_bin]
+        true_hot = np.eye(n_bins, dtype=np.float64)[true_bin]
+        joint = np.einsum("ncb,ncd->cbd", pred_hot, true_hot) / n_items
+        px = joint.sum(axis=2)
+        py = joint.sum(axis=1)
+        expected = px[:, :, None] * py[:, None, :]
+        nonzero = joint > 0
+        ratio = np.divide(joint, expected, out=np.ones_like(joint), where=nonzero)
+        mi = np.sum(np.where(nonzero, joint * np.log(ratio), 0.0), axis=(1, 2))
+        hx = -np.sum(np.where(px > 0, px * np.log(np.maximum(px, 1e-300)), 0.0), axis=1)
+        hy = -np.sum(np.where(py > 0, py * np.log(np.maximum(py, 1e-300)), 0.0), axis=1)
+        denominator = np.sqrt(hx * hy)
+        block = np.full(end - start, np.nan, dtype=np.float64)
+        truth_variable = np.ptp(true[:, start:end], axis=0) >= 1e-8
+        pred_variable = np.ptp(pred[:, start:end], axis=0) >= 1e-8
+        valid = truth_variable & pred_variable & (denominator > 1e-12)
+        block[valid] = np.clip(mi[valid] / denominator[valid], 0.0, 1.0)
+        block[truth_variable & ~pred_variable] = 0.0
+        out[start:end] = block
+    return out
+
+
+def jensen_shannon_divergence_per_gene(
+    pred: np.ndarray, true: np.ndarray, *, chunk_size: int = 256,
+) -> np.ndarray:
+    """Per-gene Jensen-Shannon divergence across spots (base 2, 0--1)."""
+    pred = np.asarray(pred)
+    true = np.asarray(true)
+    if pred.ndim != 2 or pred.shape != true.shape or pred.shape[0] == 0:
+        raise ValueError("pred and true must be matching non-empty 2-D arrays")
+    out = np.full(pred.shape[1], np.nan, dtype=np.float64)
+    for start in range(0, pred.shape[1], chunk_size):
+        end = min(start + chunk_size, pred.shape[1])
+        p = np.maximum(np.asarray(pred[:, start:end], dtype=np.float64), 0.0)
+        q = np.maximum(np.asarray(true[:, start:end], dtype=np.float64), 0.0)
+        p_sum = p.sum(axis=0, keepdims=True)
+        q_sum = q.sum(axis=0, keepdims=True)
+        p = np.divide(p, p_sum, out=np.full_like(p, 1.0 / len(p)), where=p_sum > 0)
+        q = np.divide(q, q_sum, out=np.full_like(q, 1.0 / len(q)), where=q_sum > 0)
+        midpoint = 0.5 * (p + q)
+        p_ratio = np.divide(p, midpoint, out=np.ones_like(p), where=p > 0)
+        q_ratio = np.divide(q, midpoint, out=np.ones_like(q), where=q > 0)
+        p_term = np.where(p > 0, p * np.log2(np.maximum(p_ratio, 1e-300)), 0.0)
+        q_term = np.where(q > 0, q * np.log2(np.maximum(q_ratio, 1e-300)), 0.0)
+        out[start:end] = np.clip(0.5 * (p_term.sum(axis=0) + q_term.sum(axis=0)), 0.0, 1.0)
+    return out
+
+
+def normalized_rmse_per_gene(
+    pred: np.ndarray, true: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-gene RMSE normalized by truth range and truth standard deviation."""
+    pred = np.asarray(pred, dtype=np.float64)
+    true = np.asarray(true, dtype=np.float64)
+    if pred.ndim != 2 or pred.shape != true.shape or pred.shape[0] == 0:
+        raise ValueError("pred and true must be matching non-empty 2-D arrays")
+    error = np.sqrt(np.mean(np.square(pred - true), axis=0))
+    value_range = np.ptp(true, axis=0)
+    standard_deviation = np.std(true, axis=0, ddof=1) if len(true) > 1 else np.zeros(true.shape[1])
+    by_range = np.full(true.shape[1], np.nan, dtype=np.float64)
+    by_sd = np.full(true.shape[1], np.nan, dtype=np.float64)
+    np.divide(error, value_range, out=by_range, where=value_range >= 1e-8)
+    np.divide(error, standard_deviation, out=by_sd, where=standard_deviation >= 1e-8)
+    return by_range, by_sd
+
+
+def benchmark_vector_ssim_per_gene(
+    pred: np.ndarray, true: np.ndarray, *, chunk_size: int = 256,
+) -> np.ndarray:
+    """Coordinate-free vector SSIM compatible with HEtoSGEBench.
+
+    This is intentionally named separately from our coordinate-aware Visium
+    raster SSIM. Each gene vector is independently mapped to 256 intensity
+    bins before the global SSIM formula is applied across spots.
+    """
+    pred = np.asarray(pred)
+    true = np.asarray(true)
+    if pred.ndim != 2 or pred.shape != true.shape or pred.shape[0] == 0:
+        raise ValueError("pred and true must be matching non-empty 2-D arrays")
+    out = np.full(pred.shape[1], np.nan, dtype=np.float64)
+    c1, c2 = (0.01 * 255.0) ** 2, (0.03 * 255.0) ** 2
+    for start in range(0, pred.shape[1], chunk_size):
+        end = min(start + chunk_size, pred.shape[1])
+        p = np.asarray(pred[:, start:end], dtype=np.float64)
+        q = np.asarray(true[:, start:end], dtype=np.float64)
+        # Mirror the reference implementation's first normalization step.
+        # The subsequent equal-width discretization makes this redundant for
+        # ordinary non-negative expression, but retaining it makes the metric
+        # contract explicit and reproducible.
+        p_max = p.max(axis=0)
+        q_max = q.max(axis=0)
+        p = np.divide(p, p_max, out=np.zeros_like(p), where=np.abs(p_max) >= 1e-12)
+        q = np.divide(q, q_max, out=np.zeros_like(q), where=np.abs(q_max) >= 1e-12)
+        p_range = np.ptp(p, axis=0)
+        q_range = np.ptp(q, axis=0)
+        p_scaled = np.divide(
+            p - p.min(axis=0), p_range,
+            out=np.zeros_like(p), where=p_range >= 1e-8,
+        ) * 255.0
+        q_scaled = np.divide(
+            q - q.min(axis=0), q_range,
+            out=np.zeros_like(q), where=q_range >= 1e-8,
+        ) * 255.0
+        p_scaled = np.floor(p_scaled)
+        q_scaled = np.floor(q_scaled)
+        p_mean, q_mean = p_scaled.mean(axis=0), q_scaled.mean(axis=0)
+        ddof = 1 if len(p_scaled) > 1 else 0
+        p_var = p_scaled.var(axis=0, ddof=ddof)
+        q_var = q_scaled.var(axis=0, ddof=ddof)
+        covariance = np.mean(
+            (p_scaled - p_mean) * (q_scaled - q_mean), axis=0,
+        ) * (len(p_scaled) / max(len(p_scaled) - 1, 1))
+        score = (
+            (2.0 * p_mean * q_mean + c1) * (2.0 * covariance + c2)
+            / ((p_mean ** 2 + q_mean ** 2 + c1) * (p_var + q_var + c2))
+        )
+        score[q_range < 1e-8] = np.nan
+        out[start:end] = np.clip(score, -1.0, 1.0)
+    return out
+
+
+def nonzero_auc_per_gene(
+    pred: np.ndarray, true: np.ndarray, *, chunk_size: int = 256,
+) -> np.ndarray:
+    """Per-gene zero/nonzero AUC using a vectorized Mann--Whitney statistic."""
+    pred = np.asarray(pred)
+    true = np.asarray(true)
+    if pred.ndim != 2 or pred.shape != true.shape or pred.shape[0] == 0:
+        raise ValueError("pred and true must be matching non-empty 2-D arrays")
+    out = np.full(pred.shape[1], np.nan, dtype=np.float64)
+    for start in range(0, pred.shape[1], chunk_size):
+        end = min(start + chunk_size, pred.shape[1])
+        positive = true[:, start:end] > 0
+        n_positive = positive.sum(axis=0).astype(np.float64)
+        n_negative = len(true) - n_positive
+        ranks = rankdata(pred[:, start:end], axis=0, method="average")
+        rank_sum = np.sum(ranks * positive, axis=0)
+        valid = (n_positive > 0) & (n_negative > 0)
+        block = np.full(end - start, np.nan, dtype=np.float64)
+        block[valid] = (
+            rank_sum[valid] - n_positive[valid] * (n_positive[valid] + 1.0) / 2.0
+        ) / (n_positive[valid] * n_negative[valid])
+        out[start:end] = np.clip(block, 0.0, 1.0)
+    return out
+
+
 def comparable_expression_metrics(pred: np.ndarray, true: np.ndarray) -> dict[str, float]:
     """Shared literature-facing point metric contract.
 
@@ -197,14 +436,35 @@ def comparable_expression_metrics(pred: np.ndarray, true: np.ndarray) -> dict[st
     per_gene_pcc = pearson_per_gene(pred, true)
     per_gene_spearman = spearman_per_gene(pred, true)
     per_gene_r2 = r2_per_gene(pred, true)
+    per_spot_pcc = spot_profile_pcc_per_spot(pred, true)
+    per_gene_nmi = normalized_mutual_information_per_gene(pred, true)
+    per_gene_js = jensen_shannon_divergence_per_gene(pred, true)
+    per_gene_nrmse_range, per_gene_nrmse_sd = normalized_rmse_per_gene(pred, true)
+    per_gene_benchmark_ssim = benchmark_vector_ssim_per_gene(pred, true)
+    per_gene_auc = nonzero_auc_per_gene(pred, true)
     valid_pcc = np.isfinite(per_gene_pcc)
     valid_spearman = np.isfinite(per_gene_spearman)
+    mean_profile_pred = np.mean(pred, axis=0).reshape(-1, 1)
+    mean_profile_true = np.mean(true, axis=0).reshape(-1, 1)
+    expression_profile_pcc = pearson_per_gene(mean_profile_pred, mean_profile_true)[0]
+    expression_profile_spearman = pearson_per_gene(
+        rankdata(mean_profile_pred, axis=0), rankdata(mean_profile_true, axis=0),
+    )[0]
+    gene_pcc = float(np.mean(per_gene_pcc[valid_pcc])) if valid_pcc.any() else float("nan")
+    gene_spearman = (
+        float(np.mean(per_gene_spearman[valid_spearman]))
+        if valid_spearman.any() else float("nan")
+    )
     return {
-        "pcc": float(np.mean(per_gene_pcc[valid_pcc])) if valid_pcc.any() else float("nan"),
-        "spearman": (
-            float(np.mean(per_gene_spearman[valid_spearman]))
-            if valid_spearman.any() else float("nan")
-        ),
+        # Backward-compatible names: these have always meant the mean of
+        # per-gene correlations across spots.
+        "pcc": gene_pcc,
+        "spearman": gene_spearman,
+        "mean_gene_pcc": gene_pcc,
+        "mean_gene_spearman": gene_spearman,
+        "pooled_pcc": pooled_pearson(pred, true),
+        "mean_expression_profile_pcc": float(expression_profile_pcc),
+        "mean_expression_profile_spearman": float(expression_profile_spearman),
         "rmse": rmse(pred, true),
         "mse": mse(pred, true),
         "mae": mae(pred, true),
@@ -217,6 +477,14 @@ def comparable_expression_metrics(pred: np.ndarray, true: np.ndarray) -> dict[st
             float(np.mean(per_gene_r2[np.isfinite(per_gene_r2)] > 0.0))
             if np.isfinite(per_gene_r2).any() else float("nan")
         ),
+        **_finite_summary(per_spot_pcc, "spot_profile_pcc"),
+        **_finite_summary(per_gene_nmi, "gene_nmi"),
+        **_finite_summary(per_gene_js, "gene_js_divergence"),
+        **_finite_summary(per_gene_nrmse_range, "gene_nrmse_range"),
+        **_finite_summary(per_gene_nrmse_sd, "gene_nrmse_sd"),
+        **_finite_summary(per_gene_benchmark_ssim, "benchmark_gene_ssim"),
+        **_finite_summary(per_gene_auc, "gene_nonzero_auc"),
+        **_finite_summary(per_gene_spearman, "gene_spearman"),
         **gene_correlation_summary(per_gene_pcc),
     }
 

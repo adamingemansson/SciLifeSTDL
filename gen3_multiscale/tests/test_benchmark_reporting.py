@@ -143,6 +143,9 @@ def test_summary_parser_emits_patient_macro_ridge_row(tmp_path: Path):
         "point_metrics_patient_aggregated": {
             "all_genes": {
                 "pcc": {"patient_mean": 0.12, "n_patients": 9},
+                "mean_spot_profile_pcc": {"patient_mean": 0.72, "n_patients": 9},
+                "mean_gene_nmi": {"patient_mean": 0.21, "n_patients": 9},
+                "mean_gene_js_divergence": {"patient_mean": 0.18, "n_patients": 9},
                 "rmse": {"patient_mean": 0.34, "n_patients": 9},
                 "median_gene_pcc": {"patient_mean": 0.08, "n_patients": 9},
                 "fraction_gene_pcc_gt_0_3": {"patient_mean": 0.14, "n_patients": 9},
@@ -166,6 +169,9 @@ def test_summary_parser_emits_patient_macro_ridge_row(tmp_path: Path):
     assert rows[0]["method"] == "uni2_pca256_ridge"
     assert rows[0]["scope"] == "whole_slide"
     assert rows[0]["pcc"] == 0.12
+    assert rows[0]["mean_spot_profile_pcc"] == 0.72
+    assert rows[0]["mean_gene_nmi"] == 0.21
+    assert rows[0]["mean_gene_js_divergence"] == 0.18
     assert rows[0]["median_gene_pcc"] == 0.08
     assert rows[0]["fraction_gene_pcc_gt_0_3"] == 0.14
     assert rows[0]["mean_per_gene_ssim"] == 0.44

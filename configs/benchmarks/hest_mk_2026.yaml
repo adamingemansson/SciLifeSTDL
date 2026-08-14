@@ -1,4 +1,4 @@
-version: 2
+version: 3
 name: hest_mk_2026
 
 # Never rank rows across tracks. They answer different questions.
@@ -30,12 +30,35 @@ panels:
 
 metrics:
   primary_point:
+    # pcc/spearman are retained aliases for mean_gene_pcc/mean_gene_spearman.
     - pcc
     - spearman
+    - mean_gene_pcc
+    - mean_gene_spearman
+    - median_gene_spearman
     - rmse
     - mse
     - mae
     - r2
+  complementary_pcc_axes:
+    - mean_spot_profile_pcc
+    - median_spot_profile_pcc
+    - pooled_pcc
+    - mean_expression_profile_pcc
+    - mean_expression_profile_spearman
+  hetosgebench_formula_compatible_diagnostics:
+    - mean_gene_nmi
+    - median_gene_nmi
+    - mean_gene_js_divergence
+    - median_gene_js_divergence
+    - mean_gene_nrmse_range
+    - median_gene_nrmse_range
+    - mean_gene_nrmse_sd
+    - median_gene_nrmse_sd
+    - mean_benchmark_gene_ssim
+    - median_benchmark_gene_ssim
+    - mean_gene_nonzero_auc
+    - median_gene_nonzero_auc
   per_gene_distribution:
     - median_gene_pcc
     - gene_pcc_q25
@@ -59,6 +82,7 @@ metrics:
     - wide_sign_agreement_nontrivial
   gene_structure:
     - mean_spot_profile_pcc
+    - median_spot_profile_pcc
     - correlation_matrix_pcc
     - correlation_matrix_mae
   reliability:
