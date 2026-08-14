@@ -38,6 +38,7 @@ from gen3_multiscale.evaluation.metrics import (
     nonzero_auc,
     resolve_gene_panels,
 )
+from gen3_multiscale.evaluation.per_gene_diagnostics import PerGeneDiagnosticsAccumulator
 from gen3_multiscale.evaluation.schedule_contract import fixed_mask_evaluation_metadata
 from gen3_multiscale.evaluation.stpath_zero_shot_evaluator import (
     _rows,
@@ -110,6 +111,7 @@ def evaluate_stpath_supervisor_zero_shot(
     n_masks_per_sample: int = 8,
     device_str: str = "cpu",
     allow_test: bool = False,
+    per_gene_diagnostics_output: str | None = None,
 ) -> dict:
     if task not in TASKS:
         raise ValueError(f"task must be one of {TASKS}, got {task!r}")
@@ -303,6 +305,10 @@ def evaluate_stpath_supervisor_zero_shot(
     whole_slide_point_evaluation = None
     if task == "he_to_st":
         whole_slide_records = []
+        per_gene_accumulator = (
+            PerGeneDiagnosticsAccumulator(gene_names)
+            if per_gene_diagnostics_output else None
+        )
         for sample_id in split_ids:
             sample = samples[sample_id]
             pred_supported_native = he_only_prediction_cache[sample_id]
@@ -313,6 +319,7 @@ def evaluate_stpath_supervisor_zero_shot(
                 pred_supported_normalized, supported_positions, len(gene_names),
             )
             target = _rows(sample.adata.X, np.arange(sample.adata.n_obs, dtype=np.int64))
+            coords = np.asarray(sample.full_sample_coords, dtype=np.float32)
             whole_slide_records.append({
                 "sample_id": sample_id,
                 "patient_id": str(sample.patient_id),
@@ -327,6 +334,12 @@ def evaluate_stpath_supervisor_zero_shot(
                     predicted, target, panel_indices,
                 ),
             })
+            if per_gene_accumulator is not None:
+                per_gene_accumulator.add_slide(
+                    sample_id=sample_id, patient_id=str(sample.patient_id),
+                    organ=str(manifest["samples"][sample_id]["organ"]),
+                    predicted=predicted, target=target, coords=coords,
+                )
         whole_slide_patients = [row["patient_id"] for row in whole_slide_records]
         point_aggregated = {
             panel: aggregate_patient_metrics(
@@ -335,6 +348,16 @@ def evaluate_stpath_supervisor_zero_shot(
             )
             for panel in whole_slide_records[0]["point_metrics"]
         }
+        per_gene_path = None
+        if per_gene_accumulator is not None:
+            per_gene_path = per_gene_accumulator.save(
+                per_gene_diagnostics_output,
+                provenance={
+                    "method": "stpath_pretrained_he_to_st",
+                    "split": split, "target_space": "normalize_total_then_log1p",
+                    "primary_prediction": "pretrained_stpath_h_and_e_only",
+                },
+            )
         whole_slide_point_evaluation = {
             "scope": "all_held_out_slides_every_spot_exactly_once",
             "primary_prediction": "pretrained_stpath_h_and_e_only",
@@ -344,7 +367,12 @@ def evaluate_stpath_supervisor_zero_shot(
             "gene_panel_metadata": panel_metadata,
             "per_slide_records": whole_slide_records,
             "point_metrics_patient_aggregated": point_aggregated,
+            "per_gene_diagnostics_path": str(per_gene_path) if per_gene_path else None,
         }
+    elif per_gene_diagnostics_output:
+        raise ValueError(
+            "per-gene whole-slide diagnostics are only defined for task='he_to_st'"
+        )
 
     return {
         "version": 1,
@@ -432,6 +460,7 @@ def main() -> None:
     )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--allow-test", action="store_true")
+    parser.add_argument("--per-gene-diagnostics-output")
     args = parser.parse_args()
 
     report = evaluate_stpath_supervisor_zero_shot(
@@ -447,6 +476,7 @@ def main() -> None:
         n_masks_per_sample=args.n_masks_per_sample,
         device_str=args.device,
         allow_test=args.allow_test,
+        per_gene_diagnostics_output=args.per_gene_diagnostics_output,
     )
     path = _save_report(report, args.output)
     primary = report["normalized_log1p_patient_aggregated_metrics"]

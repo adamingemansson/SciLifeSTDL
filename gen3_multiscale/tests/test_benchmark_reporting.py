@@ -24,6 +24,7 @@ from gen3_multiscale.scripts.compare_mk_whole_slide_to_ridge import (
     _contract_from_ridge,
     _paired_patient_delta,
 )
+from gen3_multiscale.scripts.build_hest_mk_track_b_leaderboard import audit_report
 
 
 def test_stable_indices_are_reproducible_bounded_and_sample_specific():
@@ -227,3 +228,50 @@ def test_paired_delta_bootstraps_patients_after_averaging_their_slides():
     assert result["patient_mean"] == pytest.approx(0.15)
     assert result["n_patients"] == 2
     assert result["ci95_low"] <= result["patient_mean"] <= result["ci95_high"]
+
+
+def test_track_b_auditor_accepts_exact_stpath_and_rejects_context_gex(tmp_path: Path):
+    sample_ids = [f"s{i}" for i in range(14)]
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({
+        "gene_panel": ["g0", "g1"],
+        "validation_sample_ids": sample_ids,
+        "build_args": {
+            "expression_transform": "normalize_total_then_log1p",
+            "expression_target_sum": 10000.0,
+        },
+    }))
+    expected_contract = {
+        "gene_panel_sha256": __import__("hashlib").sha256(
+            json.dumps(["g0", "g1"], separators=(",", ":")).encode()
+        ).hexdigest(),
+        "validation_sample_ids": sample_ids,
+        "expression_transform": "normalize_total_then_log1p",
+        "expression_target_sum": 10000.0,
+    }
+    counts = {sample_id: 100 + index for index, sample_id in enumerate(sample_ids)}
+    report = {
+        "kind": "stpath_supervisor_zero_shot_evaluation_report",
+        "split": "validation", "task": "he_to_st",
+        "manifest_path": str(manifest),
+        "stpath": {
+            "query_expression_visible": False,
+            "surrounding_expression_visible": False,
+        },
+        "whole_slide_point_evaluation": {
+            "primary_prediction": "pretrained_stpath_h_and_e_only",
+            "target_space": "normalize_total_then_log1p",
+            "point_metrics_patient_aggregated": {"all_genes": {"pcc": {}}},
+            "per_slide_records": [
+                {"sample_id": sample_id, "n_spots": count}
+                for sample_id, count in counts.items()
+            ],
+        },
+    }
+    assert audit_report(
+        report, expected_counts=counts, expected_contract=expected_contract,
+    ) == (True, "compatible")
+    report["stpath"]["surrounding_expression_visible"] = True
+    assert audit_report(
+        report, expected_counts=counts, expected_contract=expected_contract,
+    ) == (False, "surrounding_gex_not_explicitly_hidden")

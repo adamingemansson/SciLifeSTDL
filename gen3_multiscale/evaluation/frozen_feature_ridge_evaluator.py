@@ -33,6 +33,7 @@ from gen3_multiscale.evaluation.metrics import (
     nonzero_auc,
     resolve_gene_panels,
 )
+from gen3_multiscale.evaluation.per_gene_diagnostics import PerGeneDiagnosticsAccumulator
 from gen3_multiscale.evaluation.structured_field_metrics import structured_field_metrics
 from gen3_multiscale.evaluation.train_gene_panels import load_train_derived_gene_panels
 from gen3_multiscale.data import spot_feature_cache
@@ -253,6 +254,7 @@ def evaluate_frozen_feature_ridge(
     ridge_alpha: float = 1.0, seed: int = 0, local_k: int = 6,
     wide_k: int = 18, missing_image_policy: str = "zero",
     linear_algebra_device: str = "cpu",
+    per_gene_diagnostics_output: str | None = None,
 ) -> dict:
     if image_encoder not in {"uni2", "gigapath"}:
         raise ValueError("image_encoder must be 'uni2' or 'gigapath'")
@@ -425,6 +427,10 @@ def evaluate_frozen_feature_ridge(
     print(f"Ridge fit artifact saved to {model_path}", flush=True)
 
     records = []
+    per_gene_accumulator = (
+        PerGeneDiagnosticsAccumulator(gene_names)
+        if per_gene_diagnostics_output else None
+    )
     for position, sample_id in enumerate(split_ids):
         sample = _load_sample(cfg, manifest, sample_id)
         available = _available(sample)
@@ -452,6 +458,12 @@ def evaluate_frozen_feature_ridge(
             "structured_field": structured,
         }
         records.append(record)
+        if per_gene_accumulator is not None:
+            per_gene_accumulator.add_slide(
+                sample_id=sample_id, patient_id=str(sample.patient_id),
+                organ=str(manifest["samples"][sample_id]["organ"]),
+                predicted=predicted, target=target, coords=coords, local_k=local_k,
+            )
         print(
             f"Whole-slide evaluation: {position + 1}/{len(split_ids)} "
             f"sample={sample_id} spots={len(evaluated)}",
@@ -479,6 +491,17 @@ def evaluate_frozen_feature_ridge(
     by_organ = _aggregate_point_metrics_by_group(records, "organ")
     by_technology = _aggregate_point_metrics_by_group(records, "technology")
 
+    per_gene_path = None
+    if per_gene_accumulator is not None:
+        per_gene_path = per_gene_accumulator.save(
+            per_gene_diagnostics_output,
+            provenance={
+                "method": f"{image_encoder}_pca_ridge",
+                "report_output": str(output_path), "split": split,
+                "target_space": "normalize_total_then_log1p",
+                "primary_prediction": "frozen_feature_ridge",
+            },
+        )
     report = {
         "version": 1,
         "kind": "frozen_feature_pca_ridge_whole_slide_benchmark",
@@ -508,6 +531,7 @@ def evaluate_frozen_feature_ridge(
         "point_metrics_by_organ": by_organ,
         "point_metrics_by_technology": by_technology,
         "per_slide_records": records,
+        "per_gene_diagnostics_path": str(per_gene_path) if per_gene_path else None,
         "model_artifact": str(model_path),
         "comparability_notes": {
             "primary": "whole-slide gene-wise PCC, patient macro average",
@@ -550,6 +574,7 @@ def main() -> None:
         "--linear-algebra-device", default="cpu",
         help="Torch device for PCA eigensolve and ridge solve; use cuda on the server to avoid MKL.",
     )
+    parser.add_argument("--per-gene-diagnostics-output")
     args = parser.parse_args()
     evaluate_frozen_feature_ridge(
         config_path=args.config,
@@ -569,6 +594,7 @@ def main() -> None:
         wide_k=args.wide_k,
         missing_image_policy=args.missing_image_policy,
         linear_algebra_device=args.linear_algebra_device,
+        per_gene_diagnostics_output=args.per_gene_diagnostics_output,
     )
 
 

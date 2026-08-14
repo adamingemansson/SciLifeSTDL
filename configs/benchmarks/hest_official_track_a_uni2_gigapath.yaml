@@ -1,0 +1,39 @@
+# Preparation-only configuration for the unmodified official HEST benchmark.
+#
+# Protocol source: the HEST checkout in this repository (commit 3ddb5ea when
+# this file was prepared). Run from the HEST checkout so the ./eval paths are
+# resolved by HEST itself. This is Track A and must never be pooled with the
+# expanded 242-train/14-validation Track-B results.
+
+seed: 1
+overwrite: false
+
+bench_data_root: "./eval/bench_data"
+embed_dataroot: "./eval/ST_data_emb_track_a_uni2_gigapath"
+results_dir: "./eval/ST_pred_results_track_a_uni2_gigapath"
+exp_code: "official_hest_pca256_ridge_uni2_gigapath"
+
+batch_size: 128
+num_workers: 4
+
+gene_list: "var_50genes.json"
+method: "ridge"
+kfold: false
+normalize: true
+dimreduce: "PCA"
+latent_dim: 256
+
+encoders:
+  - "uni_v2"
+  - "gigapath"
+
+datasets:
+  - "IDC"
+  - "PRAD"
+  - "PAAD"
+  - "SKCM"
+  - "COAD"
+  - "READ"
+  - "CCRCC"
+  - "LUNG"
+  - "LYMPH_IDC"
