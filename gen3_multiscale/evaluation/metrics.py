@@ -30,7 +30,7 @@ from typing import Any
 
 import numpy as np
 from scipy import linalg
-from scipy.stats import pearsonr, t as _student_t
+from scipy.stats import pearsonr, rankdata, t as _student_t
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +83,142 @@ def pearson_per_gene(pred: np.ndarray, true: np.ndarray) -> np.ndarray:
 
 def rmse(pred: np.ndarray, true: np.ndarray) -> float:
     return float(np.sqrt(np.mean((pred - true) ** 2)))
+
+
+def mse(pred: np.ndarray, true: np.ndarray) -> float:
+    """Mean squared error in the evaluator's declared expression space."""
+    pred = np.asarray(pred, dtype=np.float64)
+    true = np.asarray(true, dtype=np.float64)
+    if pred.shape != true.shape or pred.size == 0:
+        raise ValueError("pred and true must be matching non-empty arrays")
+    return float(np.mean(np.square(pred - true)))
+
+
+def mae(pred: np.ndarray, true: np.ndarray) -> float:
+    """Mean absolute error in the evaluator's declared expression space."""
+    pred = np.asarray(pred, dtype=np.float64)
+    true = np.asarray(true, dtype=np.float64)
+    if pred.shape != true.shape or pred.size == 0:
+        raise ValueError("pred and true must be matching non-empty arrays")
+    return float(np.mean(np.abs(pred - true)))
+
+
+def spearman_per_gene(
+    pred: np.ndarray, true: np.ndarray, *, chunk_size: int = 256,
+) -> np.ndarray:
+    """Per-gene Spearman correlation with PCC-compatible failure semantics.
+
+    Ranking is performed in gene chunks so whole-slide/full-panel evaluation
+    does not materialize two additional ``[n_spots, n_genes]`` float64 arrays.
+    Truth-constant genes are ineligible (NaN); a constant prediction for a
+    truth-variable gene is a model failure (0), matching ``pearson_per_gene``.
+    """
+    pred = np.asarray(pred)
+    true = np.asarray(true)
+    if pred.ndim != 2 or true.ndim != 2 or pred.shape != true.shape:
+        raise ValueError(
+            f"pred and true must be matching 2-D [n_items, n_genes] arrays; "
+            f"got {pred.shape} and {true.shape}"
+        )
+    if pred.shape[0] == 0:
+        raise ValueError("cannot compute per-gene Spearman over zero items")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+
+    out = np.full(pred.shape[1], np.nan, dtype=np.float64)
+    for start in range(0, pred.shape[1], chunk_size):
+        end = min(start + chunk_size, pred.shape[1])
+        pred_rank = rankdata(pred[:, start:end], axis=0, method="average")
+        true_rank = rankdata(true[:, start:end], axis=0, method="average")
+        out[start:end] = pearson_per_gene(pred_rank, true_rank)
+    return out
+
+
+def r2_per_gene(pred: np.ndarray, true: np.ndarray) -> np.ndarray:
+    """Per-gene coefficient of determination across spots.
+
+    A truth-constant gene has no defined R2 and is returned as NaN. Negative
+    values are retained because they are important evidence that the model is
+    worse than predicting the held-out gene mean.
+    """
+    pred = np.asarray(pred, dtype=np.float64)
+    true = np.asarray(true, dtype=np.float64)
+    if pred.ndim != 2 or true.ndim != 2 or pred.shape != true.shape:
+        raise ValueError("pred and true must be matching 2-D arrays")
+    residual = np.square(true - pred).sum(axis=0)
+    centered = true - true.mean(axis=0, keepdims=True)
+    total = np.square(centered).sum(axis=0)
+    out = np.full(true.shape[1], np.nan, dtype=np.float64)
+    valid = total > 1e-12
+    out[valid] = 1.0 - residual[valid] / total[valid]
+    return out
+
+
+def gene_correlation_summary(per_gene_pcc: np.ndarray) -> dict[str, float]:
+    """Flat per-gene PCC distribution summary for report aggregation.
+
+    Mean PCC alone can hide a model that predicts a small subset of genes
+    extremely well while failing broadly. These fields deliberately stay
+    scalar/flat so the existing patient-macro aggregator can consume them.
+    """
+    values = np.asarray(per_gene_pcc, dtype=np.float64)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return {
+            "median_gene_pcc": float("nan"),
+            "gene_pcc_q25": float("nan"),
+            "gene_pcc_q75": float("nan"),
+            "fraction_gene_pcc_gt_0": float("nan"),
+            "fraction_gene_pcc_gt_0_1": float("nan"),
+            "fraction_gene_pcc_gt_0_2": float("nan"),
+            "fraction_gene_pcc_gt_0_3": float("nan"),
+            "n_valid_genes": 0,
+        }
+    return {
+        "median_gene_pcc": float(np.median(finite)),
+        "gene_pcc_q25": float(np.quantile(finite, 0.25)),
+        "gene_pcc_q75": float(np.quantile(finite, 0.75)),
+        "fraction_gene_pcc_gt_0": float(np.mean(finite > 0.0)),
+        "fraction_gene_pcc_gt_0_1": float(np.mean(finite > 0.1)),
+        "fraction_gene_pcc_gt_0_2": float(np.mean(finite > 0.2)),
+        "fraction_gene_pcc_gt_0_3": float(np.mean(finite > 0.3)),
+        "n_valid_genes": int(finite.size),
+    }
+
+
+def comparable_expression_metrics(pred: np.ndarray, true: np.ndarray) -> dict[str, float]:
+    """Shared literature-facing point metric contract.
+
+    PCC and Spearman are gene-wise across spots. RMSE/MAE are element-wise in
+    the caller's declared target space. The returned distribution fields make
+    broad versus few-gene performance visible without storing a large vector
+    in every mask/slide record.
+    """
+    per_gene_pcc = pearson_per_gene(pred, true)
+    per_gene_spearman = spearman_per_gene(pred, true)
+    per_gene_r2 = r2_per_gene(pred, true)
+    valid_pcc = np.isfinite(per_gene_pcc)
+    valid_spearman = np.isfinite(per_gene_spearman)
+    return {
+        "pcc": float(np.mean(per_gene_pcc[valid_pcc])) if valid_pcc.any() else float("nan"),
+        "spearman": (
+            float(np.mean(per_gene_spearman[valid_spearman]))
+            if valid_spearman.any() else float("nan")
+        ),
+        "rmse": rmse(pred, true),
+        "mse": mse(pred, true),
+        "mae": mae(pred, true),
+        "r2": float(np.nanmean(per_gene_r2)) if np.isfinite(per_gene_r2).any() else float("nan"),
+        "median_gene_r2": (
+            float(np.nanmedian(per_gene_r2))
+            if np.isfinite(per_gene_r2).any() else float("nan")
+        ),
+        "fraction_gene_r2_gt_0": (
+            float(np.mean(per_gene_r2[np.isfinite(per_gene_r2)] > 0.0))
+            if np.isfinite(per_gene_r2).any() else float("nan")
+        ),
+        **gene_correlation_summary(per_gene_pcc),
+    }
 
 
 def nonzero_auc(pred: np.ndarray, true: np.ndarray) -> float:
@@ -195,17 +331,12 @@ def resolve_gene_panels(
 def gene_panel_metrics(
     pred: np.ndarray, true: np.ndarray, gene_names: list[str], gene_panels: dict[str, list[str]],
 ) -> dict[str, dict[str, float]]:
-    """PCC (nanmean over genes) and RMSE restricted to each named
-    evaluation-only panel -- "PCC/RMSE on named evaluation-only gene
-    panels" (Phase 7)."""
+    """Comparable point metrics restricted to each evaluation-only panel."""
     indices, _metadata = resolve_gene_panels(gene_names, gene_panels)
     out: dict[str, dict[str, float]] = {}
     for panel_name, idx in indices.items():
         panel_pred, panel_true = pred[:, idx], true[:, idx]
-        out[panel_name] = {
-            "pcc": float(np.nanmean(pearson_per_gene(panel_pred, panel_true))),
-            "rmse": rmse(panel_pred, panel_true),
-        }
+        out[panel_name] = comparable_expression_metrics(panel_pred, panel_true)
     return out
 
 

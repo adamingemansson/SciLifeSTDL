@@ -1,0 +1,188 @@
+version: 2
+name: hest_mk_2026
+
+# Never rank rows across tracks. They answer different questions.
+tracks:
+  official_hest:
+    purpose: published-method comparability
+    primary_metric: gene_wise_pcc_top50_hvg
+    protocol_source: https://github.com/mahmoodlab/HEST
+    published_table_version: "2026-04-03"
+    target_smoothing: false
+    status: requires_official_hest_checkout_and_folds
+  expanded_exact_split:
+    purpose: project objective on the immutable 242-train/14-validation cohort
+    primary_metric: whole_slide_gene_wise_pcc_patient_macro
+    required_validation_samples: 14
+    required_fixed_mask_items: 448
+    target_smoothing: false
+    target_space: normalize_total_then_log1p
+
+panels:
+  required:
+    - all_genes
+    - train_log1p_variance_top50
+    - train_log1p_variance_top200
+    - train_within_slide_variance_top50
+    - train_within_slide_variance_top200
+  official_hest:
+    - official_hest_top50_hvg
+
+metrics:
+  primary_point:
+    - pcc
+    - spearman
+    - rmse
+    - mse
+    - mae
+    - r2
+  per_gene_distribution:
+    - median_gene_pcc
+    - gene_pcc_q25
+    - gene_pcc_q75
+    - fraction_gene_pcc_gt_0
+    - fraction_gene_pcc_gt_0_1
+    - fraction_gene_pcc_gt_0_2
+    - fraction_gene_pcc_gt_0_3
+    - median_gene_r2
+    - fraction_gene_r2_gt_0
+  spatial:
+    - moran_i_pcc
+    - moran_i_mae
+    - local_signed_gradient_pcc
+    - wide_signed_gradient_pcc
+    - local_gradient_energy_ratio
+    - wide_gradient_energy_ratio
+    - local_sign_agreement_nontrivial
+    - wide_sign_agreement_nontrivial
+  gene_structure:
+    - mean_spot_profile_pcc
+    - correlation_matrix_pcc
+    - correlation_matrix_mae
+  reliability:
+    - noise_ceiling_fraction_achievable
+    - patient_macro_95ci
+    - by_organ
+    - by_technology
+    - image_coverage_fraction
+    - runtime_seconds
+    - peak_gpu_memory_mib
+  deferred_until_one_shared_rasterizer_exists:
+    - spatial_map_ssim
+    - spatial_map_psnr
+
+methods:
+  - id: uni2_h_pca256_ridge
+    tier: mandatory
+    family: frozen_encoder_probe
+    local_status: runnable
+    runner: gen3_multiscale.evaluation.frozen_feature_ridge_evaluator
+    reason: exact linear control for the frozen image backbone used by MK
+  - id: gigapath_pca256_ridge
+    tier: mandatory
+    family: frozen_encoder_probe
+    local_status: runnable
+    runner: gen3_multiscale.evaluation.frozen_feature_ridge_evaluator
+  - id: h_optimus_1_pca256_ridge
+    tier: mandatory
+    family: frozen_encoder_probe
+    local_status: cache_and_checkpoint_needed
+    official_hest_average_pcc: 0.4229
+  - id: genbio_pathfm_pca256_ridge
+    tier: mandatory
+    family: frozen_encoder_probe
+    local_status: cache_and_checkpoint_needed
+    official_hest_average_pcc: 0.4197
+  - id: h_optimus_0_pca256_ridge
+    tier: mandatory
+    family: frozen_encoder_probe
+    local_status: cache_and_checkpoint_needed
+    official_hest_average_pcc: 0.4150
+  - id: uni2_h_pca256_ridge_official_hest
+    tier: mandatory
+    family: frozen_encoder_probe
+    local_status: official_hest_runner_needed
+    official_hest_average_pcc: 0.4141
+  - id: gigapath_pca256_ridge_official_hest
+    tier: mandatory
+    family: frozen_encoder_probe
+    local_status: official_hest_runner_needed
+    official_hest_average_pcc: 0.3875
+  - id: stflow
+    tier: mandatory
+    family: whole_slide_generative_spatial
+    local_status: upstream_reproduction_needed
+    paper: https://arxiv.org/abs/2506.05361
+  - id: stpath
+    tier: mandatory
+    family: zero_shot_foundation_model
+    local_status: evaluator_exists_rerun_on_expanded_cohort
+    paper: https://www.nature.com/articles/s41746-025-02020-3
+  - id: triplex
+    tier: mandatory
+    family: multiresolution_spatial
+    local_status: upstream_reproduction_needed
+    paper: https://openaccess.thecvf.com/content/CVPR2024/papers/Chung_Accurate_Spatial_Gene_Expression_Prediction_by_Integrating_Multi-Resolution_Features_CVPR_2024_paper.pdf
+    standardized_stflow_table_pcc: 0.395
+  - id: bleep
+    tier: secondary
+    family: retrieval
+    local_status: upstream_reproduction_needed
+  - id: egnv2
+    tier: secondary
+    family: graph
+    local_status: protocol_not_hest_standardized
+  - id: merge
+    tier: secondary
+    family: hierarchical_graph
+    local_status: upstream_reproduction_needed
+  - id: fmh2st
+    tier: secondary
+    family: foundation_local_global_graph
+    local_status: upstream_reproduction_needed
+  - id: histogpa
+    tier: emerging
+    family: gene_prior_attention
+    local_status: preprint_protocol_audit_needed
+    paper: https://arxiv.org/abs/2607.24364
+  - id: flag
+    tier: emerging
+    family: latent_diffusion_gene_and_spatial_structure
+    local_status: upstream_protocol_and_code_audit_needed
+    paper: https://arxiv.org/abs/2605.18055
+    relevant_metrics:
+      - gene_structural_correlation
+      - spatial_structural_correlation
+  - id: hist
+    tier: emerging
+    family: hierarchical_sparse_transformer
+    local_status: upstream_protocol_and_code_audit_needed
+    paper: https://arxiv.org/abs/2606.14251
+  - id: driftst
+    tier: emerging
+    family: one_step_generative_structured_gene_model
+    local_status: upstream_protocol_and_code_audit_needed
+    paper: https://arxiv.org/abs/2607.04740
+  - id: hyperst
+    tier: emerging
+    family: hierarchical_hyperbolic
+    local_status: upstream_protocol_and_code_audit_needed
+    paper: https://openaccess.thecvf.com/content/CVPR2026/html/Zhang_HyperST_Hierarchical_Hyperbolic_Learning_for_Spatial_Transcriptomics_Prediction_CVPR_2026_paper.html
+  - id: m2tglgo
+    tier: secondary
+    family: topology_graph_with_gene_ontology_prior
+    local_status: protocol_not_hest_standardized
+    paper: https://openaccess.thecvf.com/content/CVPR2025/html/Shi_Multi-modal_Topology-embedded_Graph_Learning_for_Spatially_Resolved_Genes_Prediction_from_CVPR_2025_paper.html
+  - id: storm
+    tier: emerging
+    family: multimodal_foundation_model
+    local_status: pretraining_overlap_and_split_audit_needed
+    paper: https://arxiv.org/abs/2604.03630
+
+decision_rules:
+  - Do not compare numerical scores across tracks or output spaces.
+  - Do not select panels using validation or test expression.
+  - Do not smooth target expression in the primary benchmark.
+  - Use whole-slide deterministic H-and-E prediction as the primary MK output.
+  - If MK does not beat UNI2 ridge on point metrics, require a clear paired gain in structured metrics before further architecture tuning.
+  - Report paired per-slide deltas and confidence intervals, not only independent confidence intervals.

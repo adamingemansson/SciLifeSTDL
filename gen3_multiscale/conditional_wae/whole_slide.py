@@ -18,10 +18,9 @@ import torch
 
 from gen3_multiscale.conditional_wae.data import build_conditional_wae_example
 from gen3_multiscale.evaluation.metrics import (
+    comparable_expression_metrics,
     nonzero_auc,
-    pearson_per_gene,
     resolve_gene_panels,
-    rmse,
 )
 from gen3_multiscale.evaluation.structured_field_metrics import structured_field_metrics
 
@@ -107,8 +106,7 @@ def predict_whole_slide(
 
 def _arm_panel_metrics(pred: np.ndarray, true: np.ndarray) -> dict:
     return {
-        "pcc": float(np.nanmean(pearson_per_gene(pred, true))),
-        "rmse": rmse(pred, true),
+        **comparable_expression_metrics(pred, true),
         "auc": nonzero_auc(pred, true),
     }
 

@@ -4,12 +4,15 @@ test battery) plus the new patient-aggregation, gene-panel, binning,
 edge-gradient, and spatial-agreement functions this project needed built
 from scratch (confirmed absent anywhere else in the repo)."""
 import numpy as np
+import pytest
 from scipy.stats import pearsonr
 
 from gen3_multiscale.evaluation.metrics import (
-    aggregate_patient_metrics, boundary_interior_bins, edge_gradient_agreement, gene_panel_metrics,
-    graph_laplacian_agreement, hole_size_bins, nonzero_auc, pearson_per_gene, resolve_gene_panels, rmse,
-    spatial_variogram_agreement, st_fid, st_mmd,
+    aggregate_patient_metrics, boundary_interior_bins, comparable_expression_metrics,
+    edge_gradient_agreement, gene_panel_metrics,
+    graph_laplacian_agreement, hole_size_bins, nonzero_auc, pearson_per_gene,
+    r2_per_gene, resolve_gene_panels, rmse,
+    spatial_variogram_agreement, spearman_per_gene, st_fid, st_mmd,
 )
 
 
@@ -49,6 +52,36 @@ def test_pearson_per_gene_vectorized_matches_scalar_reference_and_preserves_fail
 def test_rmse_zero_for_identical_arrays():
     a = np.random.default_rng(0).normal(size=(10, 4))
     assert rmse(a, a) == 0.0
+
+
+def test_spearman_per_gene_tracks_monotonic_relationships_and_constant_failures():
+    true = np.arange(24, dtype=float).reshape(8, 3)
+    pred = np.exp(true / 10.0)
+    pred[:, 1] = 4.0
+    actual = spearman_per_gene(pred, true, chunk_size=2)
+    assert actual[0] == pytest.approx(1.0)
+    assert actual[1] == pytest.approx(0.0)
+    assert actual[2] == pytest.approx(1.0)
+
+
+def test_comparable_metrics_expose_broad_per_gene_performance():
+    rng = np.random.default_rng(13)
+    true = rng.normal(size=(80, 4))
+    pred = true.copy()
+    pred[:, 3] = rng.normal(size=80)
+    out = comparable_expression_metrics(pred, true)
+    assert set(("pcc", "spearman", "rmse", "mse", "mae", "r2")) <= set(out)
+    assert out["median_gene_pcc"] > 0.9
+    assert out["fraction_gene_pcc_gt_0_3"] == pytest.approx(0.75)
+
+
+def test_r2_per_gene_keeps_negative_failures_and_skips_constant_truth():
+    true = np.column_stack([np.arange(6), np.arange(6), np.ones(6)])
+    pred = np.column_stack([np.arange(6), np.zeros(6), np.ones(6)])
+    actual = r2_per_gene(pred, true)
+    assert actual[0] == pytest.approx(1.0)
+    assert actual[1] < 0.0
+    assert np.isnan(actual[2])
 
 
 def test_nonzero_auc_perfect_separation():
