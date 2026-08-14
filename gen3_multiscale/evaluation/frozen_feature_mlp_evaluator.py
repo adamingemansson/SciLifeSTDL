@@ -177,6 +177,7 @@ def evaluate_frozen_feature_mlp(
     dropout: float = 0.1, epochs: int = 30, batch_size: int = 64,
     learning_rate: float = 1e-3, weight_decay: float = 1e-4,
     patience_epochs: int = 5, minimum_delta: float = 1e-5,
+    max_wall_clock_hours: float = 8.0,
     seed: int = 0, local_k: int = 6, wide_k: int = 18,
     missing_image_policy: str = "zero", device_str: str = "cuda",
     linear_algebra_device: str = "cuda",
@@ -189,7 +190,8 @@ def evaluate_frozen_feature_mlp(
     if min(pca_components, pca_spots_per_slide, train_spots_per_slide,
            validation_spots_per_slide, hidden_dim, epochs, batch_size) < 1:
         raise ValueError("all dimensions, counts, and epochs must be positive")
-    if learning_rate <= 0 or weight_decay < 0 or patience_epochs < 1 or minimum_delta < 0:
+    if (learning_rate <= 0 or weight_decay < 0 or patience_epochs < 1
+            or minimum_delta < 0 or max_wall_clock_hours <= 0):
         raise ValueError("invalid optimizer or early-stopping settings")
 
     torch.manual_seed(seed)
@@ -251,6 +253,7 @@ def evaluate_frozen_feature_mlp(
     target_sum = np.zeros(len(gene_names), dtype=np.float64)
     target_sum_squared = np.zeros(len(gene_names), dtype=np.float64)
     n_scale_rows = 0
+    completion_reason = "epochs_completed"
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -307,7 +310,15 @@ def evaluate_frozen_feature_mlp(
             epochs_without_improvement += 1
             if epochs_without_improvement >= patience_epochs:
                 print(f"Early stopping after epoch {epoch}; best epoch={best_epoch}", flush=True)
+                completion_reason = "early_stopping"
                 break
+        if time.perf_counter() - started >= max_wall_clock_hours * 3600.0:
+            print(
+                f"Wall-clock limit reached after epoch {epoch}; best epoch={best_epoch}",
+                flush=True,
+            )
+            completion_reason = "wall_clock_limit_reached"
+            break
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
@@ -393,6 +404,8 @@ def evaluate_frozen_feature_mlp(
         "hidden_dim": int(hidden_dim), "dropout": float(dropout),
         "learning_rate": float(learning_rate), "weight_decay": float(weight_decay),
         "epochs_requested": int(epochs), "epochs_completed": len(history),
+        "max_wall_clock_hours": float(max_wall_clock_hours),
+        "completion_reason": completion_reason,
         "best_epoch": int(best_epoch), "best_validation_mse": float(best_validation_mse),
         "training_history": history,
         "n_train_samples": len(train_ids), "n_pca_rows": int(n_pca_rows),
@@ -440,6 +453,7 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--patience-epochs", type=int, default=5)
     parser.add_argument("--minimum-delta", type=float, default=1e-5)
+    parser.add_argument("--max-wall-clock-hours", type=float, default=8.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--local-k", type=int, default=6)
     parser.add_argument("--wide-k", type=int, default=18)
@@ -459,7 +473,8 @@ def main() -> None:
         hidden_dim=args.hidden_dim, dropout=args.dropout, epochs=args.epochs,
         batch_size=args.batch_size, learning_rate=args.lr,
         weight_decay=args.weight_decay, patience_epochs=args.patience_epochs,
-        minimum_delta=args.minimum_delta, seed=args.seed,
+        minimum_delta=args.minimum_delta,
+        max_wall_clock_hours=args.max_wall_clock_hours, seed=args.seed,
         local_k=args.local_k, wide_k=args.wide_k,
         missing_image_policy=args.missing_image_policy,
         device_str=args.device, linear_algebra_device=args.linear_algebra_device,

@@ -104,6 +104,7 @@ python -u -m gen3_multiscale.evaluation.frozen_feature_mlp_evaluator \
   --cache-dir "$UNI2_CACHE" \
   --pca-components 256 \
   --hidden-dim 512 \
+  --max-wall-clock-hours 8 \
   --device cuda \
   --linear-algebra-device cuda:0 \
   --output "$BENCHMARK_ROOT/uni2_pca256_mlp_validation.json"
