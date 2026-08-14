@@ -102,6 +102,10 @@ def evaluate_stpath_supervisor_zero_shot(
     task: str,
     gene_vocab_path: str | Path,
     model_weight_path: str | Path,
+    manifest_path: str | Path | None = None,
+    train_gene_panels_path: str | Path | None = None,
+    cache_dir: str | Path | None = None,
+    hest_data_dir: str | Path | None = None,
     split: str = "validation",
     n_masks_per_sample: int = 8,
     device_str: str = "cpu",
@@ -120,8 +124,35 @@ def evaluate_stpath_supervisor_zero_shot(
             raise FileNotFoundError(f"STPath {label} is missing: {path}")
 
     config = resolved_config(config_path)
+    data_config = config.setdefault("data", {})
+    if manifest_path is not None:
+        data_config["gen3_manifest_path"] = str(Path(manifest_path).expanduser().resolve())
+    if hest_data_dir is not None:
+        data_config["hest_data_dir"] = str(Path(hest_data_dir).expanduser().resolve())
+    # Released STPath was trained with GigaPath morphology embeddings.  Force
+    # that contract here so an otherwise compatible-width UNI2 cache cannot
+    # silently enter the benchmark through a comparison config.
+    data_config["image_encoder"] = "gigapath"
+    data_config["retain_patches_in_memory"] = False
+    data_config["use_histology_features"] = False
+    data_config["slide_context_source"] = "disabled"
+    if cache_dir is not None:
+        data_config["gen3_spot_feature_cache_dir"] = str(
+            Path(cache_dir).expanduser().resolve()
+        )
+    if train_gene_panels_path is not None:
+        evaluation_config = config.setdefault("evaluation", {})
+        # The explicit expanded-cohort artifact replaces, rather than merges
+        # with, panels embedded in an older comparison config.
+        evaluation_config["gene_panels"] = {}
+        evaluation_config["train_gene_panel_artifact"] = str(
+            Path(train_gene_panels_path).expanduser().resolve()
+        )
     cfg = OmegaConf.create(config)
     manifest = load_dataset_manifest(config["data"]["gen3_manifest_path"])
+    if hest_data_dir is not None:
+        manifest = dict(manifest)
+        manifest["hest_data_dir"] = str(Path(hest_data_dir).expanduser().resolve())
     split_ids = list(manifest[f"{split}_sample_ids"])
     if not split_ids:
         raise ValueError(f"dataset manifest has zero {split} samples")
@@ -320,6 +351,12 @@ def evaluate_stpath_supervisor_zero_shot(
         "kind": "stpath_supervisor_zero_shot_evaluation_report",
         "task": task,
         "config_path": str(config_path),
+        "manifest_path": str(config["data"]["gen3_manifest_path"]),
+        "train_gene_panels_path": (
+            str(Path(train_gene_panels_path).expanduser().resolve())
+            if train_gene_panels_path is not None else None
+        ),
+        "gigapath_cache_dir": str(data_config.get("gen3_spot_feature_cache_dir", "")),
         **fixed_mask_evaluation_metadata(
             split=split, sample_ids=split_ids, strata=strata,
             masks_per_stratum_per_sample=n_masks_per_sample,
@@ -382,6 +419,10 @@ def main() -> None:
     parser.add_argument("--task", choices=TASKS, required=True)
     parser.add_argument("--stpath-gene-vocab", required=True)
     parser.add_argument("--stpath-model-weights", required=True)
+    parser.add_argument("--manifest")
+    parser.add_argument("--train-gene-panels")
+    parser.add_argument("--cache-dir")
+    parser.add_argument("--hest-data-dir")
     parser.add_argument("--output", required=True)
     parser.add_argument("--split", choices=["validation", "test"], default="validation")
     parser.add_argument(
@@ -398,6 +439,10 @@ def main() -> None:
         task=args.task,
         gene_vocab_path=args.stpath_gene_vocab,
         model_weight_path=args.stpath_model_weights,
+        manifest_path=args.manifest,
+        train_gene_panels_path=args.train_gene_panels,
+        cache_dir=args.cache_dir,
+        hest_data_dir=args.hest_data_dir,
         split=args.split,
         n_masks_per_sample=args.n_masks_per_sample,
         device_str=args.device,
