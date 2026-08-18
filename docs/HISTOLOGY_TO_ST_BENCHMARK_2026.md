@@ -187,5 +187,24 @@ target-derived attribute differs between methods. It reports breadth
 associations between performance and held-out gene properties. These are
 diagnostics; they must not be used to select training features.
 
+After the finalist seed replications have been summarized, build the
+predictability atlas directly from the saved seed-by-gene table (no model or
+GPU is loaded):
+
+```bash
+python -m gen3_multiscale.scripts.build_mk_gene_predictability_atlas \
+  --seed-gene-table "$GENE_ROBUSTNESS/per_gene_seed_robustness.tsv" \
+  --architectures mk_wb_parallel_gated mk_wbw_sandwich \
+  --ceiling-threshold 0.1 \
+  --meaningful-delta 0.01 \
+  --output-dir "$GENE_ROBUSTNESS/predictability_atlas"
+```
+
+The atlas ranks genes by their worst seed rather than their luckiest run,
+reports an explicitly unbounded descriptive PCC/noise-ceiling ratio only for
+eligible genes, and quantifies the per-gene oracle gain between the two
+architectures. A small oracle gain plus high gene-PCC rank agreement means the
+architectures are effectively redundant; it is not evidence for an ensemble.
+
 The versioned machine-readable contract and method registry are in
 `configs/benchmarks/hest_mk_2026.yaml`.
