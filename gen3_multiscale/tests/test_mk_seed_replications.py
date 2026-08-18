@@ -35,7 +35,10 @@ def _structured(value):
     }
 
 
-def _report(tmp_path: Path, architecture: str, seed: int, value: float) -> tuple[Path, dict]:
+def _report(
+    tmp_path: Path, architecture: str, seed: int, value: float, *,
+    legacy_patient_schema: bool = False,
+) -> tuple[Path, dict]:
     config = tmp_path / f"{architecture}_seed{seed}.yaml"
     config.write_text(yaml.safe_dump({"training": {"seed": seed}}))
     sidecar = tmp_path / f"{architecture}_seed{seed}.npz"
@@ -44,14 +47,16 @@ def _report(tmp_path: Path, architecture: str, seed: int, value: float) -> tuple
     for index in range(448):
         patient = f"p{index % 14}"
         fixed_records.append({
-            "sample_id": f"s{index % 14}", "patient_id": patient,
+            "sample_id": f"s{index % 14}",
+            "patient_id": None if legacy_patient_schema else patient,
             "model": _point(value),
             "gene_panels": {"model": {panel: _point(value) for panel in PANELS[1:]}},
         })
     whole_records = []
     for index in range(14):
         whole_records.append({
-            "sample_id": f"s{index}", "patient_id": f"p{index}",
+            "sample_id": f"s{index}",
+            "patient_id": None if legacy_patient_schema else f"p{index}",
             "n_spots": 100 + index,
             "point_metrics": {panel: _point(value) for panel in PANELS},
             "structured_field": {"panels": {panel: _structured(value) for panel in PANELS}},
@@ -94,7 +99,10 @@ def _records(tmp_path: Path):
         # The historical finalist used seed 10; "seed0 root" means the
         # reference run operationally, not literal training seed zero.
         for seed in (10, 1, 2):
-            result[architecture][seed] = _report(tmp_path, architecture, seed, offset + seed * 0.01)
+            result[architecture][seed] = _report(
+                tmp_path, architecture, seed, offset + seed * 0.01,
+                legacy_patient_schema=seed == 10,
+            )
     return result
 
 
@@ -106,6 +114,9 @@ def test_seed_summary_audits_and_separates_seed_and_patient_uncertainty(tmp_path
     assert "mk_wb_parallel_gated" in text
     # The synthetic architecture delta is +0.1 in every seed.
     assert "0.1" in text
+    hierarchical = outputs["hierarchical_delta"].read_text()
+    assert "held_out_slide" in hierarchical
+    assert "\t14\t" in hierarchical
 
 
 def test_seed_report_audit_rejects_incomplete_fixed_records(tmp_path: Path):

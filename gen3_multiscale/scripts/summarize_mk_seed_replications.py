@@ -5,7 +5,7 @@ The report deliberately keeps two uncertainty sources separate:
 
 * ``seed_summary.tsv`` describes variation across independently trained seeds.
 * ``architecture_delta_hierarchical_bootstrap.tsv`` resamples both seeds and
-  held-out patients for the direct parallel-gated minus sandwich comparison.
+  held-out slides for the direct parallel-gated minus sandwich comparison.
 
 All inputs must use the exact expanded validation contract (448 fixed masks,
 14 whole slides, deterministic H&E-only prediction and all five panels).
@@ -184,7 +184,12 @@ def audit_report(
 def _record_metric(
     report: dict[str, Any], *, scope: str, panel: str, metric: str,
 ) -> dict[str, float]:
-    """Per-slide/per-mask values averaged inside patient for paired analyses."""
+    """Per-slide/per-mask values averaged inside stable held-out slide IDs.
+
+    ``sample_id`` is shared by the historical and replication reports. Their
+    optional ``patient_id`` fields came from different evaluator generations
+    and are therefore not a safe cross-report join key.
+    """
     result: dict[str, list[float]] = {}
     if scope == "fixed_mask":
         primary = _primary_role(report)
@@ -193,13 +198,13 @@ def _record_metric(
             values = row[primary] if panel == "all_genes" else row["gene_panels"][primary][panel]
             value = _finite(values.get(metric))
             if math.isfinite(value):
-                result.setdefault(str(row["patient_id"]), []).append(value)
+                result.setdefault(str(row["sample_id"]), []).append(value)
     elif scope == "whole_slide":
         records = report["whole_slide_structured_field_evaluation"]["per_slide_records"]
         for row in records:
             value = _finite(row["point_metrics"][panel].get(metric))
             if math.isfinite(value):
-                result.setdefault(str(row["patient_id"]), []).append(value)
+                result.setdefault(str(row["sample_id"]), []).append(value)
     else:
         raise ValueError(f"unknown point scope {scope!r}")
     return {patient: float(np.mean(values)) for patient, values in result.items()}
@@ -214,7 +219,7 @@ def _structured_record_metric(
         flat = _flatten_structured(row["structured_field"]["panels"][panel])
         value = _finite(flat.get(metric_path))
         if math.isfinite(value):
-            result.setdefault(str(row["patient_id"]), []).append(value)
+            result.setdefault(str(row["sample_id"]), []).append(value)
     return {patient: float(np.mean(values)) for patient, values in result.items()}
 
 
@@ -235,16 +240,16 @@ def _hierarchical_delta(
     seeds = sorted(set(left) & set(right))
     if not seeds:
         raise ValueError("hierarchical comparison has no shared random seeds")
-    patients = sorted(set.intersection(*(
+    held_out_units = sorted(set.intersection(*(
         set(left[value]) & set(right[value]) for value in seeds
     )))
-    if not patients:
-        raise ValueError("hierarchical comparison has no shared held-out patients")
+    if not held_out_units:
+        raise ValueError("hierarchical comparison has no shared held-out slides")
     matrix = np.asarray([
         [
-            (left[run_seed][patient] - right[run_seed][patient])
-            if higher_is_better else (right[run_seed][patient] - left[run_seed][patient])
-            for patient in patients
+            (left[run_seed][unit] - right[run_seed][unit])
+            if higher_is_better else (right[run_seed][unit] - left[run_seed][unit])
+            for unit in held_out_units
         ]
         for run_seed in seeds
     ], dtype=np.float64)
@@ -253,12 +258,16 @@ def _hierarchical_delta(
     draws = np.empty(int(n_bootstrap), dtype=np.float64)
     for index in range(int(n_bootstrap)):
         seed_rows = rng.integers(0, len(seeds), size=len(seeds))
-        patient_columns = rng.integers(0, len(patients), size=len(patients))
-        draws[index] = matrix[np.ix_(seed_rows, patient_columns)].mean()
+        unit_columns = rng.integers(0, len(held_out_units), size=len(held_out_units))
+        draws[index] = matrix[np.ix_(seed_rows, unit_columns)].mean()
     low, high = (float(value) for value in np.quantile(draws, [0.025, 0.975]))
     return {
         "mean_delta": observed, "ci95_low": low, "ci95_high": high,
-        "n_seeds": len(seeds), "n_patients": len(patients),
+        "n_seeds": len(seeds),
+        "n_held_out_units": len(held_out_units),
+        "resampling_unit": "held_out_slide",
+        # Backward-compatible alias for readers of the initial table schema.
+        "n_patients": len(held_out_units),
     }
 
 

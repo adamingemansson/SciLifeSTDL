@@ -35,6 +35,19 @@ def _nanmean_axis0(values: np.ndarray) -> np.ndarray:
     return result
 
 
+def _finite_summary(values: np.ndarray) -> tuple[float, float, float, float]:
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return (float("nan"),) * 4
+    return (
+        float(finite.mean()),
+        float(finite.std(ddof=1)) if finite.size > 1 else float("nan"),
+        float(finite.min()),
+        float(finite.max()),
+    )
+
+
 def _patient_macro(values: np.ndarray, patient_ids: list[str]) -> np.ndarray:
     return _nanmean_axis0(np.stack([
         _nanmean_axis0(values[np.asarray([value == patient for value in patient_ids])])
@@ -157,15 +170,21 @@ def analyze(
                     "spearman_across_genes": rho, "n_genes": n,
                 })
         pcc_matrix = np.stack([macro[architecture][seed]["pcc"] for seed in seeds])
-        finite_sd = np.nanstd(pcc_matrix, axis=0, ddof=1)
-        finite_mean = np.nanmean(pcc_matrix, axis=0)
+        finite_mean = _nanmean_axis0(pcc_matrix)
+        finite_sd = np.full(pcc_matrix.shape[1], np.nan, dtype=np.float64)
+        finite_count = np.isfinite(pcc_matrix).sum(axis=0)
+        for index in np.flatnonzero(finite_count > 1):
+            finite_sd[index] = np.std(
+                pcc_matrix[np.isfinite(pcc_matrix[:, index]), index], ddof=1,
+            )
         for index, gene in enumerate(gene_names):
+            pcc_mean, pcc_sd, pcc_min, pcc_max = _finite_summary(pcc_matrix[:, index])
             row: dict[str, Any] = {
                 "architecture": architecture, "gene": gene,
-                "pcc_mean": float(finite_mean[index]),
-                "pcc_seed_sd": float(finite_sd[index]),
-                "pcc_min": float(np.nanmin(pcc_matrix[:, index])),
-                "pcc_max": float(np.nanmax(pcc_matrix[:, index])),
+                "pcc_mean": pcc_mean,
+                "pcc_seed_sd": pcc_sd,
+                "pcc_min": pcc_min,
+                "pcc_max": pcc_max,
                 "fraction_seeds_pcc_positive": float(np.mean(pcc_matrix[:, index] > 0)),
                 "all_seeds_pcc_positive": bool(np.all(pcc_matrix[:, index] > 0)),
                 **{
@@ -179,8 +198,9 @@ def analyze(
                 values = np.asarray([
                     macro[architecture][seed][metric][index] for seed in seeds
                 ], dtype=np.float64)
-                row[f"{metric}_mean"] = float(np.nanmean(values))
-                row[f"{metric}_seed_sd"] = float(np.nanstd(values, ddof=1))
+                metric_mean, metric_sd, _metric_min, _metric_max = _finite_summary(values)
+                row[f"{metric}_mean"] = metric_mean
+                row[f"{metric}_seed_sd"] = metric_sd
             gene_rows.append(row)
         finite = np.isfinite(finite_mean) & np.isfinite(finite_sd)
         summary_rows.append({
@@ -207,11 +227,12 @@ def analyze(
             for seed in seeds
         }
         deltas = np.asarray([delta_by_seed[seed] for seed in seeds], dtype=np.float64)
-        mean_deltas[index] = float(np.nanmean(deltas))
+        delta_mean, delta_sd, _delta_min, _delta_max = _finite_summary(deltas)
+        mean_deltas[index] = delta_mean
         delta_rows.append({
             "gene": gene, "left": left, "right": right,
             "mean_pcc_delta": mean_deltas[index],
-            "pcc_delta_seed_sd": float(np.nanstd(deltas, ddof=1)),
+            "pcc_delta_seed_sd": delta_sd,
             "fraction_seeds_left_better": float(np.mean(deltas > 0)),
             "all_seeds_left_better": bool(np.all(deltas > 0)),
             **{f"seed{seed}_pcc_delta": delta_by_seed[seed] for seed in seeds},
