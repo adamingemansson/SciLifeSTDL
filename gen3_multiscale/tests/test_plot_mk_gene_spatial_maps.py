@@ -1,10 +1,14 @@
+import inspect
+
 import numpy as np
 
 from gen3_multiscale.scripts.plot_mk_gene_spatial_maps import (
     _global_scales,
     _load_cache,
+    _load_model_and_samples,
     _metrics,
     _save_cache,
+    _select_split_sample_ids,
 )
 
 
@@ -54,3 +58,17 @@ def test_slide_metrics_use_unclipped_values():
     assert result["rmse"] == np.sqrt(4.0 / 3.0)
     assert result["mae"] == 2.0 / 3.0
     assert np.isfinite(result["pcc"])
+
+
+def test_model_loader_accepts_an_explicit_sample_subset():
+    signature = inspect.signature(_load_model_and_samples)
+    assert signature.parameters["sample_ids"].default is None
+
+
+def test_sample_selection_keeps_an_explicit_subset_in_requested_order():
+    manifest = {"validation_sample_ids": ["slide_a", "slide_b", "slide_c"]}
+    available, selected = _select_split_sample_ids(
+        manifest, split="validation", requested=["slide_c", "slide_a"],
+    )
+    assert available == ["slide_a", "slide_b", "slide_c"]
+    assert selected == ["slide_c", "slide_a"]
