@@ -76,6 +76,13 @@ def test_predictability_atlas_reports_ceiling_and_complementarity(tmp_path: Path
     assert int(summary["n_genes"]) == 3
     assert float(summary["oracle_gain_over_best_single"]) > 0
 
+    headroom = _rows(outputs["high_headroom_genes"])
+    assert headroom[0]["architecture"] == "left"
+    assert headroom[0]["gene"] == "g0"
+    conditional = _rows(outputs["conditional_associations"])
+    assert len(conditional) == 2 * 6
+    assert "partial_spearman_controlling_other_attributes" in conditional[0]
+
 
 def test_predictability_atlas_rejects_different_gene_sets(tmp_path: Path):
     source = tmp_path / "seed_genes.tsv"

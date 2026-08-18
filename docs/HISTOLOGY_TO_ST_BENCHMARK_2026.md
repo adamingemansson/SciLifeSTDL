@@ -230,6 +230,13 @@ reports an explicitly unbounded descriptive PCC/noise-ceiling ratio only for
 eligible genes, and quantifies the per-gene oracle gain between the two
 architectures. A small oracle gain plus high gene-PCC rank agreement means the
 architectures are effectively redundant; it is not evidence for an ensemble.
+Because abundance, variance, detection frequency, spatial autocorrelation,
+gradient energy and the count-split ceiling are correlated, the atlas also
+reports partial rank associations, standardized multivariable rank
+coefficients and variance-inflation factors. These remain descriptive rather
+than causal. `high_headroom_genes.tsv` prioritizes measurable genes whose
+count-split ceiling is high relative to current reproducible PCC; this is a
+held-out diagnostic and must not be converted into a training-panel choice.
 
 The versioned machine-readable contract and method registry are in
 `configs/benchmarks/hest_mk_2026.yaml`.
