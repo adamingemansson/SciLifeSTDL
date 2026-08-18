@@ -332,6 +332,32 @@ def test_composition_contract_and_factory_fail_closed(tmp_path):
                 static_audit_conditional_wae_config(broken)
 
 
+def test_parallel_gated_objective_factorial_contract_is_exact():
+    designs = {
+        "mk_pg_objective_control": (0.1, 0.0, 0.0),
+        "mk_pg_objective_pcc": (0.5, 0.0, 0.0),
+        "mk_pg_objective_gradient": (0.1, 0.025, 0.025),
+        "mk_pg_objective_combined": (0.5, 0.025, 0.025),
+    }
+    for arm, (pcc, local, wide) in designs.items():
+        design = ("spatial", True, 1, local > 0, wide > 0)
+        config = _contract(arm, design)
+        config["model"]["params"]["structured_composition"] = "parallel_gated"
+        config["loss"].update({
+            "pcc_weight": pcc,
+            "local_gradient_weight": local,
+            "wide_gradient_weight": wide,
+        })
+        audit = static_audit_conditional_wae_config(config)
+        assert audit["passed"]
+        assert audit["structured_composition"] == "parallel_gated"
+
+        broken = copy.deepcopy(config)
+        broken["loss"]["pcc_weight"] += 0.01
+        with pytest.raises(ValueError, match="objective .* immutable factorial"):
+            static_audit_conditional_wae_config(broken)
+
+
 @pytest.mark.parametrize(
     "family,prefix,expected_prior",
     [("standard_wae", "wae", "standard"),
@@ -467,6 +493,34 @@ def test_suite_preparer_writes_four_audited_configs(tmp_path, monkeypatch):
         assert config["model"]["params"]["n_refinement_steps"] == 1
         assert config["loss"]["local_gradient_weight"] == 0
         assert config["loss"]["wide_gradient_weight"] == 0
+
+    objective_root = tmp_path / "objective-suite"
+    objective_plan = suite_module.prepare_mk_structured_field_suite(
+        comparison_config=str(comparison), manifest=str(manifest_path),
+        train_gene_panels=str(panels_path),
+        centered_gene_structure=str(structure_path), output_root=str(objective_root),
+        uni2_pinned_revision="pinned", uni2_spot_feature_cache_dir=str(uni2_cache),
+        family="deterministic_objective",
+    )
+    assert tuple(objective_plan["arm_order"]) == suite_module.OBJECTIVE_ARM_ORDER
+    expected_objectives = {
+        "mk_pg_objective_control": (0.1, 0.0, 0.0),
+        "mk_pg_objective_pcc": (0.5, 0.0, 0.0),
+        "mk_pg_objective_gradient": (0.1, 0.025, 0.025),
+        "mk_pg_objective_combined": (0.5, 0.025, 0.025),
+    }
+    for arm, expected in expected_objectives.items():
+        config = yaml.safe_load(
+            (objective_root / "configs" / f"{arm}.yaml").read_text()
+        )
+        audit = static_audit_conditional_wae_config(config)
+        assert audit["passed"]
+        assert config["model"]["params"]["structured_composition"] == "parallel_gated"
+        assert (
+            config["loss"]["pcc_weight"],
+            config["loss"]["local_gradient_weight"],
+            config["loss"]["wide_gradient_weight"],
+        ) == expected
 
 
 @pytest.mark.parametrize(

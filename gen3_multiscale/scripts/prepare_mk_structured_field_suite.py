@@ -75,6 +75,37 @@ COMPOSITION_ARM_DESIGN = {
         "parallel_gated",
     ))
 }
+OBJECTIVE_ARM_ORDER = (
+    "mk_pg_objective_control",
+    "mk_pg_objective_pcc",
+    "mk_pg_objective_gradient",
+    "mk_pg_objective_combined",
+)
+OBJECTIVE_ARM_DESIGN = {
+    "mk_pg_objective_control": {
+        "pcc_weight": 0.1, "local_gradient_weight": 0.0,
+        "wide_gradient_weight": 0.0,
+    },
+    "mk_pg_objective_pcc": {
+        "pcc_weight": 0.5, "local_gradient_weight": 0.0,
+        "wide_gradient_weight": 0.0,
+    },
+    "mk_pg_objective_gradient": {
+        "pcc_weight": 0.1, "local_gradient_weight": 0.025,
+        "wide_gradient_weight": 0.025,
+    },
+    "mk_pg_objective_combined": {
+        "pcc_weight": 0.5, "local_gradient_weight": 0.025,
+        "wide_gradient_weight": 0.025,
+    },
+}
+for _design in OBJECTIVE_ARM_DESIGN.values():
+    _design.update({
+        "conditioner_mode": "spatial",
+        "use_centered_gene_structure": True,
+        "n_refinement_steps": 1,
+        "structured_composition": "parallel_gated",
+    })
 FAMILY_SPECS = {
     "deterministic": {
         "arm_order": ARM_ORDER, "regularizer": "none",
@@ -92,10 +123,16 @@ FAMILY_SPECS = {
         "arm_order": COMPOSITION_ARM_ORDER, "regularizer": "none",
         "prior_mode": "none", "deterministic_only": True,
     },
+    "deterministic_objective": {
+        "arm_order": OBJECTIVE_ARM_ORDER, "regularizer": "none",
+        "prior_mode": "none", "deterministic_only": True,
+    },
 }
 
 
 def _design_for_arm(arm: str) -> dict:
+    if arm in OBJECTIVE_ARM_DESIGN:
+        return OBJECTIVE_ARM_DESIGN[arm]
     if arm in COMPOSITION_ARM_DESIGN:
         return COMPOSITION_ARM_DESIGN[arm]
     suffix = arm.removeprefix("mk_field_").removeprefix("cwae_").removeprefix("wae_")
@@ -204,7 +241,9 @@ def prepare_mk_structured_field_suite(
         params = copy.deepcopy(shared)
         params.update({
             key: value for key, value in design.items()
-            if key not in {"local_gradient_weight", "wide_gradient_weight"}
+            if key not in {
+                "pcc_weight", "local_gradient_weight", "wide_gradient_weight",
+            }
         })
         config = copy.deepcopy(base)
         params.update({
@@ -234,7 +273,7 @@ def prepare_mk_structured_field_suite(
             "retain_patches_in_memory": False,
         })
         config["loss"] = {
-            "pcc_weight": 0.1,
+            "pcc_weight": float(design.get("pcc_weight", 0.1)),
             "regularizer_weight": 0.0 if family_spec["deterministic_only"] else 0.1,
             "conditional_mean_weight": 1.0,
             "local_gradient_weight": design["local_gradient_weight"],
@@ -278,7 +317,7 @@ def prepare_mk_structured_field_suite(
             "model.params.use_centered_gene_structure",
             "model.params.n_refinement_steps", "loss.local_gradient_weight",
             "model.params.structured_composition",
-            "loss.wide_gradient_weight", "training.checkpoint_dir",
+            "loss.pcc_weight", "loss.wide_gradient_weight", "training.checkpoint_dir",
             "evaluation.tensorboard.log_dir",
             "evaluation.structured_field_metrics",
         ]

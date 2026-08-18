@@ -90,6 +90,35 @@ metric across arms, and report all genes, HVG-50, HVG-200, per-organ/per-slide
 results, plus whole-slide maps. Gradient losses are training terms only; final
 claims must use the shared evaluator.
 
+## Parallel-gated objective screen
+
+The gene-predictability atlas found that target Moran's I was the strongest
+independent correlate of per-gene PCC, while the finalist composition runs had
+no explicit gradient supervision.  The `deterministic_objective` family is a
+clean 2 x 2 follow-up on the exact `mk_wb_parallel_gated` architecture:
+
+| Arm | PCC weight | local gradient | wide gradient |
+|---|---:|---:|---:|
+| `mk_pg_objective_control` | 0.1 | 0 | 0 |
+| `mk_pg_objective_pcc` | 0.5 | 0 | 0 |
+| `mk_pg_objective_gradient` | 0.1 | 0.025 | 0.025 |
+| `mk_pg_objective_combined` | 0.5 | 0.025 | 0.025 |
+
+Prepare it with the same command above plus
+`--family deterministic_objective`. All other architecture, data, seed,
+optimizer, evaluation and training-budget fields remain matched. The static
+contract fails closed if any factorial cell receives different loss weights.
+
+The generic four-arm runner and monitor are:
+
+```bash
+"$PYTHON" -u -m gen3_multiscale.scripts.run_mk_architecture_suite \
+  --suite-root "$ROOT"
+
+"$PYTHON" -u -m gen3_multiscale.scripts.monitor_mk_four_arm_suite \
+  --suite-root "$ROOT" --follow --interval 10 --tail-lines 3
+```
+
 ## Final evaluation contract
 
 The active expanded cohort's **final fixed-mask evaluation on the validation

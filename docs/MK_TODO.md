@@ -106,6 +106,22 @@ each of GPUs 0,2,3,5. Each four-arm batch keeps a separate TensorBoard. Use
 bounded convergence screens before extending any arm; preparation does not
 authorize blind long runs. See `docs/MK_16_ARM_RUNBOOK.md`.
 
+## 7a. Post-screen deterministic objective factorial
+
+The composition and seed screens selected `mk_wb_parallel_gated`; the
+gene-predictability atlas then identified spatial autocorrelation as the
+strongest independent correlate of gene-level PCC. Run one matched 2 x 2
+objective screen on that exact architecture:
+
+- [ ] `mk_pg_objective_control`: PCC 0.1, no gradient loss.
+- [ ] `mk_pg_objective_pcc`: PCC 0.5, no gradient loss.
+- [ ] `mk_pg_objective_gradient`: PCC 0.1, local/wide gradient 0.025 each.
+- [ ] `mk_pg_objective_combined`: PCC 0.5, local/wide gradient 0.025 each.
+
+This screen starts all cells from the same initialization and trains them for
+the same bounded budget. It must not select genes from validation data and it
+must not alter the model architecture.
+
 ## 8. Validation and final evaluation
 
 Keep these four scopes distinct:
