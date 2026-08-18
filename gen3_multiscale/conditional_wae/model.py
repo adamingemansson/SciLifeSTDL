@@ -783,6 +783,7 @@ class ConditionalWAE(nn.Module):
                  gene_encoder_table: torch.Tensor | None = None,
                  z_noise_std: float = 0.0,
                  n_refinement_steps: int = 0,
+                 structured_composition: str = "within_then_between",
                  refinement_k_neighbors: int = 6,
                  refinement_hidden_dim: int = 256,
                  refinement_gex_feature_dim: int = 256,
@@ -790,6 +791,7 @@ class ConditionalWAE(nn.Module):
                  distributional_weight: float = 1.0,
                  distributional_hidden_dim: int = 1024,
                  prior_mode: str = "standard",
+                 latent_residual_mode: str = "free",
                  conditional_prior_hidden_dim: int = 256,
                  conditional_prior_context_weight: float = 1.0,
                  conditional_prior_anchor_weight: float = 0.1,
@@ -818,6 +820,15 @@ class ConditionalWAE(nn.Module):
             raise ValueError("encoder_conditioning must be 'none' or 'film'")
         if prior_mode not in VALID_PRIOR_MODES:
             raise ValueError(f"prior_mode must be one of {VALID_PRIOR_MODES}")
+        if structured_composition not in VALID_STRUCTURED_COMPOSITIONS:
+            raise ValueError(
+                "structured_composition must be one of "
+                f"{VALID_STRUCTURED_COMPOSITIONS}"
+            )
+        if latent_residual_mode not in {"free", "antithetic_zero_mean"}:
+            raise ValueError(
+                "latent_residual_mode must be 'free' or 'antithetic_zero_mean'"
+            )
         if prior_mode == "conditional" and regularizer != "mmd":
             raise ValueError("conditional prior is currently defined only for WAE-MMD")
         if conditional_prior_context_weight <= 0 or conditional_prior_anchor_weight < 0:
@@ -832,6 +843,7 @@ class ConditionalWAE(nn.Module):
         self.z_noise_std = float(z_noise_std)
         self.encoder_conditioning = encoder_conditioning
         self.prior_mode = str(prior_mode)
+        self.latent_residual_mode = str(latent_residual_mode)
         self.has_latent_model = True
         self.image_conditioner = image_conditioner
         if image_conditioner.n_genes != n_genes:
@@ -917,6 +929,7 @@ class ConditionalWAE(nn.Module):
         if n_refinement_steps < 0:
             raise ValueError("n_refinement_steps must be non-negative")
         self.n_refinement_steps = int(n_refinement_steps)
+        self.structured_composition = str(structured_composition)
         self.spatial_refiner = (
             SpatialExpressionRefiner(
                 n_genes, context_dim,
@@ -925,6 +938,16 @@ class ConditionalWAE(nn.Module):
                 k_neighbors=refinement_k_neighbors,
             )
             if n_refinement_steps > 0 else None
+        )
+        if self.structured_composition != "within_then_between":
+            if self.centered_gene_structure_refinement is None or self.spatial_refiner is None:
+                raise ValueError(
+                    f"structured_composition={self.structured_composition!r} requires "
+                    "both centered gene-structure and between-spot refinement"
+                )
+        self.composition_gate_logits = (
+            nn.Parameter(torch.full((2,), math.log(0.1 / 0.9), dtype=torch.float32))
+            if self.structured_composition == "parallel_gated" else None
         )
         if per_gene_scale is None:
             if local_gradient_weight > 0 or wide_gradient_weight > 0:
@@ -941,11 +964,44 @@ class ConditionalWAE(nn.Module):
         self.local_gradient_k = int(local_gradient_k)
         self.wide_gradient_k = int(wide_gradient_k)
 
-    def _refine(self, expression: torch.Tensor, context: torch.Tensor,
-                inputs: FullImageExpressionInputs) -> torch.Tensor:
-        """Apply the identical structured path to every prediction role."""
+        # New residual-WAE suites may warm-start these exact modules from a
+        # trained deterministic structured predictor.  The flag is runtime
+        # state, not checkpoint state: the pinned source bundle in the config
+        # reconstructs the frozen weights on every train/eval process.
+        self._deterministic_backbone_frozen = False
+
+    def _deterministic_backbone_modules(self) -> tuple[nn.Module, ...]:
+        modules = [self.image_conditioner, self.conditional_mean_head]
         if self.centered_gene_structure_refinement is not None:
-            expression = self.centered_gene_structure_refinement(expression)
+            modules.append(self.centered_gene_structure_refinement)
+        if self.spatial_refiner is not None:
+            modules.append(self.spatial_refiner)
+        return tuple(modules)
+
+    def freeze_deterministic_backbone(self) -> None:
+        """Freeze and pin the warm-started deterministic point predictor."""
+        for module in self._deterministic_backbone_modules():
+            module.eval()
+            for parameter in module.parameters():
+                parameter.requires_grad_(False)
+        if self.composition_gate_logits is not None:
+            self.composition_gate_logits.requires_grad_(False)
+        self._deterministic_backbone_frozen = True
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self._deterministic_backbone_frozen:
+            for module in self._deterministic_backbone_modules():
+                module.eval()
+        return self
+
+    def _apply_within(self, expression: torch.Tensor) -> torch.Tensor:
+        if self.centered_gene_structure_refinement is not None:
+            return self.centered_gene_structure_refinement(expression)
+        return expression
+
+    def _apply_between(self, expression: torch.Tensor, context: torch.Tensor,
+                       inputs: FullImageExpressionInputs) -> torch.Tensor:
         if self.spatial_refiner is None or self.n_refinement_steps == 0:
             return expression
         coords = torch.as_tensor(
@@ -963,6 +1019,58 @@ class ConditionalWAE(nn.Module):
             self.spatial_refiner, expression, context, coords,
             n_steps=self.n_refinement_steps,
         )
+
+    def _refine(self, expression: torch.Tensor, context: torch.Tensor,
+                inputs: FullImageExpressionInputs) -> torch.Tensor:
+        """Apply the configured within/between composition to one field."""
+        if self.structured_composition == "within_then_between":
+            return self._apply_between(self._apply_within(expression), context, inputs)
+        if self.structured_composition == "between_then_within":
+            return self._apply_within(self._apply_between(expression, context, inputs))
+        if self.structured_composition == "within_between_within":
+            expression = self._apply_within(expression)
+            expression = self._apply_between(expression, context, inputs)
+            return self._apply_within(expression)
+        if self.structured_composition == "parallel_gated":
+            within = self._apply_within(expression)
+            between = self._apply_between(expression, context, inputs)
+            gates = torch.sigmoid(self.composition_gate_logits)
+            return (
+                expression
+                + gates[0] * (within - expression)
+                + gates[1] * (between - expression)
+            )
+        raise RuntimeError(f"unhandled structured composition {self.structured_composition!r}")
+
+    def composition_gates(self) -> torch.Tensor | None:
+        if self.composition_gate_logits is None:
+            return None
+        return torch.sigmoid(self.composition_gate_logits)
+
+    def _prior_mean(self, context: torch.Tensor) -> torch.Tensor:
+        if self.conditional_prior is None:
+            return torch.zeros(
+                context.shape[0], self.latent_dim,
+                dtype=context.dtype, device=context.device,
+            )
+        mean, _ = self.conditional_prior(context)
+        return mean
+
+    def _latent_residual(self, z: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """Decode a free or exactly odd residual around the configured prior mean.
+
+        The odd parameterisation has zero expectation under the symmetric
+        Gaussian prior.  It prevents latent sampling from moving the already
+        strong deterministic point prediction merely because the residual MLP
+        learned a non-zero intercept.
+        """
+        center = self._prior_mean(context)
+        delta = z - center
+        if self.latent_residual_mode == "free":
+            return self.residual_decoder(torch.cat([context, z], dim=-1))
+        positive = self.residual_decoder(torch.cat([context, delta], dim=-1))
+        negative = self.residual_decoder(torch.cat([context, -delta], dim=-1))
+        return 0.5 * (positive - negative)
 
     def _target(self, inputs: FullImageExpressionInputs, target_expression, *,
                 device: torch.device, dtype: torch.dtype, n_rows: int) -> torch.Tensor:
@@ -982,7 +1090,7 @@ class ConditionalWAE(nn.Module):
         if z.shape != (context.shape[0], self.latent_dim):
             raise ValueError("z must have one configured-width row per image-context row")
         conditional_mean = self.conditional_mean_head(context)
-        residual = self.residual_decoder(torch.cat([context, z], dim=-1))
+        residual = self._latent_residual(z, context)
         reconstruction = conditional_mean + residual
         # The coexpression refinement (when enabled) only ever nudges the
         # ordinary full-gene prediction -- conditional_mean, the base
@@ -991,6 +1099,25 @@ class ConditionalWAE(nn.Module):
         if self.coexpression_refinement is not None:
             reconstruction = self.coexpression_refinement(reconstruction)
         return reconstruction, conditional_mean
+
+    def _decode_and_refine(self, z: torch.Tensor, context: torch.Tensor,
+                           inputs: FullImageExpressionInputs) -> tuple[torch.Tensor, torch.Tensor]:
+        """Decode one latent while preserving the deterministic mean exactly.
+
+        Structured refiners are nonlinear, so an odd residual before them is
+        not sufficient.  The symmetric difference below remains odd after
+        any shared within/between composition; paired prior draws therefore
+        average exactly to the deterministic refined prediction.
+        """
+        conditional_base = self.conditional_mean_head(context)
+        conditional_mean = self._refine(conditional_base, context, inputs)
+        if self.latent_residual_mode == "free":
+            reconstruction, _ = self.decode(z, context)
+            return self._refine(reconstruction, context, inputs), conditional_mean
+        residual = self._latent_residual(z, context)
+        positive = self._refine(conditional_base + residual, context, inputs)
+        negative = self._refine(conditional_base - residual, context, inputs)
+        return conditional_mean + 0.5 * (positive - negative), conditional_mean
 
     def _encode_target(self, target: torch.Tensor, context: torch.Tensor | None) -> torch.Tensor:
         if self.encoder_conditioning == "film":
@@ -1046,9 +1173,9 @@ class ConditionalWAE(nn.Module):
                 encoded.shape, dtype=encoded.dtype, device=encoded.device, generator=generator,
             )
             decoder_z = encoded + z_noise * self.z_noise_std
-        reconstruction, conditional_mean = self.decode(decoder_z, context)
-        reconstruction = self._refine(reconstruction, context, inputs)
-        conditional_mean = self._refine(conditional_mean, context, inputs)
+        reconstruction, conditional_mean = self._decode_and_refine(
+            decoder_z, context, inputs,
+        )
         reconstruction_loss, reconstruction_rmse, reconstruction_pcc = (
             rmse_pcc_reconstruction_loss(
                 reconstruction, target, pcc_weight=self.pcc_weight,
@@ -1224,8 +1351,8 @@ class ConditionalWAE(nn.Module):
         inputs: FullImageExpressionInputs,
     ) -> torch.Tensor:
         """Decode one latent field and apply the configured refinement."""
-        prediction, _ = self.decode(z, context)
-        return self.refine_prediction(prediction, context, inputs)
+        prediction, _ = self._decode_and_refine(z, context, inputs)
+        return prediction
 
     def resolve_inference_prior(
         self, context: torch.Tensor, z_mean: torch.Tensor | None = None,
@@ -1350,13 +1477,38 @@ class ConditionalWAE(nn.Module):
         # imposing correlation rho between spots. It is therefore a pure
         # inference-time change, valid on already-trained checkpoints, and
         # rho=0 (the default) reproduces the historical sampler bit for bit.
-        samples = []
-        for _ in range(count):
-            z = self.sample_inference_latent(
-                context, generator=generator, z_mean=z_mean, z_std=z_std,
-                latent_spatial_correlation=latent_spatial_correlation,
+        if self.latent_residual_mode == "antithetic_zero_mean" and (
+            z_mean is not None or z_std is not None
+        ):
+            raise ValueError(
+                "antithetic_zero_mean inference uses the model's canonical prior; "
+                "ex-post z_mean/z_std overrides are unsupported"
             )
-            samples.append(self.decode_latent_from_context(z, context, inputs))
+        samples = []
+        if self.latent_residual_mode == "antithetic_zero_mean":
+            # Paired latent draws make the finite Monte-Carlo predictive mean
+            # equal the deterministic point prediction, not merely equal in
+            # expectation as the number of samples tends to infinity.
+            prior_mean = self._prior_mean(context)
+            for _ in range(count // 2):
+                z = self.sample_inference_latent(
+                    context, generator=generator,
+                    latent_spatial_correlation=latent_spatial_correlation,
+                )
+                mirror = 2.0 * prior_mean - z
+                samples.append(self.decode_latent_from_context(z, context, inputs))
+                samples.append(self.decode_latent_from_context(mirror, context, inputs))
+            if count % 2:
+                samples.append(
+                    self.decode_latent_from_context(prior_mean, context, inputs)
+                )
+        else:
+            for _ in range(count):
+                z = self.sample_inference_latent(
+                    context, generator=generator, z_mean=z_mean, z_std=z_std,
+                    latent_spatial_correlation=latent_spatial_correlation,
+                )
+                samples.append(self.decode_latent_from_context(z, context, inputs))
         stacked = torch.stack(samples)
         conditional_mean = self.predict_point_from_context(context, inputs)
         predictive_mean = stacked.mean(0)

@@ -582,6 +582,45 @@ def test_predictive_output_names_separate_point_prediction_from_wae_prior_mean()
     )
 
 
+def test_antithetic_latent_residual_preserves_the_deterministic_mean_exactly():
+    model = ConditionalWAE(
+        7,
+        Architecture1ImageConditioner(
+            7, image_feature_dim=16, gex_feature_dim=6,
+            hidden_dim=24, n_heads=4, n_blocks=1,
+            dense_threshold=20, sparse_k=3, dropout=0.0,
+        ),
+        regularizer="mmd", latent_dim=5, autoencoder_hidden_dim=20,
+        discriminator_hidden_dim=12, n_inference_samples=8,
+        latent_residual_mode="antithetic_zero_mean",
+    ).eval()
+    inputs = _inputs()
+    prediction = model.sample_predictive_distribution(
+        inputs, n_samples=8, generator=torch.Generator().manual_seed(19),
+    )
+    torch.testing.assert_close(
+        prediction["predictive_mean"], prediction["point_prediction"],
+        rtol=1e-5, atol=1e-6,
+    )
+    assert float(prediction["predictive_std"].mean()) > 0
+
+
+def test_freezing_the_deterministic_backbone_keeps_only_latent_modules_trainable():
+    model = _model("mmd")
+    model.freeze_deterministic_backbone()
+    model.train()
+    assert model.image_conditioner.training is False
+    assert model.conditional_mean_head.training is False
+    assert all(not parameter.requires_grad
+               for parameter in model.image_conditioner.parameters())
+    assert all(not parameter.requires_grad
+               for parameter in model.conditional_mean_head.parameters())
+    assert any(parameter.requires_grad
+               for parameter in model.expression_encoder.parameters())
+    assert any(parameter.requires_grad
+               for parameter in model.residual_decoder.parameters())
+
+
 def test_masked_validation_uses_the_deterministic_point_prediction_as_primary():
     model = _model("mmd").eval()
     inputs = _inputs()
