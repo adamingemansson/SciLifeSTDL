@@ -91,6 +91,67 @@ def _linear_correlation(left: np.ndarray, right: np.ndarray) -> tuple[float, int
     return float(np.corrcoef(x, y)[0, 1]), int(finite.sum())
 
 
+def _zscore(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    scale = float(np.std(values))
+    if not math.isfinite(scale) or scale < 1e-12:
+        return np.zeros_like(values)
+    return (values - float(np.mean(values))) / scale
+
+
+def _conditional_associations(
+    architecture: str,
+    *,
+    pcc: np.ndarray,
+    attributes: dict[str, np.ndarray],
+) -> list[dict[str, Any]]:
+    """Partial rank associations and standardized multivariable coefficients.
+
+    These are descriptive diagnostics across genes. They separate correlated
+    gene properties, but do not establish a biological causal effect.
+    """
+    matrix = np.column_stack([attributes[name] for name in ATTRIBUTES])
+    finite = np.isfinite(pcc) & np.all(np.isfinite(matrix), axis=1)
+    y_raw, x_raw = pcc[finite], matrix[finite]
+    if y_raw.size < len(ATTRIBUTES) + 2:
+        # Small synthetic fixtures can still exercise output production. The
+        # resulting underdetermined coefficients are explicitly diagnostic.
+        if y_raw.size < 3:
+            raise ValueError("too few finite genes for conditional attribute analysis")
+    y = _zscore(_rankdata(y_raw))
+    x = np.column_stack([_zscore(_rankdata(x_raw[:, index])) for index in range(x_raw.shape[1])])
+    design = np.column_stack([np.ones(y.size), x])
+    beta = np.linalg.lstsq(design, y, rcond=None)[0][1:]
+    condition_number = float(np.linalg.cond(x))
+    rows: list[dict[str, Any]] = []
+    for index, name in enumerate(ATTRIBUTES):
+        controls = np.delete(x, index, axis=1)
+        controls = np.column_stack([np.ones(y.size), controls])
+        y_residual = y - controls @ np.linalg.lstsq(controls, y, rcond=None)[0]
+        x_target = x[:, index]
+        x_residual = x_target - controls @ np.linalg.lstsq(
+            controls, x_target, rcond=None,
+        )[0]
+        partial, _ = _linear_correlation(y_residual, x_residual)
+        residual_ss = float(np.sum(np.square(x_residual)))
+        total_ss = float(np.sum(np.square(x_target - np.mean(x_target))))
+        r_squared = 1.0 - residual_ss / total_ss if total_ss > 1e-12 else float("nan")
+        vif = 1.0 / (1.0 - r_squared) if math.isfinite(r_squared) and r_squared < 1.0 else float("inf")
+        marginal, _ = _rank_correlation(y_raw, x_raw[:, index])
+        rows.append({
+            "architecture": architecture,
+            "performance_metric": "pcc_mean",
+            "gene_attribute": name,
+            "marginal_spearman": marginal,
+            "partial_spearman_controlling_other_attributes": partial,
+            "standardized_multivariable_rank_beta": float(beta[index]),
+            "variance_inflation_factor": vif,
+            "design_condition_number": condition_number,
+            "n_genes_complete_case": int(y.size),
+        })
+    return rows
+
+
 def _seed_columns(rows: list[dict[str, str]]) -> list[str]:
     columns = [
         key for key in rows[0]
@@ -147,7 +208,9 @@ def build_atlas(
 
     atlas_rows: list[dict[str, Any]] = []
     association_rows: list[dict[str, Any]] = []
+    conditional_association_rows: list[dict[str, Any]] = []
     robust_rows: list[dict[str, Any]] = []
+    headroom_rows: list[dict[str, Any]] = []
     architecture_arrays: dict[str, np.ndarray] = {}
     for architecture in (left, right):
         pcc = np.asarray([_number(indexed[architecture][gene], "pcc_mean") for gene in genes])
@@ -192,6 +255,16 @@ def build_atlas(
                 "spearman_rho": rho,
                 "n_genes": n,
             })
+        conditional_association_rows.extend(_conditional_associations(
+            architecture,
+            pcc=pcc,
+            attributes={
+                name: np.asarray([
+                    _number(indexed[architecture][gene], name) for gene in genes
+                ])
+                for name in ATTRIBUTES
+            },
+        ))
 
         ranked = sorted(
             (row for row in atlas_rows if row["architecture"] == architecture),
@@ -203,6 +276,35 @@ def build_atlas(
         )
         for rank, row in enumerate(ranked[:top_n], 1):
             robust_rows.append({"architecture": architecture, "rank": rank, **row})
+
+        headroom = sorted(
+            (
+                {
+                    "architecture": architecture,
+                    "gene": row["gene"],
+                    "pcc_mean": row["pcc_mean"],
+                    "pcc_worst_seed": row["pcc_worst_seed"],
+                    "pcc_seed_sd": row["pcc_seed_sd"],
+                    "noise_ceiling": row["noise_ceiling"],
+                    "ceiling_minus_pcc": float(row["noise_ceiling"]) - float(row["pcc_mean"]),
+                    "pcc_over_noise_ceiling": row["pcc_over_noise_ceiling"],
+                    "all_seeds_positive": row["all_seeds_positive"],
+                    "target_mean": row["target_mean"],
+                    "target_std": row["target_std"],
+                    "target_nonzero_fraction": row["target_nonzero_fraction"],
+                    "target_moran_i": row["target_moran_i"],
+                    "target_local_gradient_energy": row["target_local_gradient_energy"],
+                    "local_gradient_pcc_mean": row["local_gradient_pcc_mean"],
+                }
+                for row in atlas_rows
+                if row["architecture"] == architecture
+                and bool(row["ceiling_eligible"])
+                and math.isfinite(float(row["pcc_mean"]))
+            ),
+            key=lambda row: (-float(row["ceiling_minus_pcc"]), str(row["gene"])),
+        )
+        for rank, row in enumerate(headroom[:top_n], 1):
+            headroom_rows.append({"rank": rank, **row})
 
     comparison_rows: list[dict[str, Any]] = []
     left_wins = right_wins = stable_left = stable_right = 0
@@ -272,6 +374,8 @@ def build_atlas(
         "atlas": output / "gene_predictability_atlas.tsv",
         "robust_genes": output / "top_robust_genes.tsv",
         "associations": output / "performance_attribute_associations.tsv",
+        "conditional_associations": output / "conditional_attribute_associations.tsv",
+        "high_headroom_genes": output / "high_headroom_genes.tsv",
         "architecture_comparison": output / "per_gene_architecture_comparison.tsv",
         "complementarity": output / "architecture_complementarity_summary.tsv",
     }
@@ -279,6 +383,8 @@ def build_atlas(
         ("atlas", atlas_rows),
         ("robust_genes", robust_rows),
         ("associations", association_rows),
+        ("conditional_associations", conditional_association_rows),
+        ("high_headroom_genes", headroom_rows),
         ("architecture_comparison", comparison_rows),
         ("complementarity", summary_rows),
     ):
