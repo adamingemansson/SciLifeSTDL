@@ -353,6 +353,7 @@ def _metrics(target: np.ndarray, prediction: np.ndarray) -> dict[str, float]:
 def _render(
     records: list[dict], *, output_dir: Path, model_name: str, gene: str,
     prediction_role: str, checkpoint_step: int | None,
+    marker_size_scale: float = 1.0,
 ) -> tuple[Path, Path]:
     import matplotlib
     matplotlib.use("Agg")
@@ -376,7 +377,10 @@ def _render(
                 "n_spots": len(target),
                 **metrics,
             })
-            marker_size = max(1.0, min(12.0, 12000.0 / max(len(target), 1)))
+            if marker_size_scale <= 0:
+                raise ValueError("marker_size_scale must be positive")
+            base_marker_size = max(1.0, min(12.0, 12000.0 / max(len(target), 1)))
+            marker_size = min(72.0, base_marker_size * marker_size_scale)
             fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.6), constrained_layout=True)
             panels = (
                 (target, "Target", "viridis", value_low, value_high),

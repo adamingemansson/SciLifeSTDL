@@ -68,12 +68,16 @@ def main() -> None:
     parser.add_argument("--prediction-role", choices=("point", "prior"), default="point")
     parser.add_argument("--n-samples", type=int, default=8)
     parser.add_argument("--chunk-size", type=int, default=2048)
+    parser.add_argument(
+        "--spot-size-scale", type=float, default=6.0,
+        help="Scatter-marker area multiplier; marker-panel default is 6x the legacy plots.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--allow-code-drift", action="store_true")
     parser.add_argument("--output-root", required=True)
     args = parser.parse_args()
-    if args.n_samples < 1 or args.chunk_size < 1:
-        parser.error("--n-samples and --chunk-size must be positive")
+    if args.n_samples < 1 or args.chunk_size < 1 or args.spot_size_scale <= 0:
+        parser.error("--n-samples, --chunk-size, and --spot-size-scale must be positive")
 
     repo = Path(args.repo).expanduser().resolve()
     results_root = Path(args.run_root or args.results_root).expanduser()
@@ -163,6 +167,7 @@ def main() -> None:
                 output_dir=output_root / _safe_name(scope) / _safe_name(gene),
                 model_name=source.model_name, gene=gene,
                 prediction_role=args.prediction_role, checkpoint_step=step,
+                marker_size_scale=args.spot_size_scale,
             )
             rendered += len(gene_records)
 
@@ -176,6 +181,7 @@ def main() -> None:
         "split": args.split,
         "sample_ids": sample_ids,
         "prediction_role": args.prediction_role,
+        "spot_size_scale": args.spot_size_scale,
         "target_gex_visible_to_model": False,
         "rendered_slide_gene_maps": rendered,
     }, indent=2, sort_keys=True))
