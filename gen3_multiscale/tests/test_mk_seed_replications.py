@@ -126,6 +126,25 @@ def test_seed_report_audit_rejects_incomplete_fixed_records(tmp_path: Path):
         audit_report(report, path, expected_seed=0)
 
 
+def test_seed_summary_marks_unavailable_record_metric_without_aborting(tmp_path: Path):
+    records = _records(tmp_path)
+    for by_seed in records.values():
+        for _seed, (_path, report) in by_seed.items():
+            for row in report["per_item_records"]:
+                row["model"]["auc"] = float("nan")
+    outputs = summarize(records, output_dir=tmp_path / "summary_nan", n_bootstrap=20)
+    rows = outputs["hierarchical_delta"].read_text().splitlines()
+    header = rows[0].split("\t")
+    parsed = [dict(zip(header, row.split("\t"))) for row in rows[1:]]
+    auc = next(
+        row for row in parsed
+        if row["scope"] == "fixed_mask"
+        and row["panel"] == "all_genes" and row["metric"] == "auc"
+    )
+    assert auc["status"] == "unavailable_no_shared_finite_slide_values"
+    assert auc["n_held_out_units"] == "0"
+
+
 def _write_sidecar(path: Path, architecture: str, seed: int) -> None:
     n_slides, n_genes = 14, 3
     target = np.tile(np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32), (n_slides, 1))

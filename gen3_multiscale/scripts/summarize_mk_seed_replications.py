@@ -225,6 +225,9 @@ def _structured_record_metric(
 
 def _t_interval(values: list[float]) -> tuple[float, float, float, float]:
     array = np.asarray(values, dtype=np.float64)
+    array = array[np.isfinite(array)]
+    if len(array) == 0:
+        return (float("nan"),) * 4
     mean = float(array.mean())
     sd = float(array.std(ddof=1)) if len(array) > 1 else float("nan")
     if len(array) < 2:
@@ -236,7 +239,7 @@ def _t_interval(values: list[float]) -> tuple[float, float, float, float]:
 def _hierarchical_delta(
     left: dict[int, dict[str, float]], right: dict[int, dict[str, float]], *,
     higher_is_better: bool, seed: int, n_bootstrap: int,
-) -> dict[str, float | int]:
+) -> dict[str, Any]:
     seeds = sorted(set(left) & set(right))
     if not seeds:
         raise ValueError("hierarchical comparison has no shared random seeds")
@@ -244,7 +247,16 @@ def _hierarchical_delta(
         set(left[value]) & set(right[value]) for value in seeds
     )))
     if not held_out_units:
-        raise ValueError("hierarchical comparison has no shared held-out slides")
+        return {
+            "mean_delta": float("nan"),
+            "ci95_low": float("nan"),
+            "ci95_high": float("nan"),
+            "n_seeds": len(seeds),
+            "n_held_out_units": 0,
+            "resampling_unit": "held_out_slide",
+            "n_patients": 0,
+            "status": "unavailable_no_shared_finite_slide_values",
+        }
     matrix = np.asarray([
         [
             (left[run_seed][unit] - right[run_seed][unit])
@@ -268,6 +280,7 @@ def _hierarchical_delta(
         "resampling_unit": "held_out_slide",
         # Backward-compatible alias for readers of the initial table schema.
         "n_patients": len(held_out_units),
+        "status": "ok",
     }
 
 
@@ -392,7 +405,9 @@ def summarize(
                         if higher else (right_patient[patient] - left_patient[patient])
                         for patient in sorted(left_patient)
                     ]
-                    seed_deltas[run_seed] = float(np.mean(per_patient))
+                    seed_deltas[run_seed] = (
+                        float(np.mean(per_patient)) if per_patient else float("nan")
+                    )
                 mean, sd, low, high = _t_interval(list(seed_deltas.values()))
                 seed_delta_rows.append({
                     "left": left_arch, "right": right_arch, "scope": scope,
