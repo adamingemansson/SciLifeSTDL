@@ -145,6 +145,26 @@ def test_seed_summary_marks_unavailable_record_metric_without_aborting(tmp_path:
     assert auc["n_held_out_units"] == "0"
 
 
+def test_seed_summary_accepts_fixed_mask_nonzero_auc_alias(tmp_path: Path):
+    records = _records(tmp_path)
+    for by_seed in records.values():
+        for _seed, (_path, report) in by_seed.items():
+            aggregate = report["per_arm_patient_aggregated_metrics"]["model"]
+            aggregate["nonzero_auc"] = aggregate.pop("auc")
+            for row in report["per_item_records"]:
+                row["model"]["nonzero_auc"] = row["model"].pop("auc")
+    outputs = summarize(records, output_dir=tmp_path / "summary_auc_alias", n_bootstrap=20)
+    seed_rows = outputs["seed_summary"].read_text().splitlines()
+    header = seed_rows[0].split("\t")
+    parsed = [dict(zip(header, row.split("\t"))) for row in seed_rows[1:]]
+    fixed_all = next(
+        row for row in parsed
+        if row["architecture"] == ARCHITECTURES[0]
+        and row["scope"] == "fixed_mask" and row["panel"] == "all_genes"
+    )
+    assert np.isfinite(float(fixed_all["auc_mean"]))
+
+
 def _write_sidecar(path: Path, architecture: str, seed: int) -> None:
     n_slides, n_genes = 14, 3
     target = np.tile(np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32), (n_slides, 1))

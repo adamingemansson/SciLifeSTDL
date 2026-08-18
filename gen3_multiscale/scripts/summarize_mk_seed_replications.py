@@ -33,6 +33,7 @@ PANELS = (
     "train_within_slide_variance_top200",
 )
 POINT_METRICS = ("pcc", "rmse", "auc")
+METRIC_ALIASES = {"auc": ("auc", "nonzero_auc")}
 STRUCTURED_METRICS = {
     "spot_profile_pcc": "spot_profile.mean_spot_profile_pcc",
     "coexpression_pcc": "coexpression.correlation_matrix_pcc",
@@ -60,6 +61,17 @@ def _finite(value: Any) -> float:
 
 def _patient_mean(metric: Any) -> float:
     return _finite(metric.get("patient_mean")) if isinstance(metric, dict) else _finite(metric)
+
+
+def _metric_value(metrics: dict[str, Any], metric: str) -> Any:
+    for key in METRIC_ALIASES.get(metric, (metric,)):
+        if key in metrics:
+            return metrics[key]
+    return None
+
+
+def _patient_metric(metrics: dict[str, Any], metric: str) -> float:
+    return _patient_mean(_metric_value(metrics, metric))
 
 
 def _primary_role(report: dict[str, Any]) -> str:
@@ -196,13 +208,13 @@ def _record_metric(
         records = report["per_item_records"]
         for row in records:
             values = row[primary] if panel == "all_genes" else row["gene_panels"][primary][panel]
-            value = _finite(values.get(metric))
+            value = _finite(_metric_value(values, metric))
             if math.isfinite(value):
                 result.setdefault(str(row["sample_id"]), []).append(value)
     elif scope == "whole_slide":
         records = report["whole_slide_structured_field_evaluation"]["per_slide_records"]
         for row in records:
-            value = _finite(row["point_metrics"][panel].get(metric))
+            value = _finite(_metric_value(row["point_metrics"][panel], metric))
             if math.isfinite(value):
                 result.setdefault(str(row["sample_id"]), []).append(value)
     else:
@@ -338,7 +350,7 @@ def summarize(
                     seed_rows.append({
                         "architecture": architecture, "seed": run_seed,
                         "scope": scope, "panel": panel,
-                        **{metric: _patient_mean(metrics.get(metric)) for metric in POINT_METRICS},
+                        **{metric: _patient_metric(metrics, metric) for metric in POINT_METRICS},
                         "checkpoint_step": report.get("checkpoint_step"),
                         "checkpoint_masks_seen": report.get("checkpoint_masks_seen"),
                         "source": str(path),
