@@ -530,7 +530,7 @@ def _validate(model: torch.nn.Module, dataset, *, device: torch.device, seed: in
                 ),
             )
             generator_totals.append(float(validation_losses["total"]))
-            posterior_rmses.append(float(validation_losses["rmse_loss"]))
+            posterior_rmses.append(float(validation_losses["reconstruction_rmse"]))
             prior_losses.append(float(validation_losses["prior_loss"]))
         posterior_z = None
         if has_latent_model and ((snapshot is not None and not snapshot.full) or collect_film):
