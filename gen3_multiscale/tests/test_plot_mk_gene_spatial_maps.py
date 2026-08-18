@@ -72,3 +72,11 @@ def test_sample_selection_keeps_an_explicit_subset_in_requested_order():
     )
     assert available == ["slide_a", "slide_b", "slide_c"]
     assert selected == ["slide_c", "slide_a"]
+
+
+def test_renderer_keeps_legacy_marker_scale_as_default():
+    signature = inspect.signature(__import__(
+        "gen3_multiscale.scripts.plot_mk_gene_spatial_maps",
+        fromlist=["_render"],
+    )._render)
+    assert signature.parameters["marker_size_scale"].default == 1.0
