@@ -27,6 +27,13 @@ ARM_SPECS = {
     "mk_bw_serial": ConditionalWAEArmSpec("he_to_st", "none", False),
     "mk_wbw_sandwich": ConditionalWAEArmSpec("he_to_st", "none", False),
     "mk_wb_parallel_gated": ConditionalWAEArmSpec("he_to_st", "none", False),
+    # Residual WAE-MMD factorial on the frozen, best deterministic
+    # within/between parallel-gated H&E predictor.  The two factors are the
+    # prior (global versus H&E-conditional) and posterior FiLM conditioning.
+    "mk_rwae_standard_nofilm": ConditionalWAEArmSpec("he_to_st", "mmd", False),
+    "mk_rwae_standard_film": ConditionalWAEArmSpec("he_to_st", "mmd", False),
+    "mk_rwae_conditional_nofilm": ConditionalWAEArmSpec("he_to_st", "mmd", False),
+    "mk_rwae_conditional_film": ConditionalWAEArmSpec("he_to_st", "mmd", False),
     "wae_within": ConditionalWAEArmSpec("he_to_st", "mmd", False),
     "wae_between": ConditionalWAEArmSpec("he_to_st", "mmd", False),
     "wae_gradient": ConditionalWAEArmSpec("he_to_st", "mmd", False),
@@ -166,6 +173,13 @@ _MK_STRUCTURED_COMPOSITIONS = {
     "mk_wbw_sandwich": "within_between_within",
     "mk_wb_parallel_gated": "parallel_gated",
 }
+_MK_RESIDUAL_WAE_DESIGNS = {
+    # prior_mode, posterior encoder conditioning
+    "mk_rwae_standard_nofilm": ("standard", "none"),
+    "mk_rwae_standard_film": ("standard", "film"),
+    "mk_rwae_conditional_nofilm": ("conditional", "none"),
+    "mk_rwae_conditional_film": ("conditional", "film"),
+}
 _VALID_STRUCTURED_COMPOSITIONS = frozenset({
     "within_then_between", "between_then_within",
     "within_between_within", "parallel_gated",
@@ -238,6 +252,7 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
         raise ValueError("model.params.prior_mode must be 'standard', 'conditional', or 'none'")
     is_new_mk_arm = arm.startswith("mk_") or arm in _MK_STRUCTURED_FIELD_DESIGNS
     is_structured_field_arm = arm in _MK_STRUCTURED_FIELD_DESIGNS
+    is_residual_wae_arm = arm in _MK_RESIDUAL_WAE_DESIGNS
     if arm in _MK_ARCHITECTURE_DESIGNS:
         actual_design = (conditioner_mode, prior_mode, deterministic_only)
         if actual_design != _MK_ARCHITECTURE_DESIGNS[arm]:
@@ -255,6 +270,37 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
                 raise ValueError("the deterministic MK arm must use the spatial conditioner")
             if n_refinement_steps != 0:
                 raise ValueError("deterministic MK arm tests the transformer only; spatial refinement must be off")
+    elif is_residual_wae_arm:
+        expected_prior, expected_conditioning = _MK_RESIDUAL_WAE_DESIGNS[arm]
+        if model.get("regularizer") != "mmd":
+            raise ValueError(f"{arm}: residual generative screen requires WAE-MMD")
+        if (prior_mode, encoder_conditioning) != (
+            expected_prior, expected_conditioning
+        ):
+            raise ValueError(
+                f"{arm}: prior/conditioning {(prior_mode, encoder_conditioning)} "
+                "does not match its immutable factorial cell "
+                f"{(expected_prior, expected_conditioning)}"
+            )
+        if conditioner_mode != "spatial":
+            raise ValueError(f"{arm}: frozen point predictor must be spatial")
+        if structured_composition != "parallel_gated":
+            raise ValueError(f"{arm}: frozen point predictor must be parallel_gated")
+        if n_refinement_steps != 1 or not bool(
+            params.get("use_centered_gene_structure", False)
+        ):
+            raise ValueError(
+                f"{arm}: frozen point predictor requires within-gene and "
+                "between-spot refinement"
+            )
+        if str(params.get("latent_residual_mode", "free")) != "antithetic_zero_mean":
+            raise ValueError(f"{arm}: latent residual must be antithetic_zero_mean")
+        if not bool(params.get("freeze_deterministic_backbone", False)):
+            raise ValueError(f"{arm}: deterministic backbone must be frozen")
+        if not params.get("deterministic_backbone_checkpoint"):
+            raise ValueError(f"{arm}: deterministic backbone checkpoint is required")
+        if not params.get("deterministic_backbone_weights_sha256"):
+            raise ValueError(f"{arm}: deterministic backbone weights hash is required")
     elif is_new_mk_arm:
         if structured_composition != "within_then_between":
             raise ValueError(
@@ -278,6 +324,10 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
     wide_gradient_weight = float(loss.get("wide_gradient_weight", 0.0))
     if local_gradient_weight < 0 or wide_gradient_weight < 0:
         raise ValueError("structured-field gradient weights must be non-negative")
+    if is_residual_wae_arm and (
+        local_gradient_weight != 0 or wide_gradient_weight != 0
+    ):
+        raise ValueError(f"{arm}: gradient losses are outside this controlled screen")
     if is_structured_field_arm:
         expected_prior, expected_deterministic = _MK_STRUCTURED_FIELD_FAMILIES[arm]
         if (prior_mode, deterministic_only) != (expected_prior, expected_deterministic):

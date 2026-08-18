@@ -98,6 +98,85 @@ def _select_train_item_with_minimum_queries(
     )
 
 
+def _load_frozen_deterministic_backbone(
+    model: ConditionalWAE, params: dict, gene_names: list[str] | None,
+) -> None:
+    """Reconstruct a pinned deterministic predictor inside a residual WAE."""
+    source = params.get("deterministic_backbone_checkpoint")
+    if not source:
+        if bool(params.get("freeze_deterministic_backbone", False)):
+            raise ValueError(
+                "freeze_deterministic_backbone requires "
+                "deterministic_backbone_checkpoint"
+            )
+        return
+    if gene_names is None:
+        raise ValueError("deterministic backbone warm-start requires gene_names")
+    identity = checkpoint_module.resolve_checkpoint_identity(source)
+    expected_sha256 = str(params.get("deterministic_backbone_weights_sha256", ""))
+    if not expected_sha256 or identity.weights_sha256 != expected_sha256:
+        raise ValueError(
+            "deterministic backbone checkpoint does not match its pinned "
+            f"weights hash ({identity.weights_sha256!r} != {expected_sha256!r})"
+        )
+    checkpoint_module.verify_gene_names(identity.resolved_dir, gene_names)
+    weights_path = identity.resolved_dir / "trainable_weights.pt"
+    if not weights_path.is_file():
+        raise FileNotFoundError(weights_path)
+    state = torch.load(weights_path, map_location="cpu")
+    if not isinstance(state, dict):
+        raise ValueError("deterministic backbone weights must be a state dictionary")
+
+    transfers = (
+        ("image_conditioner", model.image_conditioner),
+        ("conditional_mean_head", model.conditional_mean_head),
+        ("coexpression_refinement", model.centered_gene_structure_refinement),
+        ("spatial_refiner", model.spatial_refiner),
+    )
+    consumed: set[str] = set()
+    for source_prefix, destination in transfers:
+        if destination is None:
+            raise ValueError(
+                f"warm-start destination has no module for {source_prefix!r}"
+            )
+        prefix = source_prefix + "."
+        module_state = {
+            key[len(prefix):]: value for key, value in state.items()
+            if key.startswith(prefix)
+        }
+        expected = set(destination.state_dict())
+        if set(module_state) != expected:
+            raise ValueError(
+                f"deterministic backbone {source_prefix!r} keys do not match "
+                f"the residual-WAE destination (missing={sorted(expected - set(module_state))}, "
+                f"unexpected={sorted(set(module_state) - expected)})"
+            )
+        destination.load_state_dict(module_state, strict=True)
+        consumed.update(prefix + key for key in module_state)
+
+    for root_name in ("composition_gate_logits", "per_gene_scale"):
+        if root_name not in state:
+            raise ValueError(f"deterministic backbone is missing {root_name!r}")
+        destination_value = getattr(model, root_name)
+        if destination_value.shape != state[root_name].shape:
+            raise ValueError(f"deterministic backbone {root_name!r} shape mismatch")
+        with torch.no_grad():
+            destination_value.copy_(state[root_name])
+        consumed.add(root_name)
+    unexpected = set(state) - consumed
+    if unexpected:
+        raise ValueError(
+            "deterministic source contains unrecognized state keys: "
+            f"{sorted(unexpected)}"
+        )
+    if not bool(params.get("freeze_deterministic_backbone", False)):
+        raise ValueError(
+            "a deterministic backbone checkpoint may only be used with "
+            "freeze_deterministic_backbone=true in this controlled screen"
+        )
+    model.freeze_deterministic_backbone()
+
+
 def accumulate_and_step_discriminator(
     model: ConditionalWAE, optimizer: torch.optim.Optimizer,
     micro_batches: list[tuple[int, object, torch.Tensor]], *,
@@ -298,6 +377,9 @@ def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = N
         gene_encoder_table=gene_encoder_table,
         z_noise_std=float(params.get("z_noise_std", 0.0)),
         n_refinement_steps=int(params.get("n_refinement_steps", 0)),
+        structured_composition=str(
+            params.get("structured_composition", "within_then_between")
+        ),
         refinement_k_neighbors=int(params.get("refinement_k_neighbors", 6)),
         refinement_hidden_dim=int(params.get("refinement_hidden_dim", 256)),
         refinement_gex_feature_dim=int(params.get("refinement_gex_feature_dim", 256)),
@@ -305,6 +387,7 @@ def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = N
         distributional_weight=float(params.get("distributional_weight", 1.0)),
         distributional_hidden_dim=int(params.get("distributional_hidden_dim", 1024)),
         prior_mode=str(params.get("prior_mode", "standard")),
+        latent_residual_mode=str(params.get("latent_residual_mode", "free")),
         conditional_prior_hidden_dim=int(params.get("conditional_prior_hidden_dim", 256)),
         conditional_prior_context_weight=float(
             params.get("conditional_prior_context_weight", 1.0)
@@ -335,6 +418,7 @@ def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = N
                 "prior's gene panel can be checked against this run's"
             )
         load_spatial_prior_into(model.spatial_refiner, spatial_prior_path, gene_names=gene_names)
+    _load_frozen_deterministic_backbone(model, params, gene_names)
     return model
 
 
@@ -409,6 +493,7 @@ def _validate(model: torch.nn.Module, dataset, *, device: torch.device, seed: in
     model.eval()
     totals, rmses, pcc_losses = [], [], []
     wae_prior_totals, wae_prior_rmses, wae_prior_pcc_losses = [], [], []
+    generator_totals, posterior_rmses, prior_losses = [], [], []
     has_latent_model = bool(getattr(model, "has_latent_model", True))
     collect_film = (
         collect_film_diagnostics and has_latent_model
@@ -437,6 +522,16 @@ def _validate(model: torch.nn.Module, dataset, *, device: torch.device, seed: in
         wae_prior_totals.append(float(wae_total))
         wae_prior_rmses.append(float(wae_rmse))
         wae_prior_pcc_losses.append(float(wae_pcc_loss))
+        if has_latent_model:
+            validation_losses = model.compute_generator_losses(
+                inputs, target_tensor,
+                generator=torch.Generator(device=device).manual_seed(
+                    _stable_seed(seed, identity) + 1
+                ),
+            )
+            generator_totals.append(float(validation_losses["total"]))
+            posterior_rmses.append(float(validation_losses["rmse_loss"]))
+            prior_losses.append(float(validation_losses["prior_loss"]))
         posterior_z = None
         if has_latent_model and ((snapshot is not None and not snapshot.full) or collect_film):
             # Held-out target GEX is encoded only for a diagnostic Projector/
@@ -468,6 +563,13 @@ def _validate(model: torch.nn.Module, dataset, *, device: torch.device, seed: in
         "wae_prior_total": float(np.mean(wae_prior_totals)),
         "wae_prior_rmse": float(np.mean(wae_prior_rmses)),
         "wae_prior_pcc_loss": float(np.mean(wae_prior_pcc_losses)),
+        "generator_total": (
+            float(np.mean(generator_totals)) if generator_totals else float(np.mean(totals))
+        ),
+        "posterior_rmse": (
+            float(np.mean(posterior_rmses)) if posterior_rmses else float(np.mean(rmses))
+        ),
+        "prior_loss": float(np.mean(prior_losses)) if prior_losses else 0.0,
         "n_items": len(dataset),
     }
     if collect_film and film_posterior_z:
@@ -753,8 +855,10 @@ def run_conditional_wae_training(
     model = _build_model(config, len(gene_names), gene_names=gene_names).to(device)
     generator_parameters = [
         parameter for name, parameter in model.named_parameters()
-        if not name.startswith("discriminator.")
+        if not name.startswith("discriminator.") and parameter.requires_grad
     ]
+    if not generator_parameters:
+        raise ValueError("conditional-WAE generator has no trainable parameters")
     parameter_groups = [{"params": generator_parameters, "name": "generator"}]
     if model.discriminator is not None:
         parameter_groups.append({"params": list(model.discriminator.parameters()), "name": "discriminator"})
@@ -818,10 +922,20 @@ def run_conditional_wae_training(
         entry for entry in history
         if entry.get("primary_prediction_role") == "conditional_mean"
     ]
-    best_total = min((entry["total"] for entry in point_history), default=float("inf"))
+    best_monitor = str(training_cfg.get("best_monitor", "total"))
+    valid_best_monitors = {"total", "generator_total", "wae_prior_total"}
+    if best_monitor not in valid_best_monitors:
+        raise ValueError(
+            f"training.best_monitor must be one of {sorted(valid_best_monitors)}"
+        )
+    monitored_history = [entry for entry in point_history if best_monitor in entry]
+    best_total = min(
+        (entry[best_monitor] for entry in monitored_history), default=float("inf")
+    )
     best_step = next(
-        (entry["step"] for entry in point_history if entry["total"] == best_total), None,
-    ) if point_history else None
+        (entry["step"] for entry in monitored_history
+         if entry[best_monitor] == best_total), None,
+    ) if monitored_history else None
     if history and not point_history:
         print(
             "legacy validation history uses WAE-prior primary scores; the corrected "
@@ -1039,8 +1153,9 @@ def run_conditional_wae_training(
             )
             if tensorboard_logger is not None:
                 tensorboard_logger.add_validation_scalars(
-                    step, entry, best_total=min(best_total, entry["total"]),
-                    best_step=(step if entry["total"] <= best_total else best_step),
+                    step, entry, best_total=min(best_total, entry[best_monitor]),
+                    best_step=(step if entry[best_monitor] <= best_total else best_step),
+                    best_metric_name=best_monitor,
                 )
                 if snapshot is not None:
                     tensorboard_logger.add_snapshot(step, snapshot)
@@ -1049,15 +1164,17 @@ def run_conditional_wae_training(
             if not smoke:
                 history.append(entry)
                 _atomic_json(history, history_path)
-                if entry["total"] < best_total:
-                    best_total = entry["total"]
+                monitor_value = float(entry[best_monitor])
+                if monitor_value < best_total:
+                    best_total = monitor_value
                     best_step = step
                     save_best_checkpoint_bundle(
                         model, config, gene_names, checkpoint_dir / "best",
-                        step=step, val_loss=entry["total"], run_manifest=run_manifest,
+                        step=step, val_loss=monitor_value, run_manifest=run_manifest,
                         extra_metadata={
                             "masks_seen": masks_seen,
                             "primary_prediction_role": "conditional_mean",
+                            "best_monitor": best_monitor,
                         },
                     )
             if whole_slide_enabled:

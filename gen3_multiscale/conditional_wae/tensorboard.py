@@ -308,15 +308,21 @@ class ConditionalWAETensorBoardLogger:
             )
 
     def add_validation_scalars(self, step: int, entry: dict, *,
-                               best_total: float | None = None, best_step: int | None = None) -> None:
+                               best_total: float | None = None, best_step: int | None = None,
+                               best_metric_name: str = "total") -> None:
         for key in ("total", "rmse", "pcc_loss"):
             self.writer.add_scalar(f"validation/{key}", float(entry[key]), int(step))
             self.writer.add_scalar(f"validation/point_{key}", float(entry[key]), int(step))
         for key in ("wae_prior_total", "wae_prior_rmse", "wae_prior_pcc_loss"):
             if key in entry:
                 self.writer.add_scalar(f"validation/{key}", float(entry[key]), int(step))
+        for key in ("generator_total", "posterior_rmse", "prior_loss"):
+            if key in entry:
+                self.writer.add_scalar(f"validation/{key}", float(entry[key]), int(step))
         if best_total is not None:
-            self.writer.add_scalar("validation/best_total", float(best_total), int(step))
+            self.writer.add_scalar(
+                f"validation/best_{best_metric_name}", float(best_total), int(step),
+            )
         if best_step is not None:
             self.writer.add_scalar("validation/best_step", float(best_step), int(step))
 
