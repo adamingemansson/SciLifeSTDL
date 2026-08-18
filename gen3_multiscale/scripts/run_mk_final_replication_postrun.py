@@ -195,7 +195,9 @@ def run_postrun(
         "kind": "mk_final_replication_postrun", "version": 1,
         "replication_root": str(root), "seed0_evaluation_root": str(seed0),
         "noise_ceiling": str(ceiling), "expected_fixed_items": 448,
-        "expected_whole_slides": 14, "seeds": [0, 1, 2],
+        "expected_whole_slides": 14,
+        "replication_seeds": sorted({seed for _, seed in EXPECTED_RUNS.values()}),
+        "reference_seed": "discovered_from_reference_evaluation_config",
         "architectures": list(ARCHITECTURES),
     })
     pointer = root.parent / "LATEST_MK_FINAL_REPLICATION_EVALUATION_ROOT.txt"
@@ -267,7 +269,10 @@ def run_postrun(
         replication_evaluation_root=output,
     )
     summary_paths = summarize(records, output_dir=output / "analysis" / "seed_summary")
-    gene_paths = analyze_genes(records, output_dir=output / "analysis" / "gene_robustness")
+    gene_paths = analyze_genes(
+        records, output_dir=output / "analysis" / "gene_robustness",
+        noise_ceiling_path=ceiling,
+    )
     result = {
         "ok": True, "output_root": str(output), "evaluation_status": str(status_path),
         "seed_summary": {name: str(path) for name, path in summary_paths.items()},

@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 import math
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,12 @@ from gen3_multiscale.evaluation.per_gene_diagnostics import load_per_gene_diagno
 from gen3_multiscale.scripts.summarize_mk_seed_replications import (
     ARCHITECTURES,
     discover_records,
+)
+
+
+TARGET_ATTRIBUTES = (
+    "target_mean", "target_std", "target_nonzero_fraction",
+    "target_moran_i", "target_local_gradient_energy", "noise_ceiling",
 )
 
 
@@ -52,16 +59,42 @@ def _write(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def _noise_ceiling(
+    path: str | Path | None, *, sample_ids: list[str], gene_names: list[str],
+) -> np.ndarray | None:
+    if path is None:
+        return None
+    source = Path(path).expanduser().resolve()
+    payload = json.loads(source.read_text())
+    if payload.get("kind") != "gene_noise_ceiling_by_count_splitting":
+        raise ValueError(f"not a count-split noise-ceiling artifact: {source}")
+    by_sample = {str(row["sample_id"]): row for row in payload.get("per_slide", [])}
+    if set(by_sample) != set(sample_ids):
+        raise ValueError("noise-ceiling and per-gene diagnostic cohorts differ")
+    result = np.full((len(sample_ids), len(gene_names)), np.nan, dtype=np.float64)
+    for row, sample_id in enumerate(sample_ids):
+        values = by_sample[sample_id].get("ceiling_by_gene") or {}
+        result[row] = [float(values.get(gene, np.nan)) for gene in gene_names]
+    return result
+
+
 def analyze(
     records: dict[str, dict[int, tuple[Path, dict[str, Any]]]], *,
-    output_dir: str | Path,
+    output_dir: str | Path, noise_ceiling_path: str | Path | None = None,
 ) -> dict[str, Path]:
     payloads: dict[str, dict[int, dict[str, Any]]] = {arm: {} for arm in ARCHITECTURES}
+    seed_sets = {architecture: set(records.get(architecture, {})) for architecture in ARCHITECTURES}
+    seeds = tuple(sorted(seed_sets[ARCHITECTURES[0]]))
+    if len(seeds) != 3:
+        raise ValueError(f"exactly three independent seeds are required; got={list(seeds)}")
     identity = None
     target_reference = None
     for architecture in ARCHITECTURES:
-        if set(records.get(architecture, {})) != {0, 1, 2}:
-            raise ValueError(f"{architecture}: exactly seeds 0,1,2 are required")
+        if seed_sets[architecture] != set(seeds):
+            raise ValueError(
+                f"{architecture}: seed set differs; expected={list(seeds)}, "
+                f"got={sorted(seed_sets[architecture])}"
+            )
         for seed, (_report_path, report) in records[architecture].items():
             whole = report.get("whole_slide_structured_field_evaluation") or {}
             sidecar_path = Path(str(whole.get("per_gene_diagnostics_path") or ""))
@@ -89,7 +122,18 @@ def analyze(
             payloads[architecture][seed] = payload
 
     assert identity is not None
-    gene_names, _samples, patient_ids, _organs = identity
+    gene_names, sample_ids, patient_ids, _organs = identity
+    target_macro = {
+        name: _patient_macro(target_reference[name], patient_ids)
+        for name in TARGET_ATTRIBUTES if name != "noise_ceiling"
+    }
+    ceiling = _noise_ceiling(
+        noise_ceiling_path, sample_ids=sample_ids, gene_names=gene_names,
+    )
+    target_macro["noise_ceiling"] = (
+        _patient_macro(ceiling, patient_ids)
+        if ceiling is not None else np.full(len(gene_names), np.nan, dtype=np.float64)
+    )
     metrics = ("pcc", "spearman", "r2", "rmse", "mae", "local_gradient_pcc")
     macro: dict[str, dict[int, dict[str, np.ndarray]]] = {arm: {} for arm in ARCHITECTURES}
     for architecture in ARCHITECTURES:
@@ -102,8 +146,7 @@ def analyze(
     summary_rows: list[dict[str, Any]] = []
     rank_rows: list[dict[str, Any]] = []
     for architecture in ARCHITECTURES:
-        for left_seed in (0, 1, 2):
-            for right_seed in range(left_seed + 1, 3):
+        for left_seed, right_seed in combinations(seeds, 2):
                 rho, n = _rank_correlation(
                     macro[architecture][left_seed]["pcc"],
                     macro[architecture][right_seed]["pcc"],
@@ -113,7 +156,7 @@ def analyze(
                     "left_seed": left_seed, "right_seed": right_seed,
                     "spearman_across_genes": rho, "n_genes": n,
                 })
-        pcc_matrix = np.stack([macro[architecture][seed]["pcc"] for seed in (0, 1, 2)])
+        pcc_matrix = np.stack([macro[architecture][seed]["pcc"] for seed in seeds])
         finite_sd = np.nanstd(pcc_matrix, axis=0, ddof=1)
         finite_mean = np.nanmean(pcc_matrix, axis=0)
         for index, gene in enumerate(gene_names):
@@ -125,12 +168,16 @@ def analyze(
                 "pcc_max": float(np.nanmax(pcc_matrix[:, index])),
                 "fraction_seeds_pcc_positive": float(np.mean(pcc_matrix[:, index] > 0)),
                 "all_seeds_pcc_positive": bool(np.all(pcc_matrix[:, index] > 0)),
+                **{
+                    name: float(values[index])
+                    for name, values in target_macro.items()
+                },
             }
-            for seed in (0, 1, 2):
+            for seed in seeds:
                 row[f"seed{seed}_pcc"] = float(macro[architecture][seed]["pcc"][index])
             for metric in metrics[1:]:
                 values = np.asarray([
-                    macro[architecture][seed][metric][index] for seed in (0, 1, 2)
+                    macro[architecture][seed][metric][index] for seed in seeds
                 ], dtype=np.float64)
                 row[f"{metric}_mean"] = float(np.nanmean(values))
                 row[f"{metric}_seed_sd"] = float(np.nanstd(values, ddof=1))
@@ -149,19 +196,35 @@ def analyze(
         })
 
     delta_rows: list[dict[str, Any]] = []
+    association_rows: list[dict[str, Any]] = []
     left, right = ARCHITECTURES
+    mean_deltas = np.full(len(gene_names), np.nan, dtype=np.float64)
     for index, gene in enumerate(gene_names):
-        deltas = np.asarray([
-            macro[left][seed]["pcc"][index] - macro[right][seed]["pcc"][index]
-            for seed in (0, 1, 2)
-        ], dtype=np.float64)
+        delta_by_seed = {
+            seed: float(
+                macro[left][seed]["pcc"][index] - macro[right][seed]["pcc"][index]
+            )
+            for seed in seeds
+        }
+        deltas = np.asarray([delta_by_seed[seed] for seed in seeds], dtype=np.float64)
+        mean_deltas[index] = float(np.nanmean(deltas))
         delta_rows.append({
             "gene": gene, "left": left, "right": right,
-            "mean_pcc_delta": float(np.nanmean(deltas)),
+            "mean_pcc_delta": mean_deltas[index],
             "pcc_delta_seed_sd": float(np.nanstd(deltas, ddof=1)),
             "fraction_seeds_left_better": float(np.mean(deltas > 0)),
             "all_seeds_left_better": bool(np.all(deltas > 0)),
-            **{f"seed{seed}_pcc_delta": float(deltas[seed]) for seed in (0, 1, 2)},
+            **{f"seed{seed}_pcc_delta": delta_by_seed[seed] for seed in seeds},
+            **{
+                name: float(values[index])
+                for name, values in target_macro.items()
+            },
+        })
+    for name, values in target_macro.items():
+        rho, n = _rank_correlation(mean_deltas, values)
+        association_rows.append({
+            "left": left, "right": right, "performance_metric": "mean_pcc_delta",
+            "gene_attribute": name, "spearman_rho": rho, "n_genes": n,
         })
 
     output = Path(output_dir).expanduser().resolve()
@@ -171,17 +234,19 @@ def analyze(
         "summary": output / "gene_robustness_summary.tsv",
         "rank_stability": output / "seed_pair_gene_rank_stability.tsv",
         "architecture_delta": output / "per_gene_architecture_delta.tsv",
+        "delta_attribute_associations": output / "architecture_delta_attribute_associations.tsv",
     }
     for path, rows in (
         (paths["per_gene"], gene_rows), (paths["summary"], summary_rows),
         (paths["rank_stability"], rank_rows),
         (paths["architecture_delta"], delta_rows),
+        (paths["delta_attribute_associations"], association_rows),
     ):
         _write(path, rows)
     manifest_path = output / "gene_robustness_manifest.json"
     manifest_path.write_text(json.dumps({
         "kind": "mk_seed_gene_robustness", "version": 1,
-        "architectures": list(ARCHITECTURES), "seeds": [0, 1, 2],
+        "architectures": list(ARCHITECTURES), "seeds": list(seeds),
         "outputs": {name: str(path) for name, path in paths.items()},
     }, indent=2, sort_keys=True))
     paths["manifest"] = manifest_path
@@ -194,13 +259,17 @@ def main() -> None:
     parser.add_argument("--replication-root", required=True)
     parser.add_argument("--replication-evaluation-root", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--noise-ceiling")
     args = parser.parse_args()
     records = discover_records(
         seed0_root=args.seed0_evaluation_root,
         replication_root=args.replication_root,
         replication_evaluation_root=args.replication_evaluation_root,
     )
-    outputs = analyze(records, output_dir=args.output_dir)
+    outputs = analyze(
+        records, output_dir=args.output_dir,
+        noise_ceiling_path=args.noise_ceiling,
+    )
     for name, path in outputs.items():
         print(f"{name}: {path}")
 

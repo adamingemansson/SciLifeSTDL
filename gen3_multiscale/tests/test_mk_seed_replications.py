@@ -91,7 +91,9 @@ def _records(tmp_path: Path):
     result = {architecture: {} for architecture in ARCHITECTURES}
     for architecture in ARCHITECTURES:
         offset = 0.2 if architecture == ARCHITECTURES[0] else 0.1
-        for seed in (0, 1, 2):
+        # The historical finalist used seed 10; "seed0 root" means the
+        # reference run operationally, not literal training seed zero.
+        for seed in (10, 1, 2):
             result[architecture][seed] = _report(tmp_path, architecture, seed, offset + seed * 0.01)
     return result
 
@@ -145,7 +147,7 @@ def _write_sidecar(path: Path, architecture: str, seed: int) -> None:
 def test_gene_robustness_requires_and_summarizes_three_seeds(tmp_path: Path):
     records = {architecture: {} for architecture in ARCHITECTURES}
     for architecture in ARCHITECTURES:
-        for seed in (0, 1, 2):
+        for seed in (10, 1, 2):
             sidecar = tmp_path / f"{architecture}_{seed}.npz"
             _write_sidecar(sidecar, architecture, seed)
             records[architecture][seed] = (
@@ -154,7 +156,26 @@ def test_gene_robustness_requires_and_summarizes_three_seeds(tmp_path: Path):
                     "per_gene_diagnostics_path": str(sidecar),
                 }},
             )
-    outputs = analyze_genes(records, output_dir=tmp_path / "genes")
+    noise_ceiling = tmp_path / "noise_ceiling.json"
+    noise_ceiling.write_text(json.dumps({
+        "kind": "gene_noise_ceiling_by_count_splitting",
+        "per_slide": [
+            {
+                "sample_id": f"s{index}",
+                "ceiling_by_gene": {"g0": 0.2, "g1": 0.5, "g2": 0.8},
+            }
+            for index in range(14)
+        ],
+    }))
+    outputs = analyze_genes(
+        records, output_dir=tmp_path / "genes",
+        noise_ceiling_path=noise_ceiling,
+    )
     assert all(path.is_file() for path in outputs.values())
     assert "fraction_genes_all_seeds_positive" in outputs["summary"].read_text()
     assert "mean_pcc_delta" in outputs["architecture_delta"].read_text()
+    assert "noise_ceiling" in outputs["architecture_delta"].read_text().splitlines()[0]
+    assert "target_moran_i" in outputs["per_gene"].read_text().splitlines()[0]
+    assert "mean_pcc_delta" in outputs["delta_attribute_associations"].read_text()
+    manifest = json.loads(outputs["manifest"].read_text())
+    assert manifest["seeds"] == [1, 2, 10]

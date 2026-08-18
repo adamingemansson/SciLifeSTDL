@@ -275,11 +275,14 @@ def summarize(
     records: dict[str, dict[int, tuple[Path, dict[str, Any]]]], *,
     output_dir: str | Path, n_bootstrap: int = 10_000,
 ) -> dict[str, Path]:
-    expected_seeds = {0, 1, 2}
     if set(records) != set(ARCHITECTURES):
         raise ValueError(f"expected architectures={ARCHITECTURES}, got={sorted(records)}")
+    seed_sets = {architecture: set(records[architecture]) for architecture in ARCHITECTURES}
+    expected_seeds = seed_sets[ARCHITECTURES[0]]
+    if len(expected_seeds) != 3:
+        raise ValueError(f"exactly three independent seeds are required; got={sorted(expected_seeds)}")
     for architecture in ARCHITECTURES:
-        if set(records[architecture]) != expected_seeds:
+        if seed_sets[architecture] != expected_seeds:
             raise ValueError(
                 f"{architecture}: expected seeds={sorted(expected_seeds)}, "
                 f"got={sorted(records[architecture])}"
@@ -360,7 +363,7 @@ def summarize(
                 if metric == "auc" and panel != "all_genes":
                     continue
                 higher = metric != "rmse"
-                seed_deltas = []
+                seed_deltas: dict[int, float] = {}
                 left_by_seed, right_by_seed = {}, {}
                 for run_seed in sorted(expected_seeds):
                     left_report = records[left_arch][run_seed][1]
@@ -380,8 +383,8 @@ def summarize(
                         if higher else (right_patient[patient] - left_patient[patient])
                         for patient in sorted(left_patient)
                     ]
-                    seed_deltas.append(float(np.mean(per_patient)))
-                mean, sd, low, high = _t_interval(seed_deltas)
+                    seed_deltas[run_seed] = float(np.mean(per_patient))
+                mean, sd, low, high = _t_interval(list(seed_deltas.values()))
                 seed_delta_rows.append({
                     "left": left_arch, "right": right_arch, "scope": scope,
                     "panel": panel, "metric": metric,
@@ -418,7 +421,7 @@ def summarize(
     structured_delta_rows: list[dict[str, Any]] = []
     for panel in PANELS:
         for output_name, metric_path in STRUCTURED_METRICS.items():
-            left_by_seed, right_by_seed, seed_deltas = {}, {}, []
+            left_by_seed, right_by_seed, seed_deltas = {}, {}, {}
             unavailable = False
             for run_seed in sorted(expected_seeds):
                 left_report = records[left_arch][run_seed][1]
@@ -431,10 +434,10 @@ def summarize(
                 if set(left_patient) != set(right_patient):
                     raise ValueError(f"structured/{panel}/{output_name}: patient identity differs")
                 left_by_seed[run_seed], right_by_seed[run_seed] = left_patient, right_patient
-                seed_deltas.append(float(np.mean([
+                seed_deltas[run_seed] = float(np.mean([
                     left_patient[patient] - right_patient[patient]
                     for patient in sorted(left_patient)
-                ])))
+                ]))
             if unavailable:
                 structured_delta_rows.append({
                     "left": left_arch, "right": right_arch, "panel": panel,
@@ -447,7 +450,7 @@ def summarize(
                     "n_seeds": len(expected_seeds), "n_patients": 0,
                 })
                 continue
-            mean, sd, low, high = _t_interval(seed_deltas)
+            mean, sd, low, high = _t_interval(list(seed_deltas.values()))
             hierarchy = _hierarchical_delta(
                 left_by_seed, right_by_seed, higher_is_better=True,
                 seed=71_000 + len(structured_delta_rows), n_bootstrap=n_bootstrap,
@@ -507,11 +510,13 @@ def discover_records(
     }
     for architecture in ARCHITECTURES:
         path = seed0 / f"{architecture}_validation.json"
-        records[architecture][0] = (path, _load_json(path))
+        report = _load_json(path)
+        source_seed = _config_seed(report, path)
+        records[architecture][source_seed] = (path, report)
     for run_name, run in (plan.get("runs") or {}).items():
         architecture = str(run["source_arm"])
         run_seed = int(run["seed"])
-        if architecture not in records or run_seed not in {1, 2}:
+        if architecture not in records:
             raise ValueError(f"unexpected replication plan entry: {run_name}")
         path = evaluation / f"{run_name}_validation.json"
         if run_seed in records[architecture]:
