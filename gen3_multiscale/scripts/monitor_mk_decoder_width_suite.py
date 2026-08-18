@@ -20,6 +20,15 @@ def _alive(pid) -> bool:
         return False
 
 
+def _rss_gib(pid) -> str:
+    """Return resident RAM without adding a process-monitor dependency."""
+    try:
+        resident_pages = int(Path(f"/proc/{int(pid)}/statm").read_text().split()[1])
+        return f"{resident_pages * os.sysconf('SC_PAGE_SIZE') / 2**30:.1f}GiB"
+    except (OSError, TypeError, ValueError, IndexError):
+        return "-"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite-root", required=True)
@@ -40,7 +49,8 @@ def main() -> None:
             state = "ended_unrecorded"
         print(
             f"{arm:<28} GPU={plan['arms'][arm]['gpu']} {state:<16} "
-            f"PID={pid or '-'} step={max(steps) if steps else '-'}"
+            f"PID={pid or '-'} step={max(steps) if steps else '-'} "
+            f"RAM={_rss_gib(pid)}"
         )
         for line in lines[-max(0, args.lines):]:
             print(f"  {line}")
