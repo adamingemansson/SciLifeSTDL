@@ -5,8 +5,16 @@ import pytest
 import torch
 
 from gen3_multiscale.conditional_wae import Architecture1ImageConditioner, ConditionalWAE
+from gen3_multiscale.conditional_wae.model import DeterministicSpatialPredictor
+from gen3_multiscale.conditional_wae.structured_field import (
+    fit_centered_organ_balanced_gene_structure,
+)
 from gen3_multiscale.conditional_wae.data import build_conditional_wae_example
-from gen3_multiscale.conditional_wae.whole_slide import predict_whole_slide, whole_slide_metrics
+from gen3_multiscale.conditional_wae.whole_slide import (
+    predict_deterministic_refinement_stages,
+    predict_whole_slide,
+    whole_slide_metrics,
+)
 
 
 def _sample(n=17, genes=7, image_dim=16, seed=0):
@@ -145,3 +153,45 @@ def test_structured_whole_slide_metrics_require_training_scale():
             prediction, [f"g{i}" for i in range(7)],
             structured_field_config={"enabled": True},
         )
+
+
+def test_deterministic_stage_audit_matches_each_refinement_path():
+    torch.manual_seed(5)
+    sample = _sample(n=9, genes=7)
+    artifact = fit_centered_organ_balanced_gene_structure(
+        {"slide": np.asarray(sample.adata.X, dtype=np.float32)}, ["slide"],
+        {"slide": "organ"}, list(sample.adata.var_names), rank=3, seed=0,
+    )
+    model = DeterministicSpatialPredictor(
+        7,
+        Architecture1ImageConditioner(
+            7, image_feature_dim=16, gex_feature_dim=6, hidden_dim=24,
+            n_heads=4, n_blocks=1, dense_threshold=20, sparse_k=3, dropout=0.0,
+        ),
+        hidden_dim=20, gene_structure_artifact=artifact,
+        n_refinement_steps=1, structured_composition="parallel_gated",
+        refinement_k_neighbors=3, refinement_hidden_dim=12,
+        refinement_gex_feature_dim=8, per_gene_scale=artifact.per_gene_scale,
+    ).eval()
+    result = predict_deterministic_refinement_stages(model, sample, chunk_size=4)
+    inputs, _ = build_conditional_wae_example(
+        sample, query_indices=None, include_observed_gex=False,
+    )
+    with torch.no_grad():
+        context = model.image_conditioner(inputs)
+        base = model.decode_base_from_context(context)
+        expected = {
+            "base": base,
+            "within_only": model._apply_within(base),
+            "between_only": model._apply_between(base, context, inputs),
+            "full": model.refine_prediction(base, context, inputs),
+        }
+    assert result["n_spots"] == 9
+    assert result["composition_gates"].shape == (2,)
+    for stage, value in expected.items():
+        torch.testing.assert_close(result["stages"][stage], value)
+
+
+def test_deterministic_stage_audit_rejects_latent_models():
+    with pytest.raises(ValueError, match="deterministic"):
+        predict_deterministic_refinement_stages(_model(), _sample(n=9))

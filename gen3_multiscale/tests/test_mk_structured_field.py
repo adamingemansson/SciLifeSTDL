@@ -358,6 +358,34 @@ def test_parallel_gated_objective_factorial_contract_is_exact():
             static_audit_conditional_wae_config(broken)
 
 
+def test_parallel_gated_decoder_width_factorial_contract_is_exact():
+    designs = {
+        "mk_pg_width1024_seed1": (1024, 1),
+        "mk_pg_width1024_seed2": (1024, 2),
+        "mk_pg_width512_seed1": (512, 1),
+        "mk_pg_width512_seed2": (512, 2),
+    }
+    structured_design = ("spatial", True, 1, False, False)
+    for arm, (width, seed) in designs.items():
+        config = _contract(arm, structured_design)
+        config["model"]["params"]["structured_composition"] = "parallel_gated"
+        config["model"]["params"]["autoencoder_hidden_dim"] = width
+        config["training"]["seed"] = seed
+        audit = static_audit_conditional_wae_config(config)
+        assert audit["passed"]
+        assert audit["structured_composition"] == "parallel_gated"
+
+        wrong_width = copy.deepcopy(config)
+        wrong_width["model"]["params"]["autoencoder_hidden_dim"] = width + 1
+        with pytest.raises(ValueError, match="decoder-width design .* immutable factorial"):
+            static_audit_conditional_wae_config(wrong_width)
+
+        wrong_seed = copy.deepcopy(config)
+        wrong_seed["training"]["seed"] = seed + 10
+        with pytest.raises(ValueError, match="decoder-width design .* immutable factorial"):
+            static_audit_conditional_wae_config(wrong_seed)
+
+
 @pytest.mark.parametrize(
     "family,prefix,expected_prior",
     [("standard_wae", "wae", "standard"),

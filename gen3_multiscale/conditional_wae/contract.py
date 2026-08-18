@@ -34,6 +34,12 @@ ARM_SPECS = {
     "mk_pg_objective_pcc": ConditionalWAEArmSpec("he_to_st", "none", False),
     "mk_pg_objective_gradient": ConditionalWAEArmSpec("he_to_st", "none", False),
     "mk_pg_objective_combined": ConditionalWAEArmSpec("he_to_st", "none", False),
+    # Paired-seed decoder-capacity screen on the otherwise identical best
+    # deterministic parallel-gated architecture.
+    "mk_pg_width1024_seed1": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_pg_width1024_seed2": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_pg_width512_seed1": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_pg_width512_seed2": ConditionalWAEArmSpec("he_to_st", "none", False),
     # Residual WAE-MMD factorial on the frozen, best deterministic
     # within/between parallel-gated H&E predictor.  The two factors are the
     # prior (global versus H&E-conditional) and posterior FiLM conditioning.
@@ -159,6 +165,10 @@ _MK_STRUCTURED_FIELD_DESIGNS = {
     "mk_pg_objective_pcc": ("spatial", True, 1, False, False),
     "mk_pg_objective_gradient": ("spatial", True, 1, True, True),
     "mk_pg_objective_combined": ("spatial", True, 1, True, True),
+    "mk_pg_width1024_seed1": ("spatial", True, 1, False, False),
+    "mk_pg_width1024_seed2": ("spatial", True, 1, False, False),
+    "mk_pg_width512_seed1": ("spatial", True, 1, False, False),
+    "mk_pg_width512_seed2": ("spatial", True, 1, False, False),
 }
 _MK_STRUCTURED_FIELD_FAMILIES = {
     "mk_field_within": ("none", True),
@@ -181,6 +191,10 @@ _MK_STRUCTURED_FIELD_FAMILIES = {
     "mk_pg_objective_pcc": ("none", True),
     "mk_pg_objective_gradient": ("none", True),
     "mk_pg_objective_combined": ("none", True),
+    "mk_pg_width1024_seed1": ("none", True),
+    "mk_pg_width1024_seed2": ("none", True),
+    "mk_pg_width512_seed1": ("none", True),
+    "mk_pg_width512_seed2": ("none", True),
 }
 _MK_STRUCTURED_COMPOSITIONS = {
     "mk_wb_serial": "within_then_between",
@@ -191,6 +205,10 @@ _MK_STRUCTURED_COMPOSITIONS = {
     "mk_pg_objective_pcc": "parallel_gated",
     "mk_pg_objective_gradient": "parallel_gated",
     "mk_pg_objective_combined": "parallel_gated",
+    "mk_pg_width1024_seed1": "parallel_gated",
+    "mk_pg_width1024_seed2": "parallel_gated",
+    "mk_pg_width512_seed1": "parallel_gated",
+    "mk_pg_width512_seed2": "parallel_gated",
 }
 _MK_OBJECTIVE_SCREEN_DESIGNS = {
     # pcc_weight, local_gradient_weight, wide_gradient_weight
@@ -205,6 +223,13 @@ _MK_RESIDUAL_WAE_DESIGNS = {
     "mk_rwae_standard_film": ("standard", "film"),
     "mk_rwae_conditional_nofilm": ("conditional", "none"),
     "mk_rwae_conditional_film": ("conditional", "film"),
+}
+_MK_DECODER_WIDTH_DESIGNS = {
+    # autoencoder_hidden_dim, training seed
+    "mk_pg_width1024_seed1": (1024, 1),
+    "mk_pg_width1024_seed2": (1024, 2),
+    "mk_pg_width512_seed1": (512, 1),
+    "mk_pg_width512_seed2": (512, 2),
 }
 _VALID_STRUCTURED_COMPOSITIONS = frozenset({
     "within_then_between", "between_then_within",
@@ -402,6 +427,17 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
             raise ValueError(
                 f"{arm}: objective {actual_objective} does not match immutable "
                 f"factorial cell {expected_objective}"
+            )
+    if arm in _MK_DECODER_WIDTH_DESIGNS:
+        actual_width_design = (
+            int(params.get("autoencoder_hidden_dim", 0)),
+            int((config.get("training") or {}).get("seed", -1)),
+        )
+        expected_width_design = _MK_DECODER_WIDTH_DESIGNS[arm]
+        if actual_width_design != expected_width_design:
+            raise ValueError(
+                f"{arm}: decoder-width design {actual_width_design} does not match "
+                f"immutable factorial cell {expected_width_design}"
             )
     spatial_prior_path = data.get("spatial_prior_path")
     if spatial_prior_path and n_refinement_steps < 1:
