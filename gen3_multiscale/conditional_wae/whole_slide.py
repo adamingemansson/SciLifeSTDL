@@ -25,6 +25,61 @@ from gen3_multiscale.evaluation.metrics import (
 from gen3_multiscale.evaluation.structured_field_metrics import structured_field_metrics
 
 
+def _whole_slide_inputs_and_context(model: torch.nn.Module, sample):
+    """Build the fail-closed H&E-only full-slide input exactly once."""
+    inputs, target = build_conditional_wae_example(
+        sample, query_indices=None, include_observed_gex=False,
+    )
+    return inputs, target, model.image_conditioner(inputs)
+
+
+@torch.no_grad()
+def predict_deterministic_refinement_stages(
+    model: torch.nn.Module, sample, *, chunk_size: int = 2048,
+) -> dict:
+    """Expose the four deterministic refinement paths on one complete slide.
+
+    ``base`` is the row-wise image decoder, ``within_only`` applies only the
+    centered gene-program correction, ``between_only`` applies only the
+    spot-graph refiner, and ``full`` uses the trained composition including
+    its learned gates.  This is a checkpoint audit, not four separately
+    trained models.
+    """
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+    if bool(getattr(model, "has_latent_model", True)):
+        raise ValueError("refinement-stage inference requires a deterministic model")
+    for name in ("decode_base_from_context", "_apply_within", "_apply_between",
+                 "refine_prediction"):
+        if not hasattr(model, name):
+            raise ValueError(f"model does not expose deterministic refinement stage {name}")
+    inputs, target, context = _whole_slide_inputs_and_context(model, sample)
+    n_rows = int(context.shape[0])
+    base = torch.cat([
+        model.decode_base_from_context(context[start:min(start + chunk_size, n_rows)])
+        for start in range(0, n_rows, chunk_size)
+    ], dim=0)
+    if base.shape[0] != n_rows:
+        raise RuntimeError("whole-slide chunking did not cover every row exactly once")
+    within = model._apply_within(base)
+    between = model._apply_between(base, context, inputs)
+    full = model.refine_prediction(base, context, inputs)
+    gates = model.composition_gates() if hasattr(model, "composition_gates") else None
+    return {
+        "sample_id": inputs.sample_id,
+        "coords": np.asarray(sample.full_sample_coords, dtype=np.float32),
+        "target": target,
+        "n_spots": n_rows,
+        "stages": {
+            "base": base,
+            "within_only": within,
+            "between_only": between,
+            "full": full,
+        },
+        "composition_gates": None if gates is None else gates.detach().clone(),
+    }
+
+
 @torch.no_grad()
 def predict_whole_slide(
     model: torch.nn.Module, sample, *, chunk_size: int = 2048,
