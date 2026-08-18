@@ -158,20 +158,35 @@ def _resolve_gene(gene_names: list[str], requested: str) -> tuple[str, int]:
     raise ValueError(f"gene {requested!r} is not uniquely present in the model gene panel")
 
 
+def _select_split_sample_ids(
+    manifest: dict, *, split: str, requested: list[str] | None,
+) -> tuple[list[str], list[str]]:
+    available = list(manifest[f"{split}_sample_ids"])
+    if not available:
+        raise ValueError(f"manifest has no {split} samples")
+    selected = list(requested) if requested else available
+    unknown = sorted(set(selected) - set(available))
+    if unknown:
+        raise ValueError(f"requested samples are not in the {split} split: {unknown}")
+    if len(set(selected)) != len(selected):
+        raise ValueError("selected sample IDs must be unique")
+    return available, selected
+
+
 def _load_model_and_samples(
     source: ModelSource, *, split: str, device_name: str,
-    allow_code_drift: bool,
+    allow_code_drift: bool, sample_ids: list[str] | None = None,
 ) -> tuple[torch.nn.Module, dict, dict, list[str], torch.device, str]:
     config = resolved_config(str(source.config_path))
     _require_he_to_st_config(config, source.config_path)
     static_audit_conditional_wae_config(config)
     manifest = load_dataset_manifest(config["data"]["gen3_manifest_path"])
-    sample_ids = list(manifest[f"{split}_sample_ids"])
-    if not sample_ids:
-        raise ValueError(f"manifest has no {split} samples")
+    _, selected_ids = _select_split_sample_ids(
+        manifest, split=split, requested=sample_ids,
+    )
     cfg_om = OmegaConf.create(config)
     samples, preflight = load_and_preflight_samples(
-        cfg_om, manifest, sample_ids, expected_tile_encoder_provenance(config),
+        cfg_om, manifest, selected_ids, expected_tile_encoder_provenance(config),
     )
 
     old_manifest = checkpoint_module.load_checkpoint_run_manifest(source.checkpoint_path)
@@ -447,13 +462,9 @@ def main() -> None:
     manifest = load_dataset_manifest(config["data"]["gen3_manifest_path"])
     gene_names = list(manifest["gene_panel"])
     gene, gene_index = _resolve_gene(gene_names, args.gene)
-    available_ids = list(manifest[f"{args.split}_sample_ids"])
-    sample_ids = list(args.sample_id) if args.sample_id else available_ids
-    unknown = sorted(set(sample_ids) - set(available_ids))
-    if unknown:
-        raise ValueError(f"requested samples are not in the {args.split} split: {unknown}")
-    if len(set(sample_ids)) != len(sample_ids):
-        raise ValueError("--sample-id values must be unique")
+    available_ids, sample_ids = _select_split_sample_ids(
+        manifest, split=args.split, requested=list(args.sample_id),
+    )
 
     identity = checkpoint_module.resolve_checkpoint_identity(source.checkpoint_path)
     if identity.weights_sha256 is None:
@@ -483,6 +494,7 @@ def main() -> None:
             _load_model_and_samples(
                 source, split=args.split, device_name=args.device,
                 allow_code_drift=args.allow_code_drift,
+                sample_ids=sample_ids,
             )
         )
         if loaded_gene_names != gene_names or loaded_weights != weights_sha256:
