@@ -1,0 +1,16 @@
+{
+  "common": [
+    "EPCAM", "KRT8", "KRT18", "KRT19", "COL1A1", "COL3A1", "DCN",
+    "PECAM1", "VWF", "CLDN5", "PTPRC", "CD3D", "LST1", "MKI67", "TOP2A"
+  ],
+  "by_organ": {
+    "Bowel": ["OLFM4", "MUC2", "CLCA1", "FABP1", "CA2", "KRT20", "CD8A"],
+    "Brain": ["SLC17A7", "GAD1", "GAD2", "AQP4", "MOG", "MBP", "P2RY12"],
+    "Kidney": ["LRP2", "SLC22A8", "UMOD", "SLC12A1", "AQP2", "NPHS2", "PODXL", "CA9", "NDUFA4L2"],
+    "Liver": ["ALB", "APOA1", "ASS1", "SDS", "CYP2E1", "GLUL", "CD68"],
+    "Lung": ["SFTPC", "SFTPA1", "AGER", "PDPN", "SCGB1A1", "FOXJ1", "CD68"],
+    "Prostate": ["KLK3", "ACPP", "MSMB", "NKX3-1", "KRT5", "TP63", "AMACR", "TFF3", "SPON2", "ACTA2", "TAGLN"],
+    "Skin": ["KRT14", "KRT5", "KRT10", "FLG", "AQP5", "DCD", "SOX10", "S100B", "MLANA"]
+  },
+  "hard_immune_controls": ["IGKC", "IGHA1"]
+}
