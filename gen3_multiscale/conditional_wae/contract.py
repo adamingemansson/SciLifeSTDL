@@ -27,6 +27,13 @@ ARM_SPECS = {
     "mk_bw_serial": ConditionalWAEArmSpec("he_to_st", "none", False),
     "mk_wbw_sandwich": ConditionalWAEArmSpec("he_to_st", "none", False),
     "mk_wb_parallel_gated": ConditionalWAEArmSpec("he_to_st", "none", False),
+    # Training-objective factorial on the exact deterministic parallel-gated
+    # within/between architecture.  This isolates stronger gene-wise PCC and
+    # explicit local/wide spatial-gradient supervision from architecture.
+    "mk_pg_objective_control": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_pg_objective_pcc": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_pg_objective_gradient": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_pg_objective_combined": ConditionalWAEArmSpec("he_to_st", "none", False),
     # Residual WAE-MMD factorial on the frozen, best deterministic
     # within/between parallel-gated H&E predictor.  The two factors are the
     # prior (global versus H&E-conditional) and posterior FiLM conditioning.
@@ -148,6 +155,10 @@ _MK_STRUCTURED_FIELD_DESIGNS = {
     "mk_bw_serial": ("spatial", True, 1, False, False),
     "mk_wbw_sandwich": ("spatial", True, 1, False, False),
     "mk_wb_parallel_gated": ("spatial", True, 1, False, False),
+    "mk_pg_objective_control": ("spatial", True, 1, False, False),
+    "mk_pg_objective_pcc": ("spatial", True, 1, False, False),
+    "mk_pg_objective_gradient": ("spatial", True, 1, True, True),
+    "mk_pg_objective_combined": ("spatial", True, 1, True, True),
 }
 _MK_STRUCTURED_FIELD_FAMILIES = {
     "mk_field_within": ("none", True),
@@ -166,12 +177,27 @@ _MK_STRUCTURED_FIELD_FAMILIES = {
     "mk_bw_serial": ("none", True),
     "mk_wbw_sandwich": ("none", True),
     "mk_wb_parallel_gated": ("none", True),
+    "mk_pg_objective_control": ("none", True),
+    "mk_pg_objective_pcc": ("none", True),
+    "mk_pg_objective_gradient": ("none", True),
+    "mk_pg_objective_combined": ("none", True),
 }
 _MK_STRUCTURED_COMPOSITIONS = {
     "mk_wb_serial": "within_then_between",
     "mk_bw_serial": "between_then_within",
     "mk_wbw_sandwich": "within_between_within",
     "mk_wb_parallel_gated": "parallel_gated",
+    "mk_pg_objective_control": "parallel_gated",
+    "mk_pg_objective_pcc": "parallel_gated",
+    "mk_pg_objective_gradient": "parallel_gated",
+    "mk_pg_objective_combined": "parallel_gated",
+}
+_MK_OBJECTIVE_SCREEN_DESIGNS = {
+    # pcc_weight, local_gradient_weight, wide_gradient_weight
+    "mk_pg_objective_control": (0.1, 0.0, 0.0),
+    "mk_pg_objective_pcc": (0.5, 0.0, 0.0),
+    "mk_pg_objective_gradient": (0.1, 0.025, 0.025),
+    "mk_pg_objective_combined": (0.5, 0.025, 0.025),
 }
 _MK_RESIDUAL_WAE_DESIGNS = {
     # prior_mode, posterior encoder conditioning
@@ -365,6 +391,18 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
             )
         if int(params.get("local_gradient_k", 0)) < 1 or int(params.get("wide_gradient_k", 0)) < 1:
             raise ValueError("structured-field gradient neighbourhood sizes must be positive")
+    if arm in _MK_OBJECTIVE_SCREEN_DESIGNS:
+        actual_objective = (
+            float(loss.get("pcc_weight", -1.0)),
+            local_gradient_weight,
+            wide_gradient_weight,
+        )
+        expected_objective = _MK_OBJECTIVE_SCREEN_DESIGNS[arm]
+        if actual_objective != expected_objective:
+            raise ValueError(
+                f"{arm}: objective {actual_objective} does not match immutable "
+                f"factorial cell {expected_objective}"
+            )
     spatial_prior_path = data.get("spatial_prior_path")
     if spatial_prior_path and n_refinement_steps < 1:
         raise ValueError(
