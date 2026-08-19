@@ -294,6 +294,7 @@ def evaluate_conditional_wae(
     )
     model.eval()
     has_latent_model = bool(getattr(model, "has_latent_model", True))
+    specialist_primary = bool(getattr(model, "has_specialist_latent_head", False))
     if diagnose_latent and not has_latent_model:
         raise ValueError("--diagnose-latent is unavailable for the deterministic arm")
     if ex_post_prior is not None and getattr(model, "prior_mode", "standard") == "conditional":
@@ -345,6 +346,13 @@ def evaluate_conditional_wae(
                     z_std=ex_post_z_std,
                 )
                 prediction_tensors = {arm: prediction[arm] for arm in arm_names}
+                if specialist_primary:
+                    prediction_tensors["model"] = model.sample_predictive_distribution(
+                        inputs, n_samples=inference_samples,
+                        generator=torch.Generator(device=device).manual_seed(
+                            _stable_seed(evaluation_seed, identity) + 77
+                        ),
+                    )["point_prediction"]
                 posterior_z = prediction["posterior_z"].to(torch.float64)
                 latent_sum += posterior_z.sum(dim=0)
                 latent_sum_squared += posterior_z.square().sum(dim=0)
@@ -365,7 +373,10 @@ def evaluate_conditional_wae(
                     latent_spatial_correlation=latent_spatial_correlation,
                 )
                 prediction_tensors = {
-                    "model": prediction["predictive_mean"],
+                    "model": (
+                        prediction["point_prediction"]
+                        if specialist_primary else prediction["predictive_mean"]
+                    ),
                     "conditional_mean": prediction["conditional_mean_expression"],
                 }
                 predictive_std = prediction["predictive_std"]
@@ -450,7 +461,7 @@ def evaluate_conditional_wae(
             prediction = predict_whole_slide(
                 model, sample,
                 chunk_size=int(structured_config.get("chunk_size", 2048)),
-                n_samples=1,
+                n_samples=(inference_samples if specialist_primary else 1),
                 seed=_stable_seed(evaluation_seed, {
                     "sample_id": sample_id,
                     "stratum": "whole_slide_structured_field",
@@ -462,7 +473,12 @@ def evaluate_conditional_wae(
                 per_gene_scale=scale,
                 structured_field_config=structured_config,
             )
-            point_metrics = slide_metrics["per_arm"]["conditional_mean"]
+            primary_arm = "model" if specialist_primary else "conditional_mean"
+            point_metrics = slide_metrics["per_arm"][primary_arm]
+            primary_prediction = (
+                prediction["point_prediction"]
+                if specialist_primary else prediction["conditional_mean_expression"]
+            )
             ceiling_metrics = None
             if ceiling_by_sample is not None:
                 if sample_id not in ceiling_by_sample:
@@ -470,7 +486,7 @@ def evaluate_conditional_wae(
                         f"noise-ceiling artifact has no record for held-out slide {sample_id}"
                     )
                 ceiling_metrics = noise_ceiling_adjusted_pcc(
-                    prediction["point_prediction"].detach().cpu().numpy(),
+                    primary_prediction.detach().cpu().numpy(),
                     np.asarray(prediction["target"], dtype=np.float32),
                     gene_names,
                     ceiling_by_sample[sample_id].get("ceiling_by_gene") or {},
@@ -492,7 +508,7 @@ def evaluate_conditional_wae(
                     sample_id=sample_id,
                     patient_id=str(sample.patient_id),
                     organ=str(dataset_manifest["samples"][sample_id]["organ"]),
-                    predicted=prediction["point_prediction"].detach().cpu().numpy(),
+                    predicted=primary_prediction.detach().cpu().numpy(),
                     target=np.asarray(prediction["target"], dtype=np.float32),
                     coords=np.asarray(prediction["coords"], dtype=np.float32),
                     local_k=int(structured_config.get("local_k", 6)),
@@ -512,12 +528,18 @@ def evaluate_conditional_wae(
                     "report_output": str(Path(output).expanduser().resolve()),
                     "split": split,
                     "target_space": "normalize_total_then_log1p",
-                    "primary_prediction": "deterministic_h_and_e_point_prediction",
+                    "primary_prediction": (
+                        "specialist_prior_center_point_prediction"
+                        if specialist_primary else "deterministic_h_and_e_point_prediction"
+                    ),
                 },
             )
         whole_slide_structured = {
             "scope": "all_held_out_slides_every_spot_exactly_once",
-            "primary_prediction": "deterministic_h_and_e_point_prediction",
+            "primary_prediction": (
+                "specialist_prior_center_point_prediction"
+                if specialist_primary else "deterministic_h_and_e_point_prediction"
+            ),
             "target_gex_visible_to_model": False,
             "gene_panels_are_training_derived": True,
             "noise_ceiling_path": str(configured_ceiling) if configured_ceiling else None,
@@ -566,9 +588,16 @@ def evaluate_conditional_wae(
         "latent_diagnostic_summary": latent_summary,
         "prediction_roles": (
             {
-                "primary_point_prediction": "conditional_mean",
+                "primary_point_prediction": (
+                    "model" if specialist_primary else "conditional_mean"
+                ),
                 "deterministic_h_and_e_prediction": "conditional_mean",
-                "wae_prior_predictive_mean": "model",
+                "wae_prior_center_prediction": (
+                    "model" if specialist_primary else "not_applicable"
+                ),
+                "wae_prior_predictive_mean": (
+                    "uncertainty_diagnostic" if specialist_primary else "model"
+                ),
                 "calibration_prediction": "model",
                 "posterior_reconstruction_uses_target_gex": bool(diagnose_latent),
             }

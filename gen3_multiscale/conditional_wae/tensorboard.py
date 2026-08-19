@@ -283,6 +283,13 @@ class ConditionalWAETensorBoardLogger:
         for key in ("local_gradient_loss", "wide_gradient_loss"):
             if key in losses:
                 values[f"train/{key}"] = losses[key]
+        for key in (
+            "specialist_prior_center_loss",
+            "specialist_prior_center_rmse",
+            "specialist_prior_center_pcc_loss",
+        ):
+            if key in losses:
+                values[f"train/{key}"] = losses[key]
         for key in ("composition_gate_within", "composition_gate_between"):
             if key in losses:
                 values[f"train/{key}"] = losses[key]

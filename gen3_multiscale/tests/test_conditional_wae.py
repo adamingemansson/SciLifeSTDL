@@ -60,6 +60,68 @@ def _model(regularizer):
     )
 
 
+def _specialist_model(*, prior_mode="standard"):
+    return ConditionalWAE(
+        7,
+        Architecture1ImageConditioner(
+            7, image_feature_dim=16, gex_feature_dim=6,
+            hidden_dim=24, n_heads=4, n_blocks=1,
+            dense_threshold=20, sparse_k=3, dropout=0.0,
+        ),
+        regularizer="mmd", latent_dim=5, autoencoder_hidden_dim=20,
+        discriminator_hidden_dim=12, n_inference_samples=4,
+        prior_mode=prior_mode, latent_residual_mode="free",
+        specialist_gene_indices=(1, 3, 6),
+        specialist_prior_center_weight=1.0,
+    )
+
+
+def test_specialist_wae_encodes_full_panel_but_changes_only_selected_genes():
+    model = _specialist_model().eval()
+    inputs = _inputs()
+    target = torch.randn(12, 7)
+    assert model.expression_encoder.net[0].in_features == 7
+    assert model.residual_decoder[-1].out_features == 3
+
+    result = model.sample_predictive_distribution(
+        inputs, generator=torch.Generator().manual_seed(7),
+    )
+    direct = model(inputs)
+    torch.testing.assert_close(
+        direct["point_prediction"], result["point_prediction"], rtol=0, atol=0,
+    )
+    base = result["conditional_mean_expression"]
+    outside = torch.tensor([0, 2, 4, 5])
+    torch.testing.assert_close(
+        result["point_prediction"].index_select(1, outside),
+        base.index_select(1, outside), rtol=0, atol=0,
+    )
+    torch.testing.assert_close(
+        result["predictive_samples"].index_select(2, outside),
+        base.index_select(1, outside).unsqueeze(0).expand(4, -1, -1),
+        rtol=0, atol=0,
+    )
+    losses = model.compute_generator_losses(
+        inputs, target, generator=torch.Generator().manual_seed(11),
+    )
+    assert losses["specialist_prior_center_loss"] > 0
+    losses["total"].backward()
+    assert model.expression_encoder.net[0].weight.grad is not None
+    assert model.residual_decoder[-1].weight.grad is not None
+
+
+def test_specialist_conditional_prior_produces_deterministic_deployable_point():
+    model = _specialist_model(prior_mode="conditional").eval()
+    inputs = _inputs()
+    left = model.sample_predictive_distribution(
+        inputs, generator=torch.Generator().manual_seed(1),
+    )["point_prediction"]
+    right = model.sample_predictive_distribution(
+        inputs, generator=torch.Generator().manual_seed(99),
+    )["point_prediction"]
+    torch.testing.assert_close(left, right, rtol=0, atol=0)
+
+
 def test_latent_path_diagnostic_preserves_the_standard_prior_mean_and_supports_film():
     inputs = _inputs()
     target = torch.randn(12, 7)

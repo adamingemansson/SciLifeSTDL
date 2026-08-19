@@ -795,6 +795,8 @@ class ConditionalWAE(nn.Module):
                  conditional_prior_hidden_dim: int = 256,
                  conditional_prior_context_weight: float = 1.0,
                  conditional_prior_anchor_weight: float = 0.1,
+                 specialist_gene_indices: tuple[int, ...] | None = None,
+                 specialist_prior_center_weight: float = 0.0,
                  per_gene_scale: torch.Tensor | None = None,
                  local_gradient_weight: float = 0.0,
                  wide_gradient_weight: float = 0.0,
@@ -833,6 +835,8 @@ class ConditionalWAE(nn.Module):
             raise ValueError("conditional prior is currently defined only for WAE-MMD")
         if conditional_prior_context_weight <= 0 or conditional_prior_anchor_weight < 0:
             raise ValueError("conditional-prior context weight must be positive and anchor weight non-negative")
+        if specialist_prior_center_weight < 0:
+            raise ValueError("specialist_prior_center_weight must be non-negative")
         self.n_genes = int(n_genes)
         self.latent_dim = int(latent_dim)
         self.regularizer = regularizer
@@ -857,6 +861,28 @@ class ConditionalWAE(nn.Module):
         )
         self.conditional_prior_context_weight = float(conditional_prior_context_weight)
         self.conditional_prior_anchor_weight = float(conditional_prior_anchor_weight)
+        specialist_indices = tuple(int(index) for index in (specialist_gene_indices or ()))
+        if specialist_indices:
+            if len(set(specialist_indices)) != len(specialist_indices):
+                raise ValueError("specialist_gene_indices must be unique")
+            if min(specialist_indices) < 0 or max(specialist_indices) >= n_genes:
+                raise ValueError("specialist_gene_indices are outside the full gene panel")
+            if latent_residual_mode != "free":
+                raise ValueError("specialist latent heads require latent_residual_mode='free'")
+        elif specialist_prior_center_weight != 0:
+            raise ValueError(
+                "specialist_prior_center_weight requires specialist_gene_indices"
+            )
+        self.register_buffer(
+            "specialist_gene_indices",
+            torch.tensor(specialist_indices, dtype=torch.long),
+            # Do not add an empty buffer to the expected state of every
+            # historical checkpoint.  Specialist checkpoints persist their
+            # immutable panel; ordinary WAE checkpoints remain loadable.
+            persistent=bool(specialist_indices),
+        )
+        self.specialist_prior_center_weight = float(specialist_prior_center_weight)
+        self.has_specialist_latent_head = bool(specialist_indices)
         if gene_encoder_table is not None:
             table = torch.as_tensor(gene_encoder_table, dtype=torch.float32)
             if table.shape[1] != n_genes:
@@ -886,7 +912,10 @@ class ConditionalWAE(nn.Module):
             nn.Linear(context_dim + latent_dim, autoencoder_hidden_dim),
             nn.GELU(), nn.LayerNorm(autoencoder_hidden_dim),
             nn.Linear(autoencoder_hidden_dim, autoencoder_hidden_dim), nn.GELU(),
-            nn.Linear(autoencoder_hidden_dim, n_genes),
+            nn.Linear(
+                autoencoder_hidden_dim,
+                len(specialist_indices) if specialist_indices else n_genes,
+            ),
         )
         self.discriminator = (
             nn.Sequential(
@@ -1067,10 +1096,36 @@ class ConditionalWAE(nn.Module):
         center = self._prior_mean(context)
         delta = z - center
         if self.latent_residual_mode == "free":
-            return self.residual_decoder(torch.cat([context, z], dim=-1))
-        positive = self.residual_decoder(torch.cat([context, delta], dim=-1))
-        negative = self.residual_decoder(torch.cat([context, -delta], dim=-1))
-        return 0.5 * (positive - negative)
+            decoded = self.residual_decoder(torch.cat([context, z], dim=-1))
+        else:
+            positive = self.residual_decoder(torch.cat([context, delta], dim=-1))
+            negative = self.residual_decoder(torch.cat([context, -delta], dim=-1))
+            decoded = 0.5 * (positive - negative)
+        if not self.has_specialist_latent_head:
+            return decoded
+        residual = decoded.new_zeros(decoded.shape[0], self.n_genes)
+        return residual.index_copy(1, self.specialist_gene_indices, decoded)
+
+    def _specialist_loss_view(self, expression: torch.Tensor) -> torch.Tensor:
+        """Restrict trainable reconstruction losses to the specialist panel.
+
+        The full-gene target is still encoded by ``expression_encoder``.  Only
+        the decoded residual and its supervised loss are panel-restricted, so
+        correlations with genes outside the panel remain available to the
+        posterior without letting ~17k frozen outputs dilute a 300-gene loss.
+        """
+        if not self.has_specialist_latent_head:
+            return expression
+        return expression.index_select(1, self.specialist_gene_indices)
+
+    def restrict_specialist_prediction(
+        self, candidate: torch.Tensor, deterministic_base: torch.Tensor,
+    ) -> torch.Tensor:
+        """Keep every non-specialist gene exactly equal to the frozen base."""
+        if not self.has_specialist_latent_head:
+            return candidate
+        selected = candidate.index_select(1, self.specialist_gene_indices)
+        return deterministic_base.index_copy(1, self.specialist_gene_indices, selected)
 
     def _target(self, inputs: FullImageExpressionInputs, target_expression, *,
                 device: torch.device, dtype: torch.dtype, n_rows: int) -> torch.Tensor:
@@ -1113,11 +1168,17 @@ class ConditionalWAE(nn.Module):
         conditional_mean = self._refine(conditional_base, context, inputs)
         if self.latent_residual_mode == "free":
             reconstruction, _ = self.decode(z, context)
-            return self._refine(reconstruction, context, inputs), conditional_mean
+            candidate = self._refine(reconstruction, context, inputs)
+            return self.restrict_specialist_prediction(
+                candidate, conditional_mean,
+            ), conditional_mean
         residual = self._latent_residual(z, context)
         positive = self._refine(conditional_base + residual, context, inputs)
         negative = self._refine(conditional_base - residual, context, inputs)
-        return conditional_mean + 0.5 * (positive - negative), conditional_mean
+        candidate = conditional_mean + 0.5 * (positive - negative)
+        return self.restrict_specialist_prediction(
+            candidate, conditional_mean,
+        ), conditional_mean
 
     def _encode_target(self, target: torch.Tensor, context: torch.Tensor | None) -> torch.Tensor:
         if self.encoder_conditioning == "film":
@@ -1176,21 +1237,38 @@ class ConditionalWAE(nn.Module):
         reconstruction, conditional_mean = self._decode_and_refine(
             decoder_z, context, inputs,
         )
+        reconstruction_view = self._specialist_loss_view(reconstruction)
+        conditional_mean_view = self._specialist_loss_view(conditional_mean)
+        target_view = self._specialist_loss_view(target)
         reconstruction_loss, reconstruction_rmse, reconstruction_pcc = (
             rmse_pcc_reconstruction_loss(
-                reconstruction, target, pcc_weight=self.pcc_weight,
+                reconstruction_view, target_view, pcc_weight=self.pcc_weight,
             )
         )
         conditional_mean_loss, conditional_mean_rmse, conditional_mean_pcc = rmse_pcc_reconstruction_loss(
-            conditional_mean, target, pcc_weight=self.pcc_weight,
+            conditional_mean_view, target_view, pcc_weight=self.pcc_weight,
         )
+        prior_center_prediction = None
+        prior_center_loss = prior_center_rmse = prior_center_pcc = zero = (
+            reconstruction_loss.new_zeros(())
+        )
+        if self.has_specialist_latent_head:
+            prior_center_prediction, _ = self._decode_and_refine(
+                self._prior_mean(context), context, inputs,
+            )
+            prior_center_loss, prior_center_rmse, prior_center_pcc = (
+                rmse_pcc_reconstruction_loss(
+                    self._specialist_loss_view(prior_center_prediction),
+                    target_view,
+                    pcc_weight=self.pcc_weight,
+                )
+            )
         query_mask = torch.as_tensor(
             inputs.query_mask, dtype=torch.bool, device=context.device,
         )
         query_coords = torch.as_tensor(
             inputs.coords, dtype=context.dtype, device=context.device,
         )[query_mask]
-        zero = reconstruction_loss.new_zeros(())
         if self.local_gradient_weight > 0:
             local_gradient_reconstruction = spatial_gradient_loss(
                 reconstruction, target, query_coords,
@@ -1251,6 +1329,7 @@ class ConditionalWAE(nn.Module):
         total = (
             reconstruction_loss + self.conditional_mean_weight * conditional_mean_loss
             + self.regularizer_weight * prior_loss
+            + self.specialist_prior_center_weight * prior_center_loss
             + self.local_gradient_weight * local_gradient
             + self.wide_gradient_weight * wide_gradient
         )
@@ -1273,6 +1352,9 @@ class ConditionalWAE(nn.Module):
             "conditional_mean_rmse": conditional_mean_rmse,
             "conditional_mean_pcc_loss": conditional_mean_pcc,
             "prior_loss": prior_loss,
+            "specialist_prior_center_loss": prior_center_loss,
+            "specialist_prior_center_rmse": prior_center_rmse,
+            "specialist_prior_center_pcc_loss": prior_center_pcc,
             "local_gradient_loss": local_gradient,
             "wide_gradient_loss": wide_gradient,
             "local_gradient_reconstruction_loss": local_gradient_reconstruction,
@@ -1288,6 +1370,8 @@ class ConditionalWAE(nn.Module):
         if conditional_alignment_loss is not None:
             losses["conditional_alignment_loss"] = conditional_alignment_loss
             losses["prior_anchor_loss"] = prior_anchor_loss
+        if prior_center_prediction is not None:
+            losses["specialist_prior_center_expression"] = prior_center_prediction
         return losses
 
     def compute_discriminator_loss(self, target_expression, *, generator=None,
@@ -1319,11 +1403,16 @@ class ConditionalWAE(nn.Module):
 
     def forward(self, inputs: FullImageExpressionInputs) -> dict:
         context = self.image_conditioner(inputs)
-        point_prediction = self.predict_point_from_context(context, inputs)
+        conditional_mean = self.predict_point_from_context(context, inputs)
+        point_prediction = conditional_mean
+        if self.has_specialist_latent_head:
+            point_prediction = self.decode_latent_from_context(
+                self._prior_mean(context), context, inputs,
+            )
         return {
             "expression": point_prediction,
             "point_prediction": point_prediction,
-            "conditional_mean_expression": point_prediction,
+            "conditional_mean_expression": conditional_mean,
             "image_context": context,
         }
 
@@ -1512,12 +1601,18 @@ class ConditionalWAE(nn.Module):
         stacked = torch.stack(samples)
         conditional_mean = self.predict_point_from_context(context, inputs)
         predictive_mean = stacked.mean(0)
+        point_prediction = conditional_mean
+        if self.has_specialist_latent_head:
+            point_prediction = self.decode_latent_from_context(
+                self._prior_mean(context), context, inputs,
+            )
         return {
-            # ``expression`` now agrees with forward(): it is the
-            # deterministic H&E point prediction.  ``predictive_mean`` is
-            # retained as the backward-compatible Monte-Carlo WAE prior mean.
-            "expression": conditional_mean,
-            "point_prediction": conditional_mean,
+            # ``expression`` agrees with forward().  It is the deterministic
+            # H&E backbone for broad historical WAEs and the decoded prior
+            # center (merged into that backbone) for specialist WAEs.
+            # ``predictive_mean`` remains the Monte-Carlo WAE diagnostic.
+            "expression": point_prediction,
+            "point_prediction": point_prediction,
             "wae_predictive_mean": predictive_mean,
             "predictive_mean": predictive_mean,
             "predictive_std": stacked.std(0, unbiased=False),
