@@ -243,7 +243,10 @@ def accumulate_and_step_generator(
             raise RuntimeError(f"non-finite generator loss at mask_index={mask_index}")
         (losses["total"] / gradient_accumulation_steps).backward()
         for key, value in losses.items():
-            if key in ("expression", "conditional_mean_expression", "latent"):
+            if key in (
+                "expression", "conditional_mean_expression", "latent",
+                "specialist_prior_center_expression",
+            ):
                 continue
             accumulated_losses[key] = (
                 accumulated_losses.get(key, 0.0) + float(value.detach()) / gradient_accumulation_steps
@@ -357,6 +360,22 @@ def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = N
             local_gradient_k=int(params.get("local_gradient_k", 6)),
             wide_gradient_k=int(params.get("wide_gradient_k", 18)),
         )
+    specialist_gene_indices = None
+    specialist_gene_names = params.get("specialist_gene_names")
+    if specialist_gene_names is not None:
+        if gene_names is None:
+            raise ValueError("specialist_gene_names require the full ordered gene_names")
+        requested = [str(name) for name in specialist_gene_names]
+        if len(requested) != len(set(requested)):
+            raise ValueError("specialist_gene_names must be unique")
+        lookup = {name: index for index, name in enumerate(gene_names)}
+        missing = [name for name in requested if name not in lookup]
+        if missing:
+            raise ValueError(
+                f"specialist panel contains {len(missing)} genes outside the model panel: "
+                f"{missing[:10]}"
+            )
+        specialist_gene_indices = tuple(lookup[name] for name in requested)
     model = ConditionalWAE(
         n_genes,
         conditioner,
@@ -394,6 +413,10 @@ def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = N
         ),
         conditional_prior_anchor_weight=float(
             params.get("conditional_prior_anchor_weight", 0.1)
+        ),
+        specialist_gene_indices=specialist_gene_indices,
+        specialist_prior_center_weight=float(
+            loss.get("specialist_prior_center_weight", 0.0)
         ),
         per_gene_scale=(
             structure_artifact.per_gene_scale if structure_artifact is not None else None
@@ -492,6 +515,7 @@ def _validate(model: torch.nn.Module, dataset, *, device: torch.device, seed: in
               samples: dict | None = None, collect_film_diagnostics: bool = False) -> dict:
     model.eval()
     totals, rmses, pcc_losses = [], [], []
+    conditional_mean_totals, conditional_mean_rmses = [], []
     wae_prior_totals, wae_prior_rmses, wae_prior_pcc_losses = [], [], []
     generator_totals, posterior_rmses, prior_losses = [], [], []
     has_latent_model = bool(getattr(model, "has_latent_model", True))
@@ -506,19 +530,36 @@ def _validate(model: torch.nn.Module, dataset, *, device: torch.device, seed: in
         target_tensor = torch.as_tensor(target, dtype=torch.float32, device=device)
         generator = torch.Generator(device=device).manual_seed(_stable_seed(seed, identity))
         prediction = model.sample_predictive_distribution(inputs, generator=generator)
-        # Primary point metrics use the deterministic H&E prediction.  The
+        # Primary point metrics use the deployable deterministic prediction.
+        # For historical broad WAEs that remains the frozen H&E backbone; a
+        # specialist WAE replaces only its declared panel with the decoded
+        # prior-center output.
         # WAE prior mean remains a separate generative diagnostic; mixing the
         # two previously made early stopping and deployment report different
         # notions of "the model output".
+        primary_prediction = prediction["point_prediction"]
+        base_prediction = prediction["conditional_mean_expression"]
+        wae_prediction = prediction["wae_predictive_mean"]
+        validation_target = target_tensor
+        if bool(getattr(model, "has_specialist_latent_head", False)):
+            primary_prediction = model._specialist_loss_view(primary_prediction)
+            base_prediction = model._specialist_loss_view(base_prediction)
+            wae_prediction = model._specialist_loss_view(wae_prediction)
+            validation_target = model._specialist_loss_view(target_tensor)
         total, rmse, pcc_loss = rmse_pcc_reconstruction_loss(
-            prediction["point_prediction"], target_tensor, pcc_weight=model.pcc_weight,
+            primary_prediction, validation_target, pcc_weight=model.pcc_weight,
+        )
+        base_total, base_rmse, _ = rmse_pcc_reconstruction_loss(
+            base_prediction, validation_target, pcc_weight=model.pcc_weight,
         )
         wae_total, wae_rmse, wae_pcc_loss = rmse_pcc_reconstruction_loss(
-            prediction["wae_predictive_mean"], target_tensor, pcc_weight=model.pcc_weight,
+            wae_prediction, validation_target, pcc_weight=model.pcc_weight,
         )
         totals.append(float(total))
         rmses.append(float(rmse))
         pcc_losses.append(float(pcc_loss))
+        conditional_mean_totals.append(float(base_total))
+        conditional_mean_rmses.append(float(base_rmse))
         wae_prior_totals.append(float(wae_total))
         wae_prior_rmses.append(float(wae_rmse))
         wae_prior_pcc_losses.append(float(wae_pcc_loss))
@@ -559,7 +600,8 @@ def _validate(model: torch.nn.Module, dataset, *, device: torch.device, seed: in
         "total": float(np.mean(totals)),
         "rmse": float(np.mean(rmses)),
         "pcc_loss": float(np.mean(pcc_losses)),
-        "conditional_mean_rmse": float(np.mean(rmses)),
+        "conditional_mean_total": float(np.mean(conditional_mean_totals)),
+        "conditional_mean_rmse": float(np.mean(conditional_mean_rmses)),
         "wae_prior_total": float(np.mean(wae_prior_totals)),
         "wae_prior_rmse": float(np.mean(wae_prior_rmses)),
         "wae_prior_pcc_loss": float(np.mean(wae_prior_pcc_losses)),
@@ -676,8 +718,19 @@ def _run_whole_slide_validation(
     aggregated = _aggregate_whole_slide_metrics(per_slide_metrics)
     all_predictions = torch.cat(pooled_predictions, dim=0)
     all_targets = torch.cat(pooled_targets, dim=0)
+    # For a specialist head, all non-specialist genes are copied exactly from
+    # the frozen deterministic backbone.  Including those ~17k unchanged
+    # outputs in the checkpoint score would dilute the 300-gene experiment.
+    # The aggregated report above remains full-panel/comparable; only the
+    # training diagnostic and best-whole-slide selection use the train-only
+    # specialist panel that can actually change.
+    scoring_predictions = all_predictions
+    scoring_targets = all_targets
+    if bool(getattr(model, "has_specialist_latent_head", False)):
+        scoring_predictions = model._specialist_loss_view(all_predictions)
+        scoring_targets = model._specialist_loss_view(all_targets)
     total, rmse, pcc_loss = rmse_pcc_reconstruction_loss(
-        all_predictions, all_targets, pcc_weight=model.pcc_weight,
+        scoring_predictions, scoring_targets, pcc_weight=model.pcc_weight,
     )
     hvg50_indices = _panel_gene_indices(panels, "train_log1p_variance_top50", gene_names)
     if hvg50_indices:
@@ -918,9 +971,13 @@ def run_conditional_wae_training(
         raise ValueError("training.gradient_accumulation_steps must be a positive integer")
     history_path = checkpoint_dir / "validation_history.json"
     history = json.loads(history_path.read_text()) if history_path.is_file() and not smoke else []
+    primary_prediction_role = (
+        "model" if bool(getattr(model, "has_specialist_latent_head", False))
+        else "conditional_mean"
+    )
     point_history = [
         entry for entry in history
-        if entry.get("primary_prediction_role") == "conditional_mean"
+        if entry.get("primary_prediction_role") == primary_prediction_role
     ]
     best_monitor = str(training_cfg.get("best_monitor", "total"))
     valid_best_monitors = {"total", "generator_total", "wae_prior_total"}
@@ -990,7 +1047,7 @@ def run_conditional_wae_training(
         prior_whole_slide_state = checkpoint_module.load_training_state(checkpoint_dir / "best_whole_slide")
         if (
             "whole_slide_total" in prior_whole_slide_state
-            and prior_whole_slide_state.get("primary_prediction_role") == "conditional_mean"
+            and prior_whole_slide_state.get("primary_prediction_role") == primary_prediction_role
         ):
             best_whole_slide_total = float(prior_whole_slide_state["whole_slide_total"])
             best_whole_slide_step = int(prior_whole_slide_state["step"])
@@ -1141,7 +1198,7 @@ def run_conditional_wae_training(
             entry = {
                 "step": step,
                 "masks_seen": masks_seen,
-                "primary_prediction_role": "conditional_mean",
+                "primary_prediction_role": primary_prediction_role,
                 **validation_result,
             }
             print(
@@ -1173,7 +1230,7 @@ def run_conditional_wae_training(
                         step=step, val_loss=monitor_value, run_manifest=run_manifest,
                         extra_metadata={
                             "masks_seen": masks_seen,
-                            "primary_prediction_role": "conditional_mean",
+                            "primary_prediction_role": primary_prediction_role,
                             "best_monitor": best_monitor,
                         },
                     )
@@ -1226,7 +1283,7 @@ def run_conditional_wae_training(
                             step=step, val_loss=whole_slide_total, run_manifest=run_manifest,
                             extra_metadata={
                                 "masks_seen": masks_seen, "whole_slide_total": whole_slide_total,
-                                "primary_prediction_role": "conditional_mean",
+                                "primary_prediction_role": primary_prediction_role,
                                 "kind": "whole_slide_diagnostic_only",
                             },
                         )

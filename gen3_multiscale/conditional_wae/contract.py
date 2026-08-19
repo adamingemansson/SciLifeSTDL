@@ -47,6 +47,13 @@ ARM_SPECS = {
     "mk_rwae_standard_film": ConditionalWAEArmSpec("he_to_st", "mmd", False),
     "mk_rwae_conditional_nofilm": ConditionalWAEArmSpec("he_to_st", "mmd", False),
     "mk_rwae_conditional_film": ConditionalWAEArmSpec("he_to_st", "mmd", False),
+    # Full-panel posterior encoder with a 300-gene residual decoder.  Only
+    # the train-selected specialist panel may differ from the frozen best
+    # deterministic predictor at inference.
+    "mk_swae_hvg300_standard": ConditionalWAEArmSpec("he_to_st", "mmd", False),
+    "mk_swae_hvg300_conditional": ConditionalWAEArmSpec("he_to_st", "mmd", False),
+    "mk_swae_within300_standard": ConditionalWAEArmSpec("he_to_st", "mmd", False),
+    "mk_swae_within300_conditional": ConditionalWAEArmSpec("he_to_st", "mmd", False),
     "wae_within": ConditionalWAEArmSpec("he_to_st", "mmd", False),
     "wae_between": ConditionalWAEArmSpec("he_to_st", "mmd", False),
     "wae_gradient": ConditionalWAEArmSpec("he_to_st", "mmd", False),
@@ -224,6 +231,13 @@ _MK_RESIDUAL_WAE_DESIGNS = {
     "mk_rwae_conditional_nofilm": ("conditional", "none"),
     "mk_rwae_conditional_film": ("conditional", "film"),
 }
+_MK_SPECIALIST_WAE_DESIGNS = {
+    # train-only ranking source, prior_mode
+    "mk_swae_hvg300_standard": ("pooled_variance", "standard"),
+    "mk_swae_hvg300_conditional": ("pooled_variance", "conditional"),
+    "mk_swae_within300_standard": ("within_slide_variance", "standard"),
+    "mk_swae_within300_conditional": ("within_slide_variance", "conditional"),
+}
 _MK_DECODER_WIDTH_DESIGNS = {
     # autoencoder_hidden_dim, training seed
     "mk_pg_width1024_seed1": (1024, 1),
@@ -304,6 +318,7 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
     is_new_mk_arm = arm.startswith("mk_") or arm in _MK_STRUCTURED_FIELD_DESIGNS
     is_structured_field_arm = arm in _MK_STRUCTURED_FIELD_DESIGNS
     is_residual_wae_arm = arm in _MK_RESIDUAL_WAE_DESIGNS
+    is_specialist_wae_arm = arm in _MK_SPECIALIST_WAE_DESIGNS
     if arm in _MK_ARCHITECTURE_DESIGNS:
         actual_design = (conditioner_mode, prior_mode, deterministic_only)
         if actual_design != _MK_ARCHITECTURE_DESIGNS[arm]:
@@ -321,6 +336,31 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
                 raise ValueError("the deterministic MK arm must use the spatial conditioner")
             if n_refinement_steps != 0:
                 raise ValueError("deterministic MK arm tests the transformer only; spatial refinement must be off")
+    elif is_specialist_wae_arm:
+        expected_panel_source, expected_prior = _MK_SPECIALIST_WAE_DESIGNS[arm]
+        if model.get("regularizer") != "mmd" or prior_mode != expected_prior:
+            raise ValueError(f"{arm}: specialist screen requires its declared WAE-MMD prior")
+        if encoder_conditioning != "none":
+            raise ValueError(f"{arm}: specialist screen fixes posterior FiLM off")
+        if conditioner_mode != "spatial" or structured_composition != "parallel_gated":
+            raise ValueError(f"{arm}: specialist screen requires the frozen parallel-gated predictor")
+        if n_refinement_steps != 1 or not bool(params.get("use_centered_gene_structure", False)):
+            raise ValueError(f"{arm}: specialist screen requires within/between refinement")
+        if str(params.get("latent_residual_mode", "free")) != "free":
+            raise ValueError(f"{arm}: specialist residual must be free")
+        genes = params.get("specialist_gene_names") or []
+        if len(genes) != 300 or len(set(genes)) != 300:
+            raise ValueError(f"{arm}: specialist_gene_names must contain exactly 300 unique genes")
+        if params.get("specialist_panel_source") != expected_panel_source:
+            raise ValueError(f"{arm}: specialist panel source does not match its immutable cell")
+        if params.get("specialist_encoder_scope") != "full_gene_panel":
+            raise ValueError(f"{arm}: posterior encoder must retain the full gene panel")
+        if not bool(params.get("freeze_deterministic_backbone", False)):
+            raise ValueError(f"{arm}: deterministic backbone must be frozen")
+        if not params.get("deterministic_backbone_checkpoint") or not params.get(
+            "deterministic_backbone_weights_sha256"
+        ):
+            raise ValueError(f"{arm}: immutable deterministic source is required")
     elif is_residual_wae_arm:
         expected_prior, expected_conditioning = _MK_RESIDUAL_WAE_DESIGNS[arm]
         if model.get("regularizer") != "mmd":
@@ -375,10 +415,14 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
     wide_gradient_weight = float(loss.get("wide_gradient_weight", 0.0))
     if local_gradient_weight < 0 or wide_gradient_weight < 0:
         raise ValueError("structured-field gradient weights must be non-negative")
-    if is_residual_wae_arm and (
+    if (is_residual_wae_arm or is_specialist_wae_arm) and (
         local_gradient_weight != 0 or wide_gradient_weight != 0
     ):
         raise ValueError(f"{arm}: gradient losses are outside this controlled screen")
+    if is_specialist_wae_arm and float(
+        loss.get("specialist_prior_center_weight", 0.0)
+    ) <= 0:
+        raise ValueError(f"{arm}: specialist prior-center supervision must be positive")
     if is_structured_field_arm:
         expected_prior, expected_deterministic = _MK_STRUCTURED_FIELD_FAMILIES[arm]
         if (prior_mode, deterministic_only) != (expected_prior, expected_deterministic):

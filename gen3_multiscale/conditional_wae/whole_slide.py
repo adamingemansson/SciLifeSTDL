@@ -117,7 +117,26 @@ def predict_whole_slide(
         model.refine_prediction(raw_point, context, inputs)
         if hasattr(model, "refine_prediction") else raw_point
     )
+    # Preserve the frozen deterministic prediction before a specialist head
+    # replaces its declared genes.  Besides avoiding a second full refinement,
+    # this makes the two reported arms provably share the same base tensor.
+    conditional_mean_prediction = point_prediction
     if getattr(model, "has_latent_model", True):
+        if bool(getattr(model, "has_specialist_latent_head", False)):
+            prior_center = model._prior_mean(context)
+            specialist_chunks = []
+            for start in range(0, n_rows, chunk_size):
+                end = min(start + chunk_size, n_rows)
+                specialist_chunks.append(
+                    model.decode(prior_center[start:end], context[start:end])[0]
+                )
+            specialist_raw = torch.cat(specialist_chunks, dim=0)
+            specialist_refined = model.refine_prediction(
+                specialist_raw, context, inputs,
+            )
+            point_prediction = model.restrict_specialist_prediction(
+                specialist_refined, point_prediction,
+            )
         predictive_sum = torch.zeros_like(point_prediction)
         predictive_sum_squared = torch.zeros_like(point_prediction)
         for _ in range(count):
@@ -133,6 +152,10 @@ def predict_whole_slide(
             if complete_draw.shape != predictive_sum.shape:
                 raise RuntimeError("whole-slide chunking did not cover every row exactly once")
             complete_draw = model.refine_prediction(complete_draw, context, inputs)
+            if bool(getattr(model, "has_specialist_latent_head", False)):
+                complete_draw = model.restrict_specialist_prediction(
+                    complete_draw, point_prediction,
+                )
             predictive_sum.add_(complete_draw)
             predictive_sum_squared.add_(complete_draw.square())
         predictive_mean = predictive_sum / count
@@ -149,13 +172,16 @@ def predict_whole_slide(
         "target": target,
         "expression": point_prediction,
         "point_prediction": point_prediction,
-        "conditional_mean_expression": point_prediction,
+        "conditional_mean_expression": conditional_mean_prediction,
         "wae_predictive_mean": predictive_mean,
         "predictive_mean": predictive_mean,
         "predictive_std": predictive_variance.sqrt(),
         "image_context": context,
         "context": context,
         "n_spots": int(n_rows),
+        "specialist_primary": bool(
+            getattr(model, "has_specialist_latent_head", False)
+        ),
     }
 
 
@@ -176,8 +202,12 @@ def whole_slide_metrics(
     WAE-prior arm (predictive_mean) and deterministic point-prediction arm --
     the same two-arm split conditional_wae_evaluator.py already reports."""
     true = np.asarray(prediction["target"], dtype=np.float32)
+    specialist = bool(prediction.get("specialist_primary", False))
     arms = {
-        "model": prediction["predictive_mean"].detach().cpu().numpy().astype(np.float32),
+        "model": (
+            prediction["point_prediction"] if specialist
+            else prediction["predictive_mean"]
+        ).detach().cpu().numpy().astype(np.float32),
         "conditional_mean": prediction["conditional_mean_expression"].detach().cpu().numpy().astype(np.float32),
     }
     panel_indices, panel_metadata = (
@@ -189,12 +219,13 @@ def whole_slide_metrics(
         for panel_name, idx in panel_indices.items():
             entry[panel_name] = _arm_panel_metrics(pred[:, idx], true[:, idx])
         per_arm[arm] = entry
+    primary_arm = "model" if specialist else "conditional_mean"
     result = {
         "sample_id": prediction["sample_id"],
         "n_spots": prediction["n_spots"],
         "per_arm": per_arm,
         "prediction_roles": {
-            "primary_point_prediction": "conditional_mean",
+            "primary_point_prediction": primary_arm,
             "wae_prior_predictive_mean": "model",
         },
         "gene_panel_metadata": panel_metadata,
@@ -208,7 +239,7 @@ def whole_slide_metrics(
         if isinstance(per_gene_scale, torch.Tensor):
             per_gene_scale = per_gene_scale.detach().cpu().numpy()
         result["structured_field"] = structured_field_metrics(
-            arms["conditional_mean"], true, prediction["coords"], per_gene_scale,
+            arms[primary_arm], true, prediction["coords"], per_gene_scale,
             panel_indices=panel_indices,
             local_k=int(structured.get("local_k", 6)),
             wide_k=int(structured.get("wide_k", 18)),
