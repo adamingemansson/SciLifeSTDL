@@ -23,6 +23,9 @@ from gen3_multiscale.gen5.autoencoder import ExpressionEncoder
 from gen3_multiscale.data.boundary_graph import build_knn_adjacency
 from gen3_multiscale.models.attention import RelativeGeometryBias
 from gen3_multiscale.models.losses import (
+    field_amplitude_loss,
+    gene_map_identity_loss,
+    gene_map_spectrum_loss,
     rmse_pcc_reconstruction_loss,
     spatial_gradient_loss,
 )
@@ -521,6 +524,51 @@ class FrozenGeneEmbeddingExpressionEncoder(nn.Module):
         return self.projection(hidden)
 
 
+class StructuredGeneQueryDecoder(nn.Module):
+    """Scalable gene-aware decoder initialized from training-only programs.
+
+    Rather than learning 17k unrelated output rows, every gene owns an
+    explicit query initialized from the centered training expression basis.
+    A shared hypernetwork maps those queries into decoder weights.  Queries
+    remain trainable, so the basis is an initialization/inductive bias rather
+    than a fixed ontology or external annotation.
+    """
+
+    def __init__(self, context_dim: int, hidden_dim: int,
+                 artifact: CenteredGeneStructureArtifact,
+                 query_dim: int = 256):
+        super().__init__()
+        if query_dim < 1:
+            raise ValueError("query_dim must be positive")
+        basis = artifact.basis.basis
+        if basis.ndim != 2:
+            raise ValueError("gene structure basis must be [rank, n_genes]")
+        self.n_genes = int(basis.shape[1])
+        self.query_dim = int(query_dim)
+        self.gene_queries = nn.Parameter(basis.T.contiguous().clone())
+        rank = int(basis.shape[0])
+        self.context_network = nn.Sequential(
+            nn.LayerNorm(context_dim), nn.Linear(context_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, query_dim), nn.LayerNorm(query_dim),
+        )
+        self.gene_network = nn.Sequential(
+            nn.LayerNorm(rank), nn.Linear(rank, query_dim), nn.GELU(),
+            nn.Linear(query_dim, query_dim),
+        )
+        self.gene_bias = nn.Parameter(artifact.global_gene_mean.clone())
+        self.output_scale = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, context: torch.Tensor) -> torch.Tensor:
+        context_features = self.context_network(context)
+        gene_weights = nn.functional.normalize(
+            self.gene_network(self.gene_queries), dim=-1,
+        )
+        return (
+            self.output_scale * (context_features @ gene_weights.T)
+            + self.gene_bias
+        )
+
+
 class DeterministicSpatialPredictor(nn.Module):
     """UNI2 + spatial conditioner + supervised full-GEX prediction head.
 
@@ -543,12 +591,29 @@ class DeterministicSpatialPredictor(nn.Module):
                  local_gradient_weight: float = 0.0,
                  wide_gradient_weight: float = 0.0,
                  local_gradient_k: int = 6,
-                 wide_gradient_k: int = 18):
+                 wide_gradient_k: int = 18,
+                 decoder_kind: str = "mlp",
+                 gene_query_dim: int = 256,
+                 structured_loss_gene_indices: tuple[int, ...] | None = None,
+                 field_mean_weight: float = 0.0,
+                 field_amplitude_weight: float = 0.0,
+                 gene_identity_weight: float = 0.0,
+                 gene_identity_temperature: float = 0.1,
+                 spectrum_weight: float = 0.0,
+                 spectrum_max_rank: int = 64):
         super().__init__()
         if n_genes < 1 or hidden_dim < 1 or n_inference_samples < 1:
             raise ValueError("n_genes, hidden_dim and n_inference_samples must be positive")
-        if pcc_weight < 0 or local_gradient_weight < 0 or wide_gradient_weight < 0:
+        if any(value < 0 for value in (
+            pcc_weight, local_gradient_weight, wide_gradient_weight,
+            field_mean_weight, field_amplitude_weight, gene_identity_weight,
+            spectrum_weight,
+        )):
             raise ValueError("loss weights must be non-negative")
+        if decoder_kind not in {"mlp", "structured_gene_query"}:
+            raise ValueError("decoder_kind must be 'mlp' or 'structured_gene_query'")
+        if gene_identity_temperature <= 0 or spectrum_max_rank < 1:
+            raise ValueError("identity temperature and spectrum rank must be positive")
         if n_refinement_steps < 0:
             raise ValueError("n_refinement_steps must be non-negative")
         if structured_composition not in VALID_STRUCTURED_COMPOSITIONS:
@@ -562,11 +627,20 @@ class DeterministicSpatialPredictor(nn.Module):
         self.pcc_weight = float(pcc_weight)
         self.n_inference_samples = int(n_inference_samples)
         self.image_conditioner = image_conditioner
-        self.conditional_mean_head = nn.Sequential(
-            nn.LayerNorm(image_conditioner.hidden_dim),
-            nn.Linear(image_conditioner.hidden_dim, hidden_dim), nn.GELU(),
-            nn.Linear(hidden_dim, n_genes),
-        )
+        if decoder_kind == "structured_gene_query":
+            if gene_structure_artifact is None:
+                raise ValueError("structured gene-query decoder requires the gene structure artifact")
+            self.conditional_mean_head = StructuredGeneQueryDecoder(
+                image_conditioner.hidden_dim, hidden_dim,
+                gene_structure_artifact, query_dim=gene_query_dim,
+            )
+        else:
+            self.conditional_mean_head = nn.Sequential(
+                nn.LayerNorm(image_conditioner.hidden_dim),
+                nn.Linear(image_conditioner.hidden_dim, hidden_dim), nn.GELU(),
+                nn.Linear(hidden_dim, n_genes),
+            )
+        self.decoder_kind = str(decoder_kind)
         self.coexpression_refinement = (
             CenteredGeneStructureRefinement(
                 gene_structure_artifact, hidden_dim=int(gene_structure_hidden_dim),
@@ -609,6 +683,26 @@ class DeterministicSpatialPredictor(nn.Module):
         self.wide_gradient_weight = float(wide_gradient_weight)
         self.local_gradient_k = int(local_gradient_k)
         self.wide_gradient_k = int(wide_gradient_k)
+        indices = tuple(int(value) for value in (structured_loss_gene_indices or ()))
+        if len(indices) != len(set(indices)) or any(
+            value < 0 or value >= n_genes for value in indices
+        ):
+            raise ValueError("structured_loss_gene_indices must be unique valid gene indices")
+        if (gene_identity_weight > 0 or spectrum_weight > 0) and len(indices) < 2:
+            raise ValueError("identity/spectrum supervision requires at least two selected genes")
+        self.register_buffer(
+            "structured_loss_gene_indices",
+            # These indices are reconstructed from the immutable config.  Do
+            # not add them to checkpoints: old deterministic checkpoints must
+            # remain loadable after this optional diagnostic loss was added.
+            torch.as_tensor(indices, dtype=torch.long), persistent=False,
+        )
+        self.field_mean_weight = float(field_mean_weight)
+        self.field_amplitude_weight = float(field_amplitude_weight)
+        self.gene_identity_weight = float(gene_identity_weight)
+        self.gene_identity_temperature = float(gene_identity_temperature)
+        self.spectrum_weight = float(spectrum_weight)
+        self.spectrum_max_rank = int(spectrum_max_rank)
         self.encoder_conditioning = "none"
         self.prior_mode = "none"
         self.has_latent_model = False
@@ -715,11 +809,38 @@ class DeterministicSpatialPredictor(nn.Module):
             )
             if self.wide_gradient_weight > 0 else zero
         )
+        field_mean, field_amplitude = (
+            field_amplitude_loss(
+                point, target, per_gene_scale=self.per_gene_scale,
+            )
+            if self.field_mean_weight > 0 or self.field_amplitude_weight > 0
+            else (zero, zero)
+        )
+        gene_identity = (
+            gene_map_identity_loss(
+                point, target,
+                gene_indices=self.structured_loss_gene_indices,
+                temperature=self.gene_identity_temperature,
+            )
+            if self.gene_identity_weight > 0 else zero
+        )
+        spectrum = (
+            gene_map_spectrum_loss(
+                point, target,
+                gene_indices=self.structured_loss_gene_indices,
+                max_rank=self.spectrum_max_rank,
+            )
+            if self.spectrum_weight > 0 else zero
+        )
         primary = total
         total = (
             primary
             + self.local_gradient_weight * local_gradient
             + self.wide_gradient_weight * wide_gradient
+            + self.field_mean_weight * field_mean
+            + self.field_amplitude_weight * field_amplitude
+            + self.gene_identity_weight * gene_identity
+            + self.spectrum_weight * spectrum
         )
         result = {
             "total": total, "expression": point,
@@ -731,6 +852,10 @@ class DeterministicSpatialPredictor(nn.Module):
             "prior_loss": zero,
             "local_gradient_loss": local_gradient,
             "wide_gradient_loss": wide_gradient,
+            "field_mean_loss": field_mean,
+            "field_amplitude_loss": field_amplitude,
+            "gene_identity_loss": gene_identity,
+            "spectrum_loss": spectrum,
         }
         gates = self.composition_gates()
         if gates is not None:

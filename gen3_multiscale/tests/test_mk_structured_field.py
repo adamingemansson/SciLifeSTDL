@@ -13,6 +13,7 @@ from gen3_multiscale.conditional_wae.model import (
     Architecture1ImageConditioner,
     DeterministicSpatialPredictor,
     LocalImageConditioner,
+    StructuredGeneQueryDecoder,
 )
 from gen3_multiscale.conditional_wae.structured_field import (
     fit_centered_organ_balanced_gene_structure,
@@ -23,6 +24,11 @@ from gen3_multiscale.training.train_conditional_wae import _build_model
 from gen3_multiscale.scripts import prepare_mk_structured_field_suite as suite_module
 from gen3_multiscale.scripts.fit_mk_centered_gene_structure import _select_spot_rows
 from gen3_multiscale.conditional_wae.whole_slide import predict_whole_slide
+from gen3_multiscale.models.losses import (
+    field_amplitude_loss,
+    gene_map_identity_loss,
+    gene_map_spectrum_loss,
+)
 
 
 def _fit_artifact():
@@ -85,6 +91,73 @@ def _spatial():
         6, image_feature_dim=12, gex_feature_dim=5, hidden_dim=16,
         n_heads=4, n_blocks=1, dense_threshold=20, sparse_k=3, dropout=0.0,
     )
+
+
+def test_gene_field_losses_detect_amplitude_identity_and_rank_failures():
+    torch.manual_seed(3)
+    target = torch.randn(24, 6)
+    indices = torch.arange(6)
+    scale = torch.ones(6)
+
+    mean, amplitude = field_amplitude_loss(
+        target, target, per_gene_scale=scale,
+    )
+    assert mean == pytest.approx(0.0)
+    assert amplitude == pytest.approx(0.0)
+    _, shrunk_amplitude = field_amplitude_loss(
+        target * 0.05, target, per_gene_scale=scale,
+    )
+    assert shrunk_amplitude > 0
+
+    matched_identity = gene_map_identity_loss(
+        target, target, gene_indices=indices,
+    )
+    shuffled_identity = gene_map_identity_loss(
+        target[:, torch.tensor([1, 2, 3, 4, 5, 0])], target,
+        gene_indices=indices,
+    )
+    assert matched_identity < shuffled_identity
+
+    matched_spectrum = gene_map_spectrum_loss(
+        target, target, gene_indices=indices,
+    )
+    collapsed = target[:, :1].repeat(1, 6)
+    collapsed_spectrum = gene_map_spectrum_loss(
+        collapsed, target, gene_indices=indices,
+    )
+    assert matched_spectrum == pytest.approx(0.0, abs=1e-7)
+    assert collapsed_spectrum > matched_spectrum
+
+
+def test_structured_gene_query_decoder_and_losses_are_real_and_checkpoint_safe():
+    artifact = _fit_artifact()
+    decoder = StructuredGeneQueryDecoder(
+        context_dim=16, hidden_dim=20, artifact=artifact, query_dim=12,
+    )
+    decoded = decoder(torch.randn(5, 16))
+    assert decoded.shape == (5, 6)
+    assert torch.isfinite(decoded).all()
+    assert decoder.gene_queries.shape == (6, 3)
+
+    model = DeterministicSpatialPredictor(
+        6, _spatial(), hidden_dim=20, gene_structure_artifact=artifact,
+        n_refinement_steps=1, structured_composition="parallel_gated",
+        per_gene_scale=artifact.per_gene_scale,
+        decoder_kind="structured_gene_query", gene_query_dim=12,
+        structured_loss_gene_indices=tuple(range(6)),
+        local_gradient_weight=0.025, wide_gradient_weight=0.025,
+        local_gradient_k=2, wide_gradient_k=3,
+        field_mean_weight=0.05, field_amplitude_weight=0.05,
+        gene_identity_weight=0.01, spectrum_weight=0.02,
+        spectrum_max_rank=3,
+    )
+    losses = model.compute_generator_losses(_inputs(), torch.randn(4, 6))
+    for key in (
+        "total", "field_mean_loss", "field_amplitude_loss",
+        "gene_identity_loss", "spectrum_loss",
+    ):
+        assert torch.isfinite(losses[key])
+    assert "structured_loss_gene_indices" not in model.state_dict()
 
 
 def test_centering_makes_program_subspace_invariant_to_slide_offsets(tmp_path):
