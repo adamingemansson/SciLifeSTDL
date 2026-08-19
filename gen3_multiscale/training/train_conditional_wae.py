@@ -337,6 +337,21 @@ def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = N
         raise ValueError(
             "use_centered_gene_structure requires data.centered_gene_structure_path"
         )
+    structured_loss_gene_indices = None
+    structured_loss_gene_names = params.get("structured_loss_gene_names")
+    if structured_loss_gene_names is not None:
+        if gene_names is None:
+            raise ValueError("structured_loss_gene_names require the ordered gene panel")
+        requested = [str(name) for name in structured_loss_gene_names]
+        if len(requested) != len(set(requested)):
+            raise ValueError("structured_loss_gene_names must be unique")
+        lookup = {name: index for index, name in enumerate(gene_names)}
+        missing = [name for name in requested if name not in lookup]
+        if missing:
+            raise ValueError(
+                f"structured loss panel contains genes outside the model panel: {missing[:10]}"
+            )
+        structured_loss_gene_indices = tuple(lookup[name] for name in requested)
     if bool(params.get("deterministic_only", False)):
         return DeterministicSpatialPredictor(
             n_genes, conditioner,
@@ -359,6 +374,17 @@ def _build_model(config: dict, n_genes: int, *, gene_names: list[str] | None = N
             wide_gradient_weight=float(loss.get("wide_gradient_weight", 0.0)),
             local_gradient_k=int(params.get("local_gradient_k", 6)),
             wide_gradient_k=int(params.get("wide_gradient_k", 18)),
+            decoder_kind=str(params.get("decoder_kind", "mlp")),
+            gene_query_dim=int(params.get("gene_query_dim", 256)),
+            structured_loss_gene_indices=structured_loss_gene_indices,
+            field_mean_weight=float(loss.get("field_mean_weight", 0.0)),
+            field_amplitude_weight=float(loss.get("field_amplitude_weight", 0.0)),
+            gene_identity_weight=float(loss.get("gene_identity_weight", 0.0)),
+            gene_identity_temperature=float(
+                params.get("gene_identity_temperature", 0.1)
+            ),
+            spectrum_weight=float(loss.get("spectrum_weight", 0.0)),
+            spectrum_max_rank=int(params.get("spectrum_max_rank", 64)),
         )
     specialist_gene_indices = None
     specialist_gene_names = params.get("specialist_gene_names")
@@ -1147,6 +1173,10 @@ def run_conditional_wae_training(
             for key, label in (
                 ("local_gradient_loss", "gradient_local"),
                 ("wide_gradient_loss", "gradient_wide"),
+                ("field_mean_loss", "field_mean"),
+                ("field_amplitude_loss", "field_amplitude"),
+                ("gene_identity_loss", "gene_identity"),
+                ("spectrum_loss", "spectrum"),
             ):
                 if key in accumulated_losses:
                     pieces.append(f"{label}={accumulated_losses[key]:.6f}")

@@ -40,6 +40,17 @@ ARM_SPECS = {
     "mk_pg_width1024_seed2": ConditionalWAEArmSpec("he_to_st", "none", False),
     "mk_pg_width512_seed1": ConditionalWAEArmSpec("he_to_st", "none", False),
     "mk_pg_width512_seed2": ConditionalWAEArmSpec("he_to_st", "none", False),
+    # Mechanism-first deterministic screen on the best parallel-gated model.
+    # No cell is a duplicate baseline: four isolate missing mechanisms and
+    # four test their most informative combinations.
+    "mk_pg_genequery": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_pg_field": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_pg_identity": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_pg_spectrum": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_pg_genequery_field": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_pg_genequery_structure": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_pg_field_structure": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_pg_full": ConditionalWAEArmSpec("he_to_st", "none", False),
     # Residual WAE-MMD factorial on the frozen, best deterministic
     # within/between parallel-gated H&E predictor.  The two factors are the
     # prior (global versus H&E-conditional) and posterior FiLM conditioning.
@@ -176,6 +187,14 @@ _MK_STRUCTURED_FIELD_DESIGNS = {
     "mk_pg_width1024_seed2": ("spatial", True, 1, False, False),
     "mk_pg_width512_seed1": ("spatial", True, 1, False, False),
     "mk_pg_width512_seed2": ("spatial", True, 1, False, False),
+    "mk_pg_genequery": ("spatial", True, 1, False, False),
+    "mk_pg_field": ("spatial", True, 1, True, True),
+    "mk_pg_identity": ("spatial", True, 1, False, False),
+    "mk_pg_spectrum": ("spatial", True, 1, False, False),
+    "mk_pg_genequery_field": ("spatial", True, 1, True, True),
+    "mk_pg_genequery_structure": ("spatial", True, 1, False, False),
+    "mk_pg_field_structure": ("spatial", True, 1, True, True),
+    "mk_pg_full": ("spatial", True, 1, True, True),
 }
 _MK_STRUCTURED_FIELD_FAMILIES = {
     "mk_field_within": ("none", True),
@@ -202,6 +221,14 @@ _MK_STRUCTURED_FIELD_FAMILIES = {
     "mk_pg_width1024_seed2": ("none", True),
     "mk_pg_width512_seed1": ("none", True),
     "mk_pg_width512_seed2": ("none", True),
+    "mk_pg_genequery": ("none", True),
+    "mk_pg_field": ("none", True),
+    "mk_pg_identity": ("none", True),
+    "mk_pg_spectrum": ("none", True),
+    "mk_pg_genequery_field": ("none", True),
+    "mk_pg_genequery_structure": ("none", True),
+    "mk_pg_field_structure": ("none", True),
+    "mk_pg_full": ("none", True),
 }
 _MK_STRUCTURED_COMPOSITIONS = {
     "mk_wb_serial": "within_then_between",
@@ -216,6 +243,14 @@ _MK_STRUCTURED_COMPOSITIONS = {
     "mk_pg_width1024_seed2": "parallel_gated",
     "mk_pg_width512_seed1": "parallel_gated",
     "mk_pg_width512_seed2": "parallel_gated",
+    "mk_pg_genequery": "parallel_gated",
+    "mk_pg_field": "parallel_gated",
+    "mk_pg_identity": "parallel_gated",
+    "mk_pg_spectrum": "parallel_gated",
+    "mk_pg_genequery_field": "parallel_gated",
+    "mk_pg_genequery_structure": "parallel_gated",
+    "mk_pg_field_structure": "parallel_gated",
+    "mk_pg_full": "parallel_gated",
 }
 _MK_OBJECTIVE_SCREEN_DESIGNS = {
     # pcc_weight, local_gradient_weight, wide_gradient_weight
@@ -244,6 +279,17 @@ _MK_DECODER_WIDTH_DESIGNS = {
     "mk_pg_width1024_seed2": (1024, 2),
     "mk_pg_width512_seed1": (512, 1),
     "mk_pg_width512_seed2": (512, 2),
+}
+_MK_GENE_FIELD_DESIGNS = {
+    # decoder_kind, field enabled, identity enabled, spectrum enabled
+    "mk_pg_genequery": ("structured_gene_query", False, False, False),
+    "mk_pg_field": ("mlp", True, False, False),
+    "mk_pg_identity": ("mlp", False, True, False),
+    "mk_pg_spectrum": ("mlp", False, False, True),
+    "mk_pg_genequery_field": ("structured_gene_query", True, False, False),
+    "mk_pg_genequery_structure": ("structured_gene_query", False, True, True),
+    "mk_pg_field_structure": ("mlp", True, True, True),
+    "mk_pg_full": ("structured_gene_query", True, True, True),
 }
 _VALID_STRUCTURED_COMPOSITIONS = frozenset({
     "within_then_between", "between_then_within",
@@ -483,6 +529,30 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
                 f"{arm}: decoder-width design {actual_width_design} does not match "
                 f"immutable factorial cell {expected_width_design}"
             )
+    if arm in _MK_GENE_FIELD_DESIGNS:
+        field_enabled = (
+            float(loss.get("field_mean_weight", 0.0)) > 0
+            and float(loss.get("field_amplitude_weight", 0.0)) > 0
+            and local_gradient_weight > 0 and wide_gradient_weight > 0
+        )
+        identity_enabled = float(loss.get("gene_identity_weight", 0.0)) > 0
+        spectrum_enabled = float(loss.get("spectrum_weight", 0.0)) > 0
+        actual = (
+            str(params.get("decoder_kind", "mlp")), field_enabled,
+            identity_enabled, spectrum_enabled,
+        )
+        expected = _MK_GENE_FIELD_DESIGNS[arm]
+        if actual != expected:
+            raise ValueError(
+                f"{arm}: gene/field design {actual} does not match immutable cell {expected}"
+            )
+        selected = params.get("structured_loss_gene_names") or []
+        if (identity_enabled or spectrum_enabled) and len(selected) < 2:
+            raise ValueError(f"{arm}: structured losses require a train-selected gene panel")
+        if str(params.get("decoder_kind", "mlp")) == "structured_gene_query" and not bool(
+            params.get("use_centered_gene_structure", False)
+        ):
+            raise ValueError(f"{arm}: gene-query decoder requires centered gene structure")
     spatial_prior_path = data.get("spatial_prior_path")
     if spatial_prior_path and n_refinement_steps < 1:
         raise ValueError(

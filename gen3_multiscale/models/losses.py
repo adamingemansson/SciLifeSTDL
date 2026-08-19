@@ -141,6 +141,123 @@ def spatial_gradient_loss(
     return torch.nn.functional.mse_loss(pred_diff, true_diff)
 
 
+def field_amplitude_loss(
+    predicted_expression: torch.Tensor,
+    target_expression: torch.Tensor,
+    *,
+    per_gene_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match gene-wise field level and within-mask spatial amplitude.
+
+    Both terms are expressed in training-fit per-gene scale units.  The
+    amplitude term compares ``log(std)`` so a uniformly shrunken prediction
+    is penalized directly instead of being largely tolerated by RMSE.
+    """
+    if predicted_expression.shape != target_expression.shape:
+        raise ValueError("predicted_expression and target_expression must match")
+    if predicted_expression.ndim != 2 or predicted_expression.shape[0] < 2:
+        zero = predicted_expression.new_zeros(())
+        return zero, zero
+    scale = torch.as_tensor(
+        per_gene_scale, dtype=predicted_expression.dtype,
+        device=predicted_expression.device,
+    )
+    if scale.shape != (predicted_expression.shape[1],):
+        raise ValueError("per_gene_scale must be [n_genes]")
+    scale = scale.clamp_min(1e-6)
+    mean_loss = torch.nn.functional.smooth_l1_loss(
+        predicted_expression.mean(dim=0) / scale,
+        target_expression.mean(dim=0) / scale,
+    )
+    pred_std = predicted_expression.std(dim=0, unbiased=False) / scale
+    true_std = target_expression.std(dim=0, unbiased=False) / scale
+    amplitude_loss = torch.nn.functional.smooth_l1_loss(
+        torch.log(pred_std + 1e-3), torch.log(true_std + 1e-3),
+    )
+    return mean_loss, amplitude_loss
+
+
+def gene_map_identity_loss(
+    predicted_expression: torch.Tensor,
+    target_expression: torch.Tensor,
+    *,
+    gene_indices: torch.Tensor,
+    temperature: float = 0.1,
+) -> torch.Tensor:
+    """Symmetric contrastive identity loss between spatial gene maps.
+
+    A predicted map for gene *g* must retrieve the target map for the same
+    gene among a bounded train-selected panel.  This directly detects the
+    repeated-template failure where several output genes receive nearly the
+    same spatial pattern.
+    """
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    if predicted_expression.shape != target_expression.shape:
+        raise ValueError("predicted_expression and target_expression must match")
+    if predicted_expression.shape[0] < 2:
+        return predicted_expression.new_zeros(())
+    indices = torch.as_tensor(
+        gene_indices, dtype=torch.long, device=predicted_expression.device,
+    )
+    if indices.ndim != 1 or indices.numel() < 2:
+        return predicted_expression.new_zeros(())
+    predicted = predicted_expression.index_select(1, indices)
+    target = target_expression.index_select(1, indices)
+    predicted = predicted - predicted.mean(dim=0, keepdim=True)
+    target = target - target.mean(dim=0, keepdim=True)
+    pred_energy = predicted.square().sum(dim=0)
+    true_energy = target.square().sum(dim=0)
+    valid = (pred_energy > 1e-8) & (true_energy > 1e-8)
+    if int(valid.sum()) < 2:
+        return predicted_expression.new_zeros(())
+    predicted = predicted[:, valid] / pred_energy[valid].sqrt().unsqueeze(0)
+    target = target[:, valid] / true_energy[valid].sqrt().unsqueeze(0)
+    logits = predicted.T @ target / float(temperature)
+    labels = torch.arange(logits.shape[0], device=logits.device)
+    return 0.5 * (
+        torch.nn.functional.cross_entropy(logits, labels)
+        + torch.nn.functional.cross_entropy(logits.T, labels)
+    )
+
+
+def gene_map_spectrum_loss(
+    predicted_expression: torch.Tensor,
+    target_expression: torch.Tensor,
+    *,
+    gene_indices: torch.Tensor,
+    max_rank: int = 64,
+) -> torch.Tensor:
+    """Match the normalized singular-value spectrum of selected gene maps.
+
+    The normalization deliberately removes total amplitude (handled by
+    :func:`field_amplitude_loss`) and isolates lost spatial/gene diversity.
+    """
+    if max_rank < 1:
+        raise ValueError("max_rank must be positive")
+    if predicted_expression.shape != target_expression.shape:
+        raise ValueError("predicted_expression and target_expression must match")
+    indices = torch.as_tensor(
+        gene_indices, dtype=torch.long, device=predicted_expression.device,
+    )
+    if predicted_expression.shape[0] < 2 or indices.numel() < 2:
+        return predicted_expression.new_zeros(())
+    predicted = predicted_expression.index_select(1, indices)
+    target = target_expression.index_select(1, indices)
+    predicted = predicted - predicted.mean(dim=0, keepdim=True)
+    target = target - target.mean(dim=0, keepdim=True)
+    rank = min(max_rank, predicted.shape[0] - 1, predicted.shape[1])
+    if rank < 1:
+        return predicted_expression.new_zeros(())
+    pred_singular = torch.linalg.svdvals(predicted.float())[:rank]
+    true_singular = torch.linalg.svdvals(target.float())[:rank]
+    pred_singular = pred_singular / pred_singular.norm().clamp_min(1e-8)
+    true_singular = true_singular / true_singular.norm().clamp_min(1e-8)
+    return torch.nn.functional.smooth_l1_loss(
+        torch.log(pred_singular + 1e-5), torch.log(true_singular + 1e-5),
+    ).to(predicted_expression.dtype)
+
+
 def combined_reconstruction_loss(
     predicted_expression: torch.Tensor,
     target_expression: torch.Tensor,
