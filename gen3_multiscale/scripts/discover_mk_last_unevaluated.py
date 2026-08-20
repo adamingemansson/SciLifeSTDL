@@ -85,7 +85,20 @@ def discover(
             f"only {len(candidates)} completed, currently unevaluated MK checkpoints found; "
             f"cannot select {count}"
         )
-    selected = candidates[:count]
+    selected = []
+    selected_arms = set()
+    for row in candidates:
+        if row["arm"] in selected_arms:
+            continue
+        selected.append(row)
+        selected_arms.add(row["arm"])
+        if len(selected) == count:
+            break
+    if len(selected) < count:
+        raise ValueError(
+            f"only {len(selected)} uniquely named, completed, currently unevaluated "
+            f"MK checkpoints found; cannot select {count}"
+        )
     selected_suite_roots = sorted({row["suite_root"] for row in selected})
     payload = {
         "kind": "mk_pending_evaluation_job_manifest",
