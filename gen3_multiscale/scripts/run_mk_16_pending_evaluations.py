@@ -46,7 +46,9 @@ def _atomic_json(path: Path, payload: Any) -> None:
     os.replace(temporary, path)
 
 
-def _load_jobs(suite_roots: list[Path], *, expected_arms: int) -> list[dict[str, Any]]:
+def _load_jobs(
+    suite_roots: list[Path], *, expected_arms: int | None,
+) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
     names: set[str] = set()
     for raw_root in suite_roots:
@@ -56,7 +58,9 @@ def _load_jobs(suite_roots: list[Path], *, expected_arms: int) -> list[dict[str,
             raise FileNotFoundError(f"suite plan is missing: {plan_path}")
         plan = json.loads(plan_path.read_text())
         kind = str(plan.get("kind"))
-        if kind not in ALLOWED_SUITE_KINDS:
+        if kind not in ALLOWED_SUITE_KINDS and not (
+            kind.startswith("mk_") and kind.endswith("_suite")
+        ):
             raise ValueError(f"{plan_path}: unsupported suite kind {kind!r}")
         order = list(plan.get("arm_order") or [])
         if not order or set(order) != set((plan.get("arms") or {}).keys()):
@@ -100,12 +104,41 @@ def _load_jobs(suite_roots: list[Path], *, expected_arms: int) -> list[dict[str,
                 "checkpoint_step": int(state["step"]),
                 "diagnose_latent": not deterministic,
             })
-    if len(jobs) != expected_arms:
+    if expected_arms is not None and len(jobs) != expected_arms:
         raise ValueError(
             f"expected exactly {expected_arms} arms, discovered {len(jobs)}: "
             f"{[job['arm'] for job in jobs]}"
         )
     return jobs
+
+
+def _load_selected_jobs(path: Path, *, expected_arms: int) -> tuple[list[dict[str, Any]], list[str]]:
+    manifest = json.loads(path.expanduser().resolve().read_text())
+    if manifest.get("kind") != "mk_pending_evaluation_job_manifest":
+        raise ValueError(f"{path}: not an MK pending-evaluation job manifest")
+    selected = list(manifest.get("jobs") or [])
+    if len(selected) != expected_arms:
+        raise ValueError(
+            f"{path}: expected {expected_arms} selected jobs, found {len(selected)}"
+        )
+    suite_roots = [str(value) for value in manifest.get("suite_roots") or []]
+    available = _load_jobs([Path(value) for value in suite_roots], expected_arms=None)
+    by_identity = {
+        (job["arm"], str(Path(job["config"]).resolve())): job for job in available
+    }
+    jobs = []
+    for record in selected:
+        identity = (str(record["arm"]), str(Path(record["config"]).resolve()))
+        if identity not in by_identity:
+            raise ValueError(f"{path}: selected job is absent from its suite: {identity}")
+        job = by_identity[identity]
+        if int(job["checkpoint_step"]) != int(record["checkpoint_step"]):
+            raise ValueError(
+                f"{job['arm']}: best checkpoint changed after discovery "
+                f"({record['checkpoint_step']} -> {job['checkpoint_step']}); rediscover first"
+            )
+        jobs.append(job)
+    return jobs, suite_roots
 
 
 def _command(
@@ -169,7 +202,8 @@ def _audit_report(path: Path, *, diagnose_latent: bool) -> dict[str, Any]:
 
 
 def run_evaluations(
-    *, suite_roots: list[str], output_root: str, gpus: tuple[int, ...],
+    *, suite_roots: list[str] | None, job_manifest: str | None,
+    output_root: str, gpus: tuple[int, ...],
     expected_arms: int = 16, cpu_threads: int = 8,
     noise_ceiling: str | None = None, allow_code_drift: bool = False,
     dry_run: bool = False,
@@ -184,9 +218,18 @@ def run_evaluations(
     ceiling = Path(noise_ceiling).expanduser().resolve() if noise_ceiling else None
     if ceiling is not None and not ceiling.is_file():
         raise FileNotFoundError(f"noise-ceiling artifact is missing: {ceiling}")
-    jobs = _load_jobs(
-        [Path(value) for value in suite_roots], expected_arms=expected_arms,
-    )
+    if bool(suite_roots) == bool(job_manifest):
+        raise ValueError("provide exactly one of suite_roots or job_manifest")
+    if job_manifest:
+        jobs, resolved_suite_roots = _load_selected_jobs(
+            Path(job_manifest), expected_arms=expected_arms,
+        )
+    else:
+        resolved_suite_roots = list(suite_roots or [])
+        jobs = _load_jobs(
+            [Path(value) for value in resolved_suite_roots],
+            expected_arms=expected_arms,
+        )
     for index, job in enumerate(jobs):
         job["gpu"] = int(gpus[index % len(gpus)])
     output.mkdir(parents=True)
@@ -195,7 +238,10 @@ def run_evaluations(
         "kind": "mk_16_pending_evaluation",
         "version": 1,
         "created_utc": datetime.now(timezone.utc).isoformat(),
-        "suite_roots": [str(Path(value).expanduser().resolve()) for value in suite_roots],
+        "suite_roots": [
+            str(Path(value).expanduser().resolve()) for value in resolved_suite_roots
+        ],
+        "job_manifest": str(Path(job_manifest).expanduser().resolve()) if job_manifest else None,
         "expected_arms": expected_arms,
         "expected_fixed_items_per_arm": EXPECTED_FIXED_ITEMS,
         "expected_whole_slides_per_arm": EXPECTED_WHOLE_SLIDES,
@@ -308,7 +354,9 @@ def run_evaluations(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite-root", action="append", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--suite-root", action="append")
+    source.add_argument("--job-manifest")
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--gpus", default="0,2,3,5")
     parser.add_argument("--expected-arms", type=int, default=16)
@@ -318,7 +366,8 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     run_evaluations(
-        suite_roots=args.suite_root, output_root=args.output_root,
+        suite_roots=args.suite_root, job_manifest=args.job_manifest,
+        output_root=args.output_root,
         gpus=tuple(int(value) for value in args.gpus.split(",") if value.strip()),
         expected_arms=args.expected_arms, cpu_threads=args.cpu_threads,
         noise_ceiling=args.noise_ceiling,
