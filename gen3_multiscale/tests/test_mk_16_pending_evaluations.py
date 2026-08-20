@@ -3,6 +3,7 @@ import sys
 
 import pytest
 
+from gen3_multiscale.scripts import discover_mk_last_unevaluated as discovery
 from gen3_multiscale.scripts import run_mk_16_pending_evaluations as launcher
 
 
@@ -71,6 +72,7 @@ def test_dry_run_distributes_four_jobs_to_each_gpu(monkeypatch, tmp_path):
     output = tmp_path / "evaluation"
     result = launcher.run_evaluations(
         suite_roots=["/suite/a", "/suite/b", "/suite/c"],
+        job_manifest=None,
         output_root=str(output), gpus=(0, 2, 3, 5), dry_run=True,
     )
     assert result["dry_run"] is True
@@ -101,10 +103,74 @@ def test_failed_arm_does_not_block_later_arm_on_same_gpu(monkeypatch, tmp_path):
     output = tmp_path / "evaluation"
     with pytest.raises(RuntimeError, match="arm_00"):
         launcher.run_evaluations(
-            suite_roots=["/suite"], output_root=str(output),
+            suite_roots=["/suite"], job_manifest=None, output_root=str(output),
             gpus=(0,), expected_arms=2,
         )
     status = json.loads((output / "evaluation_status.json").read_text())
     assert status["arm_00"]["status"] == "failed"
     assert status["arm_01"]["status"] == "finished"
 
+
+def test_selected_manifest_refuses_checkpoint_changed_after_discovery(
+    monkeypatch, tmp_path,
+):
+    suite = tmp_path / "suite"
+    jobs = _jobs(2)
+    for job in jobs:
+        job["suite_root"] = str(suite)
+        job["config"] = str(suite / "configs" / f"{job['arm']}.yaml")
+    manifest = tmp_path / "selected.json"
+    manifest.write_text(json.dumps({
+        "kind": "mk_pending_evaluation_job_manifest",
+        "suite_roots": [str(suite)],
+        "jobs": jobs,
+    }))
+    monkeypatch.setattr(launcher, "_load_jobs", lambda *_args, **_kwargs: jobs)
+    selected, roots = launcher._load_selected_jobs(manifest, expected_arms=2)
+    assert [job["arm"] for job in selected] == ["arm_00", "arm_01"]
+    assert roots == [str(suite)]
+
+    changed = [dict(job) for job in jobs]
+    changed[0]["checkpoint_step"] = 200
+    monkeypatch.setattr(launcher, "_load_jobs", lambda *_args, **_kwargs: changed)
+    with pytest.raises(ValueError, match="best checkpoint changed"):
+        launcher._load_selected_jobs(manifest, expected_arms=2)
+
+
+def test_discovery_selects_newest_exact_unevaluated_checkpoints(
+    monkeypatch, tmp_path,
+):
+    results = tmp_path / "results"
+    suites = [results / f"suite_{index}" for index in range(3)]
+    for suite in suites:
+        suite.mkdir(parents=True)
+        (suite / "suite_plan.json").write_text("{}")
+
+    jobs = []
+    times = {}
+    for index, suite in enumerate(suites):
+        job = _jobs(1)[0]
+        job["arm"] = f"arm_{index}"
+        job["suite_root"] = str(suite.resolve())
+        job["config"] = str((suite / "configs" / f"arm_{index}.yaml").resolve())
+        job["checkpoint_dir"] = str(suite / "checkpoints" / f"arm_{index}")
+        job["checkpoint_step"] = 100 + index
+        jobs.append(job)
+        times[job["checkpoint_dir"]] = 10.0 + index
+
+    def load(suite_roots, **_kwargs):
+        suite = str(suite_roots[0].resolve())
+        return [job for job in jobs if job["suite_root"] == suite]
+
+    evaluated = {(jobs[2]["config"], jobs[2]["checkpoint_step"])}
+    monkeypatch.setattr(discovery, "_load_jobs", load)
+    monkeypatch.setattr(discovery, "_complete_evaluations", lambda _root: evaluated)
+    monkeypatch.setattr(
+        discovery, "_checkpoint_time", lambda path: times[path],
+    )
+    output = tmp_path / "selected.json"
+    payload = discovery.discover(
+        results_root=str(results), output=str(output), count=2,
+    )
+    assert [job["arm"] for job in payload["jobs"]] == ["arm_1", "arm_0"]
+    assert json.loads(output.read_text())["count"] == 2
