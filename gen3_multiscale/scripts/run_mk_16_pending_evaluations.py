@@ -122,7 +122,13 @@ def _load_selected_jobs(path: Path, *, expected_arms: int) -> tuple[list[dict[st
             f"{path}: expected {expected_arms} selected jobs, found {len(selected)}"
         )
     suite_roots = [str(value) for value in manifest.get("suite_roots") or []]
-    available = _load_jobs([Path(value) for value in suite_roots], expected_arms=None)
+    available = []
+    for value in suite_roots:
+        # Arm labels can legitimately recur in historical rerun suites.  The
+        # discovery manifest identifies a job by arm plus resolved config, so
+        # validate each immutable suite separately rather than rejecting the
+        # whole selection because an unselected historical arm shares a name.
+        available.extend(_load_jobs([Path(value)], expected_arms=None))
     by_identity = {
         (job["arm"], str(Path(job["config"]).resolve())): job for job in available
     }

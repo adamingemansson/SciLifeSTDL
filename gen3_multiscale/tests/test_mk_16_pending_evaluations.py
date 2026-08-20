@@ -174,3 +174,38 @@ def test_discovery_selects_newest_exact_unevaluated_checkpoints(
     )
     assert [job["arm"] for job in payload["jobs"]] == ["arm_1", "arm_0"]
     assert json.loads(output.read_text())["count"] == 2
+
+
+def test_discovery_keeps_only_newest_rerun_with_same_arm_name(
+    monkeypatch, tmp_path,
+):
+    results = tmp_path / "results"
+    suites = [results / "old", results / "new", results / "other"]
+    for suite in suites:
+        suite.mkdir(parents=True)
+        (suite / "suite_plan.json").write_text("{}")
+    jobs = []
+    for index, suite in enumerate(suites):
+        job = _jobs(1)[0]
+        job["arm"] = "repeated" if index < 2 else "other"
+        job["suite_root"] = str(suite.resolve())
+        job["config"] = str((suite / f"config_{index}.yaml").resolve())
+        job["checkpoint_dir"] = str(suite / f"checkpoint_{index}")
+        jobs.append(job)
+
+    def load(suite_roots, **_kwargs):
+        root = str(suite_roots[0].resolve())
+        return [job for job in jobs if job["suite_root"] == root]
+
+    monkeypatch.setattr(discovery, "_load_jobs", load)
+    monkeypatch.setattr(discovery, "_complete_evaluations", lambda _root: set())
+    monkeypatch.setattr(
+        discovery, "_checkpoint_time",
+        lambda path: float(next(index for index, job in enumerate(jobs)
+                                if job["checkpoint_dir"] == path)),
+    )
+    payload = discovery.discover(
+        results_root=str(results), output=str(tmp_path / "selected.json"), count=2,
+    )
+    assert [job["arm"] for job in payload["jobs"]] == ["other", "repeated"]
+    assert payload["jobs"][1]["suite_root"] == str(suites[1].resolve())
