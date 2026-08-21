@@ -51,6 +51,15 @@ ARM_SPECS = {
     "mk_pg_genequery_structure": ConditionalWAEArmSpec("he_to_st", "none", False),
     "mk_pg_field_structure": ConditionalWAEArmSpec("he_to_st", "none", False),
     "mk_pg_full": ConditionalWAEArmSpec("he_to_st", "none", False),
+    # Conservative auxiliary-objective screen on the unchanged best
+    # deterministic MLP/parallel-gated predictor.  The earlier mechanism
+    # screen used much larger weights and changed the optimization target;
+    # these cells test whether weak amplitude/gradient/identity signals can
+    # recover spatial detail without sacrificing point prediction.
+    "mk_pg_aux_amplitude": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_pg_aux_gradient": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_pg_aux_identity_amplitude": ConditionalWAEArmSpec("he_to_st", "none", False),
+    "mk_pg_aux_identity_amplitude_gradient": ConditionalWAEArmSpec("he_to_st", "none", False),
     # Residual WAE-MMD factorial on the frozen, best deterministic
     # within/between parallel-gated H&E predictor.  The two factors are the
     # prior (global versus H&E-conditional) and posterior FiLM conditioning.
@@ -195,6 +204,10 @@ _MK_STRUCTURED_FIELD_DESIGNS = {
     "mk_pg_genequery_structure": ("spatial", True, 1, False, False),
     "mk_pg_field_structure": ("spatial", True, 1, True, True),
     "mk_pg_full": ("spatial", True, 1, True, True),
+    "mk_pg_aux_amplitude": ("spatial", True, 1, False, False),
+    "mk_pg_aux_gradient": ("spatial", True, 1, True, True),
+    "mk_pg_aux_identity_amplitude": ("spatial", True, 1, False, False),
+    "mk_pg_aux_identity_amplitude_gradient": ("spatial", True, 1, True, True),
 }
 _MK_STRUCTURED_FIELD_FAMILIES = {
     "mk_field_within": ("none", True),
@@ -229,6 +242,10 @@ _MK_STRUCTURED_FIELD_FAMILIES = {
     "mk_pg_genequery_structure": ("none", True),
     "mk_pg_field_structure": ("none", True),
     "mk_pg_full": ("none", True),
+    "mk_pg_aux_amplitude": ("none", True),
+    "mk_pg_aux_gradient": ("none", True),
+    "mk_pg_aux_identity_amplitude": ("none", True),
+    "mk_pg_aux_identity_amplitude_gradient": ("none", True),
 }
 _MK_STRUCTURED_COMPOSITIONS = {
     "mk_wb_serial": "within_then_between",
@@ -251,6 +268,10 @@ _MK_STRUCTURED_COMPOSITIONS = {
     "mk_pg_genequery_structure": "parallel_gated",
     "mk_pg_field_structure": "parallel_gated",
     "mk_pg_full": "parallel_gated",
+    "mk_pg_aux_amplitude": "parallel_gated",
+    "mk_pg_aux_gradient": "parallel_gated",
+    "mk_pg_aux_identity_amplitude": "parallel_gated",
+    "mk_pg_aux_identity_amplitude_gradient": "parallel_gated",
 }
 _MK_OBJECTIVE_SCREEN_DESIGNS = {
     # pcc_weight, local_gradient_weight, wide_gradient_weight
@@ -290,6 +311,15 @@ _MK_GENE_FIELD_DESIGNS = {
     "mk_pg_genequery_structure": ("structured_gene_query", False, True, True),
     "mk_pg_field_structure": ("mlp", True, True, True),
     "mk_pg_full": ("structured_gene_query", True, True, True),
+}
+_MK_AUX_OBJECTIVE_DESIGNS = {
+    # field-mean, field-amplitude, local-gradient, wide-gradient, identity
+    "mk_pg_aux_amplitude": (0.0, 0.005, 0.0, 0.0, 0.0),
+    "mk_pg_aux_gradient": (0.0, 0.0, 0.0025, 0.0025, 0.0),
+    "mk_pg_aux_identity_amplitude": (0.0, 0.005, 0.0, 0.0, 0.0025),
+    "mk_pg_aux_identity_amplitude_gradient": (
+        0.0, 0.005, 0.0025, 0.0025, 0.0025,
+    ),
 }
 _VALID_STRUCTURED_COMPOSITIONS = frozenset({
     "within_then_between", "between_then_within",
@@ -553,6 +583,26 @@ def static_audit_conditional_wae_config(config: dict) -> dict:
             params.get("use_centered_gene_structure", False)
         ):
             raise ValueError(f"{arm}: gene-query decoder requires centered gene structure")
+    if arm in _MK_AUX_OBJECTIVE_DESIGNS:
+        actual = (
+            float(loss.get("field_mean_weight", 0.0)),
+            float(loss.get("field_amplitude_weight", 0.0)),
+            local_gradient_weight,
+            wide_gradient_weight,
+            float(loss.get("gene_identity_weight", 0.0)),
+        )
+        expected = _MK_AUX_OBJECTIVE_DESIGNS[arm]
+        if actual != expected:
+            raise ValueError(
+                f"{arm}: auxiliary objective {actual} does not match immutable "
+                f"cell {expected}"
+            )
+        if str(params.get("decoder_kind", "mlp")) != "mlp":
+            raise ValueError(f"{arm}: auxiliary screen must retain the MLP decoder")
+        if float(loss.get("spectrum_weight", 0.0)) != 0.0:
+            raise ValueError(f"{arm}: spectrum loss is outside this controlled screen")
+        if actual[-1] > 0 and len(params.get("structured_loss_gene_names") or []) < 2:
+            raise ValueError(f"{arm}: identity loss requires a train-selected gene panel")
     spatial_prior_path = data.get("spatial_prior_path")
     if spatial_prior_path and n_refinement_steps < 1:
         raise ValueError(

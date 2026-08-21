@@ -431,6 +431,45 @@ def test_parallel_gated_objective_factorial_contract_is_exact():
             static_audit_conditional_wae_config(broken)
 
 
+def test_parallel_gated_weak_auxiliary_objective_contract_is_exact():
+    designs = {
+        "mk_pg_aux_amplitude": (0.0, 0.005, 0.0, 0.0, 0.0),
+        "mk_pg_aux_gradient": (0.0, 0.0, 0.0025, 0.0025, 0.0),
+        "mk_pg_aux_identity_amplitude": (0.0, 0.005, 0.0, 0.0, 0.0025),
+        "mk_pg_aux_identity_amplitude_gradient": (
+            0.0, 0.005, 0.0025, 0.0025, 0.0025,
+        ),
+    }
+    for arm, (mean, amplitude, local, wide, identity) in designs.items():
+        config = _contract(
+            arm, ("spatial", True, 1, local > 0, wide > 0),
+        )
+        config["model"]["params"].update({
+            "structured_composition": "parallel_gated",
+            "decoder_kind": "mlp",
+            "structured_loss_gene_names": ["g0", "g1"],
+        })
+        config["loss"].update({
+            "field_mean_weight": mean,
+            "field_amplitude_weight": amplitude,
+            "local_gradient_weight": local,
+            "wide_gradient_weight": wide,
+            "gene_identity_weight": identity,
+            "spectrum_weight": 0.0,
+        })
+        assert static_audit_conditional_wae_config(config)["passed"]
+
+        broken = copy.deepcopy(config)
+        broken["loss"]["field_amplitude_weight"] += 0.001
+        with pytest.raises(ValueError, match="auxiliary objective .* immutable cell"):
+            static_audit_conditional_wae_config(broken)
+
+        broken = copy.deepcopy(config)
+        broken["model"]["params"]["decoder_kind"] = "structured_gene_query"
+        with pytest.raises(ValueError, match="must retain the MLP decoder"):
+            static_audit_conditional_wae_config(broken)
+
+
 def test_parallel_gated_decoder_width_factorial_contract_is_exact():
     designs = {
         "mk_pg_width1024_seed1": (1024, 1),
