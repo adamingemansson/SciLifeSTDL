@@ -346,28 +346,13 @@ def analyze_slide(
     )
     context = model.image_conditioner(inputs)
     n_rows = int(context.shape[0])
-    decode_base = getattr(model, "decode_base_from_context", model.conditional_mean_head)
-    base_chunks = []
-    for start in range(0, n_rows, chunk_size):
-        end = min(start + chunk_size, n_rows)
-        if hasattr(model, "decode_base_from_context"):
-            base_chunks.append(decode_base(context[start:end], slide_context=context))
-        else:
-            base_chunks.append(decode_base(context[start:end]))
-    raw_point = torch.cat(base_chunks, dim=0)
-    point = (
-        model.refine_prediction(raw_point, context, inputs)
-        if hasattr(model, "refine_prediction") else raw_point
-    )
+    # Use the model's public inference methods.  In particular, residual WAE
+    # arms symmetrize *after* nonlinear structured refinement; manually doing
+    # decode() then refine_prediction() would measure a different model.
+    point = model.predict_point_from_context(context, inputs)
     if bool(getattr(model, "has_specialist_latent_head", False)):
         prior_center = model._prior_mean(context)
-        center_chunks = [
-            model.decode(prior_center[start:min(start + chunk_size, n_rows)],
-                         context[start:min(start + chunk_size, n_rows)])[0]
-            for start in range(0, n_rows, chunk_size)
-        ]
-        specialist = model.refine_prediction(torch.cat(center_chunks), context, inputs)
-        point = model.restrict_specialist_prediction(specialist, point)
+        point = model.decode_latent_from_context(prior_center, context, inputs)
 
     total_values = int(point.numel())
     rng = np.random.default_rng(seed)
@@ -390,18 +375,26 @@ def analyze_slide(
     ensemble_records = []
     draw_records = []
     residual_sample = sampled_target - sampled_point
+    antithetic = getattr(model, "latent_residual_mode", "free") == "antithetic_zero_mean"
+    prior_mean = model._prior_mean(context) if antithetic else None
+    mirrored_z = None
     for draw_index in range(n_draws):
-        z = model.sample_inference_latent(context, generator=generator)
-        decoded = torch.cat([
-            model.decode(
-                z[start:min(start + chunk_size, n_rows)],
-                context[start:min(start + chunk_size, n_rows)],
-            )[0]
-            for start in range(0, n_rows, chunk_size)
-        ], dim=0)
-        complete = model.refine_prediction(decoded, context, inputs)
-        if bool(getattr(model, "has_specialist_latent_head", False)):
-            complete = model.restrict_specialist_prediction(complete, point)
+        # Reproduce sample_predictive_distribution's canonical ordering:
+        # z, its mirror around the prior mean, then (for odd counts) the prior
+        # center.  Every even ensemble size therefore has the exact same
+        # finite-sample mean used by ordinary residual-WAE evaluation.
+        if antithetic and n_draws % 2 == 1 and draw_index == n_draws - 1:
+            z = prior_mean
+        elif antithetic and draw_index % 2 == 1:
+            if mirrored_z is None:
+                raise RuntimeError("antithetic mirror was not prepared")
+            z = mirrored_z
+            mirrored_z = None
+        else:
+            z = model.sample_inference_latent(context, generator=generator)
+            if antithetic:
+                mirrored_z = 2.0 * prior_mean - z
+        complete = model.decode_latent_from_context(z, context, inputs)
         predictive_sum.add_(complete)
         predictive_sum_squared.add_(complete.square())
         sampled = complete.reshape(-1).index_select(0, sampled_index_tensor).cpu().numpy()
