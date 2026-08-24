@@ -89,8 +89,15 @@ def stain_distance(vector: np.ndarray, center: np.ndarray, scale: np.ndarray) ->
 def _write_tsv(path: Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         raise ValueError(f"refusing to write an empty table: {path}")
+    fieldnames = list(rows[0])
+    known = set(fieldnames)
+    for row in rows[1:]:
+        for field in row:
+            if field not in known:
+                fieldnames.append(field)
+                known.add(field)
     with path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]), delimiter="\t")
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter="\t")
         writer.writeheader()
         writer.writerows(rows)
 
