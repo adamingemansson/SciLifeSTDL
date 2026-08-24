@@ -1,0 +1,11 @@
+dataset_id: REPLACE_ME
+sample_ids: []
+patient_ids: []
+organs: []
+spatial_technology: Visium
+target_space: normalize_total_then_log1p
+gene_coverage_fraction: 0.0
+patient_disjoint_from_training: false
+used_for_model_selection: false
+pretraining_overlap_status: possible
+data_provenance: ""

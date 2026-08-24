@@ -1,0 +1,73 @@
+version: 1
+name: mk_final_study_2026
+benchmark_contract: configs/benchmarks/hest_mk_2026.yaml
+
+scope:
+  task: H-and-E-only prediction of normalized spatial gene expression
+  target_space: normalize_total_then_log1p
+  query_gex_visible: false
+  surrounding_gex_visible: false
+  required_train_samples: 242
+  required_validation_samples: 14
+  required_fixed_mask_items: 448
+  required_panels:
+    - all_genes
+    - train_log1p_variance_top50
+    - train_log1p_variance_top200
+    - train_within_slide_variance_top50
+    - train_within_slide_variance_top200
+
+deterministic_models:
+  primary: mk_wb_parallel_gated
+  structural_reference: mk_wbw_sandwich
+  required_seeds: [1, 2, 10]
+  primary_output: deterministic_h_and_e_point_prediction
+
+generative_models:
+  role: secondary_uncertainty_analysis
+  required_draws: 32
+  decision_rule: >-
+    A WAE is retained only if its uncertainty is calibrated to held-out error
+    or a finite-sample ensemble improves over the deterministic point prediction.
+  prohibited_claim: >-
+    Seed-to-seed variation in a deterministic model is not predictive uncertainty
+    and must not be reported as the same quantity as latent-draw variation.
+
+stain_domain:
+  first_step: diagnosis_before_retraining
+  train_only_reference: true
+  features:
+    - rgb_mean
+    - rgb_std
+    - hed_mean
+    - hed_std
+  decision_gate:
+    minimum_absolute_spearman_with_pcc: 0.30
+    minimum_slides: 14
+  treatments_if_gate_passes:
+    - train_only_reference_normalization
+    - stain_augmentation
+  cache_rule: >-
+    Any transformed UNI2 input requires a separate transform-aware cache namespace
+    and provenance. The existing raw-patch UNI2 cache must not be overwritten.
+
+failure_diagnostics:
+  required:
+    - predicted_to_target_std_ratio
+    - entropy_effective_rank_ratio
+    - exact_vs_blurred_pcc
+    - same_gene_template_reuse
+    - per_gene_seed_stability
+
+external_validation:
+  required: true
+  no_model_selection_on_external_cohort: true
+  require_pretraining_overlap_declaration: true
+  require_patient_disjointness: true
+  require_gene_coverage_fraction: 0.95
+  accepted_target_spaces:
+    - normalize_total_then_log1p
+  accepted_spatial_technologies:
+    - Visium
+    - Visium_HD
+    - ST
