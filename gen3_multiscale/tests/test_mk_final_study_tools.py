@@ -1,8 +1,10 @@
 import numpy as np
 import pytest
+import csv
 
 from gen3_multiscale.scripts.analyze_mk_stain_domain_shift import (
     FEATURE_NAMES,
+    _write_tsv,
     patch_stain_features,
     robust_reference,
     stain_distance,
@@ -25,6 +27,18 @@ def test_robust_stain_distance_is_zero_at_train_center():
     center, scale = robust_reference(train)
     assert stain_distance(center, center, scale) == 0.0
     assert stain_distance(center + scale, center, scale) == pytest.approx(1.0)
+
+
+def test_stain_writer_supports_validation_only_columns(tmp_path):
+    path = tmp_path / "rows.tsv"
+    _write_tsv(path, [
+        {"split": "train", "sample_id": "a"},
+        {"split": "validation", "sample_id": "b", "all_gene_pcc": 0.2},
+    ])
+    with path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    assert rows[0]["all_gene_pcc"] == ""
+    assert rows[1]["all_gene_pcc"] == "0.2"
 
 
 def test_external_audit_passes_only_complete_disjoint_cohort():
