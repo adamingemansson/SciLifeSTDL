@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 import csv
+import json
 
 from gen3_multiscale.scripts.analyze_mk_stain_domain_shift import (
     FEATURE_NAMES,
@@ -10,6 +11,11 @@ from gen3_multiscale.scripts.analyze_mk_stain_domain_shift import (
     stain_distance,
 )
 from gen3_multiscale.scripts.audit_mk_external_validation import audit
+from gen3_multiscale.scripts.analyze_mk_stain_confounders import (
+    _organ_pair_summary,
+    _residualize_categories,
+)
+from gen3_multiscale.scripts.summarize_mk_wae_best_individual_draws import summarize
 
 
 def test_patch_stain_features_are_finite_and_color_sensitive():
@@ -67,3 +73,40 @@ def test_external_audit_passes_only_complete_disjoint_cohort():
     result = audit(candidate, contract)
     assert result["ready"] is False
     assert "used for model selection" in " ".join(result["failures"])
+
+
+def test_stain_confounder_helpers_preserve_within_organ_direction():
+    values = np.asarray([1.0, 2.0, 10.0, 12.0])
+    residual = _residualize_categories(values, ["a", "a", "b", "b"])
+    assert np.allclose(residual, [-0.5, 0.5, -1.0, 1.0])
+    pairs = _organ_pair_summary([
+        {"organ": "a", "sample_id": "a1", "stain_distance": 1.0, "all_gene_pcc": 0.1},
+        {"organ": "a", "sample_id": "a2", "stain_distance": 2.0, "all_gene_pcc": 0.2},
+        {"organ": "b", "sample_id": "b1", "stain_distance": 1.0, "all_gene_pcc": 0.3},
+        {"organ": "b", "sample_id": "b2", "stain_distance": 2.0, "all_gene_pcc": 0.1},
+    ])
+    assert pairs["n_concordant_pairs"] == 1
+    assert pairs["n_comparable_organ_pairs"] == 2
+
+
+def test_best_individual_draw_summary_compares_to_exact_deterministic_entry(tmp_path):
+    source = tmp_path / "diversity"
+    source.mkdir()
+    (source / "report.json").write_text(json.dumps({
+        "arm": "wae", "n_slides": 2,
+    }))
+    _write_tsv(source / "per_draw.tsv", [
+        {"sample_id": "a", "organ": "x", "draw": 1, "draw_vs_target_pcc": 0.4, "draw_vs_target_rmse": 0.6},
+        {"sample_id": "a", "organ": "x", "draw": 2, "draw_vs_target_pcc": 0.6, "draw_vs_target_rmse": 0.4},
+        {"sample_id": "b", "organ": "y", "draw": 1, "draw_vs_target_pcc": 0.2, "draw_vs_target_rmse": 0.8},
+        {"sample_id": "b", "organ": "y", "draw": 2, "draw_vs_target_pcc": 0.4, "draw_vs_target_rmse": 0.6},
+    ])
+    _write_tsv(source / "ensemble_convergence.tsv", [
+        {"sample_id": "a", "n_draws": 2, "sampled_value_pcc_vs_target": 0.5, "sampled_value_rmse_vs_target": 0.5, "sampled_value_rmse_vs_deterministic": 0.0},
+        {"sample_id": "b", "n_draws": 2, "sampled_value_pcc_vs_target": 0.3, "sampled_value_rmse_vs_target": 0.7, "sampled_value_rmse_vs_deterministic": 0.0},
+    ])
+    outputs = summarize(diversity_root=str(source), output_dir=str(tmp_path / "out"))
+    result = json.loads(outputs["summary"].read_text())
+    assert result["deterministic_macro_pcc"] == pytest.approx(0.4)
+    assert result["best_single_global_draw_by_pcc"]["draw"] == 2
+    assert result["best_global_draw_pcc_improvement"] == pytest.approx(0.1)

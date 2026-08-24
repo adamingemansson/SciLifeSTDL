@@ -18,9 +18,14 @@ Run `gen3_multiscale.scripts.analyze_mk_stain_domain_shift` against the primary
 whole-slide report.  It samples real H&E patches, fits the stain reference from
 training slides only, and measures held-out distance without modifying pixels.
 
-Only run a stain-normalization/augmentation training screen if the predeclared
-gate in the study contract is crossed.  Any transformed UNI2 inputs need their
-own transform-aware cache and may never overwrite the current raw-patch cache.
+Interpret the result with `analyze_mk_stain_confounders`.  The retraining gate
+is directional: normalization/augmentation is triggered only if greater stain
+distance is associated with *lower* PCC (rho <= -0.30, n >= 14).  A positive
+association does not justify normalization even when its absolute magnitude is
+large.  The post-hoc table reports raw, organ-residualized, within-organ-pair,
+and optional spatial-template/noise-ceiling associations.  Any transformed
+UNI2 inputs need their own transform-aware cache and may never overwrite the
+current raw-patch cache.
 
 ## 3. WAE uncertainty
 
@@ -35,6 +40,11 @@ Compare this with deterministic seed stability using
 
 They answer different questions and must not be merged into one uncertainty
 number.
+
+Use `summarize_mk_wae_best_individual_draws` to test whether any fixed latent
+draw beats the deterministic point prediction on the same sampled spot-gene
+values.  Its per-slide oracle is deliberately labelled non-deployable because
+it selects a draw after observing target GEX.
 
 ## 4. Underdispersion and spatial reuse
 
