@@ -20,7 +20,7 @@ from scipy.stats import spearmanr
 from skimage.color import rgb2hed
 
 from gen3_multiscale.config_identity import resolved_config
-from gen3_multiscale.data import example_builder
+from gen3_multiscale.data import loaders
 from gen3_multiscale.data.dataset_manifest import load_dataset_manifest
 
 
@@ -158,14 +158,15 @@ def analyze(
     slide_rows: list[dict[str, Any]] = []
     for split, sample_ids in (("train", train_ids), ("validation", validation_ids)):
         for index, sample_id in enumerate(sample_ids):
-            _adata, patches, available = example_builder.load_sample_for_examples(manifest, sample_id)
-            available_indices = np.flatnonzero(np.asarray(available, dtype=bool))
-            if available_indices.size < 1:
+            patches, _patch_barcodes = loaders.load_hest_patches(
+                manifest["hest_data_dir"], sample_id,
+            )
+            if len(patches) < 1:
                 raise ValueError(f"{sample_id}: no real H&E patches")
             rng = _stable_rng(seed, sample_id)
             chosen = rng.choice(
-                available_indices,
-                size=min(max_patches_per_slide, available_indices.size),
+                len(patches),
+                size=min(max_patches_per_slide, len(patches)),
                 replace=False,
             )
             features = patch_stain_features(np.asarray(patches)[chosen])
@@ -176,13 +177,13 @@ def analyze(
                 "sample_id": sample_id,
                 "patient_id": str(manifest["samples"][sample_id]["patient_id"]),
                 "organ": str(manifest["samples"][sample_id]["organ"]),
-                "n_available_patches": int(available_indices.size),
+                "n_available_patches": int(len(patches)),
                 "n_sampled_patches": int(chosen.size),
             }
             row.update({name: float(value) for name, value in zip(FEATURE_NAMES, vector)})
             slide_rows.append(row)
             print(f"stain diagnostic: {split} {index + 1}/{len(sample_ids)} sample={sample_id}", flush=True)
-            del _adata, patches, features
+            del patches, features
     center, scale = robust_reference(np.stack([slide_vectors[sample_id] for sample_id in train_ids]))
     validation_rows = []
     for row in slide_rows:
