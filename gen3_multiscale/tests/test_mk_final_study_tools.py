@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from gen3_multiscale.scripts.analyze_mk_stain_domain_shift import (
     FEATURE_NAMES,
@@ -23,7 +24,7 @@ def test_robust_stain_distance_is_zero_at_train_center():
     train = np.asarray([[0.0, 1.0], [1.0, 2.0], [2.0, 3.0]])
     center, scale = robust_reference(train)
     assert stain_distance(center, center, scale) == 0.0
-    assert stain_distance(center + scale, center, scale) == 1.0
+    assert stain_distance(center + scale, center, scale) == pytest.approx(1.0)
 
 
 def test_external_audit_passes_only_complete_disjoint_cohort():
