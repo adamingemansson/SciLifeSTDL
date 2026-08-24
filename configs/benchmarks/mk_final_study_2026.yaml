@@ -42,7 +42,8 @@ stain_domain:
     - hed_mean
     - hed_std
   decision_gate:
-    minimum_absolute_spearman_with_pcc: 0.30
+    hypothesis: higher_stain_distance_reduces_held_out_pcc
+    trigger_if_spearman_with_pcc_at_or_below: -0.30
     minimum_slides: 14
   treatments_if_gate_passes:
     - train_only_reference_normalization
