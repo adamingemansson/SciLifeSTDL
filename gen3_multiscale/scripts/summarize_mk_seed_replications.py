@@ -5,7 +5,7 @@ The report deliberately keeps two uncertainty sources separate:
 
 * ``seed_summary.tsv`` describes variation across independently trained seeds.
 * ``architecture_delta_hierarchical_bootstrap.tsv`` resamples both seeds and
-  held-out patients for the direct parallel-gated minus sandwich comparison.
+  held-out slides for the direct parallel-gated minus sandwich comparison.
 
 All inputs must use the exact expanded validation contract (448 fixed masks,
 14 whole slides, deterministic H&E-only prediction and all five panels).
@@ -33,6 +33,7 @@ PANELS = (
     "train_within_slide_variance_top200",
 )
 POINT_METRICS = ("pcc", "rmse", "auc")
+METRIC_ALIASES = {"auc": ("auc", "nonzero_auc")}
 STRUCTURED_METRICS = {
     "spot_profile_pcc": "spot_profile.mean_spot_profile_pcc",
     "coexpression_pcc": "coexpression.correlation_matrix_pcc",
@@ -60,6 +61,17 @@ def _finite(value: Any) -> float:
 
 def _patient_mean(metric: Any) -> float:
     return _finite(metric.get("patient_mean")) if isinstance(metric, dict) else _finite(metric)
+
+
+def _metric_value(metrics: dict[str, Any], metric: str) -> Any:
+    for key in METRIC_ALIASES.get(metric, (metric,)):
+        if key in metrics:
+            return metrics[key]
+    return None
+
+
+def _patient_metric(metrics: dict[str, Any], metric: str) -> float:
+    return _patient_mean(_metric_value(metrics, metric))
 
 
 def _primary_role(report: dict[str, Any]) -> str:
@@ -184,22 +196,27 @@ def audit_report(
 def _record_metric(
     report: dict[str, Any], *, scope: str, panel: str, metric: str,
 ) -> dict[str, float]:
-    """Per-slide/per-mask values averaged inside patient for paired analyses."""
+    """Per-slide/per-mask values averaged inside stable held-out slide IDs.
+
+    ``sample_id`` is shared by the historical and replication reports. Their
+    optional ``patient_id`` fields came from different evaluator generations
+    and are therefore not a safe cross-report join key.
+    """
     result: dict[str, list[float]] = {}
     if scope == "fixed_mask":
         primary = _primary_role(report)
         records = report["per_item_records"]
         for row in records:
             values = row[primary] if panel == "all_genes" else row["gene_panels"][primary][panel]
-            value = _finite(values.get(metric))
+            value = _finite(_metric_value(values, metric))
             if math.isfinite(value):
-                result.setdefault(str(row["patient_id"]), []).append(value)
+                result.setdefault(str(row["sample_id"]), []).append(value)
     elif scope == "whole_slide":
         records = report["whole_slide_structured_field_evaluation"]["per_slide_records"]
         for row in records:
-            value = _finite(row["point_metrics"][panel].get(metric))
+            value = _finite(_metric_value(row["point_metrics"][panel], metric))
             if math.isfinite(value):
-                result.setdefault(str(row["patient_id"]), []).append(value)
+                result.setdefault(str(row["sample_id"]), []).append(value)
     else:
         raise ValueError(f"unknown point scope {scope!r}")
     return {patient: float(np.mean(values)) for patient, values in result.items()}
@@ -214,12 +231,15 @@ def _structured_record_metric(
         flat = _flatten_structured(row["structured_field"]["panels"][panel])
         value = _finite(flat.get(metric_path))
         if math.isfinite(value):
-            result.setdefault(str(row["patient_id"]), []).append(value)
+            result.setdefault(str(row["sample_id"]), []).append(value)
     return {patient: float(np.mean(values)) for patient, values in result.items()}
 
 
 def _t_interval(values: list[float]) -> tuple[float, float, float, float]:
     array = np.asarray(values, dtype=np.float64)
+    array = array[np.isfinite(array)]
+    if len(array) == 0:
+        return (float("nan"),) * 4
     mean = float(array.mean())
     sd = float(array.std(ddof=1)) if len(array) > 1 else float("nan")
     if len(array) < 2:
@@ -231,20 +251,29 @@ def _t_interval(values: list[float]) -> tuple[float, float, float, float]:
 def _hierarchical_delta(
     left: dict[int, dict[str, float]], right: dict[int, dict[str, float]], *,
     higher_is_better: bool, seed: int, n_bootstrap: int,
-) -> dict[str, float | int]:
+) -> dict[str, Any]:
     seeds = sorted(set(left) & set(right))
     if not seeds:
         raise ValueError("hierarchical comparison has no shared random seeds")
-    patients = sorted(set.intersection(*(
+    held_out_units = sorted(set.intersection(*(
         set(left[value]) & set(right[value]) for value in seeds
     )))
-    if not patients:
-        raise ValueError("hierarchical comparison has no shared held-out patients")
+    if not held_out_units:
+        return {
+            "mean_delta": float("nan"),
+            "ci95_low": float("nan"),
+            "ci95_high": float("nan"),
+            "n_seeds": len(seeds),
+            "n_held_out_units": 0,
+            "resampling_unit": "held_out_slide",
+            "n_patients": 0,
+            "status": "unavailable_no_shared_finite_slide_values",
+        }
     matrix = np.asarray([
         [
-            (left[run_seed][patient] - right[run_seed][patient])
-            if higher_is_better else (right[run_seed][patient] - left[run_seed][patient])
-            for patient in patients
+            (left[run_seed][unit] - right[run_seed][unit])
+            if higher_is_better else (right[run_seed][unit] - left[run_seed][unit])
+            for unit in held_out_units
         ]
         for run_seed in seeds
     ], dtype=np.float64)
@@ -253,12 +282,17 @@ def _hierarchical_delta(
     draws = np.empty(int(n_bootstrap), dtype=np.float64)
     for index in range(int(n_bootstrap)):
         seed_rows = rng.integers(0, len(seeds), size=len(seeds))
-        patient_columns = rng.integers(0, len(patients), size=len(patients))
-        draws[index] = matrix[np.ix_(seed_rows, patient_columns)].mean()
+        unit_columns = rng.integers(0, len(held_out_units), size=len(held_out_units))
+        draws[index] = matrix[np.ix_(seed_rows, unit_columns)].mean()
     low, high = (float(value) for value in np.quantile(draws, [0.025, 0.975]))
     return {
         "mean_delta": observed, "ci95_low": low, "ci95_high": high,
-        "n_seeds": len(seeds), "n_patients": len(patients),
+        "n_seeds": len(seeds),
+        "n_held_out_units": len(held_out_units),
+        "resampling_unit": "held_out_slide",
+        # Backward-compatible alias for readers of the initial table schema.
+        "n_patients": len(held_out_units),
+        "status": "ok",
     }
 
 
@@ -275,11 +309,14 @@ def summarize(
     records: dict[str, dict[int, tuple[Path, dict[str, Any]]]], *,
     output_dir: str | Path, n_bootstrap: int = 10_000,
 ) -> dict[str, Path]:
-    expected_seeds = {0, 1, 2}
     if set(records) != set(ARCHITECTURES):
         raise ValueError(f"expected architectures={ARCHITECTURES}, got={sorted(records)}")
+    seed_sets = {architecture: set(records[architecture]) for architecture in ARCHITECTURES}
+    expected_seeds = seed_sets[ARCHITECTURES[0]]
+    if len(expected_seeds) != 3:
+        raise ValueError(f"exactly three independent seeds are required; got={sorted(expected_seeds)}")
     for architecture in ARCHITECTURES:
-        if set(records[architecture]) != expected_seeds:
+        if seed_sets[architecture] != expected_seeds:
             raise ValueError(
                 f"{architecture}: expected seeds={sorted(expected_seeds)}, "
                 f"got={sorted(records[architecture])}"
@@ -313,7 +350,7 @@ def summarize(
                     seed_rows.append({
                         "architecture": architecture, "seed": run_seed,
                         "scope": scope, "panel": panel,
-                        **{metric: _patient_mean(metrics.get(metric)) for metric in POINT_METRICS},
+                        **{metric: _patient_metric(metrics, metric) for metric in POINT_METRICS},
                         "checkpoint_step": report.get("checkpoint_step"),
                         "checkpoint_masks_seen": report.get("checkpoint_masks_seen"),
                         "source": str(path),
@@ -360,7 +397,7 @@ def summarize(
                 if metric == "auc" and panel != "all_genes":
                     continue
                 higher = metric != "rmse"
-                seed_deltas = []
+                seed_deltas: dict[int, float] = {}
                 left_by_seed, right_by_seed = {}, {}
                 for run_seed in sorted(expected_seeds):
                     left_report = records[left_arch][run_seed][1]
@@ -380,8 +417,10 @@ def summarize(
                         if higher else (right_patient[patient] - left_patient[patient])
                         for patient in sorted(left_patient)
                     ]
-                    seed_deltas.append(float(np.mean(per_patient)))
-                mean, sd, low, high = _t_interval(seed_deltas)
+                    seed_deltas[run_seed] = (
+                        float(np.mean(per_patient)) if per_patient else float("nan")
+                    )
+                mean, sd, low, high = _t_interval(list(seed_deltas.values()))
                 seed_delta_rows.append({
                     "left": left_arch, "right": right_arch, "scope": scope,
                     "panel": panel, "metric": metric,
@@ -418,7 +457,7 @@ def summarize(
     structured_delta_rows: list[dict[str, Any]] = []
     for panel in PANELS:
         for output_name, metric_path in STRUCTURED_METRICS.items():
-            left_by_seed, right_by_seed, seed_deltas = {}, {}, []
+            left_by_seed, right_by_seed, seed_deltas = {}, {}, {}
             unavailable = False
             for run_seed in sorted(expected_seeds):
                 left_report = records[left_arch][run_seed][1]
@@ -431,10 +470,10 @@ def summarize(
                 if set(left_patient) != set(right_patient):
                     raise ValueError(f"structured/{panel}/{output_name}: patient identity differs")
                 left_by_seed[run_seed], right_by_seed[run_seed] = left_patient, right_patient
-                seed_deltas.append(float(np.mean([
+                seed_deltas[run_seed] = float(np.mean([
                     left_patient[patient] - right_patient[patient]
                     for patient in sorted(left_patient)
-                ])))
+                ]))
             if unavailable:
                 structured_delta_rows.append({
                     "left": left_arch, "right": right_arch, "panel": panel,
@@ -447,7 +486,7 @@ def summarize(
                     "n_seeds": len(expected_seeds), "n_patients": 0,
                 })
                 continue
-            mean, sd, low, high = _t_interval(seed_deltas)
+            mean, sd, low, high = _t_interval(list(seed_deltas.values()))
             hierarchy = _hierarchical_delta(
                 left_by_seed, right_by_seed, higher_is_better=True,
                 seed=71_000 + len(structured_delta_rows), n_bootstrap=n_bootstrap,
@@ -507,11 +546,13 @@ def discover_records(
     }
     for architecture in ARCHITECTURES:
         path = seed0 / f"{architecture}_validation.json"
-        records[architecture][0] = (path, _load_json(path))
+        report = _load_json(path)
+        source_seed = _config_seed(report, path)
+        records[architecture][source_seed] = (path, report)
     for run_name, run in (plan.get("runs") or {}).items():
         architecture = str(run["source_arm"])
         run_seed = int(run["seed"])
-        if architecture not in records or run_seed not in {1, 2}:
+        if architecture not in records:
             raise ValueError(f"unexpected replication plan entry: {run_name}")
         path = evaluation / f"{run_name}_validation.json"
         if run_seed in records[architecture]:

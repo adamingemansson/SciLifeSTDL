@@ -35,7 +35,10 @@ def _structured(value):
     }
 
 
-def _report(tmp_path: Path, architecture: str, seed: int, value: float) -> tuple[Path, dict]:
+def _report(
+    tmp_path: Path, architecture: str, seed: int, value: float, *,
+    legacy_patient_schema: bool = False,
+) -> tuple[Path, dict]:
     config = tmp_path / f"{architecture}_seed{seed}.yaml"
     config.write_text(yaml.safe_dump({"training": {"seed": seed}}))
     sidecar = tmp_path / f"{architecture}_seed{seed}.npz"
@@ -44,14 +47,16 @@ def _report(tmp_path: Path, architecture: str, seed: int, value: float) -> tuple
     for index in range(448):
         patient = f"p{index % 14}"
         fixed_records.append({
-            "sample_id": f"s{index % 14}", "patient_id": patient,
+            "sample_id": f"s{index % 14}",
+            "patient_id": None if legacy_patient_schema else patient,
             "model": _point(value),
             "gene_panels": {"model": {panel: _point(value) for panel in PANELS[1:]}},
         })
     whole_records = []
     for index in range(14):
         whole_records.append({
-            "sample_id": f"s{index}", "patient_id": f"p{index}",
+            "sample_id": f"s{index}",
+            "patient_id": None if legacy_patient_schema else f"p{index}",
             "n_spots": 100 + index,
             "point_metrics": {panel: _point(value) for panel in PANELS},
             "structured_field": {"panels": {panel: _structured(value) for panel in PANELS}},
@@ -91,8 +96,13 @@ def _records(tmp_path: Path):
     result = {architecture: {} for architecture in ARCHITECTURES}
     for architecture in ARCHITECTURES:
         offset = 0.2 if architecture == ARCHITECTURES[0] else 0.1
-        for seed in (0, 1, 2):
-            result[architecture][seed] = _report(tmp_path, architecture, seed, offset + seed * 0.01)
+        # The historical finalist used seed 10; "seed0 root" means the
+        # reference run operationally, not literal training seed zero.
+        for seed in (10, 1, 2):
+            result[architecture][seed] = _report(
+                tmp_path, architecture, seed, offset + seed * 0.01,
+                legacy_patient_schema=seed == 10,
+            )
     return result
 
 
@@ -104,6 +114,9 @@ def test_seed_summary_audits_and_separates_seed_and_patient_uncertainty(tmp_path
     assert "mk_wb_parallel_gated" in text
     # The synthetic architecture delta is +0.1 in every seed.
     assert "0.1" in text
+    hierarchical = outputs["hierarchical_delta"].read_text()
+    assert "held_out_slide" in hierarchical
+    assert "\t14\t" in hierarchical
 
 
 def test_seed_report_audit_rejects_incomplete_fixed_records(tmp_path: Path):
@@ -111,6 +124,25 @@ def test_seed_report_audit_rejects_incomplete_fixed_records(tmp_path: Path):
     report["per_item_records"].pop()
     with pytest.raises(ValueError, match="fixed per-item record count"):
         audit_report(report, path, expected_seed=0)
+
+
+def test_seed_summary_marks_unavailable_record_metric_without_aborting(tmp_path: Path):
+    records = _records(tmp_path)
+    for by_seed in records.values():
+        for _seed, (_path, report) in by_seed.items():
+            for row in report["per_item_records"]:
+                row["model"]["auc"] = float("nan")
+    outputs = summarize(records, output_dir=tmp_path / "summary_nan", n_bootstrap=20)
+    rows = outputs["hierarchical_delta"].read_text().splitlines()
+    header = rows[0].split("\t")
+    parsed = [dict(zip(header, row.split("\t"))) for row in rows[1:]]
+    auc = next(
+        row for row in parsed
+        if row["scope"] == "fixed_mask"
+        and row["panel"] == "all_genes" and row["metric"] == "auc"
+    )
+    assert auc["status"] == "unavailable_no_shared_finite_slide_values"
+    assert auc["n_held_out_units"] == "0"
 
 
 def _write_sidecar(path: Path, architecture: str, seed: int) -> None:
@@ -145,7 +177,7 @@ def _write_sidecar(path: Path, architecture: str, seed: int) -> None:
 def test_gene_robustness_requires_and_summarizes_three_seeds(tmp_path: Path):
     records = {architecture: {} for architecture in ARCHITECTURES}
     for architecture in ARCHITECTURES:
-        for seed in (0, 1, 2):
+        for seed in (10, 1, 2):
             sidecar = tmp_path / f"{architecture}_{seed}.npz"
             _write_sidecar(sidecar, architecture, seed)
             records[architecture][seed] = (
@@ -154,7 +186,26 @@ def test_gene_robustness_requires_and_summarizes_three_seeds(tmp_path: Path):
                     "per_gene_diagnostics_path": str(sidecar),
                 }},
             )
-    outputs = analyze_genes(records, output_dir=tmp_path / "genes")
+    noise_ceiling = tmp_path / "noise_ceiling.json"
+    noise_ceiling.write_text(json.dumps({
+        "kind": "gene_noise_ceiling_by_count_splitting",
+        "per_slide": [
+            {
+                "sample_id": f"s{index}",
+                "ceiling_by_gene": {"g0": 0.2, "g1": 0.5, "g2": 0.8},
+            }
+            for index in range(14)
+        ],
+    }))
+    outputs = analyze_genes(
+        records, output_dir=tmp_path / "genes",
+        noise_ceiling_path=noise_ceiling,
+    )
     assert all(path.is_file() for path in outputs.values())
     assert "fraction_genes_all_seeds_positive" in outputs["summary"].read_text()
     assert "mean_pcc_delta" in outputs["architecture_delta"].read_text()
+    assert "noise_ceiling" in outputs["architecture_delta"].read_text().splitlines()[0]
+    assert "target_moran_i" in outputs["per_gene"].read_text().splitlines()[0]
+    assert "mean_pcc_delta" in outputs["delta_attribute_associations"].read_text()
+    manifest = json.loads(outputs["manifest"].read_text())
+    assert manifest["seeds"] == [1, 2, 10]
