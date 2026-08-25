@@ -1,0 +1,138 @@
+experiment_name: wae_mmd_geneencoder_ablation_wae_he_mmd_geneencoder_scfoundation_film_v1
+documented_divergences:
+- model.arm
+- model.params.gene_encoder_source
+- training.checkpoint_dir
+- training.device
+- evaluation.tensorboard.log_dir
+- data.gene_encoder_table_path
+- model.params.encoder_conditioning
+- model.params.film_layers
+- model.params.film_shared_generator
+model:
+  arm: wae_he_mmd_geneencoder_scfoundation_film
+  kind: conditional_wae
+  task: he_to_st
+  regularizer: mmd
+  include_observed_gex: false
+  image_mode: full_visible
+  params:
+    image_feature_dim: 1536
+    hidden_dim: 512
+    n_heads: 8
+    n_blocks: 4
+    dense_threshold: 256
+    sparse_k: 10
+    gex_feature_dim: 256
+    latent_dim: 64
+    autoencoder_hidden_dim: 1024
+    discriminator_hidden_dim: 256
+    n_inference_samples: 8
+    dropout: 0.1
+    encoder_conditioning: film
+    film_layers:
+    - first
+    - second
+    film_shared_generator: false
+    z_noise_std: 0.0
+    n_refinement_steps: 0
+    gene_encoder_source: frozen_table
+loss:
+  pcc_weight: 0.1
+  regularizer_weight: 0.1
+  conditional_mean_weight: 1.0
+masking:
+  strata:
+  - name: small_compact
+    radius_range:
+    - 3.0
+    - 5.0
+    radius_unit: spot_spacing
+    shape: circle
+  - name: medium_compact
+    radius_range:
+    - 5.0
+    - 8.0
+    radius_unit: spot_spacing
+    shape: circle
+  - name: large_compact
+    radius_range:
+    - 8.0
+    - 12.0
+    radius_unit: spot_spacing
+    shape: circle
+  - name: medium_irregular
+    radius_range:
+    - 5.0
+    - 8.0
+    radius_unit: spot_spacing
+    shape: mixed
+data:
+  hest_data_dir: /data/adam.ingemansson/SciLifeSTDL/data/raw/hest1k
+  hest_cache_dir: /data/adam.ingemansson/SciLifeSTDL/data/cache/hest1k
+  gen3_uni2_spot_feature_cache_dir: /data/adam.ingemansson/SciLifeSTDL/data/raw/hest1k
+  slide_context_source: dense_wsi_cache
+  gen3_manifest_path: /data/adam.ingemansson/SciLifeSTDL/data/cache/hest1k/gen3_multiorgan7_expanded_manifest_seed1.json
+  tile_encoder_revision: null
+  gex_feature_dim: 256
+  n_training_masks_per_sample: 500
+  n_validation_masks: 4
+  novae:
+    enabled: false
+  sample_selection:
+    organs: all
+    metadata_csv: hf://datasets/MahmoodLab/hest/HEST_v1_3_0.csv
+    min_samples_per_organ: 5
+    max_samples_per_organ: 30
+    n_validation_per_organ: 2
+    n_test_per_organ: 2
+    split_seed: 0
+  image_encoder: uni2
+  retain_patches_in_memory: false
+  uni2_pinned_revision: d517a8dd47902dd7c308b3c36f63bce47e7b9a43
+  gene_encoder_table_path: /data/adam.ingemansson/SciLifeSTDL/data/cache/hest1k/gene_coexpression_basis_scfoundation_multiorgan7.pt
+evaluation:
+  train_gene_panel_artifact: /data/adam.ingemansson/SciLifeSTDL-MK/gen3_multiscale/results/train_gene_panels_v3.json
+  gene_panels:
+    CCRCC_var_50genes: /data/adam.ingemansson/SciLifeSTDL-MK/resources/evaluation/hest_bench/CCRCC_var_50genes.json
+  compute_st_fid_mmd: false
+  patient_level_aggregation: true
+  tensorboard:
+    enabled: true
+    log_dir: /data/adam.ingemansson/SciLifeSTDL-MK/gen3_multiscale/results/wae_mmd_geneencoder_uni2_refine0_v1/tensorboard/wae_he_mmd_geneencoder_scfoundation_film
+    log_train_scalars: false
+    snapshot_every_n_evals: 5
+    embedding_max_points: 800
+    embedding_max_points_per_item: 64
+    thumbnail_max_points: 100
+    thumbnail_size: 32
+    max_spatial_samples: 4
+    spatial_gene_count: 2
+  whole_slide_validation:
+    enabled: true
+    every_n_evals: 5
+    max_slides: 7
+    chunk_size: 2048
+    reference_projection_path: /data/adam.ingemansson/SciLifeSTDL-MK/gen3_multiscale/results/mk_wae_shared_reference_gex_projection
+required_fingerprints:
+  gigapath_checkpoint: null
+  gene_vocabulary: null
+  train_mask_bank: null
+  validation_mask_bank: null
+  test_mask_bank: null
+training:
+  device: cuda:0
+  seed: 0
+  lr: 0.0001
+  total_steps: 100000000
+  max_wall_clock_hours: 8.0
+  gradient_clip_val: 1.0
+  log_every_n_steps: 50
+  checkpoint_every_n_steps: 2000
+  checkpoint_dir: /data/adam.ingemansson/SciLifeSTDL-MK/gen3_multiscale/results/wae_mmd_geneencoder_uni2_refine0_v1/checkpoints/wae_he_mmd_geneencoder_scfoundation_film
+  eval_every_n_steps: 2000
+  synchronized_init_dir: null
+  optimizer:
+    weight_decay: 0.01
+  cpu_threads: 12
+  gradient_accumulation_steps: 1
